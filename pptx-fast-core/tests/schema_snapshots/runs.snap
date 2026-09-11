@@ -1,0 +1,7 @@
+run_id: UInt64(nullable=false)
+paragraph_id: UInt64(nullable=false)
+run_index: UInt32(nullable=false)
+text: Utf8(nullable=false)
+bold: Boolean(nullable=false)
+italic: Boolean(nullable=false)
+underline: Boolean(nullable=false)

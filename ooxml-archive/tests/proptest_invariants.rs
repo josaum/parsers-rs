@@ -182,9 +182,13 @@ proptest! {
     ///
     /// This is the property the per-part form cannot express, and the reason a
     /// package with many individually-small parts cannot multiply the limit.
+    ///
+    /// `size` starts at 1: a zero-length part is a degenerate case the budget
+    /// arithmetic has nothing to say about, and asserting anything about it
+    /// here would be testing the generator rather than the archive.
     #[test]
     fn max_inflate_is_charged_across_parts(
-        size in 0usize..1024,
+        size in 1usize..1024,
         fill in any::<u8>(),
     ) {
         let body = vec![fill; size];
@@ -207,8 +211,8 @@ proptest! {
             "two parts of {size} must fit a budget of {budget}: {second:?}"
         );
 
-        // One more byte than the budget must fail on the very next read, and
-        // say so in terms a caller can act on.
+        // The budget is now exactly spent, so the next read of a non-empty
+        // part must fail and say so in terms a caller can act on.
         let third = archive.read_part("first.bin", budget);
         let err = third.expect_err("a third part must exceed an aggregate budget of two");
         prop_assert!(

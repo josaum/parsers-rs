@@ -1,0 +1,36 @@
+[package]
+name = "pptx-fast-core"
+version = "0.2.1"
+edition.workspace = true
+authors.workspace = true
+description = "High-performance PowerPoint (.pptx) parser with full slide extraction"
+license.workspace = true
+keywords = ["pptx", "powerpoint", "ooxml", "parser", "office", "presentation"]
+categories = ["parser-implementations", "encoding"]
+rust-version.workspace = true
+
+[lib]
+name = "pptx_fast_core"
+
+[features]
+# `arrow` is on by default so the Arrow IPC and dataset writers are exercised by
+# the repository's own build command. As a non-default feature they were
+# silently skipped by `cargo test --workspace`, and the path shipped only
+# because the Python binding happened to enable the feature.
+default = ["arrow"]
+arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc"]
+
+[dependencies]
+anyhow = "1.0"
+arrow-array = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+ooxml-archive = { path = "../ooxml-archive" }
+quick-xml = "0.36"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+zip = "0.6"

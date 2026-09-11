@@ -1,0 +1,3 @@
+slide_id: UInt32(nullable=false)
+name: Utf8(nullable=true)
+slide_index: UInt32(nullable=false)

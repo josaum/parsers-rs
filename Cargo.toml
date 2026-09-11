@@ -6,6 +6,8 @@ members = [
   "ooxml-archive",
   "xlsx-fast-core",
   "xlsx-fast-py",
+  "pptx-fast-core",
+  "pptx-fast-py",
   "email-fast-core",
   "email-fast-py",
   "json-fast-core",

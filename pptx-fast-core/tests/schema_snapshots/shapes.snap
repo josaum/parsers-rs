@@ -1,0 +1,7 @@
+shape_id: UInt64(nullable=false)
+owner_kind: Utf8(nullable=false)
+owner_id: Utf8(nullable=false)
+shape_xml_id: UInt32(nullable=true)
+name: Utf8(nullable=true)
+placeholder: Utf8(nullable=true)
+shape_index: UInt32(nullable=false)

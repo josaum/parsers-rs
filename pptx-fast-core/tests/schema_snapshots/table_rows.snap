@@ -1,0 +1,3 @@
+row_id: UInt64(nullable=false)
+table_id: UInt64(nullable=false)
+row_index: UInt32(nullable=false)

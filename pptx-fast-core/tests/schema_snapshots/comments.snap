@@ -1,0 +1,5 @@
+comment_id: UInt32(nullable=false)
+author: Utf8(nullable=true)
+date: Utf8(nullable=true)
+text: Utf8(nullable=true)
+slide_id: UInt32(nullable=false)

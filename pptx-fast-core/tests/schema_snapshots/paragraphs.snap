@@ -1,0 +1,5 @@
+paragraph_id: UInt64(nullable=false)
+shape_id: UInt64(nullable=false)
+para_index: UInt32(nullable=false)
+level: UInt8(nullable=true)
+text: Utf8(nullable=false)
