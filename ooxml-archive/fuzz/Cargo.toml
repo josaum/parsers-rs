@@ -1,0 +1,23 @@
+[package]
+name = "ooxml-archive-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ooxml-archive = { path = ".." }
+
+[[bin]]
+name = "store_from_bytes"
+path = "fuzz_targets/store_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone fuzz crate: intentionally outside the office-parsers-rs
+# workspace (members are explicit) and outside any parent workspace.
+[workspace]

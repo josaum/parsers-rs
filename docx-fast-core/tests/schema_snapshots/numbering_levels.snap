@@ -1,0 +1,5 @@
+abstract_id: UInt32(nullable=false)
+level: UInt8(nullable=false)
+format: Utf8(nullable=true)
+text: Utf8(nullable=true)
+start: UInt32(nullable=true)

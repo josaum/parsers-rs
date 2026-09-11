@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SBOM_SOURCES: dict[str, str] = {
     "json_fast": "json-fast-core",
     "xsd_fast": "xsd-fast-core",
+    "docx_fast": "docx-fast-core",
     "email_fast": "email-fast-core",
 }
 

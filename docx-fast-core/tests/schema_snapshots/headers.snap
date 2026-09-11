@@ -1,0 +1,4 @@
+header_id: UInt32(nullable=false)
+kind: Utf8(nullable=false)
+ref_type: Utf8(nullable=true)
+part: Utf8(nullable=false)

@@ -1,0 +1,4 @@
+image_id: Utf8(nullable=false)
+source_part: Utf8(nullable=false)
+target: Utf8(nullable=false)
+content_type: Utf8(nullable=true)

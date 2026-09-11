@@ -1,0 +1,4 @@
+table_id: UInt64(nullable=false)
+owner_kind: Utf8(nullable=false)
+owner_id: Int64(nullable=false)
+block_index: UInt32(nullable=false)

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+  "docx-fast-core",
+  "docx-fast-py",
+  "ooxml-archive",
   "email-fast-core",
   "email-fast-py",
   "json-fast-core",

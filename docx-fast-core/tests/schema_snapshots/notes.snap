@@ -1,0 +1,2 @@
+note_type: Utf8(nullable=false)
+note_id: Int32(nullable=false)

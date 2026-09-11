@@ -1,0 +1,4 @@
+field_id: UInt32(nullable=false)
+instr: Utf8(nullable=true)
+result: Utf8(nullable=false)
+kind: Utf8(nullable=true)

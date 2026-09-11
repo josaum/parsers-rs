@@ -45,6 +45,7 @@ SCHEMA_VERSION = "parsers-rs.release.v1"
 CRATES: dict[str, str] = {
     "json_fast": "json-fast-py",
     "xsd_fast": "xsd-fast-py",
+    "docx_fast": "docx-fast-py",
     "email_fast": "email-fast-py",
 }
 
