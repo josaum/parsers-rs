@@ -1,0 +1,38 @@
+[package]
+name = "xlsx-fast-core"
+version = "0.2.1"
+edition.workspace = true
+authors.workspace = true
+description = "High-performance Excel (.xlsx) parser with SIMD optimizations"
+license.workspace = true
+keywords = ["xlsx", "excel", "ooxml", "parser", "office", "spreadsheet"]
+categories = ["parser-implementations", "encoding"]
+rust-version.workspace = true
+
+[lib]
+name = "xlsx_fast_core"
+
+[features]
+# `arrow` is on by default so the Arrow IPC path is exercised by the
+# repository's own build command. As a non-default feature the IPC tests were
+# silently skipped by `cargo test --workspace`, which meant the streaming path
+# shipped only because the Python binding happened to enable it.
+default = ["arrow"]
+arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc"]
+
+[dependencies]
+anyhow = "1.0"
+arrow-array = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+lexical-core = "0.8"
+ooxml-archive = { path = "../ooxml-archive" }
+quick-xml = "0.36"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+calamine = "0.22"
+tempfile = "3.10"
+zip = "0.6"

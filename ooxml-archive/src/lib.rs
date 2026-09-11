@@ -2,22 +2,21 @@
 //!
 //! Memory-maps (or owns) a ZIP package, indexes parts once, and returns
 //! stored parts as borrowed slices so XML parsers never copy uncompressed
-//! bytes. Deflate parts are inflated through a thread-local `libdeflater`
-//! decompressor, with a streaming fallback for unknown or oversized sizes.
+//! bytes. Deflate parts are inflated through a capped decoder before being
+//! exposed to callers.
 
 use anyhow::{anyhow, Context, Result};
 use flate2::read::DeflateDecoder;
-use libdeflater::Decompressor;
 use memmap2::Mmap;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use rawzip::{CompressionMethod, ZipArchive, ZipArchiveEntryWayfinder, ZipSliceArchive};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read};
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// Transitional Office Open XML officeDocument relationship type.
 pub const REL_OFFICE_DOCUMENT: &str =
@@ -27,17 +26,32 @@ pub const REL_OFFICE_DOCUMENT: &str =
 pub const STRICT_RELATIONSHIP_PREFIX: &str =
     "http://purl.oclc.org/ooxml/officeDocument/relationships/";
 
-thread_local! {
-    // Reused per thread so hot-path inflate does not allocate a decompressor
-    // for every package part. Scratch only; not process-wide semantic state.
-    static DECOMPRESSOR: RefCell<Decompressor> = RefCell::new(Decompressor::new());
-}
-
 /// Default per-part inflate ceiling (128 MiB).
 ///
 /// Matches the historical `ParseOptions::max_inflate` default in the
 /// office parsers. Raising it increases zip-bomb exposure.
 pub const DEFAULT_MAX_INFLATE: usize = 128 * 1024 * 1024;
+
+/// Request-scoped aggregate budget shared by every view of one OOXML package.
+///
+/// Parsers that reopen a package for parallel reads must clone the same
+/// [`SharedInflateBudget`]. The lock is intentionally held while a Deflate
+/// member is expanded, so concurrent workers cannot each allocate against the
+/// same remaining bytes before either charge becomes visible.
+#[derive(Debug, Default)]
+pub struct InflateBudget {
+    consumed: Mutex<usize>,
+}
+
+/// Shared handle for one request/document inflate budget.
+pub type SharedInflateBudget = Arc<InflateBudget>;
+
+impl InflateBudget {
+    /// Create a fresh shared budget for one package parse.
+    pub fn shared() -> SharedInflateBudget {
+        Arc::new(Self::default())
+    }
+}
 
 #[derive(Debug)]
 enum ArchiveStorage {
@@ -58,7 +72,6 @@ impl AsRef<[u8]> for ArchiveStorage {
 struct EntryMeta {
     wayfinder: ZipArchiveEntryWayfinder,
     compression: CompressionMethod,
-    uncompressed_size: u64,
 }
 
 /// Memory-mapped or owned OOXML ZIP package with a path index.
@@ -66,11 +79,21 @@ struct EntryMeta {
 pub struct OoxmlArchive {
     archive: ZipSliceArchive<ArchiveStorage>,
     entries: HashMap<String, EntryMeta>,
+    inflate_budget: SharedInflateBudget,
 }
 
 impl OoxmlArchive {
     /// Open a package from a filesystem path, preferring a read-only mmap.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_budget(path, InflateBudget::shared())
+    }
+
+    /// Open a package while sharing an existing request-scoped inflate budget.
+    ///
+    /// This is required when parallel workers reopen the same package: each
+    /// archive owns its ZIP index, while every part read charges one common
+    /// aggregate limit.
+    pub fn open_with_budget(path: &Path, inflate_budget: SharedInflateBudget) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open file: {}", path.display()))?;
         let storage = match unsafe {
             // SAFETY: the file is mapped read-only and treated as an
@@ -81,18 +104,35 @@ impl OoxmlArchive {
             Ok(mmap) => ArchiveStorage::Mmap(mmap),
             Err(_) => ArchiveStorage::Owned(read_all(&file)?),
         };
-        Self::from_storage(storage)
+        Self::from_storage(storage, inflate_budget)
     }
 
     /// Open a package from owned bytes without writing a temp file.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        Self::from_storage(ArchiveStorage::Owned(bytes))
+        Self::from_bytes_with_budget(bytes, InflateBudget::shared())
     }
 
-    fn from_storage(storage: ArchiveStorage) -> Result<Self> {
+    /// Open owned package bytes while sharing an existing inflate budget.
+    pub fn from_bytes_with_budget(
+        bytes: Vec<u8>,
+        inflate_budget: SharedInflateBudget,
+    ) -> Result<Self> {
+        Self::from_storage(ArchiveStorage::Owned(bytes), inflate_budget)
+    }
+
+    fn from_storage(storage: ArchiveStorage, inflate_budget: SharedInflateBudget) -> Result<Self> {
         let archive = ZipArchive::from_slice(storage).context("open zip archive")?;
         let entries = build_index(&archive)?;
-        Ok(Self { archive, entries })
+        Ok(Self {
+            archive,
+            entries,
+            inflate_budget,
+        })
+    }
+
+    /// Clone the request-scoped budget for another archive view or worker.
+    pub fn shared_inflate_budget(&self) -> SharedInflateBudget {
+        Arc::clone(&self.inflate_budget)
     }
 
     /// Whether a package part exists in the central directory index.
@@ -110,64 +150,44 @@ impl OoxmlArchive {
     /// Fails when the uncompressed size exceeds `max_inflate`.
     pub fn read_part(&self, name: &str, max_inflate: usize) -> Result<PartBytes<'_>> {
         let (meta, data) = self.part_data(name)?;
-        match meta.compression {
+        self.with_inflate_budget(name, max_inflate, |remaining| match meta.compression {
             CompressionMethod::Store => {
-                ensure_within_max(name, data.len(), max_inflate)?;
-                Ok(PartBytes::Borrowed(data))
+                ensure_within_max(name, data.len(), remaining)?;
+                Ok((PartBytes::Borrowed(data), data.len()))
             }
             CompressionMethod::Deflate => {
-                let expected = meta.uncompressed_size as usize;
-                if expected > max_inflate {
-                    return Err(oversize_error(name, max_inflate));
-                }
-                if expected > 0 {
-                    Ok(PartBytes::Owned(inflate_oneshot(name, data, expected)?))
-                } else {
-                    Ok(PartBytes::Owned(inflate_capped(name, data, max_inflate)?))
-                }
+                let inflated = inflate_capped(name, data, remaining)?;
+                let inflated_len = inflated.len();
+                Ok((PartBytes::Owned(inflated), inflated_len))
             }
             _ => Err(anyhow!("unsupported compression for part: {name}")),
-        }
+        })
     }
 
     /// Open a buffered reader over a part.
     ///
-    /// When `stream_oversize` is true, Deflate parts with unknown size or
-    /// size above `max_inflate` are streamed instead of rejected. Stored
-    /// parts are always borrowed.
+    /// Deflate data is bounded by `max_inflate` before any bytes are exposed.
+    /// `stream_oversize` is retained for compatibility and cannot bypass that
+    /// boundary.
     pub fn open_part_reader(
         &self,
         name: &str,
         max_inflate: usize,
-        stream_oversize: bool,
+        _stream_oversize: bool,
     ) -> Result<PartReader<'_>> {
         let (meta, data) = self.part_data(name)?;
-        match meta.compression {
+        self.with_inflate_budget(name, max_inflate, |remaining| match meta.compression {
             CompressionMethod::Store => {
-                ensure_within_max(name, data.len(), max_inflate)?;
-                Ok(PartReader::Stored(Cursor::new(data)))
+                ensure_within_max(name, data.len(), remaining)?;
+                Ok((PartReader::Stored(Cursor::new(data)), data.len()))
             }
             CompressionMethod::Deflate => {
-                let expected = meta.uncompressed_size as usize;
-                if expected > 0 && expected <= max_inflate {
-                    let out = inflate_oneshot(name, data, expected)?;
-                    return Ok(PartReader::Owned(Cursor::new(out)));
-                }
-                if stream_oversize {
-                    let decoder = DeflateDecoder::new(Cursor::new(data));
-                    return Ok(PartReader::Deflate(BufReader::new(decoder)));
-                }
-                if expected > max_inflate {
-                    return Err(oversize_error(name, max_inflate));
-                }
-                Ok(PartReader::Owned(Cursor::new(inflate_capped(
-                    name,
-                    data,
-                    max_inflate,
-                )?)))
+                let inflated = inflate_capped(name, data, remaining)?;
+                let inflated_len = inflated.len();
+                Ok((PartReader::Owned(Cursor::new(inflated)), inflated_len))
             }
             _ => Err(anyhow!("unsupported compression for part: {name}")),
-        }
+        })
     }
 
     /// Resolve the officeDocument part from `_rels/.rels`, else `fallback`.
@@ -198,6 +218,29 @@ impl OoxmlArchive {
             .get_entry(meta.wayfinder)
             .with_context(|| format!("open part: {name}"))?;
         Ok((meta, entry.data()))
+    }
+
+    fn with_inflate_budget<T>(
+        &self,
+        name: &str,
+        max_inflate: usize,
+        operation: impl FnOnce(usize) -> Result<(T, usize)>,
+    ) -> Result<T> {
+        let mut consumed = self
+            .inflate_budget
+            .consumed
+            .lock()
+            .map_err(|_| anyhow!("OOXML inflate budget lock poisoned"))?;
+        let remaining = max_inflate
+            .checked_sub(*consumed)
+            .ok_or_else(|| oversize_error(name, max_inflate))?;
+        let (value, actual_bytes) = operation(remaining)?;
+        let next = consumed
+            .checked_add(actual_bytes)
+            .ok_or_else(|| oversize_error(name, max_inflate))?;
+        ensure_within_max(name, next, max_inflate)?;
+        *consumed = next;
+        Ok(value)
     }
 }
 
@@ -250,14 +293,12 @@ impl AsRef<[u8]> for PartBytes<'_> {
     }
 }
 
-/// Buffered reader over a stored, inflated, or streaming Deflate part.
+/// Buffered reader over a stored or bounded inflated part.
 pub enum PartReader<'a> {
     /// Stored ZIP entry.
     Stored(Cursor<&'a [u8]>),
     /// Inflated Deflate entry held in memory.
     Owned(Cursor<Vec<u8>>),
-    /// Streaming Deflate decoder for unknown or oversized parts.
-    Deflate(BufReader<DeflateDecoder<Cursor<&'a [u8]>>>),
 }
 
 impl Read for PartReader<'_> {
@@ -265,7 +306,6 @@ impl Read for PartReader<'_> {
         match self {
             Self::Stored(reader) => reader.read(buf),
             Self::Owned(reader) => reader.read(buf),
-            Self::Deflate(reader) => reader.read(buf),
         }
     }
 }
@@ -275,7 +315,6 @@ impl BufRead for PartReader<'_> {
         match self {
             Self::Stored(reader) => reader.fill_buf(),
             Self::Owned(reader) => reader.fill_buf(),
-            Self::Deflate(reader) => reader.fill_buf(),
         }
     }
 
@@ -283,7 +322,6 @@ impl BufRead for PartReader<'_> {
         match self {
             Self::Stored(reader) => reader.consume(amt),
             Self::Owned(reader) => reader.consume(amt),
-            Self::Deflate(reader) => reader.consume(amt),
         }
     }
 }
@@ -493,22 +531,10 @@ fn build_index(archive: &ZipSliceArchive<ArchiveStorage>) -> Result<HashMap<Stri
         let meta = EntryMeta {
             wayfinder: entry.wayfinder(),
             compression: entry.compression_method(),
-            uncompressed_size: entry.uncompressed_size_hint(),
         };
         map.insert(path, meta);
     }
     Ok(map)
-}
-
-fn inflate_oneshot(name: &str, src: &[u8], expected: usize) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; expected];
-    let actual = DECOMPRESSOR.with(|cell| {
-        cell.borrow_mut()
-            .deflate_decompress(src, &mut out)
-            .map_err(|err| anyhow!("inflate {name}: {err:?}"))
-    })?;
-    out.truncate(actual);
-    Ok(out)
 }
 
 fn inflate_capped(name: &str, src: &[u8], max_inflate: usize) -> Result<Vec<u8>> {
@@ -612,6 +638,67 @@ mod tests {
             err.to_string().contains("max_inflate"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn reader_rejects_oversize_deflate_even_when_streaming_is_requested() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("big-reader.zip");
+        let body = vec![b'x'; 512];
+        write_pkg(
+            &path,
+            &[("xl/workbook.xml", &body, ZipCompression::Deflated)],
+        );
+
+        let archive = OoxmlArchive::open(&path).unwrap();
+        let err = match archive.open_part_reader("xl/workbook.xml", 256, true) {
+            Ok(_) => panic!("streaming must not bypass max_inflate"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("max_inflate"), "{err:#}");
+    }
+
+    #[test]
+    fn cumulative_inflate_budget_rejects_multiple_small_parts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aggregate.zip");
+        let body = vec![b'x'; 200];
+        write_pkg(
+            &path,
+            &[
+                ("xl/one.xml", &body, ZipCompression::Deflated),
+                ("xl/two.xml", &body, ZipCompression::Deflated),
+            ],
+        );
+        let archive = OoxmlArchive::open(&path).unwrap();
+        archive.read_part("xl/one.xml", 300).unwrap();
+        let err = archive
+            .read_part("xl/two.xml", 300)
+            .expect_err("aggregate inflated bytes must remain bounded");
+        assert!(err.to_string().contains("max_inflate"), "{err:#}");
+    }
+
+    #[test]
+    fn reopened_archives_share_one_inflate_budget() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("shared-aggregate.zip");
+        let body = vec![b'x'; 200];
+        write_pkg(
+            &path,
+            &[
+                ("xl/one.xml", &body, ZipCompression::Deflated),
+                ("xl/two.xml", &body, ZipCompression::Deflated),
+            ],
+        );
+        let budget = InflateBudget::shared();
+        let first = OoxmlArchive::open_with_budget(&path, Arc::clone(&budget)).unwrap();
+        let second = OoxmlArchive::open_with_budget(&path, budget).unwrap();
+
+        first.read_part("xl/one.xml", 300).unwrap();
+        let err = second
+            .read_part("xl/two.xml", 300)
+            .expect_err("reopening must not reset the aggregate budget");
+        assert!(err.to_string().contains("max_inflate"), "{err:#}");
     }
 
     #[test]

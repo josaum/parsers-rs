@@ -1,14 +1,13 @@
 [package]
 name = "ooxml-archive"
 version = "0.1.0"
-edition = "2021"
-authors = ["Mycelia Team"]
+edition.workspace = true
+authors.workspace = true
 description = "Shared OOXML ZIP archive, inflate, and relationship helpers"
-license = "MIT"
-repository = "https://github.com/mycelia/office-parsers-rs"
+license.workspace = true
 keywords = ["ooxml", "zip", "office", "parser"]
 categories = ["parser-implementations", "encoding"]
-rust-version = "1.94"
+rust-version.workspace = true
 
 [lib]
 name = "ooxml_archive"
@@ -16,7 +15,6 @@ name = "ooxml_archive"
 [dependencies]
 anyhow = "1.0"
 flate2 = "1.0"
-libdeflater = "0.12"
 memmap2 = "0.9"
 quick-xml = "0.36"
 rawzip = "0.4.3"

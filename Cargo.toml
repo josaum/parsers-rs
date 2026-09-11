@@ -4,6 +4,8 @@ members = [
   "docx-fast-core",
   "docx-fast-py",
   "ooxml-archive",
+  "xlsx-fast-core",
+  "xlsx-fast-py",
   "email-fast-core",
   "email-fast-py",
   "json-fast-core",

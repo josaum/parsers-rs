@@ -1,0 +1,20 @@
+[package]
+name = "xlsx-fast-py"
+version = "0.2.1"
+edition.workspace = true
+authors.workspace = true
+description = "Python bindings for xlsx-fast-core"
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "xlsx_fast_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+xlsx-fast-core = { path = "../xlsx-fast-core", features = ["arrow"] }
+pyo3 = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = "0.28.3"

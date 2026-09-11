@@ -223,6 +223,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "calamine"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe0ba51a659bb6c8bffd6f7c1c5ffafcafa0c97e4769411d841c3cc5c154ab47"
+dependencies = [
+ "byteorder",
+ "codepage",
+ "encoding_rs",
+ "log",
+ "quick-xml 0.30.0",
+ "serde",
+ "zip",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -270,6 +285,15 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+]
+
+[[package]]
+name = "codepage"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48f68d061bc2828ae826206326e61251aca94c1e4a5305cf52d9138639c918b4"
+dependencies = [
+ "encoding_rs",
 ]
 
 [[package]]
@@ -383,7 +407,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "ooxml-archive",
- "quick-xml",
+ "quick-xml 0.36.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -392,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "docx-fast-py"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "docx-fast-core",
  "pyo3",
@@ -713,28 +737,74 @@ dependencies = [
 ]
 
 [[package]]
+name = "lexical-core"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cde5de06e8d4c2faabc400238f9ae1c74d5412d03a7bd067645ccbc47070e46"
+dependencies = [
+ "lexical-parse-float",
+ "lexical-parse-integer",
+ "lexical-util",
+ "lexical-write-float",
+ "lexical-write-integer",
+]
+
+[[package]]
+name = "lexical-parse-float"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683b3a5ebd0130b8fb52ba0bdc718cc56815b6a097e28ae5a6997d0ad17dc05f"
+dependencies = [
+ "lexical-parse-integer",
+ "lexical-util",
+ "static_assertions",
+]
+
+[[package]]
+name = "lexical-parse-integer"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d0994485ed0c312f6d965766754ea177d07f9c00c9b82a5ee62ed5b47945ee9"
+dependencies = [
+ "lexical-util",
+ "static_assertions",
+]
+
+[[package]]
+name = "lexical-util"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5255b9ff16ff898710eb9eb63cb39248ea8a5bb036bea8085b1a767ff6c4e3fc"
+dependencies = [
+ "static_assertions",
+]
+
+[[package]]
+name = "lexical-write-float"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accabaa1c4581f05a3923d1b4cfd124c329352288b7b9da09e766b0668116862"
+dependencies = [
+ "lexical-util",
+ "lexical-write-integer",
+ "static_assertions",
+]
+
+[[package]]
+name = "lexical-write-integer"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1b6f3d1f4422866b68192d62f77bc5c700bee84f3069f2469d7bc8c77852446"
+dependencies = [
+ "lexical-util",
+ "static_assertions",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
-
-[[package]]
-name = "libdeflate-sys"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1f7b0817f85e2ba608892f30fbf4c9d03f3ebf9db0c952d1b7c8f7387b54785"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "libdeflater"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "671e63282f642c7bcc7d292b212d5a4739fef02a77fe98429a75d308f96e7931"
-dependencies = [
- "libdeflate-sys",
-]
 
 [[package]]
 name = "libm"
@@ -902,10 +972,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flate2",
- "libdeflater",
  "memmap2",
  "proptest",
- "quick-xml",
+ "quick-xml 0.36.2",
  "rawzip",
  "tempfile",
  "zip",
@@ -1078,6 +1147,16 @@ name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
+
+[[package]]
+name = "quick-xml"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eff6510e86862b57b210fd8cbe8ed3f0d7d600b9c2863cd4549a2e033c66e956"
+dependencies = [
+ "encoding_rs",
+ "memchr",
+]
 
 [[package]]
 name = "quick-xml"
@@ -1440,6 +1519,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1733,6 +1818,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "xlsx-fast-core"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "calamine",
+ "chrono",
+ "lexical-core",
+ "ooxml-archive",
+ "quick-xml 0.36.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "zip",
+]
+
+[[package]]
+name = "xlsx-fast-py"
+version = "0.2.1"
+dependencies = [
+ "pyo3",
+ "pyo3-build-config",
+ "serde_json",
+ "xlsx-fast-core",
+]
+
+[[package]]
 name = "xsd-fast-core"
 version = "0.2.0"
 dependencies = [
@@ -1742,7 +1856,7 @@ dependencies = [
  "arrow-schema",
  "indexmap",
  "memmap2",
- "quick-xml",
+ "quick-xml 0.36.2",
  "serde",
  "serde_json",
  "tempfile",

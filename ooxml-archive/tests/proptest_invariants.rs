@@ -116,10 +116,12 @@ proptest! {
     fn resolve_part_dotdot_comes_only_from_base(base_dir in arb_path(), target in arb_path()) {
         let resolved = resolve_part(&base_dir, &target);
         prop_assert!(!resolved.starts_with('/'), "resolved is absolute: {resolved}");
-        let base_dotdot = base_dir.split('/').filter(|&seg| seg == "..").count();
+        let base_normalized = base_dir.replace('\\', "/");
+        let base_dotdot = base_normalized.split('/').filter(|&seg| seg == "..").count();
         let out_dotdot = resolved.split('/').filter(|&seg| seg == "..").count();
         prop_assert!(out_dotdot <= base_dotdot, "target injected ..: {resolved}");
     }
+
 
     /// Every Type URI matches itself.
     #[test]
@@ -139,8 +141,10 @@ proptest! {
         prop_assert!(!relationship_matches(&transitional, &strict));
     }
 
-    /// `read_part` succeeds iff the uncompressed size fits `max_inflate`, on
-    /// both the stored and the deflated path, and failures name `max_inflate`.
+    /// An isolated `read_part` request succeeds iff the uncompressed size fits
+    /// `max_inflate`, on both the stored and deflated paths. Each compression
+    /// path gets its own request budget; aggregate behavior is covered by the
+    /// shared-budget tests in the library suite.
     #[test]
     fn max_inflate_fails_loud(size in 0usize..2048, max_inflate in 0usize..2048, fill in any::<u8>()) {
         let body = vec![fill; size];
@@ -148,8 +152,8 @@ proptest! {
             ("stored/part.bin", &body, ZipCompression::Stored),
             ("deflated/part.bin", &body, ZipCompression::Deflated),
         ]);
-        let archive = OoxmlArchive::from_bytes(bytes).unwrap();
         for name in ["stored/part.bin", "deflated/part.bin"] {
+            let archive = OoxmlArchive::from_bytes(bytes.clone()).unwrap();
             match archive.read_part(name, max_inflate) {
                 Ok(part) => {
                     prop_assert!(
@@ -169,6 +173,64 @@ proptest! {
                     );
                 }
             }
+        }
+    }
+
+    /// `max_inflate` is an **aggregate** budget for one archive view, not a
+    /// per-part cap: two parts of `size` bytes each fit exactly when their sum
+    /// does, and the second read is what reports the overflow.
+    ///
+    /// This is the property the per-part form cannot express, and the reason a
+    /// package with many individually-small parts cannot multiply the limit.
+    #[test]
+    fn max_inflate_is_charged_across_parts(
+        size in 0usize..1024,
+        fill in any::<u8>(),
+    ) {
+        let body = vec![fill; size];
+        let bytes = zip_bytes(&[
+            ("first.bin", &body, ZipCompression::Stored),
+            ("second.bin", &body, ZipCompression::Stored),
+        ]);
+        let archive = OoxmlArchive::from_bytes(bytes).unwrap();
+        let budget = size.saturating_mul(2);
+
+        let first = archive.read_part("first.bin", budget);
+        prop_assert!(first.is_ok(), "the first part alone must fit: {size} of {budget}");
+        first.unwrap();
+
+        // Exactly twice `size` was budgeted, so the second read consumes the
+        // remainder and must succeed rather than be rejected as a fresh cap.
+        let second = archive.read_part("second.bin", budget);
+        prop_assert!(
+            second.is_ok(),
+            "two parts of {size} must fit a budget of {budget}: {second:?}"
+        );
+
+        // One more byte than the budget must fail on the very next read, and
+        // say so in terms a caller can act on.
+        let third = archive.read_part("first.bin", budget);
+        let err = third.expect_err("a third part must exceed an aggregate budget of two");
+        prop_assert!(
+            err.to_string().contains("max_inflate"),
+            "the overflow error must name max_inflate: {err:#}"
+        );
+    }
+
+    /// A fresh archive view gets a fresh budget; the same bytes read twice in
+    /// isolation must both succeed. This is what keeps the aggregate cap from
+    /// behaving like a one-shot latch.
+    #[test]
+    fn a_reopened_archive_starts_a_fresh_budget(size in 0usize..1024, fill in any::<u8>()) {
+        let body = vec![fill; size];
+        let bytes = zip_bytes(&[("part.bin", &body, ZipCompression::Deflated)]);
+
+        for _ in 0..2 {
+            let archive = OoxmlArchive::from_bytes(bytes.clone()).unwrap();
+            let part = archive
+                .read_part("part.bin", size)
+                .unwrap_or_else(|err| panic!("a {size}-byte part must fit a {size} budget: {err:#}"));
+            prop_assert_eq!(part.as_slice(), body.as_slice());
         }
     }
 
