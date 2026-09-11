@@ -28,5 +28,7 @@ serde_json = "1.0"
 authors = ["parsers-rs maintainers"]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/parsers-rs/parsers-rs"
+# Set the real remote here once the host and org are chosen; every published
+# artifact inherits this, so it must not point at a consumer.
+repository = "https://example.invalid/parsers-rs"
 rust-version = "1.94"
