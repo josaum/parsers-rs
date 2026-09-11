@@ -21,8 +21,22 @@ interop contract** — the same purpose in every consumer.
 | --- | --- |
 | `json-fast-core`, `json-fast-py` | SIMD JSON/JSONL and JSON-family decode; same in both consumers |
 | `xsd-fast-core`, `xsd-fast-py` | XSD schema reading and Arrow derivation; no consumer semantics |
-| Document/email/pdf read cores (planned) | Same read-only output contract in both consumers |
+| `docx-fast-core`, `docx-fast-py` | Read-only DOCX structure extraction and NDJSON streaming |
+| `email-fast-core`, `email-fast-py` | Read-only EML/MSG/mbox extraction, with a bounded attachment budget |
+| `xlsx-fast-core`, `xlsx-fast-py` | Read-only XLSX workbook extraction, NDJSON and Arrow IPC streaming |
+| `ooxml-archive` | Shared OOXML ZIP, bounded inflate, and relationship resolution |
+| PDF and PPTX read cores (planned) | Same read-only output contract in both consumers |
 | `*-node` bindings (planned) | Thin, per-platform, versioned alongside the core |
+
+`ooxml-archive` is the load-bearing one. `max_inflate` is an **aggregate**
+budget for one archive view, not a per-part cap: a package with many
+individually-small parts cannot multiply the limit by having many of them. The
+restricted decoder that bounds output before exposing bytes is the `flate2` one,
+so there is no fast path that inflates first and checks afterwards — a faster
+decoder can only be reinstated by keeping that ordering.
+
+The shipped surface is **10 artifacts**: five crates × macOS arm64 and Linux
+x86_64.
 
 ## What must not belong here
 
@@ -58,8 +72,7 @@ owl-fast-core = { version = "x.y.z", features = ["atlas-reasoner-rows"] }
 The default build stays a neutral reader with no consumer dependency; the
 `atlas-reasoner-rows` feature adds the Arrow projection and pulls
 `atlas-reasoner`. That resolves the collision without moving Atlas's reasoner
-types into this repository. It is **not implemented here yet** — this release
-ships `json-fast` and `xsd-fast` only.
+types into this repository. It is **not implemented here yet**.
 
 ## Build
 
@@ -103,9 +116,12 @@ target triple. It refuses to write a manifest when:
   drift that produced two different `json_fast-0.1.0` artifacts,
 * a wheel is attributed to a consumer rather than to this repository.
 
-`cargo-cyclonedx` is not installed here; the manifest records that SBOMs are
-absent rather than implying they exist. Install it before a release consumers
-depend on:
+`cargo-cyclonedx` is required for a release. Each wheel carries **exactly one**
+CycloneDX SBOM, for the core crate that defines its dependencies;
+`scripts/inject_sbom.py` is authoritative about that and strips any SBOM that
+arrived by another route, because a stray `cargo cyclonedx` in a binding
+directory is enough for the wheel builder to package a second one. A missing or
+duplicate SBOM fails the release rather than being recorded as an absence.
 
 ```bash
 cargo install cargo-cyclonedx
@@ -117,7 +133,8 @@ Pin the **version**, verify the **hash** from the manifest, and do not vendor a
 private fork — a fork is how the drift started.
 
 ```bash
-pip install json_fast==0.1.0 --hash=sha256:64914c6ca83030b3d55c7f83732c4ebe1b3bf0d72097143296f1f056075b4c19
+pip install xlsx_fast==0.2.1 \
+  --hash=sha256:b72174d0d9f5fa944998abc8b38822f0e957808916b16d462b636c23936e83c8
 ```
 
 For Rust consumers, depend on a tag and let the workspace pin transitive
@@ -127,19 +144,36 @@ versions:
 json-fast-core = { git = "<remote>", tag = "v0.1.0" }
 ```
 
-## Provenance of the first release
+## Provenance and cutover state
 
 `json-fast` and `xsd-fast` were extracted from Atlas Brain's
-`office-parsers-rs/` at the commit recorded in `dist/release-manifest.json`.
-Their public Python surface was verified against the call sites in both
-consumers before publishing:
+`office-parsers-rs/`; `docx-fast`, `email-fast`, and `xlsx-fast` were
+reconciled from the two repositories that had been building them independently.
+Every artifact in `dist/release-manifest.json` names its source commit.
 
-| Wheel | API | Atlas call site | Verified |
-| --- | --- | --- | --- |
-| `json_fast` | `loads`, `loads_many` | `cartridges/atlas/_jsonl.py`, `margin.py`, `feeds/pacvue.py`, `dataplane.py` | ✅ |
-| `xsd_fast` | `list_elements_bytes`, `describe_element_bytes` | `app/atlas_demo/uploads.py` | ✅ |
+A wheel in `dist/` is not the same claim as a wheel a consumer installs. The
+distinction is recorded here because it is the difference between "released"
+and "in use":
 
-Consumer repositories still build these crates from their own local source.
-Switching them to this release is a separate, deliberate step: it changes their
-build inputs, so it should land with a pinned version and hash rather than as a
-side effect of this repository appearing.
+| Wheel | Atlas | Mycelia |
+| --- | --- | --- |
+| `json_fast` | installs this release | builds from its own source |
+| `xsd_fast` | installs this release | builds from its own source |
+| `docx_fast` | installs this release | builds from its own source |
+| `email_fast` | installs this release | builds from its own source |
+| `xlsx_fast` | installs this release | builds from its own source |
+
+Atlas consumes these through `vendor/parsers-rs/` with a version and a SHA-256
+in `app/requirements/parsers-rs-pinned.txt`. Because a find-links source records
+no hash in `uv.lock`, a hash-verifying install is a separate documented command
+rather than something `uv sync` does for you — see `vendor/parsers-rs/README.md`
+in the consumer.
+
+Public surface is verified against consumer call sites before a cutover, not
+after:
+
+| API | Verified against |
+| --- | --- |
+| `json_fast.loads`, `loads_many` | Atlas `cartridges/atlas/_jsonl.py`, `margin.py`, `feeds/pacvue.py`, `dataplane.py` |
+| `xsd_fast.list_elements_bytes`, `describe_element_bytes` | Atlas `app/atlas_demo/uploads.py` |
+| `docx_fast`, `email_fast`, `xlsx_fast` | Atlas upload suite; `xlsx_fast` additionally compared wheel-to-wheel against the previous artifact, byte-identical under default, no-date, formula, and raw-value options |
