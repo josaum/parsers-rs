@@ -78,7 +78,19 @@ cd xsd-fast-py  && maturin build --release --out ../dist
 ## Release
 
 ```bash
+# embed each crate's CycloneDX SBOM in its wheels (authoritative: injection
+# owns what a wheel carries), then stamp the manifest
+cargo cyclonedx --manifest-path json-fast-core/Cargo.toml -f json --describe crate
+python3 scripts/inject_sbom.py --dist dist
 python3 scripts/release_manifest.py --out dist
+```
+
+Cross-platform wheels use the toolchain the native reader already relies on:
+
+```bash
+rustup target add x86_64-unknown-linux-gnu
+(cd json-fast-py && maturin build --release \
+   --target x86_64-unknown-linux-gnu --zig --out ../dist)
 ```
 
 This writes `dist/release-manifest.json`, which binds every wheel to its

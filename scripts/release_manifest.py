@@ -45,6 +45,7 @@ SCHEMA_VERSION = "parsers-rs.release.v1"
 CRATES: dict[str, str] = {
     "json_fast": "json-fast-py",
     "xsd_fast": "xsd-fast-py",
+    "email_fast": "email-fast-py",
 }
 
 
@@ -93,6 +94,24 @@ def wheel_distribution(path: Path) -> tuple[str, str, str | None]:
     if name is None or version is None:
         raise SystemExit(f"{path.name} carries no Name/Version metadata")
     return name.group(1).strip(), version.group(1).strip(), (author.group(1).strip() if author else None)
+
+
+def wheel_sbom(path: Path) -> dict[str, str] | None:
+    """Return the embedded SBOM's identity, or None when the wheel carries none."""
+
+    with zipfile.ZipFile(path) as archive:
+        members = [n for n in archive.namelist() if "/sboms/" in n and n.endswith(".json")]
+        if not members:
+            return None
+        document = json.loads(archive.read(members[0]))
+    component = (document.get("metadata") or {}).get("component") or {}
+    return {
+        "member": members[0],
+        "spec_version": str(document.get("specVersion") or ""),
+        "component": str(component.get("name") or ""),
+        "component_version": str(component.get("version") or ""),
+        "format": str(document.get("bomFormat") or ""),
+    }
 
 
 def digest(path: Path) -> str:
@@ -153,6 +172,7 @@ def main() -> int:
             )
         artifacts.append(
             {
+                "sbom": wheel_sbom(wheel),
                 "distribution": distribution,
                 "crate": crate,
                 "version": version,
@@ -178,12 +198,12 @@ def main() -> int:
         },
         "sbom": {
             "tool": "cargo-cyclonedx" if cyclonedx_available() else None,
+            "embedded": all(artifact["sbom"] for artifact in artifacts),
             "note": (
                 None
-                if cyclonedx_available()
-                else "cargo-cyclonedx is not installed; SBOMs are absent from this "
-                "manifest. Install it (cargo install cargo-cyclonedx) before a "
-                "release consumers depend on."
+                if all(artifact["sbom"] for artifact in artifacts)
+                else "One or more wheels carry no embedded SBOM. Run "
+                "scripts/inject_sbom.py before generating this manifest."
             ),
         },
         "artifacts": artifacts,

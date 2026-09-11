@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.6,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "email-fast"
+version = "0.2.0"
+description = "High-performance email parser for .eml, .msg, and mbox formats"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "parsers-rs maintainers" }]
+
+[project.optional-dependencies]
+arrow = []
+
+[tool.maturin]
+module-name = "email_fast._core"
+python-source = "."
+features = ["pyo3/extension-module"]

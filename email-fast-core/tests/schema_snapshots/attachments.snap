@@ -1,0 +1,6 @@
+email_message_id: Utf8(nullable=true)
+filename: Utf8(nullable=false)
+content_type: Utf8(nullable=false)
+size: UInt32(nullable=false)
+content_id: Utf8(nullable=true)
+is_inline: Boolean(nullable=false)
