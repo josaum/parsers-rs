@@ -1,0 +1,7 @@
+@versao: Utf8(nullable=true)
+codigo: Utf8(nullable=false)
+dataInicio: Date32(nullable=false)
+registradoEm: Timestamp(Microsecond, Some("UTC"))(nullable=false)
+ativo: Boolean(nullable=false)
+valor: Float64(nullable=false)
+responsavel: Struct([Field { name: "@id", data_type: Utf8 }, Field { name: "nome", data_type: Utf8 }, Field { name: "email", data_type: Utf8, nullable: true }])(nullable=false)

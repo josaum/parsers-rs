@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+  "json-fast-core",
+  "json-fast-py",
+  "xsd-fast-core",
+  "xsd-fast-py",
+]
+
+# Shared dependency versions for every parser crate in this repository.
+#
+# These are pinned exactly where a wire or contract format is involved, so a
+# consumer's bytes cannot shift under a caret range. `arrow*` is pinned to the
+# same version Atlas and the semantic dataplane use: an Arrow IPC payload
+# written here must be readable there without a conversion step.
+[workspace.dependencies]
+arrow-array = "=58.3.0"
+arrow-ipc = { version = "=58.3.0", features = ["lz4", "zstd"] }
+arrow-schema = "=58.3.0"
+pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py38"] }
+regex = "1.12"
+serde_json = "1.0"
+
+# Inherited by every member that does not override it. Attribution stays with
+# this repository: a consumer must be able to tell which project produced an
+# artifact, and an artifact that names its consumer cannot.
+[workspace.package]
+authors = ["parsers-rs maintainers"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/parsers-rs/parsers-rs"
+rust-version = "1.94"

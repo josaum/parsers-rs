@@ -1,0 +1,53 @@
+[package]
+name = "json-fast-core"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+description = "SIMD-accelerated JSON/JSON-family parser: the six ECMA-404 JSON types, JSONL/NDJSON streaming, JSON Schema validation, JSON-RPC 2.0, JSON:API, JWK/JWT split, JSON-LD context peek"
+license.workspace = true
+keywords = ["json", "jsonl", "ndjson", "json-schema", "json-rpc", "jsonapi", "jwt", "simd"]
+categories = ["encoding", "parser-implementations", "web-programming"]
+rust-version.workspace = true
+
+[lib]
+name = "json_fast_core"
+
+[features]
+default = []
+# Columnar output: parse JSONL into Apache Arrow RecordBatches / IPC streams.
+# Matches the xlsx-fast-core `arrow` feature pattern (workspace arrow =58.3.0).
+# chrono parses RFC-3339/ISO-8601 strings for explicit-schema TIMESTAMP columns
+# (e.g. Databricks Delta TIMESTAMP), keeping the base crate dependency-free.
+arrow = [
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:arrow-ipc",
+    "dep:chrono",
+]
+
+[dependencies]
+base64 = "0.22"
+regex = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+# preserve_order keeps object keys in first-seen order so infer_schema matches
+# the documented Arrow contract (union of keys in document order).
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sonic-rs = "0.5"
+
+[dependencies.chrono]
+version = "0.4"
+default-features = false
+features = ["std"]
+optional = true
+
+[dependencies.arrow-array]
+workspace = true
+optional = true
+
+[dependencies.arrow-ipc]
+workspace = true
+optional = true
+
+[dependencies.arrow-schema]
+workspace = true
+optional = true

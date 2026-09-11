@@ -1,0 +1,21 @@
+[package]
+name = "xsd-fast-py"
+version = "0.2.0"
+edition.workspace = true
+authors.workspace = true
+description = "Python bindings for xsd-fast-core"
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "xsd_fast_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+pyo3 = { workspace = true }
+serde_json = { workspace = true }
+xsd-fast-core = { path = "../xsd-fast-core", features = ["arrow"] }
+
+[build-dependencies]
+pyo3-build-config = "0.28.3"

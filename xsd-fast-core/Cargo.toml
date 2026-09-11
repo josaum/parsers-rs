@@ -1,0 +1,31 @@
+[package]
+name = "xsd-fast-core"
+version = "0.2.0"
+edition.workspace = true
+authors.workspace = true
+description = "High-performance XSD schema parser with Arrow schema derivation and simple-type validation"
+license.workspace = true
+keywords = ["xsd", "xml-schema", "parser", "arrow", "validation"]
+categories = ["parser-implementations", "encoding"]
+rust-version.workspace = true
+
+[lib]
+name = "xsd_fast_core"
+
+[features]
+default = []
+arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc"]
+
+[dependencies]
+anyhow = "1.0"
+arrow-array = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+memmap2 = "0.9"
+quick-xml = "0.36"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+indexmap = { version = "2.2", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3.10"

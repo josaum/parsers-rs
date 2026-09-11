@@ -1,0 +1,20 @@
+[package]
+name = "json-fast-py"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+description = "Python bindings for json-fast-core (SIMD JSON/JSONL + JSON-family)"
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "json_fast_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+json-fast-core = { path = "../json-fast-core" }
+pyo3 = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = "0.28.3"
