@@ -26,7 +26,7 @@ interop contract** — the same purpose in every consumer.
 | `xlsx-fast-core`, `xlsx-fast-py` | Read-only XLSX workbook extraction, NDJSON and Arrow IPC streaming |
 | `pptx-fast-core`, `pptx-fast-py` | Read-only PPTX extraction, NDJSON, Arrow dataset, embedded media |
 | `ooxml-archive` | Shared OOXML ZIP, bounded inflate, and relationship resolution |
-| PDF read core (planned) | Same read-only output contract in both consumers |
+| `pdf-fast-core`, `pdf-fast-py` | Read-only PDF extraction: text, structure, tables, raster, Arrow |
 | `*-node` bindings (planned) | Thin, per-platform, versioned alongside the core |
 
 `ooxml-archive` is the load-bearing one. `max_inflate` is an **aggregate**
@@ -36,7 +36,7 @@ restricted decoder that bounds output before exposing bytes is the `flate2` one,
 so there is no fast path that inflates first and checks afterwards — a faster
 decoder can only be reinstated by keeping that ordering.
 
-The shipped surface is **12 artifacts**: six crates × macOS arm64 and Linux
+The shipped surface is **14 artifacts**: seven crates × macOS arm64 and Linux
 x86_64.
 
 ## What must not belong here
@@ -49,6 +49,14 @@ repository into a component of one product.
 | --- | --- |
 | **Atlas**: `owl-fast-core` (reasoner projection) | It depends on `atlas-reasoner` and emits `RulePackage` `owl_axiom` rows. A shared crate cannot depend on one consumer. |
 | **Mycelia**: `gliner-core`, `gliner2-core`, OCR models, `geom-core`, `layout-fast-*`, `web-fast-core`, `chunk-fast-core`, `fca-fast-*` | Product components — NER, OCR, layout and chunking — not parsers. |
+
+`pdf-fast-py` carries one further consumer-shaped feature: `reading-order`
+enables a reading-order policy that needs the consumer's layout engine. It
+declares no dependency here at all — a sovereign repository cannot name a
+consumer's crate — so a consumer enables it and supplies the crate from its own
+workspace. This is the same rule `owl-fast-core`'s `atlas-reasoner-rows` follows
+for the Atlas reasoner, and asking for reading order on a build without it is an
+error rather than a silent fall back to stream order.
 
 `gliner` and `embed` are **optional features** on Mycelia's docx/pdf/email/
 xlsx/pptx crates, and both must be removed when a core moves here. They are not
@@ -166,6 +174,7 @@ and "in use":
 | `email_fast` | installs this release | builds from its own source |
 | `xlsx_fast` | installs this release | builds from its own source |
 | `pptx_fast` | installs this release | builds from its own source |
+| `pdf_fast` | installs this release | builds from its own source |
 
 Atlas consumes these through `vendor/parsers-rs/` with a version and a SHA-256
 in `app/requirements/parsers-rs-pinned.txt`. Because a find-links source records
