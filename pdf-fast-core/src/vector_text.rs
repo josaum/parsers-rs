@@ -1,0 +1,1060 @@
+//! Vector-glyph extraction from PDF content streams.
+//!
+//! Walks the content-stream operator sequence (`q`/`Q` save/restore, `cm`
+//! transforms, `m`/`l`/`c`/`v`/`y`/`h` path ops) to recover the glyph
+//! outlines a typesetter laid down on the page. Each rendered glyph becomes a
+//! [`VectorGlyph`] (normalized contours + a stable `shape_hash`) grouped into
+//! page-local [`GlyphRun`]s for the table/text reconstruction layer above.
+//!
+//! With the `glyph-atlas` feature, [`learn_page_glyph_mappings`] correlates
+//! these shape hashes against CMap-resolved (`/ToUnicode`) text so the
+//! scanner can learn glyph→grapheme mappings for downstream pages that lack
+//! a CMap.
+
+use crate::*;
+use anyhow::Result;
+#[cfg(feature = "serde")]
+use serde::Serialize;
+
+/// 2×3 affine transform stored row-major as `[a b c d e f]`, matching the PDF
+/// content-stream `cm` operand order.
+pub type Matrix = [f32; 6];
+
+/// Identity transform (no rotation, scale, or translation).
+pub const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// Compose two 2×3 affine matrices in PDF convention: `a` applied first,
+/// then `b`. Returns the combined transform.
+pub fn compose(a: Matrix, b: Matrix) -> Matrix {
+    [
+        a[0] * b[0] + a[1] * b[2],
+        a[0] * b[1] + a[1] * b[3],
+        a[2] * b[0] + a[3] * b[2],
+        a[2] * b[1] + a[3] * b[3],
+        a[4] * b[0] + a[5] * b[2] + b[4],
+        a[4] * b[1] + a[5] * b[3] + b[5],
+    ]
+}
+
+/// Apply an affine transform to a point in PDF space.
+pub fn transform_pt(matrix: Matrix, x: f32, y: f32) -> (f32, f32) {
+    (
+        matrix[0] * x + matrix[2] * y + matrix[4],
+        matrix[1] * x + matrix[3] * y + matrix[5],
+    )
+}
+
+/// One block of glyphs sharing the same text-matrix block (between PDF
+/// `q`/`Q` save/restore pairs). Positions are in page space with `page_y`
+/// already flipped to a top-down origin.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct GlyphRun {
+    /// Run origin x in page space (left edge).
+    pub page_x: f32,
+    /// Run origin y in page space (top-down: 0 at top of page).
+    pub page_y: f32,
+    /// Effective glyph scale recovered from the run's text matrix.
+    pub scale: f32,
+    /// Translation x recovered from the run's text matrix (PDF-space).
+    pub tx: f32,
+    /// Translation y recovered from the run's text matrix (PDF-space).
+    pub ty: f32,
+    /// Glyphs in the run, in left-to-right reading order.
+    pub glyphs: Vec<VectorGlyph>,
+}
+
+/// A single vector glyph rebuilt from path ops. `shape_hash` is the
+/// FNV-1a hash of the contours after translation+scale normalization, so
+/// glyph shapes can be deduplicated across runs and pages.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct VectorGlyph {
+    /// Glyph left x-offset in run-local coordinates.
+    pub x_offset: f32,
+    /// Glyph contours; each inner `Vec<BezPt>` is one closed subpath.
+    pub contours: Vec<Vec<BezPt>>,
+    /// Stable hash of the normalized glyph shape (0 means "no geometry").
+    pub shape_hash: u64,
+    /// Pre-normalization ink-bottom y of the glyph in run-local units
+    /// (min contour y). `GlyphRun::page_y` is the RUN origin: on real
+    /// documents runs on one visual line sit at origins scattered by several
+    /// points while the contour y-offsets compensate, so line banding must
+    /// use `page_y - y_offset` (per-glyph ink position), not the run origin.
+    pub y_offset: f32,
+    /// Pre-normalization glyph extent, `max(width, height)` in run-local
+    /// units — the scale factor divided out by normalization. Two instances
+    /// of the same glyph at the same font size report the same `size`; the
+    /// value is what lets identity clustering keep small degenerate glyphs
+    /// (superscript digits flattened to a handful of points) apart from
+    /// same-structured glyphs at other sizes.
+    pub size: f32,
+}
+
+/// One point on a glyph contour. `kind` encodes the role of the point:
+/// `0` = moveto, `1` = lineto, `2` = Bézier control or endpoint.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct BezPt {
+    /// X coordinate in run-local space.
+    pub x: f32,
+    /// Y coordinate in run-local space.
+    pub y: f32,
+    /// Point kind: 0 = moveto, 1 = lineto, 2 = Bézier control / endpoint.
+    pub kind: u8,
+}
+
+struct VectorTextExtractor {
+    page_height: f32,
+    skip_first_cm: bool,
+    stack: Vec<Matrix>,
+    runs: Vec<GlyphRun>,
+
+    in_run: bool,
+    trans_cms: usize,
+    block_entry: Matrix,
+
+    current_scale: f32,
+    current_tx: f32,
+    current_ty: f32,
+
+    glyphs: Vec<VectorGlyph>,
+    current_contour: Vec<BezPt>,
+    /// Contours of the path being constructed, held until the paint op
+    /// reveals whether they are ink or invisible (white) geometry.
+    pending: Vec<Vec<BezPt>>,
+    /// Approximate luminance of the current non-stroking / stroking color
+    /// (0 = black ink, 1 = white paper). Content streams that never set a
+    /// color default to black, per the PDF graphics state.
+    fill_lum: f32,
+    stroke_lum: f32,
+    /// Most recent name token (`/Fm0`), consumed by `Do` to resolve the
+    /// Form XObject being invoked.
+    last_name: Option<Vec<u8>>,
+    /// Active indirect Form objects, used to reject cycles and bound nested
+    /// traversal before materializing another stream.
+    form_stack: Vec<(u32, u16)>,
+
+    win: [f32; 6],
+}
+
+/// Document context for Form XObject traversal. Without it (unit tests over
+/// raw byte streams), `Do` is a no-op — exactly the old behavior.
+pub(crate) struct XObjectCtx<'a> {
+    pub doc: &'a PdfDocument,
+    pub resources: Option<&'a PdfDictionary>,
+    pub depth: usize,
+}
+
+impl VectorTextExtractor {
+    fn new(base_ctm: Matrix, page_height: f32) -> Self {
+        Self {
+            page_height,
+            skip_first_cm: false,
+            stack: vec![base_ctm],
+            runs: Vec::new(),
+            in_run: false,
+            trans_cms: 0,
+            block_entry: IDENTITY,
+            current_scale: 1.0,
+            current_tx: 0.0,
+            current_ty: 0.0,
+            glyphs: Vec::new(),
+            current_contour: Vec::new(),
+            pending: Vec::new(),
+            fill_lum: 0.0,
+            stroke_lum: 0.0,
+            last_name: None,
+            form_stack: Vec::new(),
+            win: [0.0; 6],
+        }
+    }
+
+    fn flush(&mut self) {
+        self.finalize_contour();
+        // Paths still unpainted at a run boundary keep the old committed
+        // behavior, gated only by the current fill color.
+        self.commit_pending(self.fill_lum);
+
+        // Glyphs drawn OUTSIDE a translate-cm "run" (absolute path
+        // coordinates, no positioning cm) used to be discarded here — which
+        // is where a DocuSign contract's punctuation died: every `.` `/` `-`
+        // is emitted as a tiny absolute-coordinate path that the rasterizer
+        // paints but this extractor dropped at flush.
+        if self.in_run && !self.glyphs.is_empty() {
+            let (px, py_pdf) = transform_pt(self.block_entry, self.current_tx, self.current_ty);
+            let page_y = self.page_height - py_pdf;
+
+            self.normalize_and_hash_glyphs();
+
+            self.runs.push(GlyphRun {
+                page_x: px,
+                page_y,
+                scale: self.current_scale,
+                tx: self.current_tx,
+                ty: self.current_ty,
+                glyphs: std::mem::take(&mut self.glyphs),
+            });
+        } else if !self.glyphs.is_empty() {
+            // No positioning run: contours are in ABSOLUTE user space with
+            // PDF's y-up orientation, so the in-run offset convention flips
+            // sign (measured: naive reuse placed glyphs at y up to 1463 on an
+            // 842pt page). Place each glyph the way the rasterizer would:
+            // transform its contours through the current CTM, anchor the run
+            // at (0, page_height), and store per-glyph offsets from the
+            // transformed bbox — ink-left for x, negated ink-top for y so
+            // `page_y + y_offset` is top-down ink-top like every other glyph.
+            let ctm = *self.stack.last().unwrap_or(&IDENTITY);
+            let mut anchors = Vec::with_capacity(self.glyphs.len());
+            for g in &mut self.glyphs {
+                let mut min_x = f32::MAX;
+                let mut max_x = f32::MIN;
+                let mut min_y = f32::MAX;
+                let mut max_y = f32::MIN;
+                for contour in &mut g.contours {
+                    for pt in contour.iter_mut() {
+                        let (tx, ty) = transform_pt(ctm, pt.x, pt.y);
+                        pt.x = tx;
+                        pt.y = ty;
+                        min_x = min_x.min(tx);
+                        max_x = max_x.max(tx);
+                        min_y = min_y.min(ty);
+                        max_y = max_y.max(ty);
+                    }
+                }
+                anchors.push((min_x, max_y, (max_x - min_x).max(max_y - min_y)));
+            }
+            // Punctuation-scale ONLY. The extractor's transform model is a
+            // heuristic, and for some no-run blocks the flush-time CTM is not
+            // the drawing CTM — letter-scale no-run glyphs then land inside
+            // foreign lines and poison banding (measured: "Ate" fragments
+            // interleaved into a CNPJ row, CER 30%→41%). Dots, commas,
+            // hyphens and slashes — the class that was actually missing — are
+            // ≤ ~3.5pt and place correctly; anything larger waits until
+            // transform tracking is interpreter-grade.
+            let keep: Vec<bool> = anchors.iter().map(|a| a.2 <= 3.5).collect();
+            let mut it = keep.iter();
+            self.glyphs.retain(|_| *it.next().unwrap());
+            let anchors: Vec<(f32, f32)> = anchors
+                .into_iter()
+                .zip(keep)
+                .filter_map(|(a, k)| k.then_some((a.0, a.1)))
+                .collect();
+            self.normalize_and_hash_glyphs();
+            for (g, (min_x, max_y)) in self.glyphs.iter_mut().zip(anchors) {
+                g.x_offset = min_x;
+                g.y_offset = -max_y;
+            }
+            self.runs.push(GlyphRun {
+                page_x: 0.0,
+                page_y: self.page_height,
+                scale: self.current_scale,
+                tx: 0.0,
+                ty: 0.0,
+                glyphs: std::mem::take(&mut self.glyphs),
+            });
+        }
+        self.in_run = false;
+        self.trans_cms = 0;
+        self.glyphs.clear();
+        self.current_contour.clear();
+    }
+
+    fn finalize_contour(&mut self) {
+        if self.current_contour.is_empty() {
+            return;
+        }
+        let contour = std::mem::take(&mut self.current_contour);
+        self.pending.push(contour);
+    }
+
+    /// Commit (or drop) the current path's contours at PAINT time, when the
+    /// fill/stroke color is finally known. White-ish paint (`lum > 0.85`) is
+    /// paper, not ink: DocuSign-class PDFs carry white-filled duplicate text
+    /// layers that the rasterizer paints invisibly but that used to enter the
+    /// glyph stream, interleaving phantom glyphs into real lines.
+    fn commit_pending(&mut self, lum: f32) {
+        if lum > 0.85 {
+            self.pending.clear();
+            return;
+        }
+        for contour in std::mem::take(&mut self.pending) {
+            self.merge_contour(contour);
+        }
+    }
+
+    fn merge_contour(&mut self, contour: Vec<BezPt>) {
+        let (c_min, c_max) = x_bounds_contour(&contour);
+
+        if let Some(last) = self.glyphs.last_mut() {
+            let (l_min, l_max) = x_bounds_contours(&last.contours);
+            let overlap = (c_max.min(l_max) - c_min.max(l_min)).max(0.0);
+            let cw = (c_max - c_min).max(0.001);
+            let lw = (l_max - l_min).max(0.001);
+
+            // SIGNIFICANT OVERLAP: "the X-span significantly overlaps"
+            if overlap > 0.05 * cw || overlap > 0.05 * lw {
+                last.contours.push(contour);
+                return;
+            }
+        }
+
+        self.glyphs.push(VectorGlyph {
+            x_offset: c_min,
+            contours: vec![contour],
+            shape_hash: 0,
+            y_offset: 0.0,
+            size: 0.0,
+        });
+    }
+
+    fn normalize_and_hash_glyphs(&mut self) {
+        for g in &mut self.glyphs {
+            let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+            let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+            for contour in &g.contours {
+                for pt in contour {
+                    min_x = min_x.min(pt.x);
+                    max_x = max_x.max(pt.x);
+                    min_y = min_y.min(pt.y);
+                    max_y = max_y.max(pt.y);
+                }
+            }
+
+            let w = (max_x - min_x).max(0.0001);
+            let h = (max_y - min_y).max(0.0001);
+            let scale_factor = w.max(h);
+            g.size = scale_factor;
+            g.y_offset = min_y;
+
+            let mut hash = 14695981039346656037u64;
+            let fnv_prime = 1099511628211u64;
+
+            for contour in &mut g.contours {
+                for pt in contour {
+                    pt.x = (pt.x - min_x) / scale_factor;
+                    pt.y = (pt.y - min_y) / scale_factor;
+
+                    let qx = (pt.x * 255.0).clamp(0.0, 255.0) as u8;
+                    let qy = (pt.y * 255.0).clamp(0.0, 255.0) as u8;
+                    let qk = pt.kind;
+
+                    hash ^= qx as u64;
+                    hash = hash.wrapping_mul(fnv_prime);
+                    hash ^= qy as u64;
+                    hash = hash.wrapping_mul(fnv_prime);
+                    hash ^= qk as u64;
+                    hash = hash.wrapping_mul(fnv_prime);
+                }
+            }
+            g.shape_hash = hash;
+        }
+    }
+
+    fn apply_cm(&mut self, cm_matrix: Matrix) {
+        if cm_matrix[0] == 1.0 && cm_matrix[1] == 0.0 && cm_matrix[2] == 0.0 && cm_matrix[3] == 1.0
+        {
+            // pure translate
+            self.trans_cms += 1;
+            if self.trans_cms == 1 {
+                self.in_run = true;
+                self.current_tx = cm_matrix[4];
+                self.current_ty = cm_matrix[5];
+            }
+        } else if cm_matrix[0] == 0.0 && cm_matrix[3] == 0.0 {
+            // Assume rotate/scale matrix (0, -s, s, 0, 0, 0)
+            self.current_scale = cm_matrix[2].abs().max(cm_matrix[1].abs());
+        }
+
+        if let Some(last) = self.stack.last_mut() {
+            *last = compose(*last, cm_matrix);
+        }
+    }
+
+    #[allow(dead_code)] // ctx-free entry kept for unit tests
+    fn parse_stream(&mut self, stream: &[u8]) -> Result<()> {
+        self.parse_stream_ctx(stream, None)
+    }
+
+    fn parse_stream_ctx(&mut self, stream: &[u8], ctx: Option<&XObjectCtx<'_>>) -> Result<()> {
+        let mut cursor = 0;
+        let mut num_cm_seen = 0;
+
+        while cursor < stream.len() {
+            while cursor < stream.len() && is_whitespace(stream[cursor]) {
+                cursor += 1;
+            }
+            if cursor >= stream.len() {
+                break;
+            }
+
+            let start = cursor;
+            while cursor < stream.len() && !is_whitespace(stream[cursor]) {
+                cursor += 1;
+            }
+            let tok = &stream[start..cursor];
+
+            if let Some(v) = fast_parse_f32(tok) {
+                self.win.copy_within(1..6, 0);
+                self.win[5] = v;
+                continue;
+            }
+
+            if tok.first() == Some(&b'/') && tok.len() > 1 {
+                self.last_name = Some(tok[1..].to_vec());
+            }
+
+            match tok {
+                b"q" => {
+                    self.flush();
+                    let current = *self.stack.last().unwrap_or(&IDENTITY);
+                    self.stack.push(current);
+                    self.block_entry = current; // Context before cm
+                }
+                b"Q" => {
+                    self.flush();
+                    if self.stack.len() > 1 {
+                        self.stack.pop();
+                    }
+                }
+                b"cm" => {
+                    num_cm_seen += 1;
+                    if num_cm_seen == 1 && self.skip_first_cm && ctx.is_none_or(|c| c.depth == 0) {
+                        continue;
+                    }
+
+                    let cm_matrix = [
+                        self.win[0],
+                        self.win[1],
+                        self.win[2],
+                        self.win[3],
+                        self.win[4],
+                        self.win[5],
+                    ];
+                    self.apply_cm(cm_matrix);
+                }
+                b"m" => {
+                    self.finalize_contour();
+                    self.current_contour.push(BezPt {
+                        x: self.win[4],
+                        y: self.win[5],
+                        kind: 0,
+                    });
+                }
+                b"l" => {
+                    self.current_contour.push(BezPt {
+                        x: self.win[4],
+                        y: self.win[5],
+                        kind: 1,
+                    });
+                }
+                b"c" => {
+                    // 3 points
+                    self.current_contour.push(BezPt {
+                        x: self.win[0],
+                        y: self.win[1],
+                        kind: 2,
+                    }); // cp1
+                    self.current_contour.push(BezPt {
+                        x: self.win[2],
+                        y: self.win[3],
+                        kind: 2,
+                    }); // cp2
+                    self.current_contour.push(BezPt {
+                        x: self.win[4],
+                        y: self.win[5],
+                        kind: 2,
+                    }); // end pt
+                }
+                b"v" => {
+                    // cp2 and end
+                    self.current_contour.push(BezPt {
+                        x: self.win[2],
+                        y: self.win[3],
+                        kind: 2,
+                    }); // cp2
+                    self.current_contour.push(BezPt {
+                        x: self.win[4],
+                        y: self.win[5],
+                        kind: 2,
+                    }); // end
+                }
+                b"y" => {
+                    // cp1 and end
+                    self.current_contour.push(BezPt {
+                        x: self.win[2],
+                        y: self.win[3],
+                        kind: 2,
+                    }); // cp1
+                    self.current_contour.push(BezPt {
+                        x: self.win[4],
+                        y: self.win[5],
+                        kind: 2,
+                    }); // end
+                }
+                b"re" => {
+                    // Rectangle op: `x y w h re`. Periods, hyphens, slash
+                    // bars and table rules are commonly emitted as `re f`
+                    // instead of explicit path ops — without this, every
+                    // thin punctuation glyph silently never enters the
+                    // vector stream (measured: a CNPJ table row extracted
+                    // 18 glyphs for 23 characters, the missing 5 being
+                    // exactly `. . . / -`).
+                    self.finalize_contour();
+                    let (x, y, w, h) = (self.win[2], self.win[3], self.win[4], self.win[5]);
+                    self.current_contour.push(BezPt { x, y, kind: 0 });
+                    self.current_contour.push(BezPt {
+                        x: x + w,
+                        y,
+                        kind: 1,
+                    });
+                    self.current_contour.push(BezPt {
+                        x: x + w,
+                        y: y + h,
+                        kind: 1,
+                    });
+                    self.current_contour.push(BezPt {
+                        x,
+                        y: y + h,
+                        kind: 1,
+                    });
+                    self.current_contour.push(BezPt { x, y, kind: 1 });
+                    self.finalize_contour();
+                }
+                b"h" => {
+                    if let Some(first) = self.current_contour.first().copied() {
+                        self.current_contour.push(BezPt {
+                            x: first.x,
+                            y: first.y,
+                            kind: 1,
+                        });
+                    }
+                    self.finalize_contour();
+                }
+                b"f" | b"f*" | b"F" | b"B" | b"B*" | b"b" | b"b*" => {
+                    self.finalize_contour();
+                    self.commit_pending(self.fill_lum);
+                }
+                b"S" | b"s" => {
+                    self.finalize_contour();
+                    self.commit_pending(self.stroke_lum);
+                }
+                b"n" => {
+                    // path painted with nothing (clip-path terminator): the
+                    // geometry never becomes ink
+                    self.finalize_contour();
+                    self.pending.clear();
+                }
+                // Non-stroking / stroking color: track approximate luminance so
+                // the paint ops above can tell ink from white geometry. Args
+                // are the trailing entries of the numeric window.
+                b"g" => self.fill_lum = self.win[5].clamp(0.0, 1.0),
+                b"G" => self.stroke_lum = self.win[5].clamp(0.0, 1.0),
+                b"rg" => self.fill_lum = rgb_lum(self.win[3], self.win[4], self.win[5]),
+                b"RG" => self.stroke_lum = rgb_lum(self.win[3], self.win[4], self.win[5]),
+                b"k" => {
+                    self.fill_lum = cmyk_lum(self.win[2], self.win[3], self.win[4], self.win[5]);
+                }
+                b"K" => {
+                    self.stroke_lum = cmyk_lum(self.win[2], self.win[3], self.win[4], self.win[5]);
+                }
+                b"Do" => {
+                    // Form XObject invocation. Punctuation and other small
+                    // glyphs are routinely emitted inside forms (measured on
+                    // a DocuSign contract: every `.` `/` `-` of a CNPJ table
+                    // row lived in a form the rasterizer painted but this
+                    // extractor never walked). Semantics mirror
+                    // `q; /Matrix cm; <form stream>; Q`.
+                    let name = self.last_name.take();
+                    if let (Some(ctx), Some(name)) = (ctx, name) {
+                        let name = String::from_utf8_lossy(&name).into_owned();
+                        if let Some(form) = ctx.doc.resolve_form_xobject(
+                            ctx.resources,
+                            &name,
+                            self.form_stack.as_slice(),
+                        )? {
+                            self.flush();
+                            let current = *self.stack.last().unwrap_or(&IDENTITY);
+                            self.stack.push(current);
+                            self.block_entry = current;
+                            if form.matrix != IDENTITY {
+                                self.apply_cm(form.matrix);
+                            }
+                            let inner = XObjectCtx {
+                                doc: ctx.doc,
+                                resources: form.resources.as_ref().or(ctx.resources),
+                                depth: ctx.depth + 1,
+                            };
+                            self.form_stack.push(form.object_id);
+                            let nested_result = self.parse_stream_ctx(&form.bytes, Some(&inner));
+                            self.form_stack.pop();
+                            if nested_result.is_ok() {
+                                self.flush();
+                            }
+                            if self.stack.len() > 1 {
+                                self.stack.pop();
+                            }
+                            nested_result?;
+                        }
+                    }
+                }
+                b"W" | b"W*" => {
+                    self.flush();
+                }
+                _ => {}
+            }
+        }
+        self.flush();
+        Ok(())
+    }
+}
+
+/// Rec. 601 luminance of an RGB non-stroking color.
+fn rgb_lum(r: f32, g: f32, b: f32) -> f32 {
+    (0.299 * r + 0.587 * g + 0.114 * b).clamp(0.0, 1.0)
+}
+
+/// Approximate luminance of a CMYK color (1 = white paper, 0 = full ink).
+fn cmyk_lum(c: f32, m: f32, y: f32, k: f32) -> f32 {
+    (1.0 - (0.299 * c + 0.587 * m + 0.114 * y + k)).clamp(0.0, 1.0)
+}
+
+fn x_bounds_contour(contour: &[BezPt]) -> (f32, f32) {
+    let mut min = f32::MAX;
+    let mut max = f32::MIN;
+    for pt in contour {
+        min = min.min(pt.x);
+        max = max.max(pt.x);
+    }
+    if min <= max {
+        (min, max)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+fn x_bounds_contours(contours: &[Vec<BezPt>]) -> (f32, f32) {
+    let mut min = f32::MAX;
+    let mut max = f32::MIN;
+    for contour in contours {
+        for pt in contour {
+            min = min.min(pt.x);
+            max = max.max(pt.x);
+        }
+    }
+    if min <= max {
+        (min, max)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+fn is_whitespace(b: u8) -> bool {
+    b == b' ' || b == b'\n' || b == b'\r' || b == b'\t' || b == 0 || b == 12 // PDF whitespaces
+}
+
+fn fast_parse_f32(tok: &[u8]) -> Option<f32> {
+    std::str::from_utf8(tok)
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+}
+
+/// Scan a content stream for its leading page-CTM `cm` operator and return
+/// the recovered matrix, or [`IDENTITY`] if none is found.
+pub fn detect_page_ctm(stream: &[u8]) -> Matrix {
+    let mut cursor = 0;
+    let mut win = [0.0; 6];
+
+    while cursor < stream.len() {
+        while cursor < stream.len() && is_whitespace(stream[cursor]) {
+            cursor += 1;
+        }
+        if cursor >= stream.len() {
+            break;
+        }
+
+        let start = cursor;
+        while cursor < stream.len() && !is_whitespace(stream[cursor]) {
+            cursor += 1;
+        }
+        let tok = &stream[start..cursor];
+
+        if let Some(v) = fast_parse_f32(tok) {
+            win.copy_within(1..6, 0);
+            win[5] = v;
+        } else if tok == b"cm" {
+            let m = [win[0], win[1], win[2], win[3], win[4], win[5]];
+            // We expect the page CTM to translate Y by some page_height (e.g. 841.92)
+            if m[1] == 0.0 && m[2] == 0.0 {
+                return m;
+            }
+        }
+    }
+    IDENTITY
+}
+
+/// Returns true if the first `cm` in `stream` matches `target` within a
+/// small epsilon. Used to detect when the extractor should skip the page-CTM
+/// transform (it has already been factored into the run's base matrix).
+pub fn check_first_cm_matches(stream: &[u8], target: Matrix) -> bool {
+    let ctm = detect_page_ctm(stream);
+    // Compare floats with epsilon
+    for i in 0..6 {
+        if (ctm[i] - target[i]).abs() > 0.001 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Extract vector glyph runs for a single PDF page, sorted top-to-bottom and
+/// left-to-right (4-unit row buckets, x within bucket). Empty if no content
+/// streams or no glyph geometry was emitted.
+pub fn extract_page_vector_text_runs(doc: &PdfDocument, page: &PdfPage) -> Vec<GlyphRun> {
+    extract_page_vector_text_runs_checked(doc, page).unwrap_or_default()
+}
+
+/// Checked page-level vector extraction. Unlike
+/// [`extract_page_vector_text_runs`], governed resource and bounded Form
+/// traversal failures are returned to the caller.
+pub fn extract_page_vector_text_runs_checked(
+    doc: &PdfDocument,
+    page: &PdfPage,
+) -> Result<Vec<GlyphRun>> {
+    let mut all_runs = Vec::new();
+
+    // Re-implemented to fetch streams similar to page_content_streams_for_raster
+    let streams = doc.page_content_streams_for_raster(page)?;
+    if streams.is_empty() {
+        return Ok(all_runs);
+    }
+
+    let page_ctm = detect_page_ctm(&streams[0]);
+    let page_height = page
+        .page_box()
+        .map(|b| (b[3] - b[1]).abs().max(1.0))
+        .unwrap_or(841.92);
+
+    let page_dict = doc
+        .object_by_id(page.object_number, page.generation)
+        .and_then(|object| object.dictionary.as_ref());
+    let resources = page
+        .resources
+        .as_ref()
+        .or_else(|| page_dict.and_then(|d| doc.resolve_inherited_resources(d)));
+    for stream in streams {
+        let mut extractor = VectorTextExtractor::new(page_ctm, page_height);
+        extractor.skip_first_cm = check_first_cm_matches(&stream, page_ctm);
+        let ctx = XObjectCtx {
+            doc,
+            resources,
+            depth: 0,
+        };
+        extractor.parse_stream_ctx(&stream, Some(&ctx))?;
+        all_runs.extend(extractor.runs);
+    }
+
+    // Sort rows top-to-bottom, columns left-to-right
+    // Top-to-bottom = increasing Y if page_y is 0 at top, or maybe it's bottom up?
+    // "page_y_topdown = 841.92 - py_pdf" -> meaning Y = 0 is top.
+    all_runs.sort_by(|a, b| {
+        let bucket_a = (a.page_y / 4.0).round() as i32;
+        let bucket_b = (b.page_y / 4.0).round() as i32;
+        bucket_a.cmp(&bucket_b).then_with(|| {
+            a.page_x
+                .partial_cmp(&b.page_x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    Ok(all_runs)
+}
+
+/// Look up a glyph hash in the pre-computed atlas, falling back to `None`
+/// when the atlas is not compiled in (feature `glyph-atlas` disabled).
+///
+/// Returns the mapped grapheme (multi-codepoint safe) rather than a single
+/// `char` so ligatures and composed accents round-trip through the scanner.
+#[inline]
+fn atlas_lookup(_hash: u64) -> Option<&'static str> {
+    #[cfg(feature = "glyph-atlas")]
+    {
+        crate::glyph_atlas::lookup_entry(_hash).map(|e| e.grapheme)
+    }
+    #[cfg(not(feature = "glyph-atlas"))]
+    {
+        None
+    }
+}
+
+/// Summary of a learning pass: how many pairs were inspected, filtered, emitted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LearningStats {
+    /// Glyph runs produced by the vector extractor for the page.
+    pub glyph_runs: usize,
+    /// Semantic (CMap-resolved) text runs for the page.
+    pub semantic_runs: usize,
+    /// Pairs (shape_hash, grapheme) emitted to the learning sink.
+    pub emitted: usize,
+    /// Pairs skipped because of whitespace, zero hash, or CMap fallback.
+    pub skipped: usize,
+    /// `true` when this page contributed no learning — counts imbalanced,
+    /// CMap fell back, or no runs at all.
+    pub nothing_to_learn: bool,
+}
+
+/// Correlate vector-glyph runs with semantic (CMap-resolved) text runs and
+/// push high-confidence `(shape_hash → grapheme)` pairs into the process
+/// learning sink (`crate::glyph_atlas::record_learned`).
+///
+/// # Correlation strategy
+///
+/// Both passes walk the same content stream ops, so the Nth `Tj`/`TJ`
+/// produces the Nth run on each side — modulo `q`/`Q` save/restore flushes
+/// on the vector side. We use two layers:
+///
+/// 1. **Index-aligned**: when `glyph_runs.len() == semantic_runs.len()` AND
+///    every semantic run resolved fully via `/ToUnicode`
+///    (`cmap_fallback_chars == 0`), pair them by index. For each aligned
+///    pair where the glyph count equals the visible-char count, emit per-
+///    character mappings.
+///
+/// 2. **Total-flatten fallback**: if the counts don't line up 1:1 but the
+///    total glyph count equals the total visible-char count across the
+///    page, pair by flattened index. Less precise but still high-signal
+///    when /ToUnicode is uniformly reliable.
+///
+/// Pairs are skipped when the glyph's `shape_hash == 0` (no normalised
+/// geometry), when the char is whitespace (the vector path does not emit
+/// glyph shapes for spaces), or when CMap fallback occurred.
+///
+/// The emitted entries use `AtlasSource::Corpus` and a conservative 0.85
+/// confidence — real ground-truth but subject to our correlation heuristic.
+#[cfg(feature = "glyph-atlas")]
+pub fn learn_page_glyph_mappings(doc: &PdfDocument, page: &PdfPage) -> LearningStats {
+    learn_page_glyph_mappings_checked(doc, page).unwrap_or_else(|_| LearningStats {
+        nothing_to_learn: true,
+        ..LearningStats::default()
+    })
+}
+
+/// Checked page glyph-learning surface. Governed vector extraction failures
+/// abort before any mapping is promoted to the process learning sink.
+#[cfg(feature = "glyph-atlas")]
+pub fn learn_page_glyph_mappings_checked(
+    doc: &PdfDocument,
+    page: &PdfPage,
+) -> Result<LearningStats> {
+    use crate::glyph_atlas::{record_learned, AtlasSource};
+
+    let glyph_runs = extract_page_vector_text_runs_checked(doc, page)?;
+    let semantic_runs = doc.semantic_text_runs_for_page(page);
+    let mut stats = LearningStats {
+        glyph_runs: glyph_runs.len(),
+        semantic_runs: semantic_runs.len(),
+        ..Default::default()
+    };
+    if glyph_runs.is_empty() || semantic_runs.is_empty() {
+        stats.nothing_to_learn = true;
+        return Ok(stats);
+    }
+
+    // Any CMap fallback on the page poisons the whole page — if even one
+    // char fell through to "byte as char" we can't trust the positional
+    // alignment either, since the vector path skips glyphs that never
+    // appeared in the content stream.
+    let any_fallback = semantic_runs.iter().any(|r| r.cmap_fallback_chars > 0);
+    if any_fallback {
+        stats.nothing_to_learn = true;
+        return Ok(stats);
+    }
+
+    // ── Layer 1: index-aligned runs ──────────────────────────────────
+    if glyph_runs.len() == semantic_runs.len() {
+        for (g_run, t_run) in glyph_runs.iter().zip(semantic_runs.iter()) {
+            let chars: Vec<char> = t_run.text.chars().filter(|c| !c.is_whitespace()).collect();
+            let glyphs: Vec<&VectorGlyph> = g_run.glyphs.iter().collect();
+            if chars.len() != glyphs.len() {
+                continue;
+            }
+            for (glyph, ch) in glyphs.iter().zip(chars.iter()) {
+                if glyph.shape_hash == 0 {
+                    stats.skipped += 1;
+                    continue;
+                }
+                let s = ch.to_string();
+                record_learned(glyph.shape_hash, &s, 0.85, AtlasSource::Corpus);
+                stats.emitted += 1;
+            }
+        }
+        if stats.emitted > 0 {
+            return Ok(stats);
+        }
+    }
+
+    // ── Layer 2: flattened-index fallback ────────────────────────────
+    let all_glyphs: Vec<&VectorGlyph> = glyph_runs
+        .iter()
+        .flat_map(|r| r.glyphs.iter())
+        .filter(|g| g.shape_hash != 0)
+        .collect();
+    let all_chars: Vec<char> = semantic_runs
+        .iter()
+        .flat_map(|r| r.text.chars())
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    if all_glyphs.len() == all_chars.len() && !all_glyphs.is_empty() {
+        for (glyph, ch) in all_glyphs.iter().zip(all_chars.iter()) {
+            let s = ch.to_string();
+            record_learned(glyph.shape_hash, &s, 0.80, AtlasSource::Corpus);
+            stats.emitted += 1;
+        }
+        return Ok(stats);
+    }
+
+    stats.nothing_to_learn = stats.emitted == 0;
+    Ok(stats)
+}
+
+/// Page-iteration convenience: run the learner across every page of a
+/// document and return the aggregate stats. Pages that cannot be learned
+/// from are quietly skipped.
+#[cfg(feature = "glyph-atlas")]
+pub fn learn_document_glyph_mappings(doc: &PdfDocument) -> LearningStats {
+    learn_document_glyph_mappings_checked(doc).unwrap_or_else(|_| LearningStats {
+        nothing_to_learn: true,
+        ..LearningStats::default()
+    })
+}
+
+/// Checked document-wide glyph learning. Any page resource or bounded Form
+/// traversal failure aborts the document operation.
+#[cfg(feature = "glyph-atlas")]
+pub fn learn_document_glyph_mappings_checked(doc: &PdfDocument) -> Result<LearningStats> {
+    let mut agg = LearningStats::default();
+    for page in doc.pages() {
+        let s = learn_page_glyph_mappings_checked(doc, &page)?;
+        agg.glyph_runs += s.glyph_runs;
+        agg.semantic_runs += s.semantic_runs;
+        agg.emitted += s.emitted;
+        agg.skipped += s.skipped;
+    }
+    agg.nothing_to_learn = agg.emitted == 0;
+    Ok(agg)
+}
+
+/// Render a sequence of [`GlyphRun`]s back into approximate text by looking
+/// each glyph up in the atlas (feature `glyph-atlas`). Unknown glyphs render
+/// as `_`. Newlines are inserted on >6pt y-jumps and spaces on >6pt x-gaps —
+/// a coarse heuristic intended for diagnostic / preview output, not for
+/// extraction-quality text.
+pub fn runs_to_string(runs: &[GlyphRun]) -> String {
+    let mut text = String::new();
+    let mut last_y = f32::MIN;
+    let mut last_x = f32::MIN;
+
+    for run in runs {
+        if last_y != f32::MIN && (run.page_y - last_y).abs() > 6.0 {
+            text.push('\n');
+        } else if last_x != f32::MIN && (run.page_x - last_x) > 6.0 {
+            // Rough space heuristic, might need tuning based on font scale
+            text.push(' ');
+        }
+
+        for glyph in &run.glyphs {
+            if let Some(grapheme) = atlas_lookup(glyph.shape_hash) {
+                if grapheme != "?" {
+                    text.push_str(grapheme);
+                }
+            } else {
+                text.push('_'); // Unknown glyph
+            }
+        }
+
+        last_y = run.page_y;
+        last_x = run.page_x + (run.glyphs.len() as f32 * 6.0 * run.scale); // simple approx width
+    }
+
+    text
+}
+
+#[cfg(test)]
+#[cfg(feature = "glyph-atlas")]
+mod learning_tests {
+    use super::*;
+    use crate::glyph_atlas;
+    use crate::{ParseOptions, PdfDocument};
+
+    use crate::glyph_atlas::env_lock_for_tests as test_env_lock;
+
+    #[test]
+    fn learning_is_noop_when_no_vector_glyphs() {
+        // A minimal valid PDF with only text ops (Tj) referencing a Type 0
+        // font — no vector path draws. The vector-text extractor produces
+        // zero glyph runs, so the learner correctly emits zero pairs and
+        // flags nothing_to_learn.
+        let _g = test_env_lock();
+        let before = glyph_atlas::pending_learned_count();
+        let pdf = br#"%PDF-1.7
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 14 >>
+stream
+q 1 0 0 1 0 0 cm Q
+endstream
+endobj
+"#;
+        let doc = PdfDocument::from_slice(pdf, ParseOptions::default()).unwrap();
+        let stats = learn_document_glyph_mappings(&doc);
+        assert_eq!(stats.emitted, 0);
+        assert_eq!(glyph_atlas::pending_learned_count(), before);
+    }
+
+    #[test]
+    fn learning_stats_zeroed_on_empty_doc() {
+        let _g = test_env_lock();
+        // No Kids, no content.
+        let pdf = br#"%PDF-1.7
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [] /Count 0 >>
+endobj
+"#;
+        let doc = PdfDocument::from_slice(pdf, ParseOptions::default()).unwrap();
+        let stats = learn_document_glyph_mappings(&doc);
+        assert_eq!(stats.glyph_runs, 0);
+        assert_eq!(stats.semantic_runs, 0);
+        assert_eq!(stats.emitted, 0);
+        assert!(stats.nothing_to_learn);
+    }
+
+    /// The bounded compatibility shim never persists learned mappings.
+    #[test]
+    fn compatibility_shim_is_nonpersistent() {
+        let _g = test_env_lock();
+        glyph_atlas::learned_sink_for_test_clear();
+
+        glyph_atlas::record_learned(
+            0xa11000bb22cc33dd,
+            "Ω",
+            0.91,
+            glyph_atlas::AtlasSource::Corpus,
+        );
+        glyph_atlas::save_process_atlas().unwrap();
+
+        let mut reloaded = glyph_atlas::GlyphAtlas::new();
+        reloaded.load_default_cache().unwrap();
+        assert!(reloaded.lookup(0xa11000bb22cc33dd).is_none());
+    }
+}

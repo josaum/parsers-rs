@@ -1,0 +1,67 @@
+[package]
+name = "pdf-fast-core"
+version = "0.2.0"
+edition.workspace = true
+authors.workspace = true
+description = "Byte-level, xref-free PDF scanner focused on zero-copy extraction"
+license.workspace = true
+keywords = ["pdf", "parser", "document", "text-extraction"]
+categories = ["parser-implementations", "encoding"]
+rust-version.workspace = true
+
+[lib]
+name = "pdf_fast_core"
+
+# ── Features ─────────────────────────────────────────────────────────────
+#
+# Default pulls in everything the workspace consumers rely on today. Build
+# with `--no-default-features` and opt back in selectively for a minimal
+# core (just the byte-scanner + Flate decode).
+#
+# Transitive dep cost, current benchmark:
+#   default (all features)     : ~238 crates
+#   --no-default-features      : ~10  crates (bumpalo, libdeflater, memchr, anyhow)
+[features]
+default = [
+    "arrow",        # RecordBatch APIs (heaviest dep; 170+ transitives)
+    "serde",        # Serialize/Deserialize of PDF model types + JSON output
+    "mmap",         # memmap2-backed zero-copy PdfDocument::open
+    "parallel",     # rayon par_iter for batch rasterization + record batches
+    "rasterize",    # tiny-skia rasterizer + PNG encoding via `image`
+]
+
+arrow       = ["dep:arrow"]
+serde       = ["dep:serde"]
+mmap        = ["dep:memmap2"]
+parallel    = ["dep:rayon"]
+rasterize   = ["dep:tiny-skia", "dep:image", "dep:hayro", "dep:hayro-ccitt"]
+glyph-atlas = []   # retained only to keep downstream cfg compatibility; no Atlas default surface
+
+[dependencies]
+# ── Core (always on) ─────────────────────────────────────────────────────
+anyhow      = "1.0"
+bumpalo     = "3.17"
+libdeflater = "0.12"
+memchr      = "2.7"
+
+# ── Optional ─────────────────────────────────────────────────────────────
+arrow       = { workspace = true, optional = true }
+memmap2     = { version = "0.9", optional = true }
+rayon       = { version = "1.10", optional = true }
+serde       = { version = "1.0", features = ["derive", "rc"], optional = true }
+tiny-skia   = { version = "0.11", optional = true }
+hayro       = { version = "0.5", optional = true }
+hayro-ccitt = { version = "0.2", optional = true }
+
+# Used for /Rotate correction in page_rasterized_png and PNG/JPEG payload handling.
+[dependencies.image]
+version          = "0.25"
+default-features = false
+features         = ["png", "jpeg"]
+optional         = true
+
+[dev-dependencies]
+flate2      = "1.0"
+tempfile    = "3.10"
+base64      = "0.22"
+csv         = "1"

@@ -8,6 +8,7 @@ members = [
   "xlsx-fast-py",
   "pptx-fast-core",
   "pptx-fast-py",
+  "pdf-fast-core",
   "email-fast-core",
   "email-fast-py",
   "json-fast-core",
@@ -24,6 +25,7 @@ members = [
 # written here must be readable there without a conversion step.
 [workspace.dependencies]
 arrow-array = "=58.3.0"
+arrow = "=58.3.0"
 arrow-ipc = { version = "=58.3.0", features = ["lz4", "zstd"] }
 arrow-schema = "=58.3.0"
 pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py38"] }
