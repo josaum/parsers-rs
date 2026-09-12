@@ -1,0 +1,49 @@
+[build-system]
+requires = ["maturin>=1.6,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pdf-fast"
+version = "0.2.0"
+description = "High-performance PDF parser powered by Rust"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "parsers-rs maintainers" }]
+dependencies = [
+    "numpy>=1.26",
+    "pyarrow>=25.0.1",  # IPC reader floor for Rust arrow* =58.3.0
+]
+keywords = [
+    "pdf",
+    "parser",
+    "document",
+    "rust",
+    "performance",
+    "arrow",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: General",
+]
+
+[tool.maturin]
+module-name = "pdf_fast._core"
+python-source = "."
+features = ["pyo3/extension-module"]
+
+[project.optional-dependencies]
+# Reading order needs the consumer's layout engine; see the `reading-order`
+# feature note in Cargo.toml. The shared wheel is built without it.
+reading-order = []

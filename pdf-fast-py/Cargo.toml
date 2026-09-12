@@ -1,0 +1,54 @@
+[package]
+name = "pdf-fast-py"
+version = "0.2.0"
+edition.workspace = true
+authors.workspace = true
+description = "Python bindings for pdf-fast-core"
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pdf_fast_py"
+# `rlib` keeps `cargo test` working for pure Arrow OCR helpers; `cdylib` is
+# what maturin loads into Python.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Reading-order pipeline (paragraph-merge → layout engine) for
+# `parse_pdf_text(reading_order=True)`.
+#
+# It is behind a feature because the layout engine is a *product* component: it
+# implements a consumer's reading-order policy, not a generic parse. Both
+# consumers carry the same dependency today, so this decides only whether a
+# given install includes it.
+#
+# The default build is a no-op for a consumer that never sets `reading_order`,
+# which is the case on Atlas's product path (`parse_pdf_text_bytes(data)`).
+# Asking for `reading_order = True` without this feature is an error rather
+# than a silent fall back to stream order: returning a different order than the
+# caller asked for would be a plausible-looking wrong answer.
+#
+# This feature declares no dependency **on purpose**. A sovereign repository
+# cannot name a consumer's crate in its own manifest: a path into a sibling
+# checkout would make this repository unbuildable on a clean clone, and a
+# version requirement would make it unresolvable. Instead a consumer that wants
+# reading order adds `layout-fast-core` to its own workspace and enables this
+# feature from its binding. Compare `owl-fast-core`'s `atlas-reasoner-rows`,
+# where the same rule is applied to the Atlas reasoner.
+#
+# Enabled from here without a consumer supplying the crate, the build fails at
+# the missing dependency rather than silently dropping the capability.
+reading-order = []
+
+[dependencies]
+anyhow = "1.0"
+arrow = { workspace = true, features = ["ffi"] }
+pyo3 = { workspace = true }
+serde_json = { workspace = true }
+pdf-fast-core = { path = "../pdf-fast-core" }
+# Data-parallel per-page text extraction for large PDFs (compute_full_text).
+rayon = "1.10"
+
+[build-dependencies]
+pyo3-build-config = "0.28.3"

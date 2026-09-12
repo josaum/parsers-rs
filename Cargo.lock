@@ -261,6 +261,9 @@ name = "arrow-schema"
 version = "58.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
+dependencies = [
+ "bitflags 2.13.2",
+]
 
 [[package]]
 name = "arrow-select"
@@ -1587,6 +1590,19 @@ dependencies = [
  "serde",
  "tempfile",
  "tiny-skia",
+]
+
+[[package]]
+name = "pdf-fast-py"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "pdf-fast-core",
+ "pyo3",
+ "pyo3-build-config",
+ "rayon",
+ "serde_json",
 ]
 
 [[package]]

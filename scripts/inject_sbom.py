@@ -35,6 +35,7 @@ SBOM_SOURCES: dict[str, str] = {
     "email_fast": "email-fast-core",
     "xlsx_fast": "xlsx-fast-core",
     "pptx_fast": "pptx-fast-core",
+    "pdf_fast": "pdf-fast-core",
 }
 
 

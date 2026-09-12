@@ -9,6 +9,7 @@ members = [
   "pptx-fast-core",
   "pptx-fast-py",
   "pdf-fast-core",
+  "pdf-fast-py",
   "email-fast-core",
   "email-fast-py",
   "json-fast-core",
