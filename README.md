@@ -24,8 +24,9 @@ interop contract** — the same purpose in every consumer.
 | `docx-fast-core`, `docx-fast-py` | Read-only DOCX structure extraction and NDJSON streaming |
 | `email-fast-core`, `email-fast-py` | Read-only EML/MSG/mbox extraction, with a bounded attachment budget |
 | `xlsx-fast-core`, `xlsx-fast-py` | Read-only XLSX workbook extraction, NDJSON and Arrow IPC streaming |
+| `pptx-fast-core`, `pptx-fast-py` | Read-only PPTX extraction, NDJSON, Arrow dataset, embedded media |
 | `ooxml-archive` | Shared OOXML ZIP, bounded inflate, and relationship resolution |
-| PDF and PPTX read cores (planned) | Same read-only output contract in both consumers |
+| PDF read core (planned) | Same read-only output contract in both consumers |
 | `*-node` bindings (planned) | Thin, per-platform, versioned alongside the core |
 
 `ooxml-archive` is the load-bearing one. `max_inflate` is an **aggregate**
@@ -35,7 +36,7 @@ restricted decoder that bounds output before exposing bytes is the `flate2` one,
 so there is no fast path that inflates first and checks afterwards — a faster
 decoder can only be reinstated by keeping that ordering.
 
-The shipped surface is **10 artifacts**: five crates × macOS arm64 and Linux
+The shipped surface is **12 artifacts**: six crates × macOS arm64 and Linux
 x86_64.
 
 ## What must not belong here
@@ -49,9 +50,11 @@ repository into a component of one product.
 | **Atlas**: `owl-fast-core` (reasoner projection) | It depends on `atlas-reasoner` and emits `RulePackage` `owl_axiom` rows. A shared crate cannot depend on one consumer. |
 | **Mycelia**: `gliner-core`, `gliner2-core`, OCR models, `geom-core`, `layout-fast-*`, `web-fast-core`, `chunk-fast-core`, `fca-fast-*` | Product components — NER, OCR, layout and chunking — not parsers. |
 
-`gliner` is an **optional feature** on Mycelia's docx/pdf/email/xlsx/pptx
-crates. If those cores move here, that feature must be removed from the core and
-expressed by the consumer, or the core acquires a Mycelia dependency.
+`gliner` and `embed` are **optional features** on Mycelia's docx/pdf/email/
+xlsx/pptx crates, and both must be removed when a core moves here. They are not
+only feature flags: each gates a whole module (`adapter.rs`, `embed.rs`) that
+depends on `gliner-core` or `mycelia-client`. Removed so far from docx, email,
+xlsx, and pptx; `pdf` still carries them.
 
 ### The `owl-fast-core` name collision
 
@@ -162,6 +165,7 @@ and "in use":
 | `docx_fast` | installs this release | builds from its own source |
 | `email_fast` | installs this release | builds from its own source |
 | `xlsx_fast` | installs this release | builds from its own source |
+| `pptx_fast` | installs this release | builds from its own source |
 
 Atlas consumes these through `vendor/parsers-rs/` with a version and a SHA-256
 in `app/requirements/parsers-rs-pinned.txt`. Because a find-links source records
@@ -176,4 +180,5 @@ after:
 | --- | --- |
 | `json_fast.loads`, `loads_many` | Atlas `cartridges/atlas/_jsonl.py`, `margin.py`, `feeds/pacvue.py`, `dataplane.py` |
 | `xsd_fast.list_elements_bytes`, `describe_element_bytes` | Atlas `app/atlas_demo/uploads.py` |
-| `docx_fast`, `email_fast`, `xlsx_fast` | Atlas upload suite; `xlsx_fast` additionally compared wheel-to-wheel against the previous artifact, byte-identical under default, no-date, formula, and raw-value options |
+| `docx_fast`, `email_fast` | Atlas upload suite |
+| `xlsx_fast`, `pptx_fast` | Compared wheel-to-wheel against the artifact each replaced, byte-identical on every case exercised; their NDJSON and Arrow surfaces cross-checked against the document projection on a fixture where no surface is vacuously empty |
