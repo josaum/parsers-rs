@@ -783,6 +783,13 @@ impl PdfDocument {
             .iter()
             .find(|page| page.page_index == page_index)
             .ok_or_else(|| anyhow!("page index {} out of bounds", page_index))?;
+        // Refuse a malformed `/Rotate` before rendering. Normalization folds a
+        // multiple of 90 and cannot represent anything else, so without this
+        // check a file declaring `/Rotate 45` rasterizes upright and the
+        // sideways page reaches OCR looking entirely normal.
+        if let Some(raw) = page.rotate_raw {
+            normalize_rotate(raw)?;
+        }
         let fast_path = self.rasterized_page_image_payload(page, dpi)?;
         let (png_bytes, apply_fast_path_rotation) =
             if let Some(png) = fast_path.and_then(|(bytes, _format)| bytes) {
@@ -2661,7 +2668,12 @@ impl PdfDocument {
                 .dictionary
                 .as_ref()
                 .and_then(|dictionary| self.resolve_inherited_rotate(dictionary))
+                .and_then(|raw| normalize_rotate(raw).ok())
                 .unwrap_or(0),
+            rotate_raw: object
+                .dictionary
+                .as_ref()
+                .and_then(|dictionary| self.resolve_inherited_rotate(dictionary)),
             resources,
         }
     }
@@ -2748,7 +2760,14 @@ impl PdfDocument {
         None
     }
 
-    fn resolve_inherited_rotate(&self, dictionary: &PdfDictionary) -> Option<u32> {
+    /// Resolve the inherited raw `/Rotate` value, unnormalized.
+    ///
+    /// Kept raw so the renderer can refuse a value the format does not allow.
+    /// Normalizing here would have to either round it (a page silently rotated
+    /// the wrong way) or propagate an error through the recursive page walk,
+    /// which drops a page it cannot read — worse than the bug. PDF 32000-1
+    /// §7.7.3.3: `/Rotate` "shall be a multiple of 90".
+    fn resolve_inherited_rotate(&self, dictionary: &PdfDictionary) -> Option<i64> {
         let mut current: Option<&PdfDictionary> = Some(dictionary);
         let mut depth = 0;
         while let Some(dict) = current {
@@ -2757,7 +2776,7 @@ impl PdfDocument {
             }
             depth += 1;
             if let Some(rotate) = dict.get("Rotate").and_then(|v| match v {
-                PdfValue::Integer(n) => Some(((*n).rem_euclid(360) as u32 / 90) * 90),
+                PdfValue::Integer(n) => Some(*n),
                 _ => None,
             }) {
                 return Some(rotate);
@@ -3111,7 +3130,19 @@ pub struct PdfPage {
     pub resources: Option<PdfDictionary>,
     /// Page rotation in degrees from the PDF /Rotate key (0, 90, 180, 270).
     /// Inherited from parent page tree nodes if not set on the page itself.
+    ///
+    /// This is the **normalized** rotation: a multiple of 90, with out-of-range
+    /// multiples folded (`-90` → `270`, `450` → `90`). The raw value the file
+    /// declared is kept in [`Self::rotate_raw`] so a renderer can refuse one
+    /// that is not a multiple of 90 rather than picking a rounding.
     pub rotate: u32,
+    /// The `/Rotate` value exactly as the file declared it, before folding.
+    ///
+    /// `None` when the page tree declares none. Equal to `rotate` for every
+    /// well-formed file; differs when the file is malformed, which is the case
+    /// [`PdfDocument::page_rasterized_png`] reports.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub rotate_raw: Option<i64>,
 }
 
 impl PdfPage {
@@ -6547,6 +6578,23 @@ fn collect_indirect_integers(
             }
         })
         .collect()
+}
+
+/// Normalize a page `/Rotate` to one of `0`, `90`, `180`, `270`.
+///
+/// PDF 32000-1 §7.7.3.3 requires a multiple of 90. Out-of-range multiples are
+/// folded (`-90` → `270`, `450` → `90`, `360` → `0`), which every viewer does
+/// and which is unambiguous. A value that is not a multiple of 90 has no
+/// correct reading, so it is refused: the alternative is to round it, and a
+/// page silently rotated the wrong way is a plausible-looking wrong answer
+/// rather than a visible failure.
+fn normalize_rotate(rotate: i64) -> Result<u32> {
+    if rotate % 90 != 0 {
+        return Err(anyhow!(
+            "unsupported PDF page rotation {rotate}: /Rotate must be a multiple of 90"
+        ));
+    }
+    Ok((rotate.rem_euclid(360) as u32 / 90) * 90)
 }
 
 fn resolve_stream_length(
