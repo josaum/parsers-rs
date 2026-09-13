@@ -209,6 +209,20 @@ pub struct VectorGlyph {
     pub size: f32,
 }
 
+/// One operand of a `TJ` array.
+///
+/// `TJ` interleaves strings with numbers: the strings are shown, and each number
+/// between them is a kerning adjustment in thousandths of an em applied to the
+/// text matrix before the next string. Both have to be kept in order, which is
+/// why the array is collected rather than treated as a run of strings.
+#[derive(Debug, Clone)]
+enum TjPart {
+    /// A string operand to show.
+    Text(Vec<u8>),
+    /// A kerning adjustment in thousandths of an em; positive moves left.
+    Kern(f32),
+}
+
 /// A Type 3 font resolved far enough to draw its glyphs.
 ///
 /// A Type 3 font defines each glyph as a content stream in `/CharProcs` and
@@ -296,6 +310,10 @@ struct VectorTextExtractor {
     last_name: Option<Vec<u8>>,
     /// Most recent string operand, consumed by `Tj` and its relatives.
     last_string: Option<Vec<u8>>,
+    /// Operands of the `TJ` array currently being read, in order.
+    tj_parts: Vec<TjPart>,
+    /// Depth inside a `[` ... `]` operand array. Only `TJ` uses one.
+    in_array: bool,
     /// Transform that maps the glyph stream currently executing into page
     /// user space (`CTM . Tm . Fm`). Contours are recorded through it, so a
     /// text-drawn glyph arrives in the same space as one drawn by a path on the
@@ -362,6 +380,8 @@ impl VectorTextExtractor {
             stroke_lum: 0.0,
             last_name: None,
             last_string: None,
+            tj_parts: Vec::new(),
+            in_array: false,
             in_type3_glyph: false,
             type3_ctm: IDENTITY,
             form_stack: Vec::new(),
@@ -614,11 +634,27 @@ impl VectorTextExtractor {
             // and escaped parentheses, so `(A B)` would arrive as two tokens
             // and `(a\)b)` would end early. Only `Tj` and its relatives need
             // this, but the reader has to be here, ahead of the token split.
+            // `[` is a PDF delimiter, not whitespace: `[(A) -2000 (B)]` has no
+            // space between the bracket and the string, so a tokenizer that
+            // only splits on whitespace sees `[(A)` as one token and never
+            // recognizes the array at all. Consuming it here is what makes the
+            // array reachable; `]` needs no handling because it trails the last
+            // operand, which is already read by its own branch.
+            if stream[cursor] == b'[' {
+                self.in_array = true;
+                self.tj_parts.clear();
+                cursor += 1;
+                continue;
+            }
             if stream[cursor] == b'(' {
                 let (bytes, next) = read_literal_string(stream, cursor);
                 self.win.copy_within(1..6, 0);
                 self.win[5] = 0.0;
-                self.last_string = Some(bytes);
+                if self.in_array {
+                    self.tj_parts.push(TjPart::Text(bytes));
+                } else {
+                    self.last_string = Some(bytes);
+                }
                 cursor = next;
                 continue;
             }
@@ -628,18 +664,42 @@ impl VectorTextExtractor {
                 let (bytes, next) = read_hex_string(stream, cursor);
                 self.win.copy_within(1..6, 0);
                 self.win[5] = 0.0;
-                self.last_string = Some(bytes);
+                if self.in_array {
+                    self.tj_parts.push(TjPart::Text(bytes));
+                } else {
+                    self.last_string = Some(bytes);
+                }
                 cursor = next;
                 continue;
             }
 
             let start = cursor;
             while cursor < stream.len() && !is_whitespace(stream[cursor]) {
+                // Stop at a delimiter so `(B)]` and `]TJ` do not become one
+                // token. `(` and `[` are handled above, before the scan starts.
+                if stream[cursor] == b']' && cursor > start {
+                    break;
+                }
                 cursor += 1;
             }
             let tok = &stream[start..cursor];
+            // A lone `]` closes the operand list; the operator after it
+            // consumes what was collected, so nothing to do here.
+            if tok == b"]" {
+                if self.in_array {
+                    self.in_array = false;
+                }
+                continue;
+            }
 
             if let Some(v) = fast_parse_f32(tok) {
+                // Inside a `TJ` array a number is a kerning operand, not a
+                // text-state one: pushing it through `win` would let a later
+                // operator read it as its argument.
+                if self.in_array {
+                    self.tj_parts.push(TjPart::Kern(v));
+                    continue;
+                }
                 self.win.copy_within(1..6, 0);
                 self.win[5] = v;
                 continue;
@@ -914,13 +974,23 @@ impl VectorTextExtractor {
                     }
                 }
                 b"TJ" => {
-                    // The array's strings and the kerning numbers between them
-                    // were both consumed by the tokenizer; strings land in
-                    // `last_string` only for the single-string form, so an
-                    // array is not reconstructed here. A TJ-only document
-                    // therefore draws no Type 3 outlines rather than drawing
-                    // them at wrong advances, which is the conservative
-                    // failure: a misplaced glyph is worse than a missing one.
+                    // The array's strings were collected as they were read and
+                    // the numbers between them are kerning adjustments, in
+                    // thousandths of an em, applied to the text matrix. A
+                    // positive adjustment moves *left*, per the spec.
+                    let parts = std::mem::take(&mut self.tj_parts);
+                    // Cleared here rather than at `]`, so a malformed array
+                    // that never closes cannot leave every later number in the
+                    // stream being read as a kerning operand.
+                    self.in_array = false;
+                    for part in parts {
+                        match part {
+                            TjPart::Text(bytes) => self.show_text(&bytes),
+                            TjPart::Kern(amount) => {
+                                self.kern(amount);
+                            }
+                        }
+                    }
                 }
 
                 _ => {}
@@ -928,6 +998,19 @@ impl VectorTextExtractor {
         }
         self.flush();
         Ok(())
+    }
+
+    /// Apply a `TJ` kerning adjustment to the text matrix.
+    ///
+    /// The value is in thousandths of an em and is subtracted: a positive
+    /// adjustment moves the next glyph left, per PDF 32000-1 §9.4.3. Text state
+    /// only, so the shown strings stay put.
+    fn kern(&mut self, amount: f32) {
+        if self.type3.is_none() || amount == 0.0 {
+            return;
+        }
+        let shift = -(amount / 1000.0) * self.font_size;
+        self.text_matrix = compose([1.0, 0.0, 0.0, 1.0, shift, 0.0], self.text_matrix);
     }
 
     /// Draw one shown string by executing each Type 3 glyph's own stream.

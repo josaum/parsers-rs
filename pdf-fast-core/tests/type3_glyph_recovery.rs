@@ -150,6 +150,39 @@ fn two_page_pdf() -> Vec<u8> {
     ])
 }
 
+/// One page drawing `(A)` then `[(A) -2000 (B)] TJ`.
+fn tj_pdf() -> Vec<u8> {
+    pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", b"BT /F1 12 Tf 72 700 Td (A) Tj [(A) -2000 (B)] TJ ET"),
+        type3_font(Some("7 0 R")),
+        square_proc(),
+        tounicode_cmap(),
+        tee_proc(),
+    ])
+}
+
+/// One page drawing with the `'` and `"` operators, which show a string after
+/// moving to the next line.
+fn quote_pdf() -> Vec<u8> {
+    pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", b"BT /F1 12 Tf 72 700 Td (A) ' (B) \" ET"),
+        type3_font(Some("7 0 R")),
+        square_proc(),
+        tounicode_cmap(),
+        tee_proc(),
+    ])
+}
+
 #[test]
 fn type3_outlines_are_extracted_and_their_text_is_recovered_by_shape() {
     glyph_atlas::clear_learned();
@@ -291,5 +324,55 @@ fn a_shape_learned_from_outlines_is_recovered_for_a_different_rendering() {
         "a shape learned from outlines must survive a re-rendering"
     );
 
+    glyph_atlas::clear_learned();
+}
+
+/// A `TJ` array is shown in order, with its kerning applied.
+///
+/// `TJ` interleaves strings with numbers: the strings are shown, and each number
+/// between them shifts the text matrix by thousandths of an em before the next
+/// string. Treating the array as a run of strings would draw every glyph in the
+/// wrong place; the earlier behaviour — skipping the array — draws nothing at
+/// all. The assertion is on the *gap* between the two glyphs rather than on the
+/// count, because a count passes with the kerning ignored.
+#[test]
+fn a_tj_array_shows_every_string_with_its_kerning_applied() {
+    glyph_atlas::clear_learned();
+    let doc = PdfDocument::from_slice(&tj_pdf(), ParseOptions::default())
+        .expect("the document must parse");
+
+    let runs = doc.page_vector_text_runs(0).expect("vector runs");
+    let glyphs: Vec<&pdf_fast_core::vector_text::VectorGlyph> =
+        runs.iter().flat_map(|r| r.glyphs.iter()).collect();
+    // Three in total: the standalone `(A) Tj` before the array, then the two
+    // strings inside it.
+    assert_eq!(
+        glyphs.len(),
+        3,
+        "every string must be shown, both the standalone one and both in the array"
+    );
+
+    // Plain advance is 600 units at 12pt = 7.2pt. The -2000 adjustment adds
+    // 24pt, so the threshold sits unambiguously between the two.
+    let gap = (glyphs[2].x_offset - glyphs[1].x_offset).abs();
+    assert!(
+        gap > 10.0,
+        "the kerning operand must move the second glyph well past the plain \
+         advance; a gap near 7.2 means the numbers between the strings were \
+         ignored: {gap}"
+    );
+
+    glyph_atlas::clear_learned();
+}
+
+/// `'` and `"` show their string, so their glyphs are drawn too.
+#[test]
+fn the_quote_operators_show_their_string() {
+    glyph_atlas::clear_learned();
+    let doc = PdfDocument::from_slice(&quote_pdf(), ParseOptions::default())
+        .expect("the document must parse");
+    let runs = doc.page_vector_text_runs(0).expect("vector runs");
+    let glyphs: usize = runs.iter().map(|r| r.glyphs.len()).sum();
+    assert_eq!(glyphs, 2, "both quote operators must draw their string");
     glyph_atlas::clear_learned();
 }
