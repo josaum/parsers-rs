@@ -28,6 +28,7 @@
 use anyhow::{anyhow, Context, Result};
 pub mod raster_glyphs;
 pub mod tessellation;
+pub mod truetype;
 #[cfg(feature = "arrow")]
 use arrow::array::{
     Array, BinaryBuilder, FixedSizeListBuilder, Float32Array, Float32Builder, Float64Array,
