@@ -223,6 +223,43 @@ enum TjPart {
     Kern(f32),
 }
 
+/// A font whose outlines this parser can reach.
+///
+/// Two subtypes qualify, for different reasons. A Type 3 font *is* its outlines
+/// — each glyph is a content stream, so drawing them means executing them. An
+/// embedded TrueType program carries its outlines in `glyf`, so drawing them
+/// means emitting points. Everything else keeps its outlines in a form this
+/// crate does not read, and the atlas gets nothing rather than an approximation.
+#[derive(Debug, Clone)]
+pub(crate) enum DrawableFont {
+    /// Glyphs are content streams in `/CharProcs`.
+    Type3(Type3Font),
+    /// Glyphs are outlines in an embedded `glyf` table.
+    TrueType(crate::truetype::TrueTypeFont),
+}
+
+/// Where one glyph's outline comes from.
+enum GlyphSource {
+    /// A Type 3 glyph: a content stream to execute.
+    Stream(Vec<u8>),
+    /// A TrueType glyph: already-parsed points in font units.
+    Outline(crate::truetype::GlyphOutline),
+}
+
+/// Font matrix for a TrueType program: font units to text space.
+///
+/// TrueType outlines are in design units, so the matrix is a uniform scale by
+/// the reciprocal of the em size — the same shape a Type 3 `/FontMatrix`
+/// declares explicitly.
+fn true_type_matrix(units_per_em: f32) -> Matrix {
+    let scale = if units_per_em > 0.0 {
+        1.0 / units_per_em
+    } else {
+        0.0
+    };
+    [scale, 0.0, 0.0, scale, 0.0, 0.0]
+}
+
 /// A Type 3 font resolved far enough to draw its glyphs.
 ///
 /// A Type 3 font defines each glyph as a content stream in `/CharProcs` and
@@ -341,10 +378,13 @@ struct VectorTextExtractor {
     /// would put it.
     text_matrix: Matrix,
     text_line_matrix: Matrix,
-    /// The `Tf`-selected font, when it is a Type 3 font this parser resolved.
-    /// `None` for every other font: those draw with a font program, not with
-    /// outlines, and this extractor has nothing to add for them.
-    type3: Option<Type3Font>,
+    /// The `Tf`-selected font, when it is one whose outlines this parser can
+    /// reach: a Type 3 font (outlines are content streams) or an embedded
+    /// TrueType program (outlines are in `glyf`). `None` for a font whose
+    /// outlines live in CFF, or that embeds no program at all — for those there
+    /// is nothing here to draw, and guessing at a shape is worse than drawing
+    /// nothing.
+    drawable: Option<DrawableFont>,
     /// Font size from `Tf`, scaling the font matrix.
     font_size: f32,
     in_text: bool,
@@ -387,7 +427,7 @@ impl VectorTextExtractor {
             form_stack: Vec::new(),
             text_matrix: IDENTITY,
             text_line_matrix: IDENTITY,
-            type3: None,
+            drawable: None,
             font_size: 0.0,
             in_text: false,
             win: [0.0; 6],
@@ -922,15 +962,15 @@ impl VectorTextExtractor {
                 b"ET" => {
                     self.flush();
                     self.in_text = false;
-                    self.type3 = None;
+                    self.drawable = None;
                 }
                 b"Tf" => {
                     self.font_size = self.win[5];
                     let name = self.last_name.take();
-                    self.type3 = match (ctx, name) {
+                    self.drawable = match (ctx, name) {
                         (Some(ctx), Some(name)) => {
                             let name = String::from_utf8_lossy(&name).into_owned();
-                            ctx.doc.resolve_type3_font(ctx.resources, &name)
+                            ctx.doc.resolve_drawable_font(ctx.resources, &name)
                         }
                         _ => None,
                     };
@@ -1006,7 +1046,7 @@ impl VectorTextExtractor {
     /// adjustment moves the next glyph left, per PDF 32000-1 §9.4.3. Text state
     /// only, so the shown strings stay put.
     fn kern(&mut self, amount: f32) {
-        if self.type3.is_none() || amount == 0.0 {
+        if self.drawable.is_none() || amount == 0.0 {
             return;
         }
         let shift = -(amount / 1000.0) * self.font_size;
@@ -1025,21 +1065,41 @@ impl VectorTextExtractor {
     /// handling below. That is what the rasterizer does, and it means the
     /// outline arrives in page space with no separate transform stage.
     fn show_text(&mut self, bytes: &[u8]) {
-        let Some(font) = self.type3.clone() else {
+        let Some(font) = self.drawable.clone() else {
             return;
         };
         self.flush();
 
         for &code in bytes {
-            let Some(name) = font.glyph_name(code) else {
-                continue;
-            };
-            let Some(proc_bytes) = font.char_proc(name) else {
-                continue;
+            // A Type 3 glyph is a content stream to execute; a TrueType glyph
+            // is a point stream to emit. Both arrive in font units, y-up, and
+            // both are then placed by the same `CTM * Tm * Fm` transform.
+            let (outline, font_matrix) = match &font {
+                DrawableFont::Type3(type3) => {
+                    let Some(name) = type3.glyph_name(code) else {
+                        continue;
+                    };
+                    let Some(proc_bytes) = type3.char_proc(name) else {
+                        continue;
+                    };
+                    (GlyphSource::Stream(proc_bytes.to_vec()), type3.font_matrix)
+                }
+                DrawableFont::TrueType(program) => {
+                    let Some(index) = program.glyph_index(code as u32) else {
+                        continue;
+                    };
+                    let Some(outline) = program.outline(index) else {
+                        continue;
+                    };
+                    (
+                        GlyphSource::Outline(outline),
+                        true_type_matrix(program.units_per_em()),
+                    )
+                }
             };
 
             let glyph_matrix = compose(
-                compose(self.text_matrix, font.font_matrix),
+                compose(self.text_matrix, font_matrix),
                 scale_matrix(self.font_size),
             );
             self.in_type3_glyph = true;
@@ -1051,14 +1111,46 @@ impl VectorTextExtractor {
             // A CharProc is a content stream. A failure inside one glyph must
             // not abandon the page: skip that glyph and keep the rest, which is
             // the same choice the `Do` path makes for an unreadable form.
-            let _ = self.parse_stream_ctx(proc_bytes, None);
-            self.in_type3_glyph = false;
+            match &outline {
+                GlyphSource::Stream(bytes) => {
+                    let _ = self.parse_stream_ctx(bytes, None);
+                }
+                GlyphSource::Outline(parsed) => {
+                    // Font units, y-up, straight into the pending contours the
+                    // commit step transforms into page space.
+                    for contour in &parsed.contours {
+                        self.pending.push(
+                            contour
+                                .iter()
+                                .map(|p| BezPt {
+                                    x: p.x,
+                                    y: p.y,
+                                    // TrueType's off-curve points are quadratic
+                                    // controls, the same role kind 2 carries
+                                    // for Type 3 outlines.
+                                    kind: if p.on_curve { 1 } else { 2 },
+                                })
+                                .collect(),
+                        );
+                    }
+                    self.commit_pending(0.0);
+                }
+            }
+            // Flushed while the flag is still set, so the glyph takes the
+            // positioned branch. Clearing it first sent every text-drawn glyph
+            // down the no-run path, where the punctuation-scale guard discards
+            // it — the glyph vanished with no error and no empty result to
+            // notice, only a wrong size in what survived.
             self.flush();
+            self.in_type3_glyph = false;
             self.stack.pop();
 
             // Advance the text matrix by the glyph width, in text space:
             // Tm = translate(w * size, 0) · Tm.
-            let advance = font.width(code) * self.font_size;
+            let advance = match &font {
+                DrawableFont::Type3(type3) => type3.width(code),
+                DrawableFont::TrueType(program) => program.advance_units(code as u32).unwrap_or(0.0),
+            } * self.font_size;
             self.text_matrix = compose([1.0, 0.0, 0.0, 1.0, advance, 0.0], self.text_matrix);
         }
     }

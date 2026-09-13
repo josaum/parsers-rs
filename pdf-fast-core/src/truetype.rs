@@ -65,6 +65,8 @@ pub struct TrueTypeFont {
     loca: Vec<u32>,
     glyf: (usize, usize),
     cmap4: Option<(usize, usize)>,
+    /// `numberOfHMetrics`, and the `hmtx` byte range.
+    hmtx: Option<(usize, usize, usize)>,
     data: Vec<u8>,
 }
 
@@ -91,6 +93,8 @@ impl TrueTypeFont {
         let mut loca = None;
         let mut glyf = None;
         let mut cmap = None;
+        let mut hhea = None;
+        let mut hmtx = None;
         for index in 0..num_tables {
             let record = 12 + index * 16;
             if record + 16 > data.len() {
@@ -118,6 +122,8 @@ impl TrueTypeFont {
                 b"loca" => loca = Some(offset),
                 b"glyf" => glyf = Some((offset, end)),
                 b"cmap" => cmap = Some((offset, end)),
+                b"hhea" => hhea = Some(offset),
+                b"hmtx" => hmtx = Some((offset, end)),
                 _ => {}
             }
         }
@@ -168,12 +174,22 @@ impl TrueTypeFont {
         }
 
         let cmap4 = cmap.and_then(|(start, end)| find_cmap4(&data[..end], start));
+        // `hhea`'s numberOfHMetrics is at offset 34; without it the advance
+        // table cannot be indexed.
+        let hmtx = match (hhea, hmtx) {
+            (Some(hhea), Some(hmtx)) if hhea + 36 <= data.len() => {
+                let count = u16::from_be_bytes([data[hhea + 34], data[hhea + 35]]);
+                Some((count as usize, hmtx.0, hmtx.1))
+            }
+            _ => None,
+        };
         Some(Self {
             units_per_em,
             num_glyphs,
             loca,
             glyf,
             cmap4,
+            hmtx,
             data: data.to_vec(),
         })
     }
@@ -189,6 +205,31 @@ impl TrueTypeFont {
         let (start, end) = self.cmap4?;
         let table = self.data.get(start..end)?;
         lookup_cmap4(table, code).filter(|index| *index < self.num_glyphs)
+    }
+
+    /// Advance width for a character code, in font units.
+    ///
+    /// Without it text cannot advance, and text that does not advance collapses
+    /// onto one position — the failure the atlas cannot see, because the shapes
+    /// are all correct.
+    ///
+    /// `hmtx` stores one entry per glyph up to `numberOfHMetrics`, then repeats
+    /// the last width for the remaining glyphs.
+    pub fn advance_units(&self, code: u32) -> Option<f32> {
+        let index = self.glyph_index(code)? as usize;
+        let (metric_count, start, end) = self.hmtx?;
+        if metric_count == 0 {
+            return None;
+        }
+        let at = if index < metric_count {
+            start + index * 4
+        } else {
+            start + (metric_count - 1) * 4
+        };
+        if at + 2 > end || at + 2 > self.data.len() {
+            return None;
+        }
+        Some(u16::from_be_bytes([self.data[at], self.data[at + 1]]) as f32)
     }
 
     /// Outline for a glyph index, in font units, y-up.

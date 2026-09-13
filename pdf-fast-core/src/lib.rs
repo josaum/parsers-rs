@@ -3028,22 +3028,90 @@ impl PdfDocument {
     /// Lives here rather than in `vector_text` because resolving dictionaries
     /// and materializing streams is this type's business; the extractor only
     /// consumes the result.
-    fn resolve_type3_font(
+    /// Resolve a resource name to a font whose outlines this parser can reach.
+    ///
+    /// Two subtypes qualify, for different reasons. A Type 3 font *is* its
+    /// outlines — each glyph is a content stream — so reaching them means
+    /// executing them. An embedded TrueType program carries its outlines in
+    /// `glyf`, so reaching them means reading that table. Every other subtype
+    /// keeps its outlines in a form this crate does not read, and returning
+    /// `None` is the honest answer: a plausible wrong shape is exactly what the
+    /// atlas would then compare against.
+    fn resolve_drawable_font(
         &self,
         resources: Option<&PdfDictionary>,
         name: &str,
-    ) -> Option<crate::vector_text::Type3Font> {
+    ) -> Option<crate::vector_text::DrawableFont> {
         let fonts = resources
             .and_then(|resources| resources.get("Font"))
-            .and_then(|value| self.resolve_dictionary(value));
-        let fonts = fonts?;
+            .and_then(|value| self.resolve_dictionary(value))?;
         let font = fonts
             .get(name)
-            .and_then(|value| self.resolve_dictionary(value));
-        let font = font?;
-        if font.get_name("Subtype") != Some("Type3") {
-            return None;
+            .and_then(|value| self.resolve_dictionary(value))?;
+        match font.get_name("Subtype") {
+            Some("Type3") => self
+                .resolve_type3_font(font)
+                .map(crate::vector_text::DrawableFont::Type3),
+            Some("TrueType") => self
+                .resolve_true_type_font(font)
+                .map(crate::vector_text::DrawableFont::TrueType),
+            _ => None,
         }
+    }
+
+    /// The embedded TrueType program for a font dictionary, if it has one.
+    ///
+    /// `/FontDescriptor` may sit on the font or on a CIDFont descendant, which
+    /// is why both are tried: a subset font is normally a Type0 whose program
+    /// lives on the descendant, and those are the fonts real documents embed.
+    fn resolve_true_type_font(
+        &self,
+        font: &PdfDictionary,
+    ) -> Option<crate::truetype::TrueTypeFont> {
+        let descriptor = self.font_descriptor(font)?;
+        let program = descriptor
+            .get("FontFile2")
+            .and_then(|value| self.resolve_stream_value_bytes(value))?;
+        crate::truetype::TrueTypeFont::parse(&program)
+    }
+
+    /// The `/FontDescriptor` for a font, following `/DescendantFonts` once.
+    fn font_descriptor<'a>(&'a self, font: &'a PdfDictionary) -> Option<&'a PdfDictionary> {
+        if let Some(descriptor) = font
+            .get("FontDescriptor")
+            .and_then(|value| self.resolve_dictionary(value))
+        {
+            return Some(descriptor);
+        }
+        font.get("DescendantFonts")
+            .and_then(|value| self.resolve_array(value))?
+            .first()
+            .and_then(|value| self.resolve_dictionary(value))?
+            .get("FontDescriptor")
+            .and_then(|value| self.resolve_dictionary(value))
+    }
+
+    /// Decoded bytes for an indirect stream value.
+    fn resolve_stream_value_bytes(&self, value: &PdfValue) -> Option<Vec<u8>> {
+        let (object_number, generation) = match value {
+            PdfValue::Reference {
+                object_number,
+                generation,
+            } => (*object_number, *generation),
+            _ => return None,
+        };
+        let object = self.object_by_id(object_number, generation)?;
+        let stream_index = object.stream_index?;
+        self.materialize_stream_bytes_for_raster(stream_index)
+            .ok()
+            .flatten()
+    }
+
+    /// A Type 3 font's glyph programs, encoding, and widths.
+    fn resolve_type3_font(
+        &self,
+        font: &PdfDictionary,
+    ) -> Option<crate::vector_text::Type3Font> {
 
         let font_matrix = font
             .get("FontMatrix")
@@ -3093,7 +3161,7 @@ impl PdfDocument {
             .and_then(|value| self.resolve_dictionary(value))
         {
             for entry in &procs.entries {
-                if let Some(bytes) = self.resolve_char_proc_bytes(&entry.value) {
+                if let Some(bytes) = self.resolve_stream_value_bytes(&entry.value) {
                     char_procs.insert(entry.key.clone(), bytes);
                 }
             }
@@ -3113,23 +3181,6 @@ impl PdfDocument {
             first_char,
             widths,
         })
-    }
-
-    /// Bytes of one `/CharProcs` entry, following the indirect reference a
-    /// glyph procedure is normally stored behind.
-    fn resolve_char_proc_bytes(&self, value: &PdfValue) -> Option<Vec<u8>> {
-        let (object_number, generation) = match value {
-            PdfValue::Reference {
-                object_number,
-                generation,
-            } => (*object_number, *generation),
-            _ => return None,
-        };
-        let object = self.object_by_id(object_number, generation)?;
-        let stream_index = object.stream_index?;
-        self.materialize_stream_bytes_for_raster(stream_index)
-            .ok()
-            .flatten()
     }
 
     /// Resolve an array value, following one indirect reference hop.
