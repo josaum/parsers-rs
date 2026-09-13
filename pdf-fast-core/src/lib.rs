@@ -7752,6 +7752,20 @@ fn extract_semantic_text_runs(
             ContentToken::Value(value) => operands.push(value),
             ContentToken::Operator(operator) => {
                 match operator.as_str() {
+                    // Inline image: `BI <params> ID <binary> EI`.
+                    //
+                    // The binary is raw and unbounded — this is the one place a
+                    // content stream carries bytes that are not operands — so
+                    // without this branch the tokenizer reads image data as
+                    // operators and strings. Measured on a fixture whose 1x1
+                    // RGB payload happened to contain `(AB)Tj`: the extracted
+                    // text came back as `BeforeABAfter`, three characters of
+                    // fabricated text from a bitmap. Silently wrong text is
+                    // worse than missing text.
+                    "BI" => {
+                        skip_inline_image(bytes, &mut cursor, &operands);
+                        operands.clear();
+                    }
                     "q" => {
                         state.graphics_stack.push(state.ctm);
                         state
@@ -7963,6 +7977,106 @@ enum ContentValue {
     Number(f32),
     Array(Vec<ContentValue>),
     Other,
+}
+
+/// Advance `cursor` past an inline image's binary payload.
+///
+/// Called with the cursor just after the `BI` operator. The payload begins one
+/// whitespace byte after `ID` and ends at a whitespace-delimited `EI`, so the
+/// scan is for that terminator. The length is computed first when the image is
+/// unfiltered and its geometry is known, which removes the ambiguity: a bitmap
+/// may legitimately contain the letters `EI`, and stopping there would resume
+/// tokenizing mid-payload and produce fabricated text.
+///
+/// A filtered image (DCT, JPX, CCITT, ASCII85) has no length the parser can
+/// compute without decoding, so it falls back to the terminator scan. That is
+/// what the spec prescribes for a reader that cannot determine the length, and
+/// a false terminator inside compressed data costs the rest of one stream
+/// rather than corrupting every stream — a bounded failure rather than an
+/// unbounded one.
+fn skip_inline_image(bytes: &[u8], cursor: &mut usize, params: &[ContentValue]) {
+    let mut width = None;
+    let mut height = None;
+    let mut bits = None;
+    let mut components = 1u32;
+    let mut filtered = false;
+    let mut index = 0usize;
+    while index < params.len() {
+        match &params[index] {
+            ContentValue::Name(name) => match name.as_str() {
+                "W" => width = params.get(index + 1).and_then(content_value_number),
+                "H" => height = params.get(index + 1).and_then(content_value_number),
+                "BPC" => bits = params.get(index + 1).and_then(content_value_number),
+                "CS" | "ColorSpace" => match params.get(index + 1) {
+                    Some(ContentValue::Name(space)) => {
+                        components = match space.as_str() {
+                            "G" | "DeviceGray" => 1,
+                            "RGB" | "DeviceRGB" => 3,
+                            "CMYK" | "DeviceCMYK" => 4,
+                            "I" | "Indexed" => 1,
+                            _ => 1,
+                        }
+                    }
+                    _ => {}
+                },
+                // Any filter means the payload is not the raw pixel array.
+                "F" | "Filter" => filtered = true,
+                _ => {}
+            },
+            _ => {}
+        }
+        index += 1;
+    }
+
+    // Past `ID` and its single following whitespace byte.
+    while *cursor < bytes.len() && !is_content_whitespace(bytes[*cursor]) {
+        *cursor += 1;
+    }
+    if *cursor < bytes.len() {
+        *cursor += 1;
+    }
+
+    if !filtered {
+        if let (Some(w), Some(h), Some(b)) = (width, height, bits) {
+            let w = w.max(0.0) as usize;
+            let h = h.max(0.0) as usize;
+            let b = b.max(0.0) as usize;
+            let row_bits = w.saturating_mul(b).saturating_mul(components as usize);
+            // Rows are byte-aligned.
+            let row_bytes = row_bits.div_ceil(8);
+            let total = row_bytes.saturating_mul(h);
+            // Bound the advance to the buffer: a malformed length must not walk
+            // the cursor past the end and silently end the stream.
+            *cursor = (*cursor).saturating_add(total).min(bytes.len());
+            return;
+        }
+    }
+
+    // Fall back to the terminator: `EI` delimited by whitespace on both sides.
+    let mut i = *cursor;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'E'
+            && bytes[i + 1] == b'I'
+            && (i == 0 || is_content_whitespace(bytes[i - 1]))
+            && (i + 2 >= bytes.len() || is_content_whitespace(bytes[i + 2]))
+        {
+            *cursor = i + 2;
+            return;
+        }
+        i += 1;
+    }
+    *cursor = bytes.len();
+}
+
+fn content_value_number(value: &ContentValue) -> Option<f32> {
+    match value {
+        ContentValue::Number(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn is_content_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0')
 }
 
 fn next_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> {
