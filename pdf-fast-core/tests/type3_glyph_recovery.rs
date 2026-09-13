@@ -14,16 +14,19 @@
 //! that the fixture produced work to do. Where a fixture cannot exercise a
 //! path, the test says so instead of passing vacuously.
 //!
-//! # A fixture limitation, recorded rather than hidden
+//! # The boundary this file also pins
 //!
 //! A faithful Type 3 font — glyph procedures in `/CharProcs`, no `/ToUnicode` —
-//! is the real-world case, and an attempt at one is kept below. It parses, both
-//! pages are found, and the extractor reports **zero** vector glyph runs for
-//! it: this parser's outline extraction does not rebuild glyphs from Type 3
-//! char procedures. So the fixture cannot demonstrate recovery, and asserting
-//! through it would be measuring the fixture. Whether Type 3 support is worth
-//! adding is a separate question from whether the atlas works; the atlas is
-//! covered by the unit tests and by the wiring tests here.
+//! is the real-world case the atlas was built for, and the fixture below is one.
+//! It parses, its pages are found, and its characters come through the semantic
+//! pass flagged as unverified; but the extractor reports **zero** vector glyph
+//! runs for it, so the atlas never sees an outline. Reaching Type 3 needs
+//! outline extraction — resolve `Tf` to the font, read `/Encoding /
+//! Differences` and `/CharProcs`, execute each glyph's stream under the font
+//! matrix composed with the text matrix. That is a feature in the
+//! content-stream interpreter, not a fix to the atlas, and
+//! `a_type3_font_yields_no_outline_runs_today` pins the gap so implementing it
+//! causes a failure rather than silence.
 
 #![cfg(feature = "glyph-atlas")]
 
@@ -206,6 +209,59 @@ fn outline_pdf() -> Vec<u8> {
 ",
         ),
     ])
+}
+
+/// The honest statement of what this parser does with a Type 3 font.
+///
+/// A Type 3 font defines each glyph as a small content stream in `/CharProcs` —
+/// a path, drawn by `d0`/`d1` and the usual `m`/`l`/`c`/`f` operators — and
+/// shows it with the ordinary text operators. Reading such a document's text
+/// requires resolving the text operators against the font, then executing each
+/// glyph's stream under the font matrix composed with the text matrix.
+///
+/// The outline extractor does neither: its operator table (`vector_text.rs`)
+/// handles path and graphics state only — no `BT`, `Tf`, `Td`, `Tj` — and no
+/// code anywhere reads `/CharProcs`. So a Type 3 page yields zero outline runs,
+/// which is exactly what this test pins. It is a fixture limitation with a
+/// cause, not a fixture that happened to be malformed.
+///
+/// The atlas this file otherwise exercises therefore cannot be reached on the
+/// document class it was built for until Type 3 outline extraction exists.
+/// Pinning the current behaviour keeps that gap visible: if extraction is added,
+/// this test fails and the end-to-end recovery assertion can be written.
+#[test]
+fn a_type3_font_yields_no_outline_runs_today() {
+    let doc = PdfDocument::from_slice(&two_page_pdf(false), ParseOptions::default())
+        .expect("the Type 3 document must parse");
+    let pages = doc.pages();
+    assert!(!pages.is_empty(), "the document must yield pages");
+
+    for page in &pages {
+        let runs = doc
+            .page_vector_text_runs(page.page_index)
+            .expect("vector runs must not fail on a well-formed document");
+        let glyphs: usize = runs.iter().map(|r| r.glyphs.len()).sum();
+        assert_eq!(
+            (runs.len(), glyphs),
+            (0, 0),
+            "page {} unexpectedly produced outline runs; if Type 3 extraction \
+             has been implemented, replace this test with a recovery assertion \
+             rather than deleting it",
+            page.page_index
+        );
+    }
+
+    // The characters themselves do come through, flagged as unverified.
+    let page = &pages[0];
+    let runs = doc.semantic_text_runs_for_page(page);
+    let text: String = runs.iter().map(|r| r.text.clone()).collect();
+    let fallback: u32 = runs.iter().map(|r| r.cmap_fallback_chars).sum();
+    assert_eq!(text, "AB", "the text operators must resolve even without a CMap");
+    assert_eq!(
+        fallback as usize,
+        text.chars().count(),
+        "every character must be reported as decoded by byte-code fallback"
+    );
 }
 
 /// The control: a document this parser can read by encoding alone.
