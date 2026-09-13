@@ -553,9 +553,10 @@ impl PdfDocument {
                                     skip_whitespace_and_comments(decoded, &mut obj_cursor);
                                     let mut parser = ValueParser::new(decoded, obj_cursor);
                                     if let Ok(value) = parser.parse_value() {
-                                        let dictionary = match value {
-                                            PdfValue::Dictionary(d) => Some(d),
-                                            _ => None,
+                                        let (dictionary, array) = match value {
+                                            PdfValue::Dictionary(d) => (Some(d), None),
+                                            PdfValue::Array(a) => (None, Some(a)),
+                                            _ => (None, None),
                                         };
                                         objstm_objects.push(PdfObject {
                                             object_number: obj_num,
@@ -566,6 +567,7 @@ impl PdfDocument {
                                             },
                                             dictionary_range: None,
                                             dictionary,
+                                            array,
                                             stream_index: None,
                                         });
                                     }
@@ -3129,17 +3131,22 @@ impl PdfDocument {
             .flatten()
     }
 
-    /// An inline array. Returns `None` for an indirect reference.
+    /// Resolve an array value, following one indirect reference hop.
     ///
-    /// `PdfObject` stores a parsed dictionary but not a parsed array, so an
-    /// array behind a reference is not reachable through this document model —
-    /// the same limit `resolve_dictionary` works within from the other side.
-    /// Type 3 `/Widths`, `/FontMatrix`, and `/Encoding /Differences` are
-    /// normally written inline; a font that hides one behind a reference draws
-    /// nothing rather than drawing at a guessed advance.
+    /// Mirrors [`Self::resolve_dictionary`]. An array is commonly written as an
+    /// indirect object when it is long or shared — `/Widths` across subset fonts
+    /// especially — so following the reference is not an edge case for the
+    /// fonts this parser reads.
     fn resolve_array<'a>(&'a self, value: &'a PdfValue) -> Option<&'a Vec<PdfValue>> {
         match value {
             PdfValue::Array(values) => Some(values),
+            PdfValue::Reference {
+                object_number,
+                generation,
+            } => self
+                .object_by_id(*object_number, *generation)?
+                .array
+                .as_ref(),
             _ => None,
         }
     }
@@ -3230,6 +3237,15 @@ pub struct PdfObject {
     /// Parsed dictionary, when one was recovered.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub dictionary: Option<PdfDictionary>,
+    /// Parsed array, when the object is one.
+    ///
+    /// Only dictionaries used to be kept, so an array written as an indirect
+    /// object — `/Widths 12 0 R`, which a producer emitting many subset fonts
+    /// will do — was unreachable: `resolve_array` could follow the reference and
+    /// find nothing. The value parser has always handled arrays; the result was
+    /// dropped one line after being produced.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub array: Option<Vec<PdfValue>>,
     /// Index into [`PdfDocument::streams`] when this object hosts a stream.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub stream_index: Option<usize>,
@@ -6308,6 +6324,14 @@ fn scan_object(
     let (dictionary_range, dictionary) = find_dictionary(bytes, header.header_end)
         .map(|(range, dict)| (Some(range), Some(dict)))
         .unwrap_or((None, None));
+    // Only one of the two can be present for a well-formed object, and a
+    // dictionary with a stream after it is the common case; the array is read
+    // only when there is no dictionary to read.
+    let array = if dictionary.is_none() {
+        find_array(bytes, header.header_end).map(|(_, values)| values)
+    } else {
+        None
+    };
 
     let (stream_index, span_end) = if let Some((stream, endobj_end)) = scan_stream(
         bytes,
@@ -6340,6 +6364,7 @@ fn scan_object(
         },
         dictionary_range,
         dictionary,
+        array,
         stream_index,
     })
 }
@@ -6901,6 +6926,36 @@ fn find_dictionary(bytes: &[u8], start: usize) -> Option<(ByteRange, PdfDictiona
                 end: parser.pos,
             },
             dictionary,
+        )),
+        _ => None,
+    }
+}
+
+/// Parse a leading array, when the indirect object is one.
+///
+/// An indirect object is normally a dictionary, but a producer that shares or
+/// sizes a long array writes the array itself as the object — `/Widths` across
+/// subset fonts is the case this parser reads. Only dictionaries used to be
+/// kept, so such a reference resolved to nothing, which for a font means no
+/// advance widths.
+///
+/// Kept separate from [`find_dictionary`] rather than folded into one "parse any
+/// value" helper, so the dictionary path stays byte-for-byte what it was and
+/// cannot perturb object recovery, which everything downstream depends on.
+fn find_array(bytes: &[u8], start: usize) -> Option<(ByteRange, Vec<PdfValue>)> {
+    let mut cursor = start;
+    skip_whitespace_and_comments(bytes, &mut cursor);
+    if bytes.get(cursor) != Some(&b'[') {
+        return None;
+    }
+    let mut parser = ValueParser::new(bytes, cursor);
+    match parser.parse_value().ok()? {
+        PdfValue::Array(values) => Some((
+            ByteRange {
+                start: cursor,
+                end: parser.pos,
+            },
+            values,
         )),
         _ => None,
     }
