@@ -44,6 +44,114 @@ pub fn transform_pt(matrix: Matrix, x: f32, y: f32) -> (f32, f32) {
     )
 }
 
+/// Uniform scale matrix, used to fold `Tf`'s size into the glyph transform.
+fn scale_matrix(scale: f32) -> Matrix {
+    [scale, 0.0, 0.0, scale, 0.0, 0.0]
+}
+
+/// Read a PDF literal string, returning its bytes and the index just past it.
+///
+/// Handles nested unescaped parentheses, backslash escapes, and a backslash at
+/// end of line. A string that never closes is taken to end at the stream end
+/// rather than failing the page: a malformed glyph stream should cost one
+/// glyph, not the document.
+fn read_literal_string(stream: &[u8], start: usize) -> (Vec<u8>, usize) {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < stream.len() {
+        match stream[i] {
+            b'\\' => {
+                i += 1;
+                if i >= stream.len() {
+                    break;
+                }
+                match stream[i] {
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0C),
+                    b'\n' => {}
+                    b'\r' => {
+                        if stream.get(i + 1) == Some(&b'\n') {
+                            i += 1;
+                        }
+                    }
+                    // Octal escape: up to three digits.
+                    d @ b'0'..=b'7' => {
+                        let mut value = (d - b'0') as u32;
+                        let mut digits = 1;
+                        while digits < 3 {
+                            match stream.get(i + 1) {
+                                Some(&n @ b'0'..=b'7') => {
+                                    value = value * 8 + (n - b'0') as u32;
+                                    i += 1;
+                                    digits += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        out.push(value as u8);
+                    }
+                    other => out.push(other),
+                }
+                i += 1;
+            }
+            b'(' => {
+                depth += 1;
+                if depth > 1 {
+                    out.push(b'(');
+                }
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return (out, i);
+                }
+                out.push(b')');
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    (out, stream.len())
+}
+
+/// Read a PDF hex string, returning its bytes and the index just past it.
+fn read_hex_string(stream: &[u8], start: usize) -> (Vec<u8>, usize) {
+    let mut nibbles: Vec<u8> = Vec::new();
+    let mut i = start + 1;
+    while i < stream.len() && stream[i] != b'>' {
+        let b = stream[i];
+        let value = match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        };
+        if let Some(v) = value {
+            nibbles.push(v);
+        }
+        i += 1;
+    }
+    let past = if i < stream.len() { i + 1 } else { i };
+    // An odd final digit is padded with 0, per the spec.
+    let mut out = Vec::with_capacity(nibbles.len() / 2 + 1);
+    for pair in nibbles.chunks(2) {
+        let hi = pair[0];
+        let lo = pair.get(1).copied().unwrap_or(0);
+        out.push((hi << 4) | lo);
+    }
+    (out, past)
+}
+
+
+
 /// One block of glyphs sharing the same text-matrix block (between PDF
 /// `q`/`Q` save/restore pairs). Positions are in page space with `page_y`
 /// already flipped to a top-down origin.
@@ -101,6 +209,51 @@ pub struct VectorGlyph {
     pub size: f32,
 }
 
+/// A Type 3 font resolved far enough to draw its glyphs.
+///
+/// A Type 3 font defines each glyph as a content stream in `/CharProcs` and
+/// shows it with the ordinary text operators, so its outlines are reachable
+/// only by resolving the text operators and executing those streams. Nothing
+/// else in this parser does that: the semantic pass reads the characters, but
+/// with no `/ToUnicode` it decodes byte codes directly and reports every one as
+/// unverified, and a font program is never consulted for outlines.
+///
+/// Only the narrow path needed to draw a glyph is resolved. `/Widths` is read
+/// because text must advance; `/Encoding /Differences` is read because it is
+/// how a code reaches a glyph name. A font this parser cannot resolve draws
+/// nothing rather than drawing at a guessed position.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Type3Font {
+    /// Character code -> glyph name, from `/Encoding /Differences`.
+    pub(crate) differences: HashMap<u8, String>,
+    /// Glyph name -> the stream that draws it.
+    pub(crate) char_procs: HashMap<String, Vec<u8>>,
+    /// Font matrix, mapping glyph space to text space.
+    pub(crate) font_matrix: Matrix,
+    /// `/FirstChar` and the widths that follow it; absent widths advance by 0
+    /// so a font without `/Widths` still draws, just without spacing.
+    pub(crate) first_char: u8,
+    pub(crate) widths: Vec<f32>,
+}
+
+impl Type3Font {
+    /// The glyph name for a character code, if `/Differences` names one.
+    fn glyph_name(&self, code: u8) -> Option<&str> {
+        self.differences.get(&code).map(String::as_str)
+    }
+
+    /// The stream that draws a glyph, if the font defines one.
+    fn char_proc(&self, name: &str) -> Option<&[u8]> {
+        self.char_procs.get(name).map(Vec::as_slice)
+    }
+
+    /// Advance for a character code, in glyph space.
+    fn width(&self, code: u8) -> f32 {
+        let index = code.wrapping_sub(self.first_char) as usize;
+        self.widths.get(index).copied().unwrap_or(0.0)
+    }
+}
+
 /// One point on a glyph contour. `kind` encodes the role of the point:
 /// `0` = moveto, `1` = lineto, `2` = Bézier control or endpoint.
 #[derive(Debug, Clone, Copy)]
@@ -141,9 +294,42 @@ struct VectorTextExtractor {
     /// Most recent name token (`/Fm0`), consumed by `Do` to resolve the
     /// Form XObject being invoked.
     last_name: Option<Vec<u8>>,
+    /// Most recent string operand, consumed by `Tj` and its relatives.
+    last_string: Option<Vec<u8>>,
+    /// Transform that maps the glyph stream currently executing into page
+    /// user space (`CTM . Tm . Fm`). Contours are recorded through it, so a
+    /// text-drawn glyph arrives in the same space as one drawn by a path on the
+    /// page — the flush path already knows how to place those.
+    type3_ctm: Matrix,
+    /// Set while executing a Type 3 glyph stream.
+    ///
+    /// Text-drawn glyphs are positioned by the text matrix, so they are not the
+    /// absolute-coordinate shapes the no-run flush branch was written for. That
+    /// branch keeps only punctuation-scale ink (<= 3.5pt) because its transform
+    /// model is a heuristic, and it would silently discard every Type 3 glyph at
+    /// any real font size — measured: 12pt text produced 7.2pt outlines, all
+    /// dropped, which is why outline extraction appeared to produce nothing.
+    in_type3_glyph: bool,
     /// Active indirect Form objects, used to reject cycles and bound nested
     /// traversal before materializing another stream.
     form_stack: Vec<(u32, u16)>,
+
+    /// Text object state, live only between `BT` and `ET`.
+    ///
+    /// The extractor's other inputs are painted paths, which carry their own
+    /// coordinates. Text carries none: a glyph's position is the product of the
+    /// text matrix, the font matrix, and the CTM, and it advances per glyph. So
+    /// this state has to exist to place a Type 3 glyph where the rasterizer
+    /// would put it.
+    text_matrix: Matrix,
+    text_line_matrix: Matrix,
+    /// The `Tf`-selected font, when it is a Type 3 font this parser resolved.
+    /// `None` for every other font: those draw with a font program, not with
+    /// outlines, and this extractor has nothing to add for them.
+    type3: Option<Type3Font>,
+    /// Font size from `Tf`, scaling the font matrix.
+    font_size: f32,
+    in_text: bool,
 
     win: [f32; 6],
 }
@@ -175,7 +361,15 @@ impl VectorTextExtractor {
             fill_lum: 0.0,
             stroke_lum: 0.0,
             last_name: None,
+            last_string: None,
+            in_type3_glyph: false,
+            type3_ctm: IDENTITY,
             form_stack: Vec::new(),
+            text_matrix: IDENTITY,
+            text_line_matrix: IDENTITY,
+            type3: None,
+            font_size: 0.0,
+            in_text: false,
             win: [0.0; 6],
         }
     }
@@ -191,7 +385,7 @@ impl VectorTextExtractor {
         // is where a DocuSign contract's punctuation died: every `.` `/` `-`
         // is emitted as a tiny absolute-coordinate path that the rasterizer
         // paints but this extractor dropped at flush.
-        if self.in_run && !self.glyphs.is_empty() {
+        if (self.in_run || self.in_type3_glyph) && !self.glyphs.is_empty() {
             let (px, py_pdf) = transform_pt(self.block_entry, self.current_tx, self.current_ty);
             let page_y = self.page_height - py_pdf;
 
@@ -288,7 +482,19 @@ impl VectorTextExtractor {
             self.pending.clear();
             return;
         }
-        for contour in std::mem::take(&mut self.pending) {
+        let into_page = self.in_type3_glyph.then_some(self.type3_ctm);
+        for mut contour in std::mem::take(&mut self.pending) {
+            // A glyph stream draws in glyph space: its `0 0 m 600 0 l` means
+            // "this outline in the font's own units", not a point on the page.
+            // Paths drawn directly on a page are already in user space, so only
+            // the glyph case is transformed here.
+            if let Some(ctm) = into_page {
+                for pt in contour.iter_mut() {
+                    let (x, y) = transform_pt(ctm, pt.x, pt.y);
+                    pt.x = x;
+                    pt.y = y;
+                }
+            }
             self.merge_contour(contour);
         }
     }
@@ -401,6 +607,30 @@ impl VectorTextExtractor {
             }
             if cursor >= stream.len() {
                 break;
+            }
+
+            // String operands are read delimiters-first. The whitespace token
+            // scan below cannot see them: a literal string may contain spaces
+            // and escaped parentheses, so `(A B)` would arrive as two tokens
+            // and `(a\)b)` would end early. Only `Tj` and its relatives need
+            // this, but the reader has to be here, ahead of the token split.
+            if stream[cursor] == b'(' {
+                let (bytes, next) = read_literal_string(stream, cursor);
+                self.win.copy_within(1..6, 0);
+                self.win[5] = 0.0;
+                self.last_string = Some(bytes);
+                cursor = next;
+                continue;
+            }
+            if stream[cursor] == b'<'
+                && stream.get(cursor + 1).is_some_and(|b| *b != b'<')
+            {
+                let (bytes, next) = read_hex_string(stream, cursor);
+                self.win.copy_within(1..6, 0);
+                self.win[5] = 0.0;
+                self.last_string = Some(bytes);
+                cursor = next;
+                continue;
             }
 
             let start = cursor;
@@ -616,11 +846,138 @@ impl VectorTextExtractor {
                 b"W" | b"W*" => {
                     self.flush();
                 }
+
+                // ── Text objects ────────────────────────────────────────
+                //
+                // Added for Type 3 fonts, whose glyphs are content streams and
+                // therefore outline-reachable. For every other font these
+                // operators keep the text state and draw nothing, because a
+                // font program is not an outline this extractor can read.
+                b"BT" => {
+                    self.flush();
+                    self.in_text = true;
+                    self.text_matrix = IDENTITY;
+                    self.text_line_matrix = IDENTITY;
+                }
+                b"ET" => {
+                    self.flush();
+                    self.in_text = false;
+                    self.type3 = None;
+                }
+                b"Tf" => {
+                    self.font_size = self.win[5];
+                    let name = self.last_name.take();
+                    self.type3 = match (ctx, name) {
+                        (Some(ctx), Some(name)) => {
+                            let name = String::from_utf8_lossy(&name).into_owned();
+                            ctx.doc.resolve_type3_font(ctx.resources, &name)
+                        }
+                        _ => None,
+                    };
+                }
+                // Td: translate the line matrix; TD also sets the leading,
+                // which this extractor does not track because nothing here
+                // needs it.
+                b"Td" | b"TD" => {
+                    let (tx, ty) = (self.win[4], self.win[5]);
+                    self.text_line_matrix =
+                        compose(self.text_line_matrix, [1.0, 0.0, 0.0, 1.0, tx, ty]);
+                    self.text_matrix = self.text_line_matrix;
+                }
+                // T*: next line using the leading, which is only reachable when
+                // TL set one; without it this is a no-op rather than a guess.
+                b"T*" => {}
+                b"Tm" => {
+                    self.text_line_matrix = [
+                        self.win[0],
+                        self.win[1],
+                        self.win[2],
+                        self.win[3],
+                        self.win[4],
+                        self.win[5],
+                    ];
+                    self.text_matrix = self.text_line_matrix;
+                }
+                b"Tj" => {
+                    if let Some(text) = self.last_string.take() {
+                        self.show_text(&text);
+                    }
+                }
+                b"'" => {
+                    if let Some(text) = self.last_string.take() {
+                        self.show_text(&text);
+                    }
+                }
+                b"\"" => {
+                    if let Some(text) = self.last_string.take() {
+                        self.show_text(&text);
+                    }
+                }
+                b"TJ" => {
+                    // The array's strings and the kerning numbers between them
+                    // were both consumed by the tokenizer; strings land in
+                    // `last_string` only for the single-string form, so an
+                    // array is not reconstructed here. A TJ-only document
+                    // therefore draws no Type 3 outlines rather than drawing
+                    // them at wrong advances, which is the conservative
+                    // failure: a misplaced glyph is worse than a missing one.
+                }
+
                 _ => {}
             }
         }
         self.flush();
         Ok(())
+    }
+
+    /// Draw one shown string by executing each Type 3 glyph's own stream.
+    ///
+    /// A no-op unless `Tf` selected a Type 3 font this parser resolved. Codes
+    /// that `/Encoding /Differences` does not name are skipped rather than
+    /// guessed at: with no mapping there is no outline to draw, and inventing a
+    /// position would put a fabricated glyph into the text.
+    ///
+    /// Each glyph is executed under `CTM · Tm · Fm`, pushed as a matrix so the
+    /// glyph's own `m`/`l`/`c`/`f` operators run through the ordinary path
+    /// handling below. That is what the rasterizer does, and it means the
+    /// outline arrives in page space with no separate transform stage.
+    fn show_text(&mut self, bytes: &[u8]) {
+        let Some(font) = self.type3.clone() else {
+            return;
+        };
+        self.flush();
+
+        for &code in bytes {
+            let Some(name) = font.glyph_name(code) else {
+                continue;
+            };
+            let Some(proc_bytes) = font.char_proc(name) else {
+                continue;
+            };
+
+            let glyph_matrix = compose(
+                compose(self.text_matrix, font.font_matrix),
+                scale_matrix(self.font_size),
+            );
+            self.in_type3_glyph = true;
+            let current = self.stack.last().copied().unwrap_or(IDENTITY);
+            let composed = compose(current, glyph_matrix);
+            self.type3_ctm = composed;
+            self.stack.push(composed);
+            self.block_entry = current;
+            // A CharProc is a content stream. A failure inside one glyph must
+            // not abandon the page: skip that glyph and keep the rest, which is
+            // the same choice the `Do` path makes for an unreadable form.
+            let _ = self.parse_stream_ctx(proc_bytes, None);
+            self.in_type3_glyph = false;
+            self.flush();
+            self.stack.pop();
+
+            // Advance the text matrix by the glyph width, in text space:
+            // Tm = translate(w * size, 0) · Tm.
+            let advance = font.width(code) * self.font_size;
+            self.text_matrix = compose([1.0, 0.0, 0.0, 1.0, advance, 0.0], self.text_matrix);
+        }
     }
 }
 

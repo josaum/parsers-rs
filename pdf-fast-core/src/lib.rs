@@ -3014,6 +3014,136 @@ impl PdfDocument {
         Ok(None)
     }
 
+    /// Resolve a resource name to a Type 3 font, or `None` for anything else.
+    ///
+    /// Type 3 is the one font subtype whose glyphs are content streams
+    /// (`/CharProcs`), which makes its outlines reachable by a parser that can
+    /// execute those streams. Every other subtype draws with a font program this
+    /// crate does not interpret, so it returns `None` rather than carrying state
+    /// it cannot use.
+    ///
+    /// Lives here rather than in `vector_text` because resolving dictionaries
+    /// and materializing streams is this type's business; the extractor only
+    /// consumes the result.
+    fn resolve_type3_font(
+        &self,
+        resources: Option<&PdfDictionary>,
+        name: &str,
+    ) -> Option<crate::vector_text::Type3Font> {
+        let fonts = resources
+            .and_then(|resources| resources.get("Font"))
+            .and_then(|value| self.resolve_dictionary(value));
+        let fonts = fonts?;
+        let font = fonts
+            .get(name)
+            .and_then(|value| self.resolve_dictionary(value));
+        let font = font?;
+        if font.get_name("Subtype") != Some("Type3") {
+            return None;
+        }
+
+        let font_matrix = font
+            .get("FontMatrix")
+            .and_then(|value| self.resolve_array(value))
+            .filter(|values| values.len() == 6)
+            .map(|values| {
+                let mut matrix = crate::vector_text::IDENTITY;
+                for (slot, value) in matrix.iter_mut().zip(values) {
+                    if let Some(number) = pdf_value_as_f32(value) {
+                        *slot = number;
+                    }
+                }
+                matrix
+            })
+            // A Type 3 font without a usable font matrix is malformed. The
+            // 1000-unit em default is what the spec's own example uses, and
+            // falling back to the identity would draw glyphs three orders of
+            // magnitude too large — a visible wrong answer rather than a
+            // contained one.
+            .unwrap_or([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+
+        let mut differences = HashMap::new();
+        if let Some(array) = font
+            .get("Encoding")
+            .and_then(|value| self.resolve_dictionary(value))
+            .and_then(|encoding| encoding.get("Differences"))
+            .and_then(|value| self.resolve_array(value))
+        {
+            let mut code: u32 = 0;
+            for value in array {
+                match value {
+                    PdfValue::Integer(n) => code = (*n).clamp(0, 255) as u32,
+                    PdfValue::Name(glyph) => {
+                        if code <= 255 {
+                            differences.insert(code as u8, glyph.clone());
+                        }
+                        code += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut char_procs = HashMap::new();
+        if let Some(procs) = font
+            .get("CharProcs")
+            .and_then(|value| self.resolve_dictionary(value))
+        {
+            for entry in &procs.entries {
+                if let Some(bytes) = self.resolve_char_proc_bytes(&entry.value) {
+                    char_procs.insert(entry.key.clone(), bytes);
+                }
+            }
+        }
+
+        let first_char = font.get_integer("FirstChar").unwrap_or(0).clamp(0, 255) as u8;
+        let widths: Vec<f32> = font
+            .get("Widths")
+            .and_then(|value| self.resolve_array(value))
+            .map(|values| values.iter().filter_map(pdf_value_as_f32).collect())
+            .unwrap_or_default();
+
+        Some(crate::vector_text::Type3Font {
+            differences,
+            char_procs,
+            font_matrix,
+            first_char,
+            widths,
+        })
+    }
+
+    /// Bytes of one `/CharProcs` entry, following the indirect reference a
+    /// glyph procedure is normally stored behind.
+    fn resolve_char_proc_bytes(&self, value: &PdfValue) -> Option<Vec<u8>> {
+        let (object_number, generation) = match value {
+            PdfValue::Reference {
+                object_number,
+                generation,
+            } => (*object_number, *generation),
+            _ => return None,
+        };
+        let object = self.object_by_id(object_number, generation)?;
+        let stream_index = object.stream_index?;
+        self.materialize_stream_bytes_for_raster(stream_index)
+            .ok()
+            .flatten()
+    }
+
+    /// An inline array. Returns `None` for an indirect reference.
+    ///
+    /// `PdfObject` stores a parsed dictionary but not a parsed array, so an
+    /// array behind a reference is not reachable through this document model —
+    /// the same limit `resolve_dictionary` works within from the other side.
+    /// Type 3 `/Widths`, `/FontMatrix`, and `/Encoding /Differences` are
+    /// normally written inline; a font that hides one behind a reference draws
+    /// nothing rather than drawing at a guessed advance.
+    fn resolve_array<'a>(&'a self, value: &'a PdfValue) -> Option<&'a Vec<PdfValue>> {
+        match value {
+            PdfValue::Array(values) => Some(values),
+            _ => None,
+        }
+    }
+
     fn resolve_form_xobject(
         &self,
         resources: Option<&PdfDictionary>,
@@ -6595,6 +6725,19 @@ fn normalize_rotate(rotate: i64) -> Result<u32> {
         ));
     }
     Ok((rotate.rem_euclid(360) as u32 / 90) * 90)
+}
+
+/// A PDF number as `f32`.
+///
+/// Integers and reals arrive as distinct variants; anything else — a name, a
+/// string, a nested array — is not a number and yields `None` so the caller can
+/// decide what a missing value means.
+fn pdf_value_as_f32(value: &PdfValue) -> Option<f32> {
+    match value {
+        PdfValue::Integer(n) => Some(*n as f32),
+        PdfValue::Real(n) => Some(*n as f32),
+        _ => None,
+    }
 }
 
 fn resolve_stream_length(

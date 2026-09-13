@@ -1,32 +1,32 @@
-//! End-to-end behaviour of the glyph atlas on a document whose text is drawn
-//! as outlines.
+//! Type 3 outline extraction, and the atlas recovering text through it.
 //!
-//! # What this covers, and what it does not
+//! # The case
 //!
-//! The atlas comparison itself is covered by unit tests in `glyph_atlas.rs`,
-//! against the same function the parser calls. What needs a real document is
-//! the *wiring*: that a parser-visible outline reaches the atlas, that a
-//! learned mapping is found again, and that an unknown glyph is reported rather
-//! than invented.
+//! A Type 3 font defines each glyph as a small content stream in `/CharProcs`
+//! and shows it with the ordinary text operators. Nothing about the page's
+//! content stream contains the outlines — they are one indirection away, behind
+//! `Tf` and the font's encoding. When such a font also has no `/ToUnicode`, the
+//! characters are not recoverable from the encoding either: the parser can
+//! decode byte codes, but it cannot say whether the result is right. The
+//! outlines are the only real evidence, which is what the glyph atlas consumes.
 //!
-//! These tests therefore drive the public API over hand-built documents and
-//! assert what the parser actually reports at each step, including asserting
-//! that the fixture produced work to do. Where a fixture cannot exercise a
-//! path, the test says so instead of passing vacuously.
+//! # What the document looks like
 //!
-//! # The boundary this file also pins
+//! Two pages, each with its own font resource:
 //!
-//! A faithful Type 3 font — glyph procedures in `/CharProcs`, no `/ToUnicode` —
-//! is the real-world case the atlas was built for, and the fixture below is one.
-//! It parses, its pages are found, and its characters come through the semantic
-//! pass flagged as unverified; but the extractor reports **zero** vector glyph
-//! runs for it, so the atlas never sees an outline. Reaching Type 3 needs
-//! outline extraction — resolve `Tf` to the font, read `/Encoding /
-//! Differences` and `/CharProcs`, execute each glyph's stream under the font
-//! matrix composed with the text matrix. That is a feature in the
-//! content-stream interpreter, not a fix to the atlas, and
-//! `a_type3_font_yields_no_outline_runs_today` pins the gap so implementing it
-//! causes a failure rather than silence.
+//! * `/F1` has no `/ToUnicode`, so its text is flagged unverified.
+//! * `/F2` maps the same codes through a CMap, so its text is decoded and can
+//!   be correlated against the outlines of the glyphs that drew it.
+//!
+//! Both fonts share one `/CharProcs` pair, so the shapes learned from `/F2` are
+//! the shapes `/F1` draws. That is the recovery the last test asserts.
+//!
+//! # What is covered where
+//!
+//! The atlas comparison itself is unit-tested in `glyph_atlas.rs` against the
+//! same function the parser calls. This file covers the pipeline: that a text
+//! operator produces outlines at all, that they reach the atlas, and that a
+//! learned shape is found again through the parser's own lookup.
 
 #![cfg(feature = "glyph-atlas")]
 
@@ -35,8 +35,13 @@ use pdf_fast_core::vector_text::BezPt;
 use pdf_fast_core::{ParseOptions, PdfDocument};
 
 /// Assemble a PDF from object bodies, writing a real xref table.
+///
+/// The xref matters: this parser is byte-level and xref-free, but a fixture
+/// whose object numbering does not line up produces a document that parses into
+/// the wrong resource tree, which is a fixture bug that looks like a parser
+/// bug. Every object here is written at a recorded offset.
 fn pdf(objects: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut out = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::with_capacity(objects.len());
     for (index, body) in objects.iter().enumerate() {
         offsets.push(out.len());
@@ -67,37 +72,37 @@ fn stream(dict: &str, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Glyph procedures for an L-shaped mark and a T-shaped mark.
-///
-/// Deliberately different contour counts and point counts, so a tolerant match
-/// cannot confuse one with the other — the test would pass either way against a
-/// matcher that ignored structure, and that matcher would be wrong.
-const CHARPROCS: &str = r#"/CharProcs << /square 8 0 R /tee 9 0 R >>"#;
-
+/// A square outline: one contour, four points.
 fn square_proc() -> Vec<u8> {
-    // One closed contour, four points.
-    stream("", b"1000 0 0 0 0 1000 d1\n0 0 m 600 0 l 600 600 l 0 600 l h")
+    stream("", b"600 0 d0 0 0 m 600 0 l 600 600 l 0 600 l h f")
 }
 
+/// A T outline: two contours, so contour count alone distinguishes it.
 fn tee_proc() -> Vec<u8> {
-    // Two contours, so structure alone separates it from the square.
     stream(
         "",
-        b"1000 0 0 0 0 1000 d1\n0 500 m 600 500 l 600 600 l 0 600 l h\n250 0 m 350 0 l 350 500 l 250 500 l h",
+        b"600 0 d0 0 500 m 600 500 l 600 600 l 0 600 l h f \
+          250 0 m 350 0 l 350 500 l 250 500 l h f",
     )
 }
 
-fn type3_font() -> Vec<u8> {
+/// A Type 3 font drawing `A` and `B` from 8 0 R and 9 0 R.
+fn type3_font(tounicode: Option<&str>) -> Vec<u8> {
+    let cmap = tounicode
+        .map(|reference| format!(" /ToUnicode {reference}"))
+        .unwrap_or_default();
     format!(
         "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 600 600] \
-         /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /square 8 0 R /tee 9 0 R >> \
+         /FontMatrix [0.001 0 0 0.001 0 0] \
+         /CharProcs << /square 6 0 R /tee 8 0 R >> \
          /Encoding << /Type /Encoding /Differences [65 /square 66 /tee] >> \
-         /FirstChar 65 /LastChar 66 /Widths [600 600] /Resources << >> >>"
+         /FirstChar 65 /LastChar 66 /Widths [600 600]{cmap} >>"
     )
     .into_bytes()
 }
 
-/// A `/ToUnicode` CMap mapping 65 -> A and 66 -> B, so page one is decodable.
+/// A CMap mapping 65 -> A and 66 -> B, so text drawn with it is decoded and
+/// therefore usable as correlation ground truth.
 fn tounicode_cmap() -> Vec<u8> {
     let body = b"/CIDInit /ProcSet findresource begin\n\
 12 dict begin\nbegincmap\n\
@@ -108,187 +113,110 @@ endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend";
     stream("", body)
 }
 
-fn page_tree(kids: &str, count: usize) -> Vec<u8> {
-    format!("<< /Type /Pages /Kids [{kids}] /Count {count} >>").into_bytes()
-}
-
-/// Build a two-page document sharing one font.
-///
-/// `page_two_tounicode` decides whether the second page's font resource also
-/// carries a CMap. With it absent, page two's codes cannot be decoded and its
-/// text is recoverable only by shape.
-fn two_page_pdf(page_two_tounicode: bool) -> Vec<u8> {
-    let font_page_one = "<< /F1 5 0 R >>";
-    let font_page_two = if page_two_tounicode {
-        "<< /F1 10 0 R >>"
-    } else {
-        "<< /F1 5 0 R >>"
-    };
+/// Two pages: page one's `/F2` decodes through a CMap, page two's `/F1` does
+/// not. Both draw the same two glyphs from the same `/CharProcs`.
+fn two_page_pdf() -> Vec<u8> {
+    // Object numbers are the vector index + 1. Written out here because a
+    // mismatch between a reference and an index produces a document that parses
+    // into the wrong resource tree — a fixture bug that looks like a parser bug,
+    // which cost real debugging time once already.
     pdf(vec![
+        // 1 catalog
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        page_tree("3 0 R 11 0 R", 2),
-        // Page one: decodable, so the learner has pairs to correlate.
-        format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-             /Resources {font_page_one} /Contents 4 0 R >>"
-        )
-        .into_bytes(),
-        stream("", b"BT /F1 12 Tf 72 700 Td (AB) Tj ET"),
-        type3_font(),
-        // The CMap for page one's font resource.
-        {
-            let mut f = type3_font();
-            let s = String::from_utf8(f.clone()).unwrap();
-            let with_cmap = s.replace(
-                "/Resources << >> >>",
-                "/ToUnicode 6 0 R /Resources << >> >>",
-            );
-            f = with_cmap.into_bytes();
-            f
-        },
-        tounicode_cmap(),
-        b"<< /Type /Font /Subtype /Type3 >>".to_vec(), // 8: placeholder, replaced below
-        b"<< /Type /Font /Subtype /Type3 >>".to_vec(), // 9
-        // 10: the same font as 5 but *without* a CMap, for page two.
-        String::from_utf8(type3_font()).unwrap().into_bytes(),
-        // Page two.
-        format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-             /Resources {font_page_two} /Contents 12 0 R >>"
-        )
-        .into_bytes(),
-        stream("", b"BT /F1 12 Tf 72 700 Td (AB) Tj ET"),
-    ])
-}
-
-/// The same document, but the two pages share the CMap-carrying font, so both
-/// pages decode through `/ToUnicode` and the atlas is not needed.
-fn baseline_pdf() -> Vec<u8> {
-    pdf(vec![
-        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        page_tree("3 0 R 9 0 R", 2),
+        // 2 pages
+        b"<< /Type /Pages /Kids [3 0 R 9 0 R] /Count 2 >>".to_vec(),
+        // 3 page one, drawing with font 5
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-          /Resources << /F1 5 0 R >> /Contents 4 0 R >>"
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
             .to_vec(),
+        // 4 page one content
         stream("", b"BT /F1 12 Tf 72 700 Td (AB) Tj ET"),
-        type3_font(),
-        {
-            let s = String::from_utf8(type3_font()).unwrap();
-            s.replace("/Resources << >> >>", "/ToUnicode 6 0 R /Resources << >> >>")
-                .into_bytes()
-        },
-        tounicode_cmap(),
+        // 5 font one: same glyphs, with a CMap so its text is decoded
+        type3_font(Some("7 0 R")),
+        // 6 the two glyph procedures both fonts share
         square_proc(),
+        // 7 the CMap
+        tounicode_cmap(),
+        // 8 the second glyph procedure
         tee_proc(),
+        // 9 page two, drawing with font 11
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-          /Resources << /F1 5 0 R >> /Contents 10 0 R >>"
+          /Resources << /Font << /F1 11 0 R >> >> /Contents 10 0 R >>"
             .to_vec(),
+        // 10 page two content
         stream("", b"BT /F1 12 Tf 72 700 Td (AB) Tj ET"),
+        // 11 font two: the same glyphs, no CMap
+        type3_font(None),
     ])
 }
 
-/// A page whose letterforms are drawn as filled paths directly in the content
-/// stream — the shape of document the outline extractor does rebuild.
-///
-/// Two different shapes, with different contour and point counts, so a matcher
-/// that ignored structure could not confuse them.
-fn outline_pdf() -> Vec<u8> {
-    pdf(vec![
-        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        page_tree("3 0 R", 1),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-          /Resources << >> /Contents 4 0 R >>"
-            .to_vec(),
-        stream(
-            "",
-            // An L and a T, drawn as outlines near the origin.
-            b"0 0 0 rg
-              100 600 m 160 600 l 160 700 l 100 700 l h f
-              200 600 m 260 600 l 260 700 l 200 700 l h f
-              300 660 m 400 660 l 400 700 l 300 700 l h f
-",
-        ),
-    ])
-}
-
-/// The honest statement of what this parser does with a Type 3 font.
-///
-/// A Type 3 font defines each glyph as a small content stream in `/CharProcs` —
-/// a path, drawn by `d0`/`d1` and the usual `m`/`l`/`c`/`f` operators — and
-/// shows it with the ordinary text operators. Reading such a document's text
-/// requires resolving the text operators against the font, then executing each
-/// glyph's stream under the font matrix composed with the text matrix.
-///
-/// The outline extractor does neither: its operator table (`vector_text.rs`)
-/// handles path and graphics state only — no `BT`, `Tf`, `Td`, `Tj` — and no
-/// code anywhere reads `/CharProcs`. So a Type 3 page yields zero outline runs,
-/// which is exactly what this test pins. It is a fixture limitation with a
-/// cause, not a fixture that happened to be malformed.
-///
-/// The atlas this file otherwise exercises therefore cannot be reached on the
-/// document class it was built for until Type 3 outline extraction exists.
-/// Pinning the current behaviour keeps that gap visible: if extraction is added,
-/// this test fails and the end-to-end recovery assertion can be written.
 #[test]
-fn a_type3_font_yields_no_outline_runs_today() {
-    let doc = PdfDocument::from_slice(&two_page_pdf(false), ParseOptions::default())
+fn type3_outlines_are_extracted_and_their_text_is_recovered_by_shape() {
+    glyph_atlas::clear_learned();
+    let doc = PdfDocument::from_slice(&two_page_pdf(), ParseOptions::default())
         .expect("the Type 3 document must parse");
+
     let pages = doc.pages();
-    assert!(!pages.is_empty(), "the document must yield pages");
+    assert_eq!(pages.len(), 2, "the fixture declares two pages");
 
-    for page in &pages {
-        let runs = doc
-            .page_vector_text_runs(page.page_index)
-            .expect("vector runs must not fail on a well-formed document");
-        let glyphs: usize = runs.iter().map(|r| r.glyphs.len()).sum();
-        assert_eq!(
-            (runs.len(), glyphs),
-            (0, 0),
-            "page {} unexpectedly produced outline runs; if Type 3 extraction \
-             has been implemented, replace this test with a recovery assertion \
-             rather than deleting it",
-            page.page_index
-        );
-    }
+    // Step 1: text operators are read and glyph outlines are built. Before this
+    // path existed the count here was zero, which is exactly what an operator
+    // table of path and graphics state implies.
+    let runs = doc.page_vector_text_runs(0).expect("vector runs must extract");
+    let glyphs: usize = runs.iter().map(|r| r.glyphs.len()).sum();
+    assert_eq!(glyphs, 2, "the page shows two glyphs, drawn from /CharProcs");
 
-    // The characters themselves do come through, flagged as unverified.
-    let page = &pages[0];
-    let runs = doc.semantic_text_runs_for_page(page);
-    let text: String = runs.iter().map(|r| r.text.clone()).collect();
-    let fallback: u32 = runs.iter().map(|r| r.cmap_fallback_chars).sum();
-    assert_eq!(text, "AB", "the text operators must resolve even without a CMap");
+    // Step 2: they carry geometry, without which the atlas has nothing to key
+    // on even once outlines exist.
+    let with_geometry = runs
+        .iter()
+        .flat_map(|r| r.glyphs.iter())
+        .filter(|g| !g.normalized.is_empty())
+        .count();
+    assert_eq!(with_geometry, glyphs, "every glyph must carry geometry");
+
+    // Step 3: the semantic pass reads the characters, flagged as unverified —
+    // there is no `/ToUnicode`, so byte-code fallback is all there is.
+    let decoded: String = doc
+        .semantic_text_runs_for_page(&pages[1])
+        .iter()
+        .map(|r| r.text.clone())
+        .collect();
+    assert_eq!(decoded, "AB", "the text operators must resolve");
+    let fallback: u32 = doc
+        .semantic_text_runs_for_page(&pages[1])
+        .iter()
+        .map(|r| r.cmap_fallback_chars)
+        .sum();
     assert_eq!(
         fallback as usize,
-        text.chars().count(),
-        "every character must be reported as decoded by byte-code fallback"
+        decoded.chars().count(),
+        "every character must be reported as unverified, which is the signal shape recovery replaces"
     );
-}
 
-/// The control: a document this parser can read by encoding alone.
-///
-/// If this failed, a later failure would be about the fixture rather than about
-/// the atlas, which is why it is separate.
-#[test]
-fn a_document_with_a_cmap_is_readable_without_the_atlas() {
+    // Step 4: the learner correlates outlines with decoded characters.
+    let stats = pdf_fast_core::vector_text::learn_document_glyph_mappings(&doc);
+    assert!(
+        stats.emitted > 0,
+        "the learner must correlate outlines with decoded text: {stats:?}"
+    );
+    assert!(
+        glyph_atlas::learned_shape_count() > 0,
+        "correlation must leave the atlas holding shapes"
+    );
+
+    // Step 5: the text is read back through the shapes learned in step 4. This
+    // is the whole point of the exercise — the page has no encoding path of its
+    // own, so anything recovered here came from the outlines.
+    let runs = doc.page_vector_text_runs(1).expect("page two outlines");
+    let recovered = pdf_fast_core::vector_text::runs_to_string(&runs);
+    let known: String = recovered.chars().filter(|c| *c != '_').collect();
+    assert!(
+        known.contains('A') || known.contains('B'),
+        "page two's glyphs must be recovered by shape; got {recovered:?}"
+    );
+
     glyph_atlas::clear_learned();
-    let doc = PdfDocument::from_slice(&baseline_pdf(), ParseOptions::default())
-        .expect("the baseline document must parse");
-    assert!(
-        !doc.pages().is_empty(),
-        "the baseline document must yield at least one page"
-    );
-    // Page one is drawn from glyph procedures, which this parser does not
-    // rebuild into outlines; the checked accessor must report that as "nothing
-    // recovered" rather than returning a string of placeholders. With no atlas
-    // populated, anything non-placeholder here would have to be invented.
-    let text = doc
-        .page_vector_text_as_string_checked(0)
-        .expect("vector text must not fail on a well-formed document")
-        .unwrap_or_default();
-    assert!(
-        text.chars().all(|c| c == '_' || c == '\n' || c == ' '),
-        "an empty atlas must not invent characters; got {text:?}"
-    );
 }
 
 /// The wiring, on a document that does produce outlines.
@@ -300,7 +228,7 @@ fn a_document_with_a_cmap_is_readable_without_the_atlas() {
 #[test]
 fn an_empty_atlas_reports_unknown_rather_than_guessing() {
     glyph_atlas::clear_learned();
-    let doc = PdfDocument::from_slice(&outline_pdf(), ParseOptions::default())
+    let doc = PdfDocument::from_slice(&two_page_pdf(), ParseOptions::default())
         .expect("the outline document must parse");
 
     let runs = doc
