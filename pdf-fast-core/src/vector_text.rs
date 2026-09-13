@@ -236,6 +236,21 @@ pub(crate) enum DrawableFont {
     Type3(Type3Font),
     /// Glyphs are outlines in an embedded `glyf` table.
     TrueType(crate::truetype::TrueTypeFont),
+    /// Glyphs are charstrings in an embedded CFF program.
+    ///
+    /// A third route to the same outlines, because OpenType fonts produced by
+    /// design tools and by LaTeX wrap CFF rather than `glyf`, and a PDF that
+    /// embeds one gives the atlas nothing until the charstrings are read.
+    ///
+    /// The encoding travels with the program because CFF is reached by glyph
+    /// *name*, and the name comes from the font's `/Encoding` — so a font whose
+    /// `/Differences` renames a code needs that map here too.
+    Cff {
+        /// The charstring program.
+        program: crate::cff::CffFont,
+        /// The font's resolved encoding, `/Differences` included.
+        encoding: Option<crate::encoding::EncodingMap>,
+    },
 }
 
 /// Where one glyph's outline comes from.
@@ -244,6 +259,31 @@ enum GlyphSource {
     Stream(Vec<u8>),
     /// A TrueType glyph: already-parsed points in font units.
     Outline(crate::truetype::GlyphOutline),
+}
+
+/// Convert a CFF outline into the shared outline type.
+///
+/// The two are the same shape — points in font units, y-up, with a flag for
+/// on-curve — but they live in different modules because the readers are
+/// independent. Keeping the conversion in one place means the atlas sees one
+/// representation regardless of which program the glyph came from.
+fn cff_to_outline(outline: &crate::truetype::GlyphOutline) -> crate::truetype::GlyphOutline {
+    crate::truetype::GlyphOutline {
+        contours: outline
+            .contours
+            .iter()
+            .map(|contour| {
+                contour
+                    .iter()
+                    .map(|point| crate::truetype::OutlinePoint {
+                        x: point.x,
+                        y: point.y,
+                        on_curve: point.on_curve,
+                    })
+                    .collect()
+            })
+            .collect(),
+    }
 }
 
 /// Font matrix for a TrueType program: font units to text space.
@@ -1096,6 +1136,31 @@ impl VectorTextExtractor {
                         true_type_matrix(program.units_per_em()),
                     )
                 }
+                DrawableFont::Cff { program, encoding } => {
+                    // CFF is reached by *name*, not by code: the PDF encoding
+                    // turns a code into a glyph name, and the charset turns the
+                    // name into a charstring index. The name comes from the
+                    // font's own resolved encoding — the same one the text pass
+                    // uses, including its `/Differences` — so a glyph is
+                    // selected by the same rule that names it.
+                    //
+                    // A code the encoding does not name draws nothing. That is
+                    // the honest outcome: a guessed name selects a real but
+                    // wrong glyph, which is a fabricated character.
+                    let Some(name) = encoding.as_ref().and_then(|e| e.decode_byte(code)) else {
+                        continue;
+                    };
+                    let Some(index) = program.glyph_id(name) else {
+                        continue;
+                    };
+                    let Some(outline) = program.outline(index) else {
+                        continue;
+                    };
+                    (
+                        GlyphSource::Outline(cff_to_outline(&outline)),
+                        true_type_matrix(program.units_per_em()),
+                    )
+                }
             };
 
             let glyph_matrix = compose(
@@ -1149,7 +1214,15 @@ impl VectorTextExtractor {
             // Tm = translate(w * size, 0) · Tm.
             let advance = match &font {
                 DrawableFont::Type3(type3) => type3.width(code),
-                DrawableFont::TrueType(program) => program.advance_units(code as u32).unwrap_or(0.0),
+                DrawableFont::TrueType(program) => {
+                    program.advance_units(code as u32).unwrap_or(0.0)
+                }
+                DrawableFont::Cff { program, encoding } => encoding
+                    .as_ref()
+                    .and_then(|e| e.decode_byte(code))
+                    .and_then(|name| program.glyph_id(name))
+                    .and_then(|index| program.advance_units(index))
+                    .unwrap_or(0.0),
             } * self.font_size;
             self.text_matrix = compose([1.0, 0.0, 0.0, 1.0, advance, 0.0], self.text_matrix);
         }

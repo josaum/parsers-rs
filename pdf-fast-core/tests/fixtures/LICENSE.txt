@@ -1,0 +1,23 @@
+Fixtures in this directory are font subsets, committed because the tests read
+them with `include_bytes!` and so the crate will not compile without them.
+
+DejaVuSans-subset.ttf
+---------------------
+Subset of DejaVu Sans, which is released under the Bitstream Vera Fonts
+Copyright and the DejaVu Fonts License — both permissive, both permitting
+redistribution including in binary form. Upstream:
+https://dejavu-fonts.github.io/License.html
+Source on this machine:
+/usr/local/texlive/2026/texmf-dist/fonts/truetype/public/dejavu/DejaVuSans.ttf
+
+Cabin-subset.otf
+----------------
+Subset of Cabin Regular, released under the SIL Open Font License 1.1, which
+permits redistribution. Upstream: https://scripts.sil.org/OFL
+Source on this machine:
+/usr/local/texlive/2026/texmf-dist/fonts/opentype/impallari/cabin/Cabin-Regular.otf
+
+Both were reduced with `fontTools.subset` to the glyphs the tests exercise, so
+each is a few kilobytes rather than the full face. No other modification was
+made: the outlines, encodings, and metrics the tests assert against are the
+fonts' own.

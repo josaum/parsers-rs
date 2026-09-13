@@ -29,6 +29,7 @@ use anyhow::{anyhow, Context, Result};
 pub mod raster_glyphs;
 pub mod tessellation;
 pub mod truetype;
+pub mod cff;
 #[cfg(feature = "arrow")]
 use arrow::array::{
     Array, BinaryBuilder, FixedSizeListBuilder, Float32Array, Float32Builder, Float64Array,
@@ -3052,9 +3053,12 @@ impl PdfDocument {
             Some("Type3") => self
                 .resolve_type3_font(font)
                 .map(crate::vector_text::DrawableFont::Type3),
-            Some("TrueType") => self
-                .resolve_true_type_font(font)
-                .map(crate::vector_text::DrawableFont::TrueType),
+            // A TrueType subtype may still carry a bare CFF, and an OpenType
+            // subtype names CFF explicitly; both routes end at the same reader.
+            Some("TrueType") => self.resolve_true_type_font(font),
+            Some("Type1") | Some("CIDFontType0") | Some("CIDFontType2") => {
+                self.resolve_cff_font(font)
+            }
             _ => None,
         }
     }
@@ -3067,12 +3071,90 @@ impl PdfDocument {
     fn resolve_true_type_font(
         &self,
         font: &PdfDictionary,
-    ) -> Option<crate::truetype::TrueTypeFont> {
+    ) -> Option<crate::vector_text::DrawableFont> {
         let descriptor = self.font_descriptor(font)?;
         let program = descriptor
             .get("FontFile2")
             .and_then(|value| self.resolve_stream_value_bytes(value))?;
-        crate::truetype::TrueTypeFont::parse(&program)
+        if let Some(parsed) = crate::truetype::TrueTypeFont::parse(&program) {
+            return Some(crate::vector_text::DrawableFont::TrueType(parsed));
+        }
+        // A `/FontFile2` is normally a `glyf` program, but a producer may put a
+        // bare CFF there; the sfnt header is what decides, and the glyph reader
+        // refuses anything it cannot interpret.
+        let encoding = self
+            .resolve_font_encoding(font, font.get_name("BaseFont"))
+            .0;
+        crate::cff::CffFont::parse(&program, None).map(|program| {
+            crate::vector_text::DrawableFont::Cff { program, encoding }
+        })
+    }
+
+    /// The embedded CFF program for a font dictionary, if it has one.
+    ///
+    /// `/FontFile3` carries CFF directly for a bare-CFF OpenType font, and an
+    /// `OTTO` sfnt wraps it in a table. Both are read, because which one a
+    /// producer writes depends on the tool rather than on the format.
+    fn resolve_cff_font(
+        &self,
+        font: &PdfDictionary,
+    ) -> Option<crate::vector_text::DrawableFont> {
+        let descriptor = self.font_descriptor(font)?;
+        let program = descriptor
+            .get("FontFile3")
+            .and_then(|value| self.resolve_stream_value_bytes(value))?;
+        // An `OTTO` sfnt keeps its outlines in a `CFF ` table, and the em size
+        // comes from `head` the same way a `glyf` program's does.
+        if program.len() > 12 && &program[0..4] == b"OTTO" {
+            let tables = u16::from_be_bytes([program[4], program[5]]) as usize;
+            let mut cff = None;
+            let mut units_per_em = None;
+            for index in 0..tables {
+                let record = 12 + index * 16;
+                if record + 16 > program.len() {
+                    break;
+                }
+                let offset = u32::from_be_bytes([
+                    program[record + 8],
+                    program[record + 9],
+                    program[record + 10],
+                    program[record + 11],
+                ]) as usize;
+                let length = u32::from_be_bytes([
+                    program[record + 12],
+                    program[record + 13],
+                    program[record + 14],
+                    program[record + 15],
+                ]) as usize;
+                let end = offset.saturating_add(length).min(program.len());
+                if offset >= program.len() {
+                    continue;
+                }
+                match &program[record..record + 4] {
+                    b"CFF " => cff = Some(program[offset..end].to_vec()),
+                    b"head" if offset + 20 <= program.len() => {
+                        units_per_em = Some(u16::from_be_bytes([
+                            program[offset + 18],
+                            program[offset + 19],
+                        ]) as f32);
+                    }
+                    _ => {}
+                }
+            }
+            let cff = cff?;
+            let encoding = self
+                .resolve_font_encoding(font, font.get_name("BaseFont"))
+                .0;
+            return crate::cff::CffFont::parse(&cff, units_per_em).map(|program| {
+                crate::vector_text::DrawableFont::Cff { program, encoding }
+            });
+        }
+        let encoding = self
+            .resolve_font_encoding(font, font.get_name("BaseFont"))
+            .0;
+        crate::cff::CffFont::parse(&program, None).map(|program| {
+            crate::vector_text::DrawableFont::Cff { program, encoding }
+        })
     }
 
     /// The `/FontDescriptor` for a font, following `/DescendantFonts` once.

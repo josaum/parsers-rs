@@ -164,3 +164,55 @@ fn a_font_without_a_program_yields_no_outlines() {
          must get nothing rather than a shape derived from the widths"
     );
 }
+
+/// An embedded CFF program yields outlines too.
+///
+/// OpenType fonts produced by design tools and by LaTeX wrap CFF rather than
+/// `glyf`, so a PDF embedding one gives the atlas nothing until the charstrings
+/// are read. This is the third route to the same outlines: Type 3 glyphs are
+/// content streams, `glyf` glyphs are a table, CFF glyphs are a bytecode.
+///
+/// The fixture is a Cabin Regular subset (SIL Open Font License).
+#[test]
+fn an_embedded_cff_program_yields_glyph_outlines() {
+    const CFF_FIXTURE: &[u8] = include_bytes!("fixtures/Cabin-subset.otf");
+    // Objects 1..=7: catalog, pages, page, content, font, descriptor, program.
+    let bytes = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", b"BT /F1 24 Tf 72 700 Td (AB) Tj ET"),
+        // An OpenType subtype: `/FontFile3` carries the program.
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Cabin-Regular \
+          /FirstChar 65 /LastChar 66 /Widths [600 600] \
+          /FontDescriptor 6 0 R /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /Cabin-Regular /Flags 32 \
+          /FontBBox [-430 -608 2518 2276] /ItalicAngle 0 /Ascent 1556 \
+          /Descent -492 /CapHeight 1400 /StemV 80 /FontFile3 7 0 R >>"
+            .to_vec(),
+        stream("/Subtype /OpenType", CFF_FIXTURE),
+    ]);
+    let doc = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("must parse");
+    let runs = doc.page_vector_text_runs(0).expect("vector runs");
+    let glyphs: Vec<&pdf_fast_core::vector_text::VectorGlyph> =
+        runs.iter().flat_map(|r| r.glyphs.iter()).collect();
+
+    assert_eq!(
+        glyphs.len(),
+        2,
+        "both characters must be drawn from the embedded CFF program"
+    );
+    assert!(
+        glyphs.iter().all(|g| !g.normalized.is_empty()),
+        "each glyph must carry normalized geometry for the atlas"
+    );
+    let gap = (glyphs[1].x_offset - glyphs[0].x_offset).abs();
+    assert!(
+        gap > 1.0,
+        "the second glyph must advance past the first; a near-zero gap means the \
+         charstring widths were not read: {gap}"
+    );
+}
