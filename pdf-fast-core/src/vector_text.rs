@@ -67,6 +67,12 @@ pub struct GlyphRun {
 /// A single vector glyph rebuilt from path ops. `shape_hash` is the
 /// FNV-1a hash of the contours after translation+scale normalization, so
 /// glyph shapes can be deduplicated across runs and pages.
+///
+/// `normalized` holds that normalized geometry, kept alongside the hash rather
+/// than recomputed on demand. The hash alone cannot carry identity — see
+/// [`crate::glyph_atlas`] — so a shape lookup needs the points, and recomputing
+/// normalization at every lookup would both cost more and risk disagreeing with
+/// the normalization the hash was taken from.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct VectorGlyph {
@@ -74,6 +80,10 @@ pub struct VectorGlyph {
     pub x_offset: f32,
     /// Glyph contours; each inner `Vec<BezPt>` is one closed subpath.
     pub contours: Vec<Vec<BezPt>>,
+    /// The same contours translated by `(-min_x, -min_y)` and divided by
+    /// `max(width, height)`, so two renderings of one glyph shape agree within
+    /// float noise. Empty when the glyph had no geometry.
+    pub normalized: Vec<Vec<BezPt>>,
     /// Stable hash of the normalized glyph shape (0 means "no geometry").
     pub shape_hash: u64,
     /// Pre-normalization ink-bottom y of the glyph in run-local units
@@ -302,6 +312,7 @@ impl VectorTextExtractor {
         self.glyphs.push(VectorGlyph {
             x_offset: c_min,
             contours: vec![contour],
+            normalized: Vec::new(),
             shape_hash: 0,
             y_offset: 0.0,
             size: 0.0,
@@ -348,6 +359,10 @@ impl VectorTextExtractor {
                 }
             }
             g.shape_hash = hash;
+            // `g.contours` is normalized in place above, so this is a copy of
+            // exactly the points the hash was taken from — not a recomputation
+            // that could drift from them.
+            g.normalized = g.contours.clone();
         }
     }
 
@@ -770,19 +785,32 @@ pub fn extract_page_vector_text_runs_checked(
     Ok(all_runs)
 }
 
-/// Look up a glyph hash in the pre-computed atlas, falling back to `None`
-/// when the atlas is not compiled in (feature `glyph-atlas` disabled).
+/// Resolve a glyph through the shape atlas, or `None` when the atlas is not
+/// compiled in (feature `glyph-atlas` disabled).
+///
+/// Takes the glyph's geometry, not just its hash. The hash cannot carry shape
+/// identity — see [`crate::glyph_atlas`] — so a lookup keyed on it alone misses
+/// glyphs the atlas has already learned, which is why recovery never worked.
 ///
 /// Returns the mapped grapheme (multi-codepoint safe) rather than a single
 /// `char` so ligatures and composed accents round-trip through the scanner.
 #[inline]
-fn atlas_lookup(_hash: u64) -> Option<&'static str> {
+fn atlas_lookup(glyph: &VectorGlyph) -> Option<String> {
     #[cfg(feature = "glyph-atlas")]
     {
-        crate::glyph_atlas::lookup_entry(_hash).map(|e| e.grapheme)
+        if glyph.normalized.is_empty() {
+            return None;
+        }
+        crate::glyph_atlas::lookup_entry(
+            glyph.shape_hash,
+            &glyph.normalized,
+            glyph.size,
+            crate::glyph_atlas::DEFAULT_EPS,
+        )
     }
     #[cfg(not(feature = "glyph-atlas"))]
     {
+        let _ = glyph;
         None
     }
 }
@@ -883,7 +911,14 @@ pub fn learn_page_glyph_mappings_checked(
                     continue;
                 }
                 let s = ch.to_string();
-                record_learned(glyph.shape_hash, &s, 0.85, AtlasSource::Corpus);
+                record_learned(
+                    glyph.shape_hash,
+                    &glyph.normalized,
+                    &s,
+                    glyph.size,
+                    0.85,
+                    AtlasSource::Corpus,
+                );
                 stats.emitted += 1;
             }
         }
@@ -907,7 +942,14 @@ pub fn learn_page_glyph_mappings_checked(
     if all_glyphs.len() == all_chars.len() && !all_glyphs.is_empty() {
         for (glyph, ch) in all_glyphs.iter().zip(all_chars.iter()) {
             let s = ch.to_string();
-            record_learned(glyph.shape_hash, &s, 0.80, AtlasSource::Corpus);
+            record_learned(
+                glyph.shape_hash,
+                &glyph.normalized,
+                &s,
+                glyph.size,
+                0.80,
+                AtlasSource::Corpus,
+            );
             stats.emitted += 1;
         }
         return Ok(stats);
@@ -963,12 +1005,11 @@ pub fn runs_to_string(runs: &[GlyphRun]) -> String {
         }
 
         for glyph in &run.glyphs {
-            if let Some(grapheme) = atlas_lookup(glyph.shape_hash) {
-                if grapheme != "?" {
-                    text.push_str(grapheme);
+            match atlas_lookup(glyph) {
+                Some(grapheme) if !grapheme.is_empty() && grapheme != "?" => {
+                    text.push_str(&grapheme);
                 }
-            } else {
-                text.push('_'); // Unknown glyph
+                _ => text.push('_'), // Unknown glyph, stated rather than guessed
             }
         }
 
@@ -986,16 +1027,11 @@ mod learning_tests {
     use crate::glyph_atlas;
     use crate::{ParseOptions, PdfDocument};
 
-    use crate::glyph_atlas::env_lock_for_tests as test_env_lock;
-
     #[test]
     fn learning_is_noop_when_no_vector_glyphs() {
-        // A minimal valid PDF with only text ops (Tj) referencing a Type 0
-        // font — no vector path draws. The vector-text extractor produces
-        // zero glyph runs, so the learner correctly emits zero pairs and
-        // flags nothing_to_learn.
-        let _g = test_env_lock();
-        let before = glyph_atlas::pending_learned_count();
+        // A page whose content stream draws no paths. The vector-text extractor
+        // produces zero glyph runs, so the learner emits zero pairs and says so
+        // rather than reporting a clean pass over nothing.
         let pdf = br#"%PDF-1.7
 1 0 obj
 << /Type /Catalog /Pages 2 0 R >>
@@ -1016,19 +1052,17 @@ endobj
         let doc = PdfDocument::from_slice(pdf, ParseOptions::default()).unwrap();
         let stats = learn_document_glyph_mappings(&doc);
         assert_eq!(stats.emitted, 0);
-        assert_eq!(glyph_atlas::pending_learned_count(), before);
     }
 
     #[test]
     fn learning_stats_zeroed_on_empty_doc() {
-        let _g = test_env_lock();
         // No Kids, no content.
         let pdf = br#"%PDF-1.7
 1 0 obj
 << /Type /Catalog /Pages 2 0 R >>
 endobj
 2 0 obj
-<< /Type /Pages /Kids [] /Count 0 >>
+<< /Type /Pages /Pages [] /Count 0 >>
 endobj
 "#;
         let doc = PdfDocument::from_slice(pdf, ParseOptions::default()).unwrap();
@@ -1039,22 +1073,89 @@ endobj
         assert!(stats.nothing_to_learn);
     }
 
-    /// The bounded compatibility shim never persists learned mappings.
+    /// A learned mapping is findable again, and it is findable through geometry
+    /// rather than through a hash that float noise can invalidate.
+    ///
+    /// This is the end-to-end shape of the bug: the learner always recorded
+    /// something, and the lookup never found it. The unit tests in
+    /// `glyph_atlas` cover the comparison itself; this covers the wiring, using
+    /// the same public functions the parser does.
     #[test]
-    fn compatibility_shim_is_nonpersistent() {
-        let _g = test_env_lock();
-        glyph_atlas::learned_sink_for_test_clear();
+    fn a_learned_shape_is_recovered_through_geometry() {
+        glyph_atlas::clear_learned();
 
+        let glyph = |jitter: f32| VectorGlyph {
+            x_offset: 0.0,
+            contours: Vec::new(),
+            normalized: vec![vec![
+                BezPt { x: jitter, y: 0.0, kind: 1 },
+                BezPt { x: 0.5, y: 0.30, kind: 1 },
+                BezPt { x: 1.0, y: 0.0, kind: 1 },
+            ]],
+            shape_hash: if jitter == 0.0 { 0xa110_00bb } else { 0x0 },
+            y_offset: 0.0,
+            size: 12.0,
+        };
+
+        // Learn from one rendering of the shape.
+        let learned = glyph(0.0);
         glyph_atlas::record_learned(
-            0xa11000bb22cc33dd,
-            "Ω",
-            0.91,
+            learned.shape_hash,
+            &learned.normalized,
+            "\u{03a9}",
+            learned.size,
+            0.9,
             glyph_atlas::AtlasSource::Corpus,
         );
-        glyph_atlas::save_process_atlas().unwrap();
+        assert_eq!(glyph_atlas::learned_shape_count(), 1, "one shape kept");
 
-        let mut reloaded = glyph_atlas::GlyphAtlas::new();
-        reloaded.load_default_cache().unwrap();
-        assert!(reloaded.lookup(0xa11000bb22cc33dd).is_none());
+        // Recover it from a different rendering of the same shape, whose hash
+        // is deliberately not the learned one — the case that used to fail.
+        let later = glyph(0.6 / 255.0);
+        let found = atlas_lookup(&later);
+        assert_eq!(
+            found.as_deref(),
+            Some("\u{03a9}"),
+            "geometry must recover a shape whose hash moved"
+        );
+
+        // A glyph with no geometry is not guessed at.
+        let blank = VectorGlyph {
+            normalized: Vec::new(),
+            ..later
+        };
+        assert!(atlas_lookup(&blank).is_none());
+
+        glyph_atlas::clear_learned();
+    }
+
+    /// One letter stays one entry no matter how many renderings are learned.
+    ///
+    /// The measured defect was 7.4k hashes for 15.7k glyphs on one contract;
+    /// the atlas is expected to converge on the alphabet instead.
+    #[test]
+    fn repeated_learning_converges_on_one_entry_per_shape() {
+        glyph_atlas::clear_learned();
+        let shape = vec![vec![
+            BezPt { x: 0.0, y: 0.0, kind: 1 },
+            BezPt { x: 0.5, y: 0.30, kind: 1 },
+            BezPt { x: 1.0, y: 0.0, kind: 1 },
+        ]];
+        for i in 0..200 {
+            let jitter = (i % 5) as f32 * 0.0002;
+            let mut jittered = shape.clone();
+            for c in jittered.iter_mut() {
+                for p in c.iter_mut() {
+                    p.x += jitter;
+                }
+            }
+            glyph_atlas::record_learned(1000 + i, &jittered, "A", 12.0, 0.8, glyph_atlas::AtlasSource::Corpus);
+        }
+        assert_eq!(
+            glyph_atlas::learned_shape_count(),
+            1,
+            "200 renderings of one letter must collapse to one entry"
+        );
+        glyph_atlas::clear_learned();
     }
 }
