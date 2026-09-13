@@ -48,15 +48,20 @@ repository into a component of one product.
 | Stays in | Because |
 | --- | --- |
 | **Atlas**: `owl-fast-core` (reasoner projection) | It depends on `atlas-reasoner` and emits `RulePackage` `owl_axiom` rows. A shared crate cannot depend on one consumer. |
+| **Mycelia**: `owl-fast-core` (ontology chunker) | Entity extraction and subject chunking for RAG grounding. Product component, not a parser. |
 | **Mycelia**: `gliner-core`, `gliner2-core`, OCR models, `geom-core`, `layout-fast-*`, `web-fast-core`, `chunk-fast-core`, `fca-fast-*` | Product components — NER, OCR, layout and chunking — not parsers. |
 
-`pdf-fast-py` carries one further consumer-shaped feature: `reading-order`
-enables a reading-order policy that needs the consumer's layout engine. It
-declares no dependency here at all — a sovereign repository cannot name a
-consumer's crate — so a consumer enables it and supplies the crate from its own
-workspace. This is the same rule `owl-fast-core`'s `atlas-reasoner-rows` follows
-for the Atlas reasoner, and asking for reading order on a build without it is an
-error rather than a silent fall back to stream order.
+`pdf-fast-py` carries one consumer-shaped feature: `reading-order` enables a
+reading-order policy that needs the consumer's layout engine. It declares no
+dependency here at all — a sovereign repository cannot name a consumer's crate —
+so a consumer enables it and supplies the crate from its own workspace. Asking
+for reading order on a build without it is an error rather than a silent fall
+back to stream order.
+
+The same rule is why `owl-fast-core` is absent: its Atlas form depends on
+`atlas-reasoner`, and a shared crate cannot depend on one consumer. Applied
+consistently, that rule is what keeps this repository a shared plane rather than
+a component of either product.
 
 `gliner` and `embed` are **optional features** on Mycelia's docx/pdf/email/
 xlsx/pptx crates, and both must be removed when a core moves here. They are not
@@ -64,26 +69,50 @@ only feature flags: each gates a whole module (`adapter.rs`, `embed.rs`) that
 depends on `gliner-core` or `mycelia-client`. Removed so far from docx, email,
 xlsx, and pptx; `pdf` still carries them.
 
-### The `owl-fast-core` name collision
+### The `owl-fast-core` name collision — measured, and not ours to merge
 
-Two crates in two repositories currently share this name and are **different
-products**:
+Two crates in two repositories share this name and are **different products**:
 
 * Mycelia's is an entity extractor and RAG chunker (`Entity`, `EntityType`,
   `SubjectChunk`); its module doc states it is not a reasoner.
-* Atlas's is a canonical reader that emits Arrow IPC `RulePackage` rows and
-  depends on `atlas-reasoner`.
+* Atlas's emits Arrow IPC `RulePackage` rows and depends on `atlas-reasoner`.
 
-The agreed target is **one crate with two features**:
+The plan recorded here was **one crate with two features**:
 
 ```toml
 owl-fast-core = { version = "x.y.z", features = ["atlas-reasoner-rows"] }
 ```
 
-The default build stays a neutral reader with no consumer dependency; the
-`atlas-reasoner-rows` feature adds the Arrow projection and pulls
-`atlas-reasoner`. That resolves the collision without moving Atlas's reasoner
-types into this repository. It is **not implemented here yet**.
+Measurement retired that plan. The two crates share **no public API at all** —
+Atlas exposes three functions (`from_name`, `parse_ontology_to_arrow_ipc`,
+`parse_ontology_to_arrow_ipc_with_limits`), Mycelia exposes sixteen, and not one
+name appears on both sides. A single shared function exists in the whole pair.
+A two-feature crate needs a common core for the features to wrap, and there is
+none: this would be a merger of two products, not a reconciliation.
+
+Both stay where they are, for the same reason in two directions: reasoner
+projection is consumer semantics, and a RAG chunker is a product component.
+
+**What is real is the packaging collision.** Both repositories publish the
+distribution `owl-fast`, importing as `owl_fast`, with different contracts —
+Atlas's `parse_ontology_ipc` against Mycelia's `parse_file` /
+`chunk_by_subject`. On the flat module namespace the last wheel installed wins
+silently, and Atlas's upload boundary calls `owl_fast.parse_ontology_ipc`, so
+the wrong package breaks every `.ttl`, `.nt`, and `.nq` upload while the module
+still imports. Atlas now guards against that at runtime by asserting each
+parser's entry points rather than its importability.
+
+The names are the defect — neither describes what its crate does. Renaming is a
+consumer decision for the two repositories, not something this one can settle.
+
+### The neutral reader here is `ontology-fast-core`
+
+The crate that *does* describe reading ontologies is `ontology-fast-core`: it
+depends only on `oxrdf` and `oxrdfio`, carries no consumer dependency, has no
+name collision, and is already the declared migration target for Atlas's
+`catalog._subject_blocks`. It is the right candidate for this repository in this
+area — not `owl-fast-core`. Its Python binding is not yet wired into Atlas's app
+path.
 
 ## Build
 
