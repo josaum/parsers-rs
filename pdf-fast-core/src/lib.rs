@@ -9133,8 +9133,10 @@ fn decode_pdf_text(bytes: &[u8]) -> String {
 fn decode_utf16_be(bytes: &[u8]) -> String {
     String::from_utf16_lossy(
         &bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_be_bytes(*chunk))
             .collect::<Vec<_>>(),
     )
 }
@@ -9142,8 +9144,10 @@ fn decode_utf16_be(bytes: &[u8]) -> String {
 fn decode_utf16_le(bytes: &[u8]) -> String {
     String::from_utf16_lossy(
         &bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect::<Vec<_>>(),
     )
 }
