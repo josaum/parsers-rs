@@ -1555,64 +1555,6 @@ unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{format_has_date_tokens, parse_cell_ref_bytes};
-    use ooxml_archive::{parse_root_rels, resolve_part};
-
-    #[test]
-    fn parse_cell_ref_basic() {
-        assert_eq!(parse_cell_ref_bytes(b"A1"), Some((1, 1)));
-        assert_eq!(parse_cell_ref_bytes(b"Z99"), Some((99, 26)));
-        assert_eq!(parse_cell_ref_bytes(b"AA10"), Some((10, 27)));
-        assert_eq!(
-            parse_cell_ref_bytes(b"XFD1048576"),
-            Some((1_048_576, 16_384))
-        );
-    }
-
-    #[test]
-    fn parse_cell_ref_dollar() {
-        assert_eq!(parse_cell_ref_bytes(b"$A$1"), Some((1, 1)));
-        assert_eq!(parse_cell_ref_bytes(b"A$1"), Some((1, 1)));
-        assert_eq!(parse_cell_ref_bytes(b"$AA20"), Some((20, 27)));
-    }
-
-    #[test]
-    fn parse_cell_ref_rejects_coordinates_outside_excel_limits() {
-        assert_eq!(parse_cell_ref_bytes(b"XFE1"), None);
-        assert_eq!(parse_cell_ref_bytes(b"A1048577"), None);
-        assert_eq!(parse_cell_ref_bytes(b"ZZZZZZZZZZ1"), None);
-    }
-
-    #[test]
-    fn parse_root_rels_finds_workbook_part() {
-        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship
-    Id="rId1"
-    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
-    Target="/xl/workbook.xml"/>
-</Relationships>"#;
-
-        assert_eq!(parse_root_rels(xml).as_deref(), Some("xl/workbook.xml"));
-    }
-
-    #[test]
-    fn resolve_part_handles_parent_segments() {
-        assert_eq!(
-            resolve_part("xl/worksheets", "../sharedStrings.xml"),
-            "xl/sharedStrings.xml"
-        );
-    }
-
-    #[test]
-    fn format_has_date_tokens_ignores_literals() {
-        assert!(!format_has_date_tokens("\"day\" 0.00"));
-        assert!(format_has_date_tokens("yyyy-mm-dd"));
-    }
-}
-
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "sse2")]
 unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
@@ -1685,4 +1627,62 @@ unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_has_date_tokens, parse_cell_ref_bytes};
+    use ooxml_archive::{parse_root_rels, resolve_part};
+
+    #[test]
+    fn parse_cell_ref_basic() {
+        assert_eq!(parse_cell_ref_bytes(b"A1"), Some((1, 1)));
+        assert_eq!(parse_cell_ref_bytes(b"Z99"), Some((99, 26)));
+        assert_eq!(parse_cell_ref_bytes(b"AA10"), Some((10, 27)));
+        assert_eq!(
+            parse_cell_ref_bytes(b"XFD1048576"),
+            Some((1_048_576, 16_384))
+        );
+    }
+
+    #[test]
+    fn parse_cell_ref_dollar() {
+        assert_eq!(parse_cell_ref_bytes(b"$A$1"), Some((1, 1)));
+        assert_eq!(parse_cell_ref_bytes(b"A$1"), Some((1, 1)));
+        assert_eq!(parse_cell_ref_bytes(b"$AA20"), Some((20, 27)));
+    }
+
+    #[test]
+    fn parse_cell_ref_rejects_coordinates_outside_excel_limits() {
+        assert_eq!(parse_cell_ref_bytes(b"XFE1"), None);
+        assert_eq!(parse_cell_ref_bytes(b"A1048577"), None);
+        assert_eq!(parse_cell_ref_bytes(b"ZZZZZZZZZZ1"), None);
+    }
+
+    #[test]
+    fn parse_root_rels_finds_workbook_part() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship
+    Id="rId1"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+    Target="/xl/workbook.xml"/>
+</Relationships>"#;
+
+        assert_eq!(parse_root_rels(xml).as_deref(), Some("xl/workbook.xml"));
+    }
+
+    #[test]
+    fn resolve_part_handles_parent_segments() {
+        assert_eq!(
+            resolve_part("xl/worksheets", "../sharedStrings.xml"),
+            "xl/sharedStrings.xml"
+        );
+    }
+
+    #[test]
+    fn format_has_date_tokens_ignores_literals() {
+        assert!(!format_has_date_tokens("\"day\" 0.00"));
+        assert!(format_has_date_tokens("yyyy-mm-dd"));
+    }
 }
