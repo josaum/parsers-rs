@@ -220,8 +220,8 @@ builds every binding for Apple Silicon, Linux x86_64 and Linux aarch64 on a
 with `SHA256SUMS` as release assets. Linux aarch64 is not optional: Mycelia's API
 image is multi-arch and cannot take a release that lacks it.
 
-Set `repository` in `Cargo.toml` when the remote exists; every artifact inherits
-it, and it must not point at a consumer.
+`repository` in `Cargo.toml` is the remote every artifact inherits;
+it must not point at a consumer.
 
 ## Provenance and cutover state
 
