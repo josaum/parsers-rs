@@ -169,20 +169,59 @@ cargo install cargo-cyclonedx
 
 ## Consuming
 
-Pin the **version**, verify the **hash** from the manifest, and do not vendor a
-private fork — a fork is how the drift started.
+A consumer ships **one release** of this repository, in two forms that must
+name the same commit:
+
+1. the wheels plus `release-manifest.json`, vendored into the consumer and
+   installed by version and hash;
+2. the source at `source.commit`, pinned as a git submodule, for any consumer
+   Rust crate that links a core directly.
+
+Do not vendor a private fork, and do not copy a crate into a consumer tree — a
+copy is how the drift started. A consumer that needs something a core does not
+do sends the change here and bumps the release.
 
 ```bash
+# wheels, by hash from the manifest
 pip install xlsx_fast==0.2.1 \
   --hash=sha256:b72174d0d9f5fa944998abc8b38822f0e957808916b16d462b636c23936e83c8
-```
 
-For Rust consumers, depend on a tag and let the workspace pin transitive
-versions:
+# source, pinned to the same commit the manifest names
+git submodule add <remote-or-relative-url> vendor/parsers-rs/src
+git -C vendor/parsers-rs/src checkout <source.commit>
+```
 
 ```toml
-json-fast-core = { git = "<remote>", tag = "v0.1.0" }
+# a consumer crate links the pinned source by path; the workspace here pins
+# the transitive versions (arrow = 58.3.0 and friends)
+json-fast-core = { path = "../../vendor/parsers-rs/src/json-fast-core", features = ["arrow"] }
 ```
+
+The invariant is checked, not trusted. `scripts/verify_consumer_pin.py` fails a
+consumer whose vendored wheels are not the manifest's bytes, whose vendored set
+differs from the manifest's, whose manifest records a dirty tree, or whose
+source pin is at any commit other than `source.commit`:
+
+```bash
+python3 vendor/parsers-rs/src/scripts/verify_consumer_pin.py --vendor vendor/parsers-rs
+```
+
+Because a release **is** a commit, a tooling-only change here does not move a
+consumer's pin: the consumer stays on the release it ships until the next one.
+Re-releasing the same crate versions from a different commit is refused by the
+manifest for the same reason — same wheel name, different bytes is the defect.
+
+### CI and release
+
+`.github/workflows/ci.yml` formats, lints (`-D warnings`) and tests the
+workspace and the release scripts on every push. `.github/workflows/release.yml`
+builds every binding for Apple Silicon, Linux x86_64 and Linux aarch64 on a
+`v*` tag, embeds one SBOM per wheel, stamps the manifest, and publishes the set
+with `SHA256SUMS` as release assets. Linux aarch64 is not optional: Mycelia's API
+image is multi-arch and cannot take a release that lacks it.
+
+Set `repository` in `Cargo.toml` when the remote exists; every artifact inherits
+it, and it must not point at a consumer.
 
 ## Provenance and cutover state
 
@@ -197,13 +236,23 @@ and "in use":
 
 | Wheel | Atlas | Mycelia |
 | --- | --- | --- |
-| `json_fast` | installs this release | builds from its own source |
+| `json_fast` | installs this release; links the pinned source | builds from its own source |
 | `xsd_fast` | installs this release | builds from its own source |
 | `docx_fast` | installs this release | builds from its own source |
 | `email_fast` | installs this release | builds from its own source |
 | `xlsx_fast` | installs this release | builds from its own source |
 | `pptx_fast` | installs this release | builds from its own source |
 | `pdf_fast` | installs this release | builds from its own source |
+
+Atlas removed its in-tree copies of all seven cores, their bindings and
+`ooxml-archive` on 2026-09-17; its `json-fast-{flight,node,zerobus}` link
+`json-fast-core` from the submodule `vendor/parsers-rs/src`, pinned to the
+commit this manifest names. Mycelia's cutover is specified in Atlas's
+`docs/atlas/specs/2026-09-17-parser-single-source-spec.md`; its four measured
+gaps (a retired glyph-atlas persistence API the extractor calls, the TISS
+shredder inside `xsd-fast-core`, the `gliner`/`embed` adapters inside five
+cores, and the four generic Node bindings) are product work on that side or
+additions here, not forks.
 
 Atlas consumes these through `vendor/parsers-rs/` with a version and a SHA-256
 in `app/requirements/parsers-rs-pinned.txt`. Because a find-links source records

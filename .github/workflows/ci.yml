@@ -1,0 +1,38 @@
+# Every push and pull request: the workspace must format, lint clean and pass.
+# This is the gate a consumer relies on when it pins a commit of this repository.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo test --workspace
+
+  release-tooling:
+    # The manifest and SBOM scripts are part of the release contract; they are
+    # tested like code because a release that lies about its bytes is worse
+    # than no release.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install pytest
+      - run: python3 -m pytest tests -q

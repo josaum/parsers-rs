@@ -1,0 +1,109 @@
+# Tag `vX.Y.Z` -> one wheel per (crate, platform), each carrying exactly one
+# CycloneDX SBOM, plus `release-manifest.json` binding every wheel to this
+# commit, its SHA-256, toolchain and target. Consumers vendor the whole set.
+#
+# Platforms are the ones the consumers actually deploy on: Apple Silicon for
+# workstations, Linux x86_64 and aarch64 for containers. Mycelia's API image is
+# multi-arch, so a release without the aarch64 Linux wheel cannot be its
+# wheelhouse; that target is not optional.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Every Python binding crate in the workspace. Adding a crate means adding it
+  # here and to the shipped-surface count in README.md.
+  BINDINGS: docx-fast-py xlsx-fast-py pptx-fast-py pdf-fast-py email-fast-py xsd-fast-py json-fast-py
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,      target: aarch64-apple-darwin,       compat: "" }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu,  compat: "--zig --compatibility manylinux_2_17" }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, compat: "--zig --compatibility manylinux_2_17" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # manylinux 2_17 via zig is what the hand-built releases shipped, so
+      # existing consumer pins keep resolving; zig also cross-compiles the
+      # aarch64 Linux set without an emulated runner.
+      - run: python3 -m pip install --upgrade "maturin>=1.6,<2.0" ziglang
+      - name: Build every binding for ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for crate in $BINDINGS; do
+            (cd "$crate" && maturin build --release --target "${{ matrix.target }}" ${{ matrix.compat }} --out ../dist)
+          done
+          ls -1 dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  manifest:
+    needs: wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Embed exactly one CycloneDX SBOM per wheel
+        run: |
+          set -euo pipefail
+          cargo install cargo-cyclonedx --locked
+          for core in *-core ooxml-archive; do
+            cargo cyclonedx --manifest-path "$core/Cargo.toml" -f json --describe crate
+          done
+          python3 scripts/inject_sbom.py --dist dist
+      - name: Stamp the release manifest
+        # Refuses a dirty tree, a wheel whose version disagrees with its crate,
+        # and a wheel attributed to a consumer. The tag is the commit it names.
+        run: |
+          set -euo pipefail
+          python3 scripts/release_manifest.py --out dist
+          python3 -m pip install pytest
+          python3 -m pytest tests -q
+          (cd dist && sha256sum *.whl release-manifest.json > SHA256SUMS)
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            dist/release-manifest.json
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: |
+            dist/*.whl
+            dist/release-manifest.json
+            dist/SHA256SUMS
