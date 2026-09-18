@@ -1,0 +1,7 @@
+# The toolchain a release is built and verified with. CI on a floating
+# `stable` failed on a lint that did not exist locally; a release whose
+# verification depends on whichever compiler the runner had that day is not
+# reproducible. Bump deliberately, in its own commit, and re-verify.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
