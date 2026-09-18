@@ -309,8 +309,7 @@ impl TrueTypeFont {
             ends.push(u16::from_be_bytes([glyph[at], glyph[at + 1]]) as usize);
         }
         let point_count = *ends.last()? + 1;
-        let instruction_length =
-            u16::from_be_bytes([glyph[ends_at], glyph[ends_at + 1]]) as usize;
+        let instruction_length = u16::from_be_bytes([glyph[ends_at], glyph[ends_at + 1]]) as usize;
         let flags_at = ends_at + 2 + instruction_length;
         if flags_at > glyph.len() {
             return None;
@@ -350,7 +349,8 @@ impl TrueTypeFont {
             } else if flag & 0x10 != 0 {
                 0
             } else {
-                let value = i16::from_be_bytes([*glyph.get(cursor)?, *glyph.get(cursor + 1)?]) as i32;
+                let value =
+                    i16::from_be_bytes([*glyph.get(cursor)?, *glyph.get(cursor + 1)?]) as i32;
                 cursor += 2;
                 value
             };
@@ -371,7 +371,8 @@ impl TrueTypeFont {
             } else if flag & 0x20 != 0 {
                 0
             } else {
-                let value = i16::from_be_bytes([*glyph.get(cursor)?, *glyph.get(cursor + 1)?]) as i32;
+                let value =
+                    i16::from_be_bytes([*glyph.get(cursor)?, *glyph.get(cursor + 1)?]) as i32;
                 cursor += 2;
                 value
             };
@@ -422,7 +423,8 @@ impl TrueTypeFont {
             let (dx, dy) = if flags & 0x0001 != 0 {
                 // ARG_1_AND_2_ARE_WORDS
                 let dx = i16::from_be_bytes([*glyph.get(cursor)?, *glyph.get(cursor + 1)?]) as f32;
-                let dy = i16::from_be_bytes([*glyph.get(cursor + 2)?, *glyph.get(cursor + 3)?]) as f32;
+                let dy =
+                    i16::from_be_bytes([*glyph.get(cursor + 2)?, *glyph.get(cursor + 3)?]) as f32;
                 cursor += 4;
                 (dx, dy)
             } else {
@@ -447,13 +449,19 @@ impl TrueTypeFont {
             };
             if flags & 0x0008 != 0 {
                 // WE_HAVE_A_SCALE
-                let scale = f2dot14(i16::from_be_bytes([*glyph.get(cursor)?, *glyph.get(cursor + 1)?]));
+                let scale = f2dot14(i16::from_be_bytes([
+                    *glyph.get(cursor)?,
+                    *glyph.get(cursor + 1)?,
+                ]));
                 cursor += 2;
                 component.a = scale;
                 component.d = scale;
             } else if flags & 0x0040 != 0 {
                 // WE_HAVE_AN_X_AND_Y_SCALE
-                component.a = f2dot14(i16::from_be_bytes([*glyph.get(cursor)?, *glyph.get(cursor + 1)?]));
+                component.a = f2dot14(i16::from_be_bytes([
+                    *glyph.get(cursor)?,
+                    *glyph.get(cursor + 1)?,
+                ]));
                 component.d = f2dot14(i16::from_be_bytes([
                     *glyph.get(cursor + 2)?,
                     *glyph.get(cursor + 3)?,
@@ -461,7 +469,10 @@ impl TrueTypeFont {
                 cursor += 4;
             } else if flags & 0x0080 != 0 {
                 // WE_HAVE_A_TWO_BY_TWO
-                component.a = f2dot14(i16::from_be_bytes([*glyph.get(cursor)?, *glyph.get(cursor + 1)?]));
+                component.a = f2dot14(i16::from_be_bytes([
+                    *glyph.get(cursor)?,
+                    *glyph.get(cursor + 1)?,
+                ]));
                 component.b = f2dot14(i16::from_be_bytes([
                     *glyph.get(cursor + 2)?,
                     *glyph.get(cursor + 3)?,
@@ -572,8 +583,8 @@ fn find_cmap4(data: &[u8], start: usize) -> Option<(usize, usize)> {
         // Prefer a Unicode platform; Windows Unicode and Unicode BMP are both
         // fine, and a symbol-encoded subtable is a last resort.
         let rank = match platform {
-            0 => 3,          // Unicode
-            3 => 2,          // Windows, and format 4 is the BMP encoding
+            0 => 3, // Unicode
+            3 => 2, // Windows, and format 4 is the BMP encoding
             _ => 1,
         };
         if best.map(|(_, _, r)| rank > r).unwrap_or(true) {
@@ -616,10 +627,8 @@ fn lookup_cmap4(table: &[u8], code: u32) -> Option<u16> {
             return Some(code.wrapping_add(delta as u16));
         }
         // The glyph is reached through a shared range table.
-        let glyph_at = id_range_offsets
-            + segment * 2
-            + range_offset as usize
-            + (code - start) as usize * 2;
+        let glyph_at =
+            id_range_offsets + segment * 2 + range_offset as usize + (code - start) as usize * 2;
         let glyph = u16::from_be_bytes([*table.get(glyph_at)?, *table.get(glyph_at + 1)?]);
         if glyph == 0 {
             return None;

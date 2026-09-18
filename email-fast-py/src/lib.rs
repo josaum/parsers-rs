@@ -1,7 +1,7 @@
 use email_fast_core::arrow::{parse_mbox_to_arrow_ipc, ArrowOptions};
 use email_fast_core::{
-    EmailFormat, extract_attachments, parse_email, parse_email_bytes, parse_email_to_ndjson,
-    parse_eml, parse_mbox_to_ndjson, ParseOptions,
+    extract_attachments, parse_email, parse_email_bytes, parse_email_to_ndjson, parse_eml,
+    parse_mbox_to_ndjson, EmailFormat, ParseOptions,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -101,6 +101,12 @@ fn parse_mbox_ndjson_py(
 }
 
 #[pyfunction]
+// The eight parameters are the released Python signature; collapsing them into
+// an options struct would change the wheel surface, not the code quality.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the released Python signature"
+)]
 fn parse_mbox_arrow_py(
     path: &str,
     out_path: &str,

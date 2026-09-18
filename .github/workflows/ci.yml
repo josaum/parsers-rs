@@ -10,6 +10,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  ARROW_FEATURES: docx-fast-core/arrow,xlsx-fast-core/arrow,pptx-fast-core/arrow,pdf-fast-core/arrow,email-fast-core/arrow,json-fast-core/arrow,xsd-fast-core/arrow
 
 jobs:
   rust:
@@ -21,8 +22,13 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features
-      - run: cargo test --workspace
+      # Default features, then the generic `arrow` features. Not --all-features:
+      # pdf-fast-py's `reading-order` compiles only when a consumer supplies
+      # its layout crate, by design (see that Cargo.toml).
+      - run: cargo clippy --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked --features ${{ env.ARROW_FEATURES }}
+      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --features ${{ env.ARROW_FEATURES }}
 
   release-tooling:
     # The manifest and SBOM scripts are part of the release contract; they are

@@ -313,7 +313,14 @@ pub fn record_learned(
     if shape.is_empty() || grapheme.is_empty() {
         return;
     }
-    let entry = AtlasEntry::new(grapheme, shape_hash, shape.to_vec(), size, confidence, source);
+    let entry = AtlasEntry::new(
+        grapheme,
+        shape_hash,
+        shape.to_vec(),
+        size,
+        confidence,
+        source,
+    );
     if let Ok(mut atlas) = process_atlas().lock() {
         atlas.insert(entry);
     }
@@ -324,12 +331,7 @@ pub fn record_learned(
 /// Returns the mapped grapheme, which may be multi-codepoint. `None` means the
 /// shape is not known, and the caller should say so rather than guess: an
 /// invented character is worse than a visible gap.
-pub fn lookup_entry(
-    shape_hash: u64,
-    shape: &[Vec<BezPt>],
-    size: f32,
-    eps: f32,
-) -> Option<String> {
+pub fn lookup_entry(shape_hash: u64, shape: &[Vec<BezPt>], size: f32, eps: f32) -> Option<String> {
     process_atlas()
         .lock()
         .ok()
@@ -439,11 +441,7 @@ mod tests {
         // staying well inside `DEFAULT_EPS` for a reader comparing points.
         let jitter = 0.002;
         assert!(jitter < DEFAULT_EPS, "the drift must be sub-tolerance");
-        let jittered = vec![vec![
-            pt(0.003 + jitter, 0.0),
-            pt(0.5, 0.25),
-            pt(1.0, 0.0),
-        ]];
+        let jittered = vec![vec![pt(0.003 + jitter, 0.0), pt(0.5, 0.25), pt(1.0, 0.0)]];
 
         assert_ne!(
             fnv_over_grid(&base),

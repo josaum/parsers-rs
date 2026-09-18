@@ -28,7 +28,9 @@ fn the_fixture_parses_as_a_glyf_font() {
 #[test]
 fn a_simple_glyph_matches_its_reference_outline() {
     let font = TrueTypeFont::parse(&fixture()).unwrap();
-    let index = font.glyph_index('A' as u32).expect("'A' must map to a glyph");
+    let index = font
+        .glyph_index('A' as u32)
+        .expect("'A' must map to a glyph");
     let outline = font.outline(index).expect("'A' has an outline");
 
     // fontTools, decomposed: two contours beginning at (700, 1294) and
@@ -88,11 +90,7 @@ fn a_composite_glyph_resolves_its_components() {
         3,
         "two contours from 'A' plus one from the accent"
     );
-    let starts: Vec<(f32, f32)> = outline
-        .contours
-        .iter()
-        .map(|c| (c[0].x, c[0].y))
-        .collect();
+    let starts: Vec<(f32, f32)> = outline.contours.iter().map(|c| (c[0].x, c[0].y)).collect();
     assert_eq!(
         starts,
         vec![(700.0, 1294.0), (586.0, 1493.0), (755.0, 1899.0)],
@@ -111,11 +109,13 @@ fn curve_points_keep_their_on_curve_flag() {
     let font = TrueTypeFont::parse(&fixture()).unwrap();
     let index = font.glyph_index('B' as u32).unwrap();
     let outline = font.outline(index).unwrap();
-    let all: Vec<bool> = outline.contours.iter().flatten().map(|p| p.on_curve).collect();
-    assert!(
-        all.iter().any(|on| *on),
-        "'B' must have on-curve points"
-    );
+    let all: Vec<bool> = outline
+        .contours
+        .iter()
+        .flatten()
+        .map(|p| p.on_curve)
+        .collect();
+    assert!(all.iter().any(|on| *on), "'B' must have on-curve points");
     assert!(
         all.iter().any(|on| !*on),
         "'B' is a curved glyph, so it must have off-curve control points too"

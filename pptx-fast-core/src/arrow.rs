@@ -1157,12 +1157,9 @@ mod tests {
         use arrow_ipc::reader::StreamReader;
         use std::io::Cursor;
 
-        let ipc = pptx_document_to_arrow_ipc(
-            &sample_doc(),
-            ArrowOptions { batch_size: 1024 },
-            "slides",
-        )
-        .expect("encode slides IPC");
+        let ipc =
+            pptx_document_to_arrow_ipc(&sample_doc(), ArrowOptions { batch_size: 1024 }, "slides")
+                .expect("encode slides IPC");
         let rows = StreamReader::try_new(Cursor::new(ipc), None)
             .expect("read slides IPC")
             .map(|batch| batch.expect("valid batch").num_rows())

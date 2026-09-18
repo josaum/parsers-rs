@@ -69,8 +69,12 @@ fn parse_pptx_ndjson_py(
     out_path: &Bound<'_, PyAny>,
     max_inflate: Option<usize>,
 ) -> PyResult<()> {
-    parse_pptx_to_ndjson(fs_path(path)?, fs_path(out_path)?, build_options(max_inflate))
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    parse_pptx_to_ndjson(
+        fs_path(path)?,
+        fs_path(out_path)?,
+        build_options(max_inflate),
+    )
+    .map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
 /// Encode one named shredded table to `out_path` as an in-memory-built Arrow

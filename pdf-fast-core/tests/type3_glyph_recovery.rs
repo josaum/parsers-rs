@@ -195,9 +195,14 @@ fn type3_outlines_are_extracted_and_their_text_is_recovered_by_shape() {
     // Step 1: text operators are read and glyph outlines are built. Before this
     // path existed the count here was zero, which is exactly what an operator
     // table of path and graphics state implies.
-    let runs = doc.page_vector_text_runs(0).expect("vector runs must extract");
+    let runs = doc
+        .page_vector_text_runs(0)
+        .expect("vector runs must extract");
     let glyphs: usize = runs.iter().map(|r| r.glyphs.len()).sum();
-    assert_eq!(glyphs, 2, "the page shows two glyphs, drawn from /CharProcs");
+    assert_eq!(
+        glyphs, 2,
+        "the page shows two glyphs, drawn from /CharProcs"
+    );
 
     // Step 2: they carry geometry, without which the atlas has nothing to key
     // on even once outlines exist.
@@ -294,9 +299,21 @@ fn a_shape_learned_from_outlines_is_recovered_for_a_different_rendering() {
 
     let outline = |jitter: f32| {
         vec![vec![
-            BezPt { x: jitter, y: 0.0, kind: 1 },
-            BezPt { x: 0.5, y: 0.30, kind: 1 },
-            BezPt { x: 1.0, y: 0.0, kind: 1 },
+            BezPt {
+                x: jitter,
+                y: 0.0,
+                kind: 1,
+            },
+            BezPt {
+                x: 0.5,
+                y: 0.30,
+                kind: 1,
+            },
+            BezPt {
+                x: 1.0,
+                y: 0.0,
+                kind: 1,
+            },
         ]]
     };
 
@@ -312,12 +329,8 @@ fn a_shape_learned_from_outlines_is_recovered_for_a_different_rendering() {
 
     // A later rendering: same shape, different hash. The old lookup returned
     // None here even though the shape had been learned.
-    let recovered = glyph_atlas::lookup_entry(
-        0x0000_0000,
-        &outline(0.002),
-        12.0,
-        glyph_atlas::DEFAULT_EPS,
-    );
+    let recovered =
+        glyph_atlas::lookup_entry(0x0000_0000, &outline(0.002), 12.0, glyph_atlas::DEFAULT_EPS);
     assert_eq!(
         recovered.as_deref(),
         Some("A"),

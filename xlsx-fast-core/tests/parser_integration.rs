@@ -317,8 +317,9 @@ fn in_memory_arrow_ipc_is_readable() {
     let path = dir.path().join("in-memory-ipc.xlsx");
     build_xlsx(&path);
 
-    let ipc = parse_xlsx_to_arrow_ipc_bytes(&path, ParseOptions::default(), ArrowOptions::default())
-        .expect("encode XLSX IPC");
+    let ipc =
+        parse_xlsx_to_arrow_ipc_bytes(&path, ParseOptions::default(), ArrowOptions::default())
+            .expect("encode XLSX IPC");
     let rows = StreamReader::try_new(Cursor::new(ipc), None)
         .expect("read XLSX IPC")
         .map(|batch| batch.expect("valid batch").num_rows())

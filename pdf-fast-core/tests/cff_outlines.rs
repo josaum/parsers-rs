@@ -126,10 +126,8 @@ fn a_curved_glyph_matches_its_reference_outline() {
     );
     // A cubic stores two controls and an endpoint, and the controls are marked
     // off-curve so a consumer can reconstruct the path.
-    let first_curve: Vec<&pdf_fast_core::truetype::OutlinePoint> = outline.contours[0]
-        .iter()
-        .take(4)
-        .collect();
+    let first_curve: Vec<&pdf_fast_core::truetype::OutlinePoint> =
+        outline.contours[0].iter().take(4).collect();
     assert_eq!(
         first_curve.iter().filter(|p| !p.on_curve).count(),
         2,
@@ -175,7 +173,11 @@ fn advance_widths_are_read_from_the_charstring() {
             .expect("every glyph advances")
     };
     // fontTools reports these from the resolved glyph set.
-    assert_eq!(width("A"), 1232.0, "A declares 171, plus nominalWidthX 1061");
+    assert_eq!(
+        width("A"),
+        1232.0,
+        "A declares 171, plus nominalWidthX 1061"
+    );
     assert_eq!(width("space"), 450.0, "space declares -611, plus 1061");
     assert_eq!(width("period"), 416.0, "period declares -645, plus 1061");
 }

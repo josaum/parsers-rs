@@ -102,8 +102,8 @@ pub struct ParseOptions {
 impl Default for ParseOptions {
     fn default() -> Self {
         Self {
-            max_inflate: 128 * 1024 * 1024,         // 128 MiB
-            max_attachment_size: 100 * 1024 * 1024, // 100 MB
+            max_inflate: 128 * 1024 * 1024,                // 128 MiB
+            max_attachment_size: 100 * 1024 * 1024,        // 100 MB
             max_total_attachment_bytes: 100 * 1024 * 1024, // 100 MB
             include_raw_headers: false,
             html_to_text: false,

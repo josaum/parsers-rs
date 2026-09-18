@@ -315,7 +315,9 @@ impl Interpreter<'_> {
                             // adjust rasterization rather than the designed
                             // outline, so the operands are dropped.
                             self.maybe_width(None);
-                            if width_only { return Some(()); }
+                            if width_only {
+                                return Some(());
+                            }
                             // The stem operators consume their operands. Not
                             // clearing leaves them on the stack, where the next
                             // operator — `endchar`, which takes none — reads one
@@ -329,17 +331,21 @@ impl Interpreter<'_> {
                             // ceil(hint_count / 8) bytes, and the hint count
                             // includes any operands on the stack.
                             self.maybe_width(None);
-                            if width_only { return Some(()); }
+                            if width_only {
+                                return Some(());
+                            }
                             let hints = self.stack.len() / 2 + self.hint_count;
                             self.hint_count = hints;
                             self.stack.clear();
-                            i += 1 + (hints + 7) / 8;
+                            i += 1 + hints.div_ceil(8);
                             false
                         }
                         21 => {
                             // rmoveto
                             self.maybe_width(Some(2));
-                            if width_only { return Some(()); }
+                            if width_only {
+                                return Some(());
+                            }
                             if self.stack.len() < 2 {
                                 return None;
                             }
@@ -353,7 +359,9 @@ impl Interpreter<'_> {
                         22 => {
                             // hmoveto
                             self.maybe_width(Some(1));
-                            if width_only { return Some(()); }
+                            if width_only {
+                                return Some(());
+                            }
                             let dx = self.stack.pop()?;
                             self.start_contour(dx, 0.0);
                             self.stack.clear();
@@ -363,7 +371,9 @@ impl Interpreter<'_> {
                         4 => {
                             // vmoveto
                             self.maybe_width(Some(1));
-                            if width_only { return Some(()); }
+                            if width_only {
+                                return Some(());
+                            }
                             let dy = self.stack.pop()?;
                             self.start_contour(0.0, dy);
                             self.stack.clear();
@@ -395,7 +405,7 @@ impl Interpreter<'_> {
                         8 => {
                             // rrcurveto: six operands per curve
                             let values = std::mem::take(&mut self.stack);
-                            if values.len() % 6 != 0 {
+                            if !values.len().is_multiple_of(6) {
                                 return None;
                             }
                             for chunk in values.chunks(6) {
@@ -409,7 +419,7 @@ impl Interpreter<'_> {
                         24 => {
                             // rcurveline: curves then one line
                             let values = std::mem::take(&mut self.stack);
-                            if values.len() < 8 || (values.len() - 2) % 6 != 0 {
+                            if values.len() < 8 || !(values.len() - 2).is_multiple_of(6) {
                                 return None;
                             }
                             let curves = (values.len() - 2) / 6;
@@ -424,7 +434,7 @@ impl Interpreter<'_> {
                         25 => {
                             // rlinecurve: one line then curves
                             let values = std::mem::take(&mut self.stack);
-                            if values.len() < 8 || (values.len() - 2) % 6 != 0 {
+                            if values.len() < 8 || !(values.len() - 2).is_multiple_of(6) {
                                 return None;
                             }
                             self.line(values[0], values[1]);
@@ -454,7 +464,7 @@ impl Interpreter<'_> {
                                 first = values[0];
                                 index = 1;
                             }
-                            if (values.len() - index) % 4 != 0 {
+                            if !(values.len() - index).is_multiple_of(4) {
                                 return None;
                             }
                             while index + 3 < values.len() {
@@ -535,7 +545,9 @@ impl Interpreter<'_> {
                             // `endchar` takes no operands, so a width here is
                             // always the single optional one.
                             self.maybe_width(Some(0));
-                            if width_only { return Some(()); }
+                            if width_only {
+                                return Some(());
+                            }
                             self.close();
                             return Some(());
                         }
@@ -565,8 +577,12 @@ impl Interpreter<'_> {
                                     if values.len() < 7 {
                                         return None;
                                     }
-                                    self.curve(values[0], 0.0, values[1], values[2], values[3], 0.0);
-                                    self.curve(values[4], 0.0, values[5], -values[2], values[6], 0.0);
+                                    self.curve(
+                                        values[0], 0.0, values[1], values[2], values[3], 0.0,
+                                    );
+                                    self.curve(
+                                        values[4], 0.0, values[5], -values[2], values[6], 0.0,
+                                    );
                                     i += 2;
                                 }
                                 36 => {
@@ -575,8 +591,17 @@ impl Interpreter<'_> {
                                     if values.len() < 9 {
                                         return None;
                                     }
-                                    self.curve(values[0], values[1], values[2], values[3], values[4], 0.0);
-                                    self.curve(values[5], 0.0, values[6], values[7], values[8], -(values[1] + values[3] + 0.0));
+                                    self.curve(
+                                        values[0], values[1], values[2], values[3], values[4], 0.0,
+                                    );
+                                    self.curve(
+                                        values[5],
+                                        0.0,
+                                        values[6],
+                                        values[7],
+                                        values[8],
+                                        -(values[1] + values[3] + 0.0),
+                                    );
                                     i += 2;
                                 }
                                 37 => {
@@ -585,15 +610,22 @@ impl Interpreter<'_> {
                                     if values.len() < 11 {
                                         return None;
                                     }
-                                    let dx = values[0] + values[2] + values[4] + values[6] + values[8];
-                                    let dy = values[1] + values[3] + values[5] + values[7] + values[9];
-                                    self.curve(values[0], values[1], values[2], values[3], values[4], values[5]);
+                                    let dx =
+                                        values[0] + values[2] + values[4] + values[6] + values[8];
+                                    let dy =
+                                        values[1] + values[3] + values[5] + values[7] + values[9];
+                                    self.curve(
+                                        values[0], values[1], values[2], values[3], values[4],
+                                        values[5],
+                                    );
                                     let (last_x, last_y) = if dx.abs() > dy.abs() {
                                         (values[10], -dy)
                                     } else {
                                         (-dx, values[10])
                                     };
-                                    self.curve(values[6], values[7], values[8], values[9], last_x, last_y);
+                                    self.curve(
+                                        values[6], values[7], values[8], values[9], last_x, last_y,
+                                    );
                                     i += 2;
                                 }
                                 _ => {
@@ -694,7 +726,6 @@ impl Interpreter<'_> {
         }
     }
 
-
     fn close(&mut self) {
         if self.contour.is_empty() {
             return;
@@ -773,7 +804,6 @@ impl Interpreter<'_> {
         self.y = end.1;
     }
 }
-
 
 // ── Container primitives ────────────────────────────────────────────────────
 
@@ -915,7 +945,6 @@ fn dict_offset(data: &[u8], dict: &Dict, key: (u8, u8)) -> Option<usize> {
     single_number(data, range.0, range.1).map(|value| value.max(0.0) as usize)
 }
 
-
 /// A DICT operand as an integer.
 ///
 /// The value is read from the byte range the DICT recorded, because a DICT that
@@ -960,7 +989,6 @@ fn single_number(data: &[u8], start: usize, end: usize) -> Option<f32> {
         _ => None,
     }
 }
-
 
 // ── Charset ────────────────────────────────────────────────────────────────
 
@@ -1451,7 +1479,6 @@ const STANDARD_STRINGS: [&str; 391] = [
     "Semibold",
 ];
 
-
 #[cfg(test)]
 mod charstring_tests {
     use super::*;
@@ -1516,7 +1543,7 @@ mod charstring_tests {
             159, 1, // 20 vstem (2 operands, no width needed)
             248, 53, 1, // 300 vstem (two-byte form)
             139, 139, 21, // 0 0 rmoveto
-            149, 159, 5,  // 10 20 rlineto
+            149, 159, 5, // 10 20 rlineto
             14,
         ];
         let outline = run(&bytes).expect("must draw");
@@ -1556,9 +1583,7 @@ mod charstring_tests {
         assert_eq!(width_of(&[159u8, 179, 1, 139, 139, 21, 14]), Some(500.0));
         // Width 100 present, three stem pairs: seven operands, still odd.
         assert_eq!(
-            width_of(&[
-                239u8, 179, 179, 179, 179, 179, 179, 1, 139, 139, 21, 14
-            ]),
+            width_of(&[239u8, 179, 179, 179, 179, 179, 179, 1, 139, 139, 21, 14]),
             Some(100.0)
         );
         // No width, three stem pairs: six operands, still even.

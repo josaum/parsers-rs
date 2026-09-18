@@ -150,8 +150,6 @@ fn read_hex_string(stream: &[u8], start: usize) -> (Vec<u8>, usize) {
     (out, past)
 }
 
-
-
 /// One block of glyphs sharing the same text-matrix block (between PDF
 /// `q`/`Q` save/restore pairs). Positions are in page space with `page_y`
 /// already flipped to a top-down origin.
@@ -738,9 +736,7 @@ impl VectorTextExtractor {
                 cursor = next;
                 continue;
             }
-            if stream[cursor] == b'<'
-                && stream.get(cursor + 1).is_some_and(|b| *b != b'<')
-            {
+            if stream[cursor] == b'<' && stream.get(cursor + 1).is_some_and(|b| *b != b'<') {
                 let (bytes, next) = read_hex_string(stream, cursor);
                 self.win.copy_within(1..6, 0);
                 self.win[5] = 0.0;
@@ -1693,9 +1689,21 @@ endobj
             x_offset: 0.0,
             contours: Vec::new(),
             normalized: vec![vec![
-                BezPt { x: jitter, y: 0.0, kind: 1 },
-                BezPt { x: 0.5, y: 0.30, kind: 1 },
-                BezPt { x: 1.0, y: 0.0, kind: 1 },
+                BezPt {
+                    x: jitter,
+                    y: 0.0,
+                    kind: 1,
+                },
+                BezPt {
+                    x: 0.5,
+                    y: 0.30,
+                    kind: 1,
+                },
+                BezPt {
+                    x: 1.0,
+                    y: 0.0,
+                    kind: 1,
+                },
             ]],
             shape_hash: if jitter == 0.0 { 0xa110_00bb } else { 0x0 },
             y_offset: 0.0,
@@ -1742,9 +1750,21 @@ endobj
     fn repeated_learning_converges_on_one_entry_per_shape() {
         glyph_atlas::clear_learned();
         let shape = vec![vec![
-            BezPt { x: 0.0, y: 0.0, kind: 1 },
-            BezPt { x: 0.5, y: 0.30, kind: 1 },
-            BezPt { x: 1.0, y: 0.0, kind: 1 },
+            BezPt {
+                x: 0.0,
+                y: 0.0,
+                kind: 1,
+            },
+            BezPt {
+                x: 0.5,
+                y: 0.30,
+                kind: 1,
+            },
+            BezPt {
+                x: 1.0,
+                y: 0.0,
+                kind: 1,
+            },
         ]];
         for i in 0..200 {
             let jitter = (i % 5) as f32 * 0.0002;
@@ -1754,7 +1774,14 @@ endobj
                     p.x += jitter;
                 }
             }
-            glyph_atlas::record_learned(1000 + i, &jittered, "A", 12.0, 0.8, glyph_atlas::AtlasSource::Corpus);
+            glyph_atlas::record_learned(
+                1000 + i,
+                &jittered,
+                "A",
+                12.0,
+                0.8,
+                glyph_atlas::AtlasSource::Corpus,
+            );
         }
         assert_eq!(
             glyph_atlas::learned_shape_count(),

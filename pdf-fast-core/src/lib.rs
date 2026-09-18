@@ -26,10 +26,10 @@
 //! when a stream must be decoded.
 
 use anyhow::{anyhow, Context, Result};
+pub mod cff;
 pub mod raster_glyphs;
 pub mod tessellation;
 pub mod truetype;
-pub mod cff;
 #[cfg(feature = "arrow")]
 use arrow::array::{
     Array, BinaryBuilder, FixedSizeListBuilder, Float32Array, Float32Builder, Float64Array,
@@ -3085,9 +3085,8 @@ impl PdfDocument {
         let encoding = self
             .resolve_font_encoding(font, font.get_name("BaseFont"))
             .0;
-        crate::cff::CffFont::parse(&program, None).map(|program| {
-            crate::vector_text::DrawableFont::Cff { program, encoding }
-        })
+        crate::cff::CffFont::parse(&program, None)
+            .map(|program| crate::vector_text::DrawableFont::Cff { program, encoding })
     }
 
     /// The embedded CFF program for a font dictionary, if it has one.
@@ -3095,10 +3094,7 @@ impl PdfDocument {
     /// `/FontFile3` carries CFF directly for a bare-CFF OpenType font, and an
     /// `OTTO` sfnt wraps it in a table. Both are read, because which one a
     /// producer writes depends on the tool rather than on the format.
-    fn resolve_cff_font(
-        &self,
-        font: &PdfDictionary,
-    ) -> Option<crate::vector_text::DrawableFont> {
+    fn resolve_cff_font(&self, font: &PdfDictionary) -> Option<crate::vector_text::DrawableFont> {
         let descriptor = self.font_descriptor(font)?;
         let program = descriptor
             .get("FontFile3")
@@ -3133,10 +3129,11 @@ impl PdfDocument {
                 match &program[record..record + 4] {
                     b"CFF " => cff = Some(program[offset..end].to_vec()),
                     b"head" if offset + 20 <= program.len() => {
-                        units_per_em = Some(u16::from_be_bytes([
-                            program[offset + 18],
-                            program[offset + 19],
-                        ]) as f32);
+                        units_per_em =
+                            Some(
+                                u16::from_be_bytes([program[offset + 18], program[offset + 19]])
+                                    as f32,
+                            );
                     }
                     _ => {}
                 }
@@ -3145,16 +3142,14 @@ impl PdfDocument {
             let encoding = self
                 .resolve_font_encoding(font, font.get_name("BaseFont"))
                 .0;
-            return crate::cff::CffFont::parse(&cff, units_per_em).map(|program| {
-                crate::vector_text::DrawableFont::Cff { program, encoding }
-            });
+            return crate::cff::CffFont::parse(&cff, units_per_em)
+                .map(|program| crate::vector_text::DrawableFont::Cff { program, encoding });
         }
         let encoding = self
             .resolve_font_encoding(font, font.get_name("BaseFont"))
             .0;
-        crate::cff::CffFont::parse(&program, None).map(|program| {
-            crate::vector_text::DrawableFont::Cff { program, encoding }
-        })
+        crate::cff::CffFont::parse(&program, None)
+            .map(|program| crate::vector_text::DrawableFont::Cff { program, encoding })
     }
 
     /// The `/FontDescriptor` for a font, following `/DescendantFonts` once.
@@ -3190,11 +3185,7 @@ impl PdfDocument {
     }
 
     /// A Type 3 font's glyph programs, encoding, and widths.
-    fn resolve_type3_font(
-        &self,
-        font: &PdfDictionary,
-    ) -> Option<crate::vector_text::Type3Font> {
-
+    fn resolve_type3_font(&self, font: &PdfDictionary) -> Option<crate::vector_text::Type3Font> {
         let font_matrix = font
             .get("FontMatrix")
             .and_then(|value| self.resolve_array(value))
@@ -8136,13 +8127,13 @@ fn skip_inline_image(bytes: &[u8], cursor: &mut usize, params: &[ContentValue]) 
     let mut filtered = false;
     let mut index = 0usize;
     while index < params.len() {
-        match &params[index] {
-            ContentValue::Name(name) => match name.as_str() {
+        if let ContentValue::Name(name) = &params[index] {
+            match name.as_str() {
                 "W" => width = params.get(index + 1).and_then(content_value_number),
                 "H" => height = params.get(index + 1).and_then(content_value_number),
                 "BPC" => bits = params.get(index + 1).and_then(content_value_number),
-                "CS" | "ColorSpace" => match params.get(index + 1) {
-                    Some(ContentValue::Name(space)) => {
+                "CS" | "ColorSpace" => {
+                    if let Some(ContentValue::Name(space)) = params.get(index + 1) {
                         components = match space.as_str() {
                             "G" | "DeviceGray" => 1,
                             "RGB" | "DeviceRGB" => 3,
@@ -8151,13 +8142,11 @@ fn skip_inline_image(bytes: &[u8], cursor: &mut usize, params: &[ContentValue]) 
                             _ => 1,
                         }
                     }
-                    _ => {}
-                },
+                }
                 // Any filter means the payload is not the raw pixel array.
                 "F" | "Filter" => filtered = true,
                 _ => {}
-            },
-            _ => {}
+            }
         }
         index += 1;
     }

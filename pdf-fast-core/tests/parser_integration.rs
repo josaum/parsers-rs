@@ -40,7 +40,10 @@ fn open_pdf(path: &Path) -> PdfDocument {
 fn an_over_budget_stream_aborts_the_parse_rather_than_failing_quietly() {
     let expanded = vec![b'A'; 4096];
     let encoded = zlib_compress(&expanded);
-    assert!(encoded.len() < 64, "the fixture must compress below the limit");
+    assert!(
+        encoded.len() < 64,
+        "the fixture must compress below the limit"
+    );
     let mut pdf = format!(
         "%PDF-2.0\n1 0 obj\n<< /Filter /FlateDecode /Length {} >>\nstream\n",
         encoded.len()
