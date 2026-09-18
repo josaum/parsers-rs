@@ -1,6 +1,6 @@
 [package]
 name = "xlsx-fast-core"
-version = "0.2.1"
+version = "0.2.2"
 edition.workspace = true
 authors.workspace = true
 description = "High-performance Excel (.xlsx) parser with SIMD optimizations"

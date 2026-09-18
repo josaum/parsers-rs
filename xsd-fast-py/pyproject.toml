@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "xsd-fast"
-version = "0.2.0"
+version = "0.2.1"
 description = "High-performance XSD schema parser with Arrow schema derivation and XML validation, powered by Rust"
 readme = "README.md"
 license = { text = "MIT" }

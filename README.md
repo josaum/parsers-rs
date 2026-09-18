@@ -36,8 +36,8 @@ restricted decoder that bounds output before exposing bytes is the `flate2` one,
 so there is no fast path that inflates first and checks afterwards — a faster
 decoder can only be reinstated by keeping that ordering.
 
-The shipped surface is **14 artifacts**: seven crates × macOS arm64 and Linux
-x86_64.
+The shipped surface is **21 artifacts**: seven crates × macOS arm64, Linux
+x86_64 and Linux aarch64.
 
 ## What must not belong here
 
@@ -208,8 +208,15 @@ python3 vendor/parsers-rs/src/scripts/verify_consumer_pin.py --vendor vendor/par
 
 Because a release **is** a commit, a tooling-only change here does not move a
 consumer's pin: the consumer stays on the release it ships until the next one.
-Re-releasing the same crate versions from a different commit is refused by the
-manifest for the same reason — same wheel name, different bytes is the defect.
+A release must bump the version of every crate whose bytes changed since the
+last tag: same wheel name, different bytes is the defect this repository
+exists to end. The manifest cannot see earlier releases, so that rule is held
+by the release procedure below and caught downstream by
+`verify_consumer_pin.py`, which fails a wheel whose SHA-256 is not its
+manifest's.
+
+Release tags are `vYYYY.MM.DD` (`v2026.09.18`); crate versions are per crate
+and live in the manifest, because the crates do not move in lockstep.
 
 ### CI and release
 
