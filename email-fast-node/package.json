@@ -1,0 +1,55 @@
+{
+  "name": "email-fast-node",
+  "version": "0.2.2",
+  "description": "High-performance email parser for .eml and .msg formats",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "author": "parsers-rs maintainers",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/josaum/parsers-rs.git",
+    "directory": "email-fast-node"
+  },
+  "homepage": "https://github.com/josaum/parsers-rs#readme",
+  "bugs": {
+    "url": "https://github.com/josaum/parsers-rs/issues"
+  },
+  "keywords": [
+    "email",
+    "eml",
+    "msg",
+    "outlook",
+    "parser",
+    "mime",
+    "rust",
+    "native",
+    "performance",
+    "arrow"
+  ],
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "napi": {
+    "name": "email_fast_node"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "scripts": {
+    "smoke": "node ../scripts/smoke-node.mjs email"
+  }
+}

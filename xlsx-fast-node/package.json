@@ -1,0 +1,54 @@
+{
+  "name": "xlsx-fast-node",
+  "version": "0.2.2",
+  "description": "High-performance Excel (.xlsx) parser with native Rust core",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "author": "parsers-rs maintainers",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/josaum/parsers-rs.git",
+    "directory": "xlsx-fast-node"
+  },
+  "homepage": "https://github.com/josaum/parsers-rs#readme",
+  "bugs": {
+    "url": "https://github.com/josaum/parsers-rs/issues"
+  },
+  "keywords": [
+    "excel",
+    "xlsx",
+    "spreadsheet",
+    "parser",
+    "office",
+    "ooxml",
+    "rust",
+    "native",
+    "performance"
+  ],
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "napi": {
+    "name": "xlsx_fast_node"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "scripts": {
+    "smoke": "node ../scripts/smoke-node.mjs xlsx"
+  }
+}

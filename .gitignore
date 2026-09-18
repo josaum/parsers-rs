@@ -7,3 +7,8 @@ __pycache__/
 # `cargo cyclonedx --manifest-path <crate>/Cargo.toml -f json --describe crate`
 # and embedded into wheels by scripts/inject_sbom.py. They are not sources.
 *.cdx.json
+
+# Node-API binaries and tarballs are release outputs of scripts/build-node.sh
+# and pnpm pack; index.js loads the binary by name, so they sit next to it.
+*.node
+*.tgz

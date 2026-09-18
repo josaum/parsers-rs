@@ -27,7 +27,7 @@ interop contract** — the same purpose in every consumer.
 | `pptx-fast-core`, `pptx-fast-py` | Read-only PPTX extraction, NDJSON, Arrow dataset, embedded media |
 | `ooxml-archive` | Shared OOXML ZIP, bounded inflate, and relationship resolution |
 | `pdf-fast-core`, `pdf-fast-py` | Read-only PDF extraction: text, structure, tables, raster, Arrow |
-| `*-node` bindings (planned) | Thin, per-platform, versioned alongside the core |
+| `docx-fast-node`, `xlsx-fast-node`, `pptx-fast-node`, `email-fast-node` | Thin Node-API 2 bindings over the same cores, one `.node` per platform, versioned with the core; the `@mycelia/*-fast-node` packages are consumer shells around these tarballs |
 
 `ooxml-archive` is the load-bearing one. `max_inflate` is an **aggregate**
 budget for one archive view, not a per-part cap: a package with many
@@ -36,8 +36,17 @@ restricted decoder that bounds output before exposing bytes is the `flate2` one,
 so there is no fast path that inflates first and checks afterwards — a faster
 decoder can only be reinstated by keeping that ordering.
 
-The shipped surface is **21 artifacts**: seven crates × macOS arm64, Linux
-x86_64 and Linux aarch64.
+The shipped surface is **33 artifacts**: seven Python wheels and four Node
+tarballs × macOS arm64, Linux x86_64 and Linux aarch64. The wheels are bound
+to the commit by `release-manifest.json` and `SHA256SUMS`; the Node tarballs
+are attached to the same release by their own job and are in neither yet
+(a documented gap: extend `scripts/release_manifest.py` before a consumer
+pins a tarball by manifest rather than by the tag it downloads from).
+
+Node bindings build with `scripts/build-node.sh [crate ...]` (cargo, no
+`@napi-rs/cli`) and are smoked with `node scripts/smoke-node.mjs`, which
+generates each fixture in-process and asserts that a known string
+round-trips through the parse.
 
 ## What must not belong here
 

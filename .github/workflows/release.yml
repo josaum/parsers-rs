@@ -21,6 +21,9 @@ env:
   # Every Python binding crate in the workspace. Adding a crate means adding it
   # here and to the shipped-surface count in README.md.
   BINDINGS: docx-fast-py xlsx-fast-py pptx-fast-py pdf-fast-py email-fast-py xsd-fast-py json-fast-py
+  # Every Node-API binding crate. Same rule: a new crate is added here and to
+  # the shipped-surface count in README.md.
+  NODE_BINDINGS: docx-fast-node xlsx-fast-node pptx-fast-node email-fast-node
 
 jobs:
   wheels:
@@ -58,6 +61,67 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
           if-no-files-found: error
+
+  # One `.node` per (crate, platform), packed as `<crate>-<version>-<platform>.tgz`
+  # with the same layout `pnpm pack` gives the crate directory: index.js,
+  # index.d.ts, the binary, README and LICENSE. The platform token follows the
+  # napi convention the consumer shells already key on. Linux aarch64 builds on
+  # a native arm runner rather than cross-linking a cdylib through zig, which
+  # also lets the smoke run on all three platforms before anything is uploaded.
+  #
+  # This job publishes its own assets and nothing waits on it: the wheel
+  # release is what consumers pin today, and a Node leg that queues or fails
+  # (the arm runner label is unverified for this repository) must not hold
+  # the wheels back. The cost is that tarballs are not in SHA256SUMS or the
+  # manifest; they are verified by the smoke that ran before the pack.
+  node:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,        target: aarch64-apple-darwin,      platform: darwin-arm64 }
+          - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,  platform: linux-x64-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, platform: linux-arm64-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build every Node binding for ${{ matrix.target }}
+        shell: bash
+        run: scripts/build-node.sh $NODE_BINDINGS
+      - name: Load and parse a generated fixture through each binding
+        run: node scripts/smoke-node.mjs
+      - name: Pack one tarball per binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-node
+          for crate in $NODE_BINDINGS; do
+            version="$(node -p "require('./$crate/package.json').version")"
+            (cd "$crate" && pnpm pack --pack-destination ../dist-node)
+            mv "dist-node/$crate-$version.tgz" "dist-node/$crate-$version-${{ matrix.platform }}.tgz"
+          done
+          ls -1 dist-node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.target }}
+          path: dist-node/*.tgz
+          if-no-files-found: error
+      - name: Attach the tarballs to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-node/*.tgz
+          fail_on_unmatched_files: true
 
   manifest:
     needs: wheels

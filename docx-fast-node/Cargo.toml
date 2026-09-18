@@ -1,0 +1,22 @@
+[package]
+name = "docx-fast-node"
+version = "0.2.2"
+edition.workspace = true
+authors.workspace = true
+description = "Node.js bindings for docx-fast-core"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "docx_fast_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+docx-fast-core = { path = "../docx-fast-core", features = ["arrow"] }
+napi = { workspace = true }
+napi-derive = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+napi-build = { workspace = true }

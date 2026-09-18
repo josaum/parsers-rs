@@ -3,15 +3,19 @@ resolver = "2"
 members = [
   "docx-fast-core",
   "docx-fast-py",
+  "docx-fast-node",
   "ooxml-archive",
   "xlsx-fast-core",
   "xlsx-fast-py",
+  "xlsx-fast-node",
   "pptx-fast-core",
   "pptx-fast-py",
+  "pptx-fast-node",
   "pdf-fast-core",
   "pdf-fast-py",
   "email-fast-core",
   "email-fast-py",
+  "email-fast-node",
   "json-fast-core",
   "json-fast-py",
   "xsd-fast-core",
@@ -30,6 +34,12 @@ arrow = "=58.3.0"
 arrow-ipc = { version = "=58.3.0", features = ["lz4", "zstd"] }
 arrow-schema = "=58.3.0"
 pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py38"] }
+# Node-API 2 bindings. napi 2 is the line the consumer shells were built
+# against; the `.node` ABI is what `@mycelia/*-fast-node` loads, so the major
+# stays put until every shell moves with it.
+napi = { version = "2.16", features = ["serde-json"] }
+napi-derive = "2.16"
+napi-build = "2.2"
 regex = "1.12"
 serde_json = "1.0"
 
