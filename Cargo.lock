@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "docx-fast-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "docx-fast-node"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "docx-fast-core",
  "napi",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "docx-fast-py"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "docx-fast-core",
  "pyo3",
@@ -721,7 +721,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "email-fast-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "email-fast-py"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "email-fast-core",
@@ -1645,7 +1645,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "ooxml-archive"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-fast-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1704,7 +1704,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-fast-py"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1823,7 +1823,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "pptx-fast-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "pptx-fast-node"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "napi",
  "napi-build",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "pptx-fast-py"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "pptx-fast-core",
  "pyo3",
@@ -2823,7 +2823,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xlsx-fast-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2842,7 +2842,7 @@ dependencies = [
 
 [[package]]
 name = "xlsx-fast-node"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "napi",
  "napi-build",
@@ -2853,7 +2853,7 @@ dependencies = [
 
 [[package]]
 name = "xlsx-fast-py"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
@@ -2863,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "xsd-fast-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "xsd-fast-py"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "pyo3",

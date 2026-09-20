@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "docx-fast"
-version = "0.2.2"
+version = "0.2.3"
 description = "High-performance Word (.docx) parser powered by Rust"
 readme = "README.md"
 license = { text = "MIT" }

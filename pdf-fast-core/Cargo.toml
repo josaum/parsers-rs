@@ -1,6 +1,6 @@
 [package]
 name = "pdf-fast-core"
-version = "0.2.1"
+version = "0.2.2"
 edition.workspace = true
 authors.workspace = true
 description = "Byte-level, xref-free PDF scanner focused on zero-copy extraction"
