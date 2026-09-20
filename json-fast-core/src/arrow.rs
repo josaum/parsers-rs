@@ -193,34 +193,74 @@ fn parse_timestamp_micros(value: &str) -> Result<i64> {
     Ok(parsed.timestamp_micros())
 }
 
-/// Look up `key` on a JSON object record. Missing keys and non-objects yield `None`.
+/// Look up `key` on a JSON object record. A missing key yields `None`.
+///
+/// Callers reach this only through [`build_batch`], which has already refused
+/// non-object records, so `None` always means "key absent" and never "this
+/// line was not an object".
 fn field_value<'a>(record: &'a Value, key: &str) -> Option<&'a Value> {
     record.as_object().and_then(|object| object.get(key))
 }
 
+/// The error for a present, non-null value whose JSON type does not fit the column.
+///
+/// A typed column must never turn a wrong-typed value into a null: a producer's
+/// type drift would land downstream as missing data with a successful exit.
+fn type_mismatch(key: &str, expected: &str, got: &Value) -> JsonError {
+    JsonError::Structure(format!("column {key:?} expected {expected}, got: {got}"))
+}
+
 /// Build one column array for `key` from a slice of records.
 fn build_column(records: &[Value], key: &str, data_type: &DataType) -> Result<ArrayRef> {
-    // Missing keys and JSON nulls both append a typed null.
+    // Missing keys and JSON nulls both append a typed null. A present value of
+    // the wrong JSON type is an error in every arm, never a null.
 
     match data_type {
         DataType::Boolean => {
             let mut builder = BooleanBuilder::new();
             for record in records {
-                builder.append_option(field_value(record, key).and_then(Value::as_bool));
+                match field_value(record, key) {
+                    None | Some(Value::Null) => builder.append_null(),
+                    Some(Value::Bool(flag)) => builder.append_value(*flag),
+                    Some(other) => return Err(type_mismatch(key, "a boolean", other)),
+                }
             }
             Ok(Arc::new(builder.finish()))
         }
         DataType::Int64 => {
             let mut builder = Int64Builder::new();
             for record in records {
-                builder.append_option(field_value(record, key).and_then(Value::as_i64));
+                match field_value(record, key) {
+                    None | Some(Value::Null) => builder.append_null(),
+                    Some(value) => match value.as_i64() {
+                        Some(number) => builder.append_value(number),
+                        // A float, a string, or an integer outside i64 (a u64
+                        // above i64::MAX) cannot be represented without loss.
+                        None => return Err(type_mismatch(key, "a 64-bit signed integer", value)),
+                    },
+                }
             }
             Ok(Arc::new(builder.finish()))
         }
         DataType::Float64 => {
             let mut builder = Float64Builder::new();
             for record in records {
-                builder.append_option(field_value(record, key).and_then(Value::as_f64));
+                match field_value(record, key) {
+                    None | Some(Value::Null) => builder.append_null(),
+                    // Any JSON number fits: inference unifies Int with Float
+                    // into Float, so integers legitimately reach this arm.
+                    Some(Value::Number(number)) => match number.as_f64() {
+                        Some(float) => builder.append_value(float),
+                        None => {
+                            return Err(type_mismatch(
+                                key,
+                                "a number representable as f64",
+                                &Value::Number(number.clone()),
+                            ));
+                        }
+                    },
+                    Some(other) => return Err(type_mismatch(key, "a number", other)),
+                }
             }
             Ok(Arc::new(builder.finish()))
         }
@@ -267,6 +307,15 @@ fn build_column(records: &[Value], key: &str, data_type: &DataType) -> Result<Ar
 /// schema. The schema must contain exactly the top-level keys to emit; unknown
 /// schema types are rejected fail-loud.
 pub fn build_batch(records: &[Value], schema: &SchemaRef) -> Result<RecordBatch> {
+    // Inference already refuses a non-object line; an explicit schema skipped
+    // that check, so `[1,2]` or `"x"` became a row of nulls. Refuse it here so
+    // both paths hold the same contract.
+    if let Some(index) = records.iter().position(|record| !record.is_object()) {
+        return Err(JsonError::Structure(format!(
+            "arrow conversion requires exactly one JSON object per line; record {index} is: {}",
+            records[index]
+        )));
+    }
     let columns = schema
         .fields()
         .iter()
@@ -525,6 +574,84 @@ mod tests {
         let records = crate::jsonl::parse_many("{\"occurred_at\":123}\n").unwrap();
         let err = build_batch(&records, &schema).unwrap_err();
         assert!(err.to_string().contains("expected an RFC-3339 string"));
+    }
+
+    fn one_column(name: &str, data_type: DataType) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(name, data_type, true)]))
+    }
+
+    fn explicit_error(jsonl: &str, schema: &SchemaRef) -> String {
+        let records = crate::jsonl::parse_many(jsonl).unwrap();
+        build_batch(&records, schema).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn explicit_schema_rejects_a_string_in_a_float_column() {
+        let err = explicit_error(
+            "{\"value\":\"3.1\"}\n",
+            &one_column("value", DataType::Float64),
+        );
+        assert!(err.contains("column \"value\" expected a number"), "{err}");
+    }
+
+    #[test]
+    fn explicit_schema_rejects_a_float_in_an_int_column() {
+        let err = explicit_error("{\"n\":1.5}\n", &one_column("n", DataType::Int64));
+        assert!(
+            err.contains("expected a 64-bit signed integer, got: 1.5"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn explicit_schema_rejects_an_integer_above_i64_max() {
+        let err = explicit_error(
+            "{\"n\":18446744073709551615}\n",
+            &one_column("n", DataType::Int64),
+        );
+        assert!(err.contains("expected a 64-bit signed integer"), "{err}");
+    }
+
+    #[test]
+    fn explicit_schema_rejects_a_number_in_a_boolean_column() {
+        let err = explicit_error("{\"ok\":1}\n", &one_column("ok", DataType::Boolean));
+        assert!(
+            err.contains("column \"ok\" expected a boolean, got: 1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn explicit_schema_rejects_a_non_object_record() {
+        let err = explicit_error("[1,2]\n", &one_column("n", DataType::Int64));
+        assert!(
+            err.contains("one JSON object per line; record 0 is: [1,2]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn explicit_schema_still_appends_null_for_absent_keys_and_json_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Boolean, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let records = crate::jsonl::parse_many(
+            "{\"b\":null,\"n\":null,\"f\":null}\n{}\n{\"b\":true,\"n\":7,\"f\":2}\n",
+        )
+        .unwrap();
+        let batch = build_batch(&records, &schema).expect("nulls and absent keys are not errors");
+        for column in batch.columns() {
+            assert_eq!(column.null_count(), 2);
+        }
+        // An integer is a legitimate value for a Float64 column.
+        let floats = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        assert_eq!(floats.value(2), 2.0);
     }
 
     #[test]

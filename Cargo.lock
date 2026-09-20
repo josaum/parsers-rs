@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "json-fast-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "json-fast-py"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "json-fast-core",
  "pyo3",
