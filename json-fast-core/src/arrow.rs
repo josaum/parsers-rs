@@ -206,8 +206,12 @@ fn field_value<'a>(record: &'a Value, key: &str) -> Option<&'a Value> {
 ///
 /// A typed column must never turn a wrong-typed value into a null: a producer's
 /// type drift would land downstream as missing data with a successful exit.
-fn type_mismatch(key: &str, expected: &str, got: &Value) -> JsonError {
-    JsonError::Structure(format!("column {key:?} expected {expected}, got: {got}"))
+fn type_mismatch(index: usize, key: &str, expected: &str, got: &Value) -> JsonError {
+    // The record index comes first: in a batch of thousands, the column and
+    // the value alone do not say which line the producer got wrong.
+    JsonError::Structure(format!(
+        "record {index}: column {key:?} expected {expected}, got: {got}"
+    ))
 }
 
 /// Build one column array for `key` from a slice of records.
@@ -218,25 +222,27 @@ fn build_column(records: &[Value], key: &str, data_type: &DataType) -> Result<Ar
     match data_type {
         DataType::Boolean => {
             let mut builder = BooleanBuilder::new();
-            for record in records {
+            for (index, record) in records.iter().enumerate() {
                 match field_value(record, key) {
                     None | Some(Value::Null) => builder.append_null(),
                     Some(Value::Bool(flag)) => builder.append_value(*flag),
-                    Some(other) => return Err(type_mismatch(key, "a boolean", other)),
+                    Some(other) => return Err(type_mismatch(index, key, "a boolean", other)),
                 }
             }
             Ok(Arc::new(builder.finish()))
         }
         DataType::Int64 => {
             let mut builder = Int64Builder::new();
-            for record in records {
+            for (index, record) in records.iter().enumerate() {
                 match field_value(record, key) {
                     None | Some(Value::Null) => builder.append_null(),
                     Some(value) => match value.as_i64() {
                         Some(number) => builder.append_value(number),
                         // A float, a string, or an integer outside i64 (a u64
                         // above i64::MAX) cannot be represented without loss.
-                        None => return Err(type_mismatch(key, "a 64-bit signed integer", value)),
+                        None => {
+                            return Err(type_mismatch(index, key, "a 64-bit signed integer", value))
+                        }
                     },
                 }
             }
@@ -244,7 +250,7 @@ fn build_column(records: &[Value], key: &str, data_type: &DataType) -> Result<Ar
         }
         DataType::Float64 => {
             let mut builder = Float64Builder::new();
-            for record in records {
+            for (index, record) in records.iter().enumerate() {
                 match field_value(record, key) {
                     None | Some(Value::Null) => builder.append_null(),
                     // Any JSON number fits: inference unifies Int with Float
@@ -253,20 +259,21 @@ fn build_column(records: &[Value], key: &str, data_type: &DataType) -> Result<Ar
                         Some(float) => builder.append_value(float),
                         None => {
                             return Err(type_mismatch(
+                                index,
                                 key,
                                 "a number representable as f64",
                                 &Value::Number(number.clone()),
                             ));
                         }
                     },
-                    Some(other) => return Err(type_mismatch(key, "a number", other)),
+                    Some(other) => return Err(type_mismatch(index, key, "a number", other)),
                 }
             }
             Ok(Arc::new(builder.finish()))
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let mut builder = TimestampMicrosecondBuilder::new().with_timezone_opt(tz.clone());
-            for record in records {
+            for (index, record) in records.iter().enumerate() {
                 match field_value(record, key) {
                     None | Some(Value::Null) => builder.append_option(None),
                     Some(Value::String(s)) => {
@@ -274,7 +281,7 @@ fn build_column(records: &[Value], key: &str, data_type: &DataType) -> Result<Ar
                     }
                     Some(other) => {
                         return Err(JsonError::Structure(format!(
-                            "timestamp column {key:?} expected an RFC-3339 string, got: {other}"
+                            "record {index}: timestamp column {key:?} expected an RFC-3339 string, got: {other}"
                         )));
                     }
                 }
