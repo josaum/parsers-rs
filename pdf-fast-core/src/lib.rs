@@ -9284,6 +9284,64 @@ mod tests {
     use flate2::{write::ZlibEncoder, Compression};
     use std::io::{Cursor, Write};
 
+    /// The reference the `as_chunks` decoders replaced: `chunks_exact(2)`, which
+    /// ignores a trailing odd byte. The decoders sit on the text-extraction
+    /// path, so "same pairs, same dropped remainder" is asserted, not assumed.
+    fn reference_utf16(bytes: &[u8], big_endian: bool) -> String {
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .filter(|chunk| chunk.len() == 2)
+            .map(|chunk| {
+                if big_endian {
+                    u16::from_be_bytes([chunk[0], chunk[1]])
+                } else {
+                    u16::from_le_bytes([chunk[0], chunk[1]])
+                }
+            })
+            .collect();
+        String::from_utf16_lossy(&units)
+    }
+
+    #[test]
+    fn utf16_decoders_match_the_chunked_reference_on_even_odd_and_tiny_inputs() {
+        // "Aé" + U+1F600 as a surrogate pair, big-endian.
+        let even_be: [u8; 8] = [0x00, 0x41, 0x00, 0xE9, 0xD8, 0x3D, 0xDE, 0x00];
+        let mut even_le = even_be;
+        for pair in even_le.chunks_mut(2) {
+            pair.swap(0, 1);
+        }
+        let mut cases: Vec<Vec<u8>> = vec![Vec::new(), vec![0x41], even_be.to_vec()];
+        // Every odd-length prefix and the even input with one stray trailing byte.
+        for len in 1..=even_be.len() {
+            cases.push(even_be[..len].to_vec());
+        }
+        let mut stray = even_be.to_vec();
+        stray.push(0x7F);
+        cases.push(stray);
+        // A lone high surrogate, which must stay lossy in both.
+        cases.push(vec![0xD8, 0x3D, 0x00]);
+
+        for bytes in &cases {
+            assert_eq!(
+                decode_utf16_be(bytes),
+                reference_utf16(bytes, true),
+                "BE {bytes:?}"
+            );
+        }
+        let mut le_cases = cases.clone();
+        le_cases.push(even_le.to_vec());
+        for bytes in &le_cases {
+            assert_eq!(
+                decode_utf16_le(bytes),
+                reference_utf16(bytes, false),
+                "LE {bytes:?}"
+            );
+        }
+        // The odd trailing byte is dropped, not decoded and not an error.
+        assert_eq!(decode_utf16_be(&[0x00, 0x41, 0x7F]), "A");
+        assert_eq!(decode_utf16_le(&[0x41, 0x00, 0x7F]), "A");
+    }
+
     #[test]
     fn bounded_path_reader_stops_one_byte_past_document_limit() {
         let directory = tempfile::tempdir().unwrap();
