@@ -480,14 +480,26 @@ pub fn parse_mbox(
 ) -> Result<usize> {
     let path = path.as_ref();
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut count = 0;
     let mut current_message = Vec::new();
     let mut in_message = false;
 
-    for line in reader.lines() {
-        let line = line?;
+    // Lossy line reads: real-world mbox corpora (e.g. 1990s corporate
+    // mail) contain non-UTF-8 bytes; BufRead::lines would abort the whole
+    // mailbox on the first one. One bad byte replaces with U+FFFD and the
+    // mailbox survives — consistent with this crate's lenient-by-design
+    // parsing posture.
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&raw)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
 
         // Mbox messages start with "From " at beginning of line
         if line.starts_with("From ") {
@@ -1243,5 +1255,31 @@ mod tests {
             content: None,
         });
         assert!(with_attachment.has_substantive_content());
+    }
+
+    #[test]
+    fn mbox_with_invalid_utf8_bytes_survives() {
+        // Real-world mbox corpora carry non-UTF-8 bytes (1990s mail,
+        // latin-1 bodies). One bad byte must not abort the mailbox.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bad.mbox");
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(
+            b"From a@x.example Mon Jan 1 00:00:00 2024\nFrom: a@x.example\nTo: b@y.example\nSubject: first\n\nbody one\n",
+        );
+        bytes.extend_from_slice(&[0xFF, 0xFE, b'\n']); // invalid UTF-8 line
+        bytes.extend_from_slice(
+            b"From c@z.example Mon Jan 2 00:00:00 2024\nFrom: c@z.example\nTo: b@y.example\nSubject: second\n\nbody two\n",
+        );
+        std::fs::write(&path, bytes).unwrap();
+        let mut subjects = Vec::new();
+        let count = parse_mbox(&path, ParseOptions::default(), |email| {
+            subjects.push(email.subject.unwrap_or_default());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 2, "both messages must survive: {subjects:?}");
+        assert!(subjects.contains(&"first".to_string()));
+        assert!(subjects.contains(&"second".to_string()));
     }
 }
