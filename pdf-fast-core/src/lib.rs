@@ -1590,9 +1590,9 @@ impl PdfDocument {
                 indices.sort_by(|&a, &b| {
                     let sy_diff = (sites[a].y - sites[b].y).abs();
                     if sy_diff > 2.0 {
-                        sites[a].y.partial_cmp(&sites[b].y).unwrap()
+                        sites[a].y.total_cmp(&sites[b].y)
                     } else {
-                        sites[a].x.partial_cmp(&sites[b].x).unwrap()
+                        sites[a].x.total_cmp(&sites[b].x)
                     }
                 });
 
@@ -2167,7 +2167,11 @@ impl PdfDocument {
                             .iter()
                             .map(|p| (p.y, p.x))
                             .fold((f32::MAX, f32::MAX), |acc, v| if v < acc { v } else { acc });
-                        ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+                        // Lexicographic on (y, x) with a total order on each
+                        // component: a tuple has no total_cmp, and comparing the
+                        // pair with `<` is exactly the partial order that made
+                        // this sort panic.
+                        ka.0.total_cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
                     });
                     let lens: Vec<f32> = contours
                         .iter()
@@ -2197,7 +2201,7 @@ impl PdfDocument {
                         .enumerate()
                         .map(|(i, l)| ((l / total) * k as f32 - alloc[i] as f32, i))
                         .collect();
-                    rema.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    rema.sort_by(|a, b| b.0.total_cmp(&a.0));
                     let mut ri = 0;
                     while assigned < k && !rema.is_empty() {
                         alloc[rema[ri % rema.len()].1] += 1;
@@ -2318,7 +2322,7 @@ impl PdfDocument {
                 // dominates by count, so the median size IS the font size —
                 // gate relative to it rather than any absolute constant.
                 let mut sizes: Vec<f32> = page.iter().map(|g| g.2).collect();
-                sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                sizes.sort_by(|a, b| a.total_cmp(b));
                 if let Some(&median) = sizes.get(sizes.len() / 2) {
                     // low gate at 7% of the font size: a body-text period is
                     // ~1.2pt against a 7.2pt median — the 15% floor was
@@ -3808,7 +3812,7 @@ pub fn band_by_projection<T: Copy>(
     }
     // median band height stands in for the leading in the box formula
     let mut heights: Vec<f32> = intervals.iter().map(|(a, b)| b - a).collect();
-    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    heights.sort_by(|a, b| a.total_cmp(b));
     let lead = heights
         .get(heights.len() / 2)
         .copied()
@@ -3829,7 +3833,7 @@ pub fn band_by_projection<T: Copy>(
         if band.is_empty() {
             continue;
         }
-        band.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap_or(std::cmp::Ordering::Equal));
+        band.sort_by(|p, q| p.0.total_cmp(&q.0));
         let top = band.iter().map(|i| i.1).fold(f32::MAX, f32::min);
         let mut members: Vec<(f32, T)> = Vec::new();
         let (mut x0, mut x1) = (band[0].0, band[0].0);
@@ -3849,16 +3853,7 @@ pub fn band_by_projection<T: Copy>(
             members,
         ));
     }
-    lines.sort_by(|a, b| {
-        a.0[1]
-            .partial_cmp(&b.0[1])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                a.0[0]
-                    .partial_cmp(&b.0[0])
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-    });
+    lines.sort_by(|a, b| a.0[1].total_cmp(&b.0[1]).then(a.0[0].total_cmp(&b.0[0])));
     lines
 }
 
@@ -3885,11 +3880,7 @@ pub fn band_text_lines_public<T: Copy>(
     if items.is_empty() {
         return Vec::new();
     }
-    items.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-    });
+    items.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.total_cmp(&b.0)));
 
     let mut distinct: Vec<f32> = items.iter().map(|o| o.1).collect();
     distinct.dedup_by(|a, b| (*a - *b).abs() < 0.05);
@@ -3898,7 +3889,7 @@ pub fn band_text_lines_public<T: Copy>(
         .map(|w| w[1] - w[0])
         .filter(|g| *g > 4.0 && *g < 60.0)
         .collect();
-    big_gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    big_gaps.sort_by(|a, b| a.total_cmp(b));
     let leading = big_gaps
         .get(big_gaps.len() / 2)
         .copied()
@@ -3930,7 +3921,7 @@ pub fn band_text_lines_public<T: Copy>(
         // Sort by x: origins arrive in baseline order, and a band spans
         // several baselines, so x is not monotonic here (left unsorted this
         // produced negative-width boxes).
-        band.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        band.sort_by(|a, b| a.0.total_cmp(&b.0));
         // Baseline of the band = the median, robust to the intra-line drift.
         let baseline = band[band.len() / 2].1;
         let mut members: Vec<(f32, T)> = Vec::new();
@@ -3962,16 +3953,7 @@ pub fn band_text_lines_public<T: Copy>(
         ));
     }
 
-    lines.sort_by(|a, b| {
-        a.0[1]
-            .partial_cmp(&b.0[1])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                a.0[0]
-                    .partial_cmp(&b.0[0])
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-    });
+    lines.sort_by(|a, b| a.0[1].total_cmp(&b.0[1]).then(a.0[0].total_cmp(&b.0[0])));
     lines
 }
 
@@ -4081,11 +4063,7 @@ fn sort_blocks_reading_order(blocks: &mut Vec<ReadingOrderBlock>, page_width: f3
     //    sweep over x_min-sorted blocks: a column break is any gap larger
     //    than `column_gap` between adjacent x_min values.
     let column_gap = (page_width * 0.10).max(30.0);
-    body.sort_by(|a, b| {
-        a.x_min
-            .partial_cmp(&b.x_min)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    body.sort_by(|a, b| a.x_min.total_cmp(&b.x_min));
 
     let mut columns: Vec<Vec<ReadingOrderBlock>> = Vec::new();
     let mut current: Vec<ReadingOrderBlock> = Vec::new();
@@ -4106,19 +4084,11 @@ fn sort_blocks_reading_order(blocks: &mut Vec<ReadingOrderBlock>, page_width: f3
     }
 
     // 3. Banners sorted top-to-bottom (descending y_max).
-    banners.sort_by(|a, b| {
-        b.y_max
-            .partial_cmp(&a.y_max)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    banners.sort_by(|a, b| b.y_max.total_cmp(&a.y_max));
 
     // 4. Each column sorted top-to-bottom.
     for col in columns.iter_mut() {
-        col.sort_by(|a, b| {
-            b.y_max
-                .partial_cmp(&a.y_max)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        col.sort_by(|a, b| b.y_max.total_cmp(&a.y_max));
     }
 
     // 5. Stitch: banners first, then columns left-to-right.
@@ -5210,7 +5180,6 @@ fn sort_into_reading_order<T>(
     }
 }
 
-
 fn contains_text_operators(bytes: &[u8]) -> bool {
     memmem::find(bytes, b"BT").is_some()
         || memmem::find(bytes, b"Tj").is_some()
@@ -5359,17 +5328,8 @@ impl TableGrid {
                 left.row
                     .cmp(&right.row)
                     .then(left.col.cmp(&right.col))
-                    .then_with(|| {
-                        right
-                            .y
-                            .partial_cmp(&left.y)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .then_with(|| {
-                        left.x
-                            .partial_cmp(&right.x)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    .then_with(|| right.y.total_cmp(&left.y))
+                    .then_with(|| left.x.total_cmp(&right.x))
             });
             let text = cell_assignments
                 .iter()
@@ -5735,9 +5695,7 @@ fn quantize_axis(mut coords: Vec<f32>, epsilon: f32) -> Vec<f32> {
     if coords.is_empty() {
         return Vec::new();
     }
-    coords.sort_unstable_by(|left, right| {
-        left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    coords.sort_unstable_by(|left, right| left.total_cmp(right));
     let mut canonical = vec![coords[0]];
     for coord in coords.into_iter().skip(1) {
         let last = *canonical.last().unwrap_or(&coord);
@@ -5749,11 +5707,7 @@ fn quantize_axis(mut coords: Vec<f32>, epsilon: f32) -> Vec<f32> {
 }
 
 fn find_nearest_axis(axis: &[f32], value: f32) -> usize {
-    match axis.binary_search_by(|probe| {
-        probe
-            .partial_cmp(&value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }) {
+    match axis.binary_search_by(|probe| probe.total_cmp(&value)) {
         Ok(index) => index,
         Err(index) => {
             if index == 0 {
@@ -5986,13 +5940,8 @@ fn merge_horizontal_rule_segments(
     }
     segments.sort_unstable_by(|left, right| {
         left.y0
-            .partial_cmp(&right.y0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                left.x0
-                    .partial_cmp(&right.x0)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+            .total_cmp(&right.y0)
+            .then(left.x0.total_cmp(&right.x0))
     });
 
     let mut merged: Vec<LineSegment> = Vec::with_capacity(segments.len());
@@ -6016,13 +5965,8 @@ fn merge_vertical_rule_segments(mut segments: Vec<LineSegment>, epsilon: f32) ->
     }
     segments.sort_unstable_by(|left, right| {
         left.x0
-            .partial_cmp(&right.x0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                left.y0
-                    .partial_cmp(&right.y0)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+            .total_cmp(&right.x0)
+            .then(left.y0.total_cmp(&right.y0))
     });
 
     let mut merged: Vec<LineSegment> = Vec::with_capacity(segments.len());

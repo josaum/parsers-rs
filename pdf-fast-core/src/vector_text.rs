@@ -1376,11 +1376,9 @@ pub fn extract_page_vector_text_runs_checked(
     all_runs.sort_by(|a, b| {
         let bucket_a = (a.page_y / 4.0).round() as i32;
         let bucket_b = (b.page_y / 4.0).round() as i32;
-        bucket_a.cmp(&bucket_b).then_with(|| {
-            a.page_x
-                .partial_cmp(&b.page_x)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        bucket_a
+            .cmp(&bucket_b)
+            .then_with(|| a.page_x.total_cmp(&b.page_x))
     });
 
     Ok(all_runs)
