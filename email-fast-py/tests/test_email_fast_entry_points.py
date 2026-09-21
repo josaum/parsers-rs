@@ -108,6 +108,40 @@ def test_parse_mbox_arrow_is_callable_with_defaults(mbox_path: str, tmp_path: Pa
     assert out.exists() or list(tmp_path.glob("out*")), "arrow output must be written"
 
 
+def test_wrappers_forward_optionals_by_keyword() -> None:
+    """Positional forwarding is how a silent misalignment becomes possible.
+
+    `parse_mbox_arrow` passed `batch_size` into the slot the native function
+    reads as `max_total_attachment_bytes`. That RAISED while the native
+    signatures lacked defaults, which is the only reason anyone noticed. Adding
+    defaults — the fix for the other seven functions — would have converted
+    that loud failure into a silent one, feeding a batch size to an attachment
+    budget forever. Keyword forwarding makes the whole class impossible rather
+    than merely tested, so this asserts the style, not one call site.
+    """
+    import re
+
+    source = (Path(__file__).resolve().parents[1] / "email_fast" / "__init__.py").read_text()
+    optionals = (
+        "max_attachment_size",
+        "include_raw_headers",
+        "html_to_text",
+        "extract_attachment_content",
+        "max_total_attachment_bytes",
+        "batch_size",
+    )
+    positional = []
+    for call in re.finditer(r"\w+_py\(\n(.*?)\n\s*\)", source, re.DOTALL):
+        for line in call.group(1).splitlines():
+            bare = line.strip().rstrip(",")
+            if bare in optionals:
+                positional.append(bare)
+    assert positional == [], (
+        "these optionals are forwarded positionally, so reordering the native "
+        f"signature would silently misalign them: {sorted(set(positional))}"
+    )
+
+
 def test_every_entry_point_has_a_test(eml_path: str) -> None:
     """The suite must not silently stop covering a function someone adds."""
     import inspect

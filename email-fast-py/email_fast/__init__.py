@@ -40,11 +40,11 @@ def parse_email(
     """
     payload = parse_email_json_py(
         path,
-        max_attachment_size,
-        include_raw_headers,
-        html_to_text,
-        extract_attachment_content,
-        max_total_attachment_bytes,
+        max_attachment_size=max_attachment_size,
+        include_raw_headers=include_raw_headers,
+        html_to_text=html_to_text,
+        extract_attachment_content=extract_attachment_content,
+        max_total_attachment_bytes=max_total_attachment_bytes,
     )
     return json.loads(payload)
 
@@ -72,11 +72,11 @@ def parse_eml(
     """
     payload = parse_eml_json_py(
         path,
-        max_attachment_size,
-        include_raw_headers,
-        html_to_text,
-        extract_attachment_content,
-        max_total_attachment_bytes,
+        max_attachment_size=max_attachment_size,
+        include_raw_headers=include_raw_headers,
+        html_to_text=html_to_text,
+        extract_attachment_content=extract_attachment_content,
+        max_total_attachment_bytes=max_total_attachment_bytes,
     )
     return json.loads(payload)
 
@@ -104,11 +104,11 @@ def parse_email_json(
     """
     return parse_email_json_py(
         path,
-        max_attachment_size,
-        include_raw_headers,
-        html_to_text,
-        extract_attachment_content,
-        max_total_attachment_bytes,
+        max_attachment_size=max_attachment_size,
+        include_raw_headers=include_raw_headers,
+        html_to_text=html_to_text,
+        extract_attachment_content=extract_attachment_content,
+        max_total_attachment_bytes=max_total_attachment_bytes,
     )
 
 
@@ -135,11 +135,11 @@ def parse_email_ndjson(
     return parse_email_ndjson_py(
         path,
         out_path,
-        max_attachment_size,
-        include_raw_headers,
-        html_to_text,
-        extract_attachment_content,
-        max_total_attachment_bytes,
+        max_attachment_size=max_attachment_size,
+        include_raw_headers=include_raw_headers,
+        html_to_text=html_to_text,
+        extract_attachment_content=extract_attachment_content,
+        max_total_attachment_bytes=max_total_attachment_bytes,
     )
 
 
@@ -169,11 +169,11 @@ def parse_mbox_ndjson(
     return parse_mbox_ndjson_py(
         path,
         out_path,
-        max_attachment_size,
-        include_raw_headers,
-        html_to_text,
-        extract_attachment_content,
-        max_total_attachment_bytes,
+        max_attachment_size=max_attachment_size,
+        include_raw_headers=include_raw_headers,
+        html_to_text=html_to_text,
+        extract_attachment_content=extract_attachment_content,
+        max_total_attachment_bytes=max_total_attachment_bytes,
     )
 
 
@@ -205,12 +205,12 @@ def parse_mbox_arrow(
     return parse_mbox_arrow_py(
         path,
         out_path,
-        max_attachment_size,
-        include_raw_headers,
-        html_to_text,
-        extract_attachment_content,
-        max_total_attachment_bytes,
-        batch_size,
+        max_attachment_size=max_attachment_size,
+        include_raw_headers=include_raw_headers,
+        html_to_text=html_to_text,
+        extract_attachment_content=extract_attachment_content,
+        max_total_attachment_bytes=max_total_attachment_bytes,
+        batch_size=batch_size,
     )
 
 
@@ -251,10 +251,10 @@ def parse_email_bytes(
         parse_email_bytes_json_py(
             source,
             format,
-            max_attachment_size,
-            include_raw_headers,
-            html_to_text,
-            extract_attachment_content,
+            max_attachment_size=max_attachment_size,
+            include_raw_headers=include_raw_headers,
+            html_to_text=html_to_text,
+            extract_attachment_content=extract_attachment_content,
         )
     )
 
