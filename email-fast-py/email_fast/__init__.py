@@ -23,6 +23,7 @@ def parse_email(
     include_raw_headers=False,
     html_to_text=False,
     extract_attachment_content=False,
+    max_total_attachment_bytes=None,
 ):
     """
     Parse an email file (.eml or .msg) and return a Python dict.
@@ -43,6 +44,7 @@ def parse_email(
         include_raw_headers,
         html_to_text,
         extract_attachment_content,
+        max_total_attachment_bytes,
     )
     return json.loads(payload)
 
@@ -53,6 +55,7 @@ def parse_eml(
     include_raw_headers=False,
     html_to_text=False,
     extract_attachment_content=False,
+    max_total_attachment_bytes=None,
 ):
     """
     Parse an EML file and return a Python dict.
@@ -73,6 +76,7 @@ def parse_eml(
         include_raw_headers,
         html_to_text,
         extract_attachment_content,
+        max_total_attachment_bytes,
     )
     return json.loads(payload)
 
@@ -83,6 +87,7 @@ def parse_email_json(
     include_raw_headers=False,
     html_to_text=False,
     extract_attachment_content=False,
+    max_total_attachment_bytes=None,
 ):
     """
     Parse an email file and return raw JSON string.
@@ -103,6 +108,7 @@ def parse_email_json(
         include_raw_headers,
         html_to_text,
         extract_attachment_content,
+        max_total_attachment_bytes,
     )
 
 
@@ -113,6 +119,7 @@ def parse_email_ndjson(
     include_raw_headers=False,
     html_to_text=False,
     extract_attachment_content=False,
+    max_total_attachment_bytes=None,
 ):
     """
     Parse an email file and write to NDJSON.
@@ -132,6 +139,7 @@ def parse_email_ndjson(
         include_raw_headers,
         html_to_text,
         extract_attachment_content,
+        max_total_attachment_bytes,
     )
 
 
@@ -142,6 +150,7 @@ def parse_mbox_ndjson(
     include_raw_headers=False,
     html_to_text=False,
     extract_attachment_content=False,
+    max_total_attachment_bytes=None,
 ):
     """
     Parse an mbox file and write to NDJSON.
@@ -164,6 +173,7 @@ def parse_mbox_ndjson(
         include_raw_headers,
         html_to_text,
         extract_attachment_content,
+        max_total_attachment_bytes,
     )
 
 
@@ -174,6 +184,7 @@ def parse_mbox_arrow(
     include_raw_headers=False,
     html_to_text=False,
     extract_attachment_content=False,
+    max_total_attachment_bytes=None,
     batch_size=None,
 ):
     """
@@ -198,11 +209,14 @@ def parse_mbox_arrow(
         include_raw_headers,
         html_to_text,
         extract_attachment_content,
+        max_total_attachment_bytes,
         batch_size,
     )
 
 
-def extract_attachments(path, out_dir, max_attachment_size=None):
+def extract_attachments(
+    path, out_dir, max_attachment_size=None, max_total_attachment_bytes=None
+):
     """
     Extract attachments from an email file.
     
@@ -214,7 +228,7 @@ def extract_attachments(path, out_dir, max_attachment_size=None):
     Returns:
         List of paths to extracted files
     """
-    return extract_attachments_py(path, out_dir, max_attachment_size)
+    return extract_attachments_py(path, out_dir, max_attachment_size, max_total_attachment_bytes)
 
 
 
@@ -226,6 +240,7 @@ def parse_email_bytes(
     include_raw_headers=False,
     html_to_text=False,
     extract_attachment_content=False,
+    max_total_attachment_bytes=None,
 ):
     """Parse EML or MSG bytes without creating or accepting a file path.
 

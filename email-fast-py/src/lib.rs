@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 #[pyfunction]
+#[pyo3(signature = (path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None))]
 fn parse_email_json_py(
     path: &str,
     max_attachment_size: Option<usize>,
@@ -32,6 +33,7 @@ fn parse_email_json_py(
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None))]
 fn parse_eml_json_py(
     path: &str,
     max_attachment_size: Option<usize>,
@@ -55,6 +57,7 @@ fn parse_eml_json_py(
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, out_path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None))]
 fn parse_email_ndjson_py(
     path: &str,
     out_path: &str,
@@ -78,6 +81,7 @@ fn parse_email_ndjson_py(
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, out_path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None))]
 fn parse_mbox_ndjson_py(
     path: &str,
     out_path: &str,
@@ -107,6 +111,7 @@ fn parse_mbox_ndjson_py(
     clippy::too_many_arguments,
     reason = "mirrors the released Python signature"
 )]
+#[pyo3(signature = (path, out_path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None, batch_size=None))]
 fn parse_mbox_arrow_py(
     path: &str,
     out_path: &str,
@@ -135,6 +140,7 @@ fn parse_mbox_arrow_py(
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, out_dir, max_attachment_size=None, max_total_attachment_bytes=None))]
 fn extract_attachments_py(
     path: &str,
     out_dir: &str,

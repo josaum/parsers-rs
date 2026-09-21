@@ -369,7 +369,6 @@ class FastPdfPageScanner:
 
 
 __all__ = [
-    "FastPdfDataset",
     "FastPdfPageScanner",
     "FullTextDiagnostics",
     "PageDimension",
