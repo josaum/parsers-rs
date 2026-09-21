@@ -1,6 +1,6 @@
 [package]
 name = "xsd-fast-core"
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 authors.workspace = true
 description = "High-performance XSD schema parser with Arrow schema derivation and simple-type validation"
