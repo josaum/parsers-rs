@@ -154,7 +154,9 @@ impl Attachment {
     /// Whether this attachment is itself an email (message/rfc822, or an
     /// `.eml` file), i.e. a candidate for recursive parsing.
     pub fn is_nested_message(&self) -> bool {
-        self.content_type.to_ascii_lowercase().contains("message/rfc822")
+        self.content_type
+            .to_ascii_lowercase()
+            .contains("message/rfc822")
             || self.filename.to_ascii_lowercase().ends_with(".eml")
     }
 
@@ -164,10 +166,9 @@ impl Attachment {
     pub fn decode_content(&self) -> Option<Vec<u8>> {
         let content = self.content.as_deref()?;
         let mut table = [255u8; 256];
-        for (i, c) in
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-                .bytes()
-                .enumerate()
+        for (i, c) in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            .bytes()
+            .enumerate()
         {
             table[c as usize] = i as u8;
         }
@@ -267,17 +268,20 @@ impl Email {
     /// "email" is garbage in, garbage out).
     pub fn has_substantive_content(&self) -> bool {
         !self.from.address.trim().is_empty()
-            || self.subject.as_deref().map_or(false, |s| !s.trim().is_empty())
+            || self
+                .subject
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
             || self
                 .body
                 .text
                 .as_deref()
-                .map_or(false, |t| !t.trim().is_empty())
+                .is_some_and(|t| !t.trim().is_empty())
             || self
                 .body
                 .html
                 .as_deref()
-                .map_or(false, |h| !h.trim().is_empty())
+                .is_some_and(|h| !h.trim().is_empty())
             || !self.attachments.is_empty()
     }
 }
@@ -1182,7 +1186,10 @@ mod tests {
             content: Some("SGVsbG8=".to_string()), // "Hello"
         };
         assert!(nested.is_nested_message());
-        assert_eq!(nested.decode_content().as_deref(), Some(b"Hello".as_slice()));
+        assert_eq!(
+            nested.decode_content().as_deref(),
+            Some(b"Hello".as_slice())
+        );
 
         let no_ext = Attachment {
             filename: "README".into(),
@@ -1202,7 +1209,10 @@ mod tests {
         fn bare_email() -> Email {
             Email {
                 message_id: None,
-                from: EmailAddress { name: None, address: String::new() },
+                from: EmailAddress {
+                    name: None,
+                    address: String::new(),
+                },
                 reply_to: None,
                 to: Vec::new(),
                 cc: Vec::new(),
@@ -1234,5 +1244,4 @@ mod tests {
         });
         assert!(with_attachment.has_substantive_content());
     }
-
 }
