@@ -158,14 +158,8 @@ pub fn build_adjacency(sites: &[GlyphSite], k: usize) -> Vec<DelaunayEdge> {
     sorted_indices.sort_by(|&a, &b| {
         sites[a]
             .y
-            .partial_cmp(&sites[b].y)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                sites[a]
-                    .x
-                    .partial_cmp(&sites[b].x)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+            .total_cmp(&sites[b].y)
+            .then(sites[a].x.total_cmp(&sites[b].x))
     });
 
     for (pos, &i) in sorted_indices.iter().enumerate() {
@@ -186,7 +180,7 @@ pub fn build_adjacency(sites: &[GlyphSite], k: usize) -> Vec<DelaunayEdge> {
             })
             .collect();
 
-        neighbors.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        neighbors.sort_by(|a, b| a.1.total_cmp(&b.1));
         neighbors.truncate(k);
 
         for (j, distance) in neighbors {
@@ -378,11 +372,7 @@ pub fn converge(
             })
             .collect();
 
-        candidates.sort_by(|a, b| {
-            a.energy
-                .partial_cmp(&b.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_by(|a, b| a.energy.total_cmp(&b.energy));
 
         for candidate in candidates {
             let ra = uf.find(candidate.region_a);
