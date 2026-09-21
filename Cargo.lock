@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "email-fast-node"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "email-fast-core",
  "napi",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "email-fast-py"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "email-fast-core",
