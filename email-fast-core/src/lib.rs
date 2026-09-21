@@ -1282,5 +1282,4 @@ mod tests {
         assert!(subjects.contains(&"first".to_string()));
         assert!(subjects.contains(&"second".to_string()));
     }
-
 }
