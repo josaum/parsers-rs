@@ -1817,15 +1817,20 @@ impl PdfDocument {
             }
         }
 
-        blocks.sort_by(|a, b| {
-            if a.page_index != b.page_index {
-                a.page_index.cmp(&b.page_index)
-            } else if (a.y - b.y).abs() < 5.0 {
-                a.x.total_cmp(&b.x)
-            } else {
-                b.y.total_cmp(&a.y)
+        // Pages in order, then reading order within each page. The previous
+        // single comparator mixed a 5pt band with a y comparison and was
+        // therefore intransitive; see sort_into_reading_order.
+        blocks.sort_by_key(|block| block.page_index);
+        let mut start = 0;
+        while start < blocks.len() {
+            let page = blocks[start].page_index;
+            let mut end = start + 1;
+            while end < blocks.len() && blocks[end].page_index == page {
+                end += 1;
             }
-        });
+            sort_into_reading_order(&mut blocks[start..end], 5.0, |b| b.y, |b| b.x);
+            start = end;
+        }
 
         blocks
     }
@@ -1833,7 +1838,12 @@ impl PdfDocument {
     #[cfg(feature = "arrow")]
     fn page_multimodal_row(&self, page: &PdfPage) -> Result<PageMultimodalRow> {
         let mut runs = self.semantic_text_runs_for_page(page);
-        runs.sort_by(compare_text_runs);
+        sort_into_reading_order(
+            &mut runs,
+            4.0,
+            |run| run.y.unwrap_or(0.0),
+            |run| run.x.unwrap_or(0.0),
+        );
 
         let input_text = runs
             .iter()
@@ -5158,22 +5168,48 @@ fn build_table_record_batch(rows: Vec<TableRow>) -> Result<RecordBatch> {
     .map_err(Into::into)
 }
 
-#[cfg(feature = "arrow")]
-fn compare_text_runs(left: &PdfTextRun, right: &PdfTextRun) -> std::cmp::Ordering {
-    let left_y = left.y.unwrap_or(0.0);
-    let right_y = right.y.unwrap_or(0.0);
-    let dy = (right_y - left_y).abs();
-    if dy > 4.0 {
-        right_y
-            .partial_cmp(&left_y)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    } else {
-        left.x
-            .unwrap_or(0.0)
-            .partial_cmp(&right.x.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
+/// Order items into reading order: lines top to bottom, left to right within a
+/// line.
+///
+/// A banded comparator — "within N points compare by x, otherwise by y" — is
+/// **not a total order**, and this is not a NaN edge case. For y values 0, 3
+/// and 6 under a 4-point band, a/b and b/c compare by x while a/c compares by
+/// y, so `a < b < c < a` is reachable with ordinary finite coordinates. Rust's
+/// stable sort detects the violated contract and panics
+/// ("user-provided comparison function does not correctly implement a total
+/// order"), which crosses the pyo3 boundary as a PanicException. Whether it
+/// trips depends on the input length, because only some paths in the sort
+/// check, so such a comparator can pass every small test and panic in
+/// production.
+///
+/// Grouping first removes the contradiction instead of hiding it: each item is
+/// assigned to a line by a single pass, and the ordering within a line is a
+/// plain comparison on x. Both steps are transitive, so the result is a total
+/// order by construction rather than by luck.
+fn sort_into_reading_order<T>(
+    items: &mut [T],
+    tolerance: f32,
+    y_of: impl Fn(&T) -> f32,
+    x_of: impl Fn(&T) -> f32,
+) {
+    // Top to bottom. total_cmp so a NaN coordinate orders deterministically
+    // instead of poisoning the comparison.
+    items.sort_by(|a, b| y_of(b).total_cmp(&y_of(a)));
+
+    // Greedy lines, anchored on the first item of each line so the band cannot
+    // drift arbitrarily far from where it started.
+    let mut start = 0;
+    while start < items.len() {
+        let anchor = y_of(&items[start]);
+        let mut end = start + 1;
+        while end < items.len() && (anchor - y_of(&items[end])).abs() <= tolerance {
+            end += 1;
+        }
+        items[start..end].sort_by(|a, b| x_of(a).total_cmp(&x_of(b)));
+        start = end;
     }
 }
+
 
 fn contains_text_operators(bytes: &[u8]) -> bool {
     memmem::find(bytes, b"BT").is_some()
