@@ -141,6 +141,54 @@ pub struct Attachment {
     pub content: Option<String>,
 }
 
+impl Attachment {
+    /// The attachment's file extension, lowercased, if any.
+    ///
+    /// Consumers classifying attachments (`attach|pdf`, `attach|zip`)
+    /// should use this instead of reimplementing `rsplit('.')`.
+    pub fn extension(&self) -> Option<String> {
+        let idx = self.filename.rfind('.')?;
+        Some(self.filename[idx + 1..].to_ascii_lowercase())
+    }
+
+    /// Whether this attachment is itself an email (message/rfc822, or an
+    /// `.eml` file), i.e. a candidate for recursive parsing.
+    pub fn is_nested_message(&self) -> bool {
+        self.content_type.to_ascii_lowercase().contains("message/rfc822")
+            || self.filename.to_ascii_lowercase().ends_with(".eml")
+    }
+
+    /// Decoded attachment bytes, when content extraction was enabled
+    /// (`ParseOptions::extract_attachment_content`). Content is
+    /// base64-encoded in transit; this decodes it.
+    pub fn decode_content(&self) -> Option<Vec<u8>> {
+        let content = self.content.as_deref()?;
+        let mut table = [255u8; 256];
+        for (i, c) in
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                .bytes()
+                .enumerate()
+        {
+            table[c as usize] = i as u8;
+        }
+        let mut out = Vec::with_capacity(content.len() / 4 * 3);
+        let (mut acc, mut bits) = (0u32, 0u32);
+        for &b in content.as_bytes() {
+            let v = table[b as usize];
+            if v == 255 {
+                continue;
+            }
+            acc = (acc << 6) | v as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        Some(out)
+    }
+}
+
 /// Email body content
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct EmailBody {
@@ -205,6 +253,33 @@ pub struct Email {
     /// All headers (if include_raw_headers is enabled)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, Vec<String>>>,
+}
+
+impl Email {
+    /// Whether the parse produced anything a consumer could use: a sender
+    /// address, a subject, body text/html, or at least one attachment.
+    ///
+    /// The parser is deliberately lenient — arbitrary bytes "parse" into
+    /// an empty Email rather than erroring, so streaming consumers never
+    /// lose a whole mbox to one bad message. Strict consumers should call
+    /// this to reject degenerate results instead of hand-rolling the
+    /// check (a from-less, subject-less, body-less, attachment-less
+    /// "email" is garbage in, garbage out).
+    pub fn has_substantive_content(&self) -> bool {
+        !self.from.address.trim().is_empty()
+            || self.subject.as_deref().map_or(false, |s| !s.trim().is_empty())
+            || self
+                .body
+                .text
+                .as_deref()
+                .map_or(false, |t| !t.trim().is_empty())
+            || self
+                .body
+                .html
+                .as_deref()
+                .map_or(false, |h| !h.trim().is_empty())
+            || !self.attachments.is_empty()
+    }
 }
 
 /// Email file format
@@ -1083,4 +1158,81 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(subjects, vec!["First", "Second"]);
     }
+
+    #[test]
+    fn attachment_helpers_classify_correctly() {
+        let att = Attachment {
+            filename: "Report.PDF".into(),
+            content_type: "application/pdf".into(),
+            size: 4,
+            content_id: None,
+            is_inline: false,
+            content: None,
+        };
+        assert_eq!(att.extension().as_deref(), Some("pdf"));
+        assert!(!att.is_nested_message());
+        assert_eq!(att.decode_content(), None);
+
+        let nested = Attachment {
+            filename: "thread.eml".into(),
+            content_type: "message/rfc822".into(),
+            size: 3,
+            content_id: None,
+            is_inline: false,
+            content: Some("SGVsbG8=".to_string()), // "Hello"
+        };
+        assert!(nested.is_nested_message());
+        assert_eq!(nested.decode_content().as_deref(), Some(b"Hello".as_slice()));
+
+        let no_ext = Attachment {
+            filename: "README".into(),
+            content_type: "text/plain".into(),
+            size: 0,
+            content_id: None,
+            is_inline: false,
+            content: None,
+        };
+        assert_eq!(no_ext.extension(), None);
+    }
+
+    #[test]
+    fn degenerate_email_has_no_substantive_content() {
+        // The parser accepts arbitrary bytes; the strict-consumer check
+        // must reject a nothing-there result.
+        fn bare_email() -> Email {
+            Email {
+                message_id: None,
+                from: EmailAddress { name: None, address: String::new() },
+                reply_to: None,
+                to: Vec::new(),
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: None,
+                date: None,
+                body: EmailBody::default(),
+                attachments: Vec::new(),
+                thread_info: ThreadInfo::default(),
+                priority: None,
+                headers: None,
+            }
+        }
+        let junk = bare_email();
+        assert!(!junk.has_substantive_content());
+
+        let mut with_subject = bare_email();
+        with_subject.subject = Some("hello".into());
+        assert!(with_subject.has_substantive_content());
+
+        let mut with_attachment = bare_email();
+        with_attachment.attachments.push(Attachment {
+            filename: "a.zip".into(),
+            content_type: "application/zip".into(),
+            size: 2,
+            content_id: None,
+            is_inline: false,
+            content: None,
+        });
+        assert!(with_attachment.has_substantive_content());
+    }
+
 }
