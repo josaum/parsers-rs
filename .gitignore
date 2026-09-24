@@ -12,3 +12,12 @@ __pycache__/
 # and pnpm pack; index.js loads the binary by name, so they sit next to it.
 *.node
 *.tgz
+
+# Repository doctors are source; local caches/build outputs are not.
+/.leio-code/rust-doctors/target/
+/.leio-code/index.json
+/.leio-code/index-summary.json
+/.leio-code/search.arrow
+/.leio-code/events/
+/.leio-code/exports/
+/.leio-code/*.lock

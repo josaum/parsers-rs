@@ -1,0 +1,29 @@
+{
+  "source_repository": "josaum/leio-code-private",
+  "source_revision": "6455416a6",
+  "authoritative_parser_revision": "49afbd7e40bf7021b13c7cd066973876010e4b6a",
+  "original_files": [
+    {
+      "source": "office_parsers_clippy_gate.rs",
+      "sha256": "215ac73ff398a28273008fa7dfef908047307536443ec57b7452629a6cab5538"
+    },
+    {
+      "source": "office_parsers_arrow_ipc.rs",
+      "sha256": "df89eef2cffabfab23f29e8988fb2f353c92038d06069839c61d9aa88255657c"
+    },
+    {
+      "source": "office_parsers_doc_coverage.rs",
+      "sha256": "8a514bdd682a034240b3ca9dbe046a41982654e5a1be07b334f962d7a353facf"
+    },
+    {
+      "source": "office_parsers_node_parity.rs",
+      "sha256": "fd3b3fa14f6eda98c80db543c05ead4debaa8c86acacd9f205c0b432fe60d9ee"
+    }
+  ],
+  "policy_changes": [
+    "Paths resolve from sovereign repository root, not office-parsers-rs.",
+    "Clippy and Arrow feature gates follow the checked-in GitHub Actions workflow.",
+    "Binding scope is the documented seven Python and four Node packages; absent Node products are not invented.",
+    "Consumer OCR, GLiNER, FCA, layout and chunking checks remain consumer-owned."
+  ]
+}

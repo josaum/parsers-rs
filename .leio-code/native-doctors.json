@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "name": "parsers-doctors",
+  "doctors": [
+    {
+      "name": "parsers-clippy-gate",
+      "description": "Sovereign parsers-rs parsers-clippy-gate",
+      "suites": [
+        "all",
+        "ci"
+      ]
+    },
+    {
+      "name": "parsers-arrow-ipc",
+      "description": "Sovereign parsers-rs parsers-arrow-ipc",
+      "suites": [
+        "all",
+        "ci"
+      ]
+    },
+    {
+      "name": "parsers-doc-coverage",
+      "description": "Sovereign parsers-rs parsers-doc-coverage",
+      "suites": [
+        "all",
+        "ci"
+      ]
+    },
+    {
+      "name": "parsers-binding-contract",
+      "description": "Sovereign parsers-rs parsers-binding-contract",
+      "suites": [
+        "all",
+        "ci"
+      ]
+    }
+  ]
+}
