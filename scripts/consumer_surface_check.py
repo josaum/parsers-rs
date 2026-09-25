@@ -12,8 +12,8 @@ Usage::
 
     python3 scripts/consumer_surface_check.py \
         --wheels dist \
-        --source ../mycelia-workspace/cartridges \
-        --source ../mycelia-workspace/mycelia-api \
+        --source ../consumer-workspace/cartridges \
+        --source ../consumer-workspace/api \
         [--exclude office-parsers-rs] [--json]
 
 Exit status is 1 when any referenced attribute is missing. The report lists,

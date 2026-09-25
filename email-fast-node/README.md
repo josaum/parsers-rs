@@ -14,7 +14,7 @@ High-performance email parser for .eml and .msg formats.
 ## Installation
 
 ```bash
-pnpm add email-fast-node  # or the @mycelia/email-fast-node consumer shell
+pnpm add email-fast-node
 ```
 
 ## Quick Start

@@ -3,12 +3,11 @@
 //! Two entry points, two callers:
 //!
 //! - `parse_xlsx_bytes_py` — parse an in-memory workbook and return the workbook
-//!   JSON as a string. This is the Atlas path: an upload is parsed where it
-//!   already is, with no temp file and no subprocess, because the parse is fast
-//!   enough to run in-process.
+//!   JSON as a string. An upload is parsed where it already is, with no temp
+//!   file and no subprocess, because the parse is fast enough to run in-process.
 //! - `parse_xlsx_json_py` / `parse_xlsx_ndjson_py` / `parse_xlsx_arrow_ipc_py` —
-//!   path-based, writing to a path. These are the Mycelia path: a large workbook
-//!   on disk that should stream to NDJSON or Arrow IPC rather than materialize.
+//!   path-based, writing to a path. A large workbook on disk should stream to
+//!   NDJSON or Arrow IPC rather than materialize in memory.
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;

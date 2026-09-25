@@ -17,7 +17,7 @@ High-performance PowerPoint (.pptx) parser with a native Rust core.
 ## Installation
 
 ```bash
-pnpm add pptx-fast-node  # or the @mycelia/pptx-fast-node consumer shell
+pnpm add pptx-fast-node
 ```
 
 ## Quick Start

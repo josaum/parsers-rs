@@ -13,7 +13,7 @@ High-performance Excel (.xlsx) parser with a native Rust core.
 ## Installation
 
 ```bash
-pnpm add xlsx-fast-node  # or the @mycelia/xlsx-fast-node consumer shell
+pnpm add xlsx-fast-node
 ```
 
 ## Quick Start

@@ -169,7 +169,7 @@ def main() -> int:
                 f"{wheel.name} reports version {version} but {crate} declares "
                 f"{declared}; a consumer pinning {version} would get other bytes"
             )
-        if author and "atlas" in author.lower():
+        if author and author.strip() != "Dionisio Chiuratto Agourakis":
             raise SystemExit(
                 f"{wheel.name} is attributed to {author!r}. A shared artifact must "
                 "name this repository, so a consumer can trace it back."

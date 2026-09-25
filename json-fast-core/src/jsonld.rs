@@ -48,8 +48,8 @@ mod tests {
 
     #[test]
     fn peeks_context_and_type() {
-        let meta =
-            peek(r#"{"@context":"https://schema.org/","@type":"Product","name":"Atlas"}"#).unwrap();
+        let meta = peek(r#"{"@context":"https://schema.org/","@type":"Product","name":"Example"}"#)
+            .unwrap();
         assert_eq!(
             meta.context,
             Some(Value::String("https://schema.org/".into()))

@@ -322,10 +322,9 @@ fn backward_compat_non_inheriting_arrow_snapshot() {
     //
     // `codigo` is the one that moved. The deleted fork emitted it nullable, which
     // contradicted its own schema; the sovereign crate emits it non-nullable. That
-    // is a fix, not a regression, and it is stricter on the TISS surface: an Arrow
-    // consumer that fed a guia with no `codigo` through the fork got a null column
-    // and now gets a schema that forbids one. Recorded here rather than absorbed,
-    // because the ANS/TISS path is a Health Audit production path.
+    // is a fix, not a regression, and it is stricter on the shredder surface: an
+    // Arrow consumer that fed a guia with no `codigo` through the fork got a null
+    // column and now gets a schema that forbids one.
     let expected: Vec<(String, String, bool)> = vec![
         ("@registroANS".into(), "Utf8".into(), false),
         ("codigo".into(), "Utf8".into(), false),

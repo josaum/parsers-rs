@@ -105,8 +105,8 @@ def test_manifest_pins_the_source_commit(manifest: dict) -> None:
 def test_artifacts_are_attributed_to_this_repository(manifest: dict) -> None:
     for artifact in manifest["artifacts"]:
         author = artifact.get("author") or ""
-        assert "atlas" not in author.lower() and "mycelia" not in author.lower(), (
-            f"{artifact['file']} is attributed to a consumer ({author!r}); a "
+        assert author == "Dionisio Chiuratto Agourakis", (
+            f"{artifact['file']} is attributed to someone else ({author!r}); a "
             "shared artifact must name the project that produced it"
         )
 

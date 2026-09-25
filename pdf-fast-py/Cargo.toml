@@ -24,7 +24,7 @@ default = []
 # given install includes it.
 #
 # The default build is a no-op for a consumer that never sets `reading_order`,
-# which is the case on Atlas's product path (`parse_pdf_text_bytes(data)`).
+# which is the case for an in-memory bytes parse (`parse_pdf_text_bytes(data)`).
 # Asking for `reading_order = True` without this feature is an error rather
 # than a silent fall back to stream order: returning a different order than the
 # caller asked for would be a plausible-looking wrong answer.
@@ -34,8 +34,8 @@ default = []
 # checkout would make this repository unbuildable on a clean clone, and a
 # version requirement would make it unresolvable. Instead a consumer that wants
 # reading order adds `layout-fast-core` to its own workspace and enables this
-# feature from its binding. Compare `owl-fast-core`'s `atlas-reasoner-rows`,
-# where the same rule is applied to the Atlas reasoner.
+# feature from its binding. Compare `owl-fast-core`'s `reasoner-rows` feature,
+# where the same rule is applied to a consumer's reasoner.
 #
 # Enabled from here without a consumer supplying the crate, the build fails at
 # the missing dependency rather than silently dropping the capability.

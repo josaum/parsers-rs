@@ -9,7 +9,7 @@ description = "SIMD-accelerated JSON/JSONL parsing and JSON-family helpers power
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
-authors = [{ name = "parsers-rs maintainers" }]
+authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 keywords = [
     "json",
     "jsonl",

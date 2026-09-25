@@ -1,5 +1,5 @@
 # One pinned stable for every Rust project in this workspace family: the same
-# version here, in Atlas and in Mycelia, updated deliberately and together.
+# version here and in the consumer workspaces, updated deliberately and together.
 # A floating `stable` made CI depend on whichever compiler the runner had
 # that day; an unpinned pin drifts between projects. Bump in its own commit
 # and re-verify.

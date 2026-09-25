@@ -119,10 +119,10 @@ mod tests {
     #[test]
     fn parses_request() {
         let req = JsonRpcRequest::parse(
-            r#"{"jsonrpc":"2.0","method":"atlas.lookup","params":["roas"],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"catalog.lookup","params":["item-1"],"id":1}"#,
         )
         .unwrap();
-        assert_eq!(req.method, "atlas.lookup");
+        assert_eq!(req.method, "catalog.lookup");
         assert_eq!(req.id, Some(Value::from(1)));
     }
 

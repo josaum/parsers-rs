@@ -35,7 +35,7 @@ serde       = ["dep:serde"]
 mmap        = ["dep:memmap2"]
 parallel    = ["dep:rayon"]
 rasterize   = ["dep:tiny-skia", "dep:image", "dep:hayro", "dep:hayro-ccitt"]
-glyph-atlas = []   # retained only to keep downstream cfg compatibility; no Atlas default surface
+glyph-atlas = []   # retained only to keep downstream cfg compatibility; not part of the default surface
 
 [dependencies]
 # ── Core (always on) ─────────────────────────────────────────────────────

@@ -9,7 +9,7 @@ description = "High-performance email parser for .eml, .msg, and mbox formats"
 requires-python = ">=3.10"
 readme = "README.md"
 license = { text = "MIT" }
-authors = [{ name = "parsers-rs maintainers" }]
+authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 
 [project.optional-dependencies]
 arrow = []

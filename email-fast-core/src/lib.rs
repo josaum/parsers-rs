@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "arrow")]
 pub mod arrow;
 
-// The GLiNER extractor and the mycelia-api embedder that were declared here are
+// The GLiNER extractor and the API embedder that were declared here are
 // consumer integrations: they depend on one product's SDK and belong in that
 // product, not in a parser shared across consumers.
 

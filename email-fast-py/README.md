@@ -1,8 +1,7 @@
 # Email Fast
 
-`email-fast-py` is Atlas Brain's read-only Python binding for deterministic EML and
-MSG extraction. It belongs to the native ingestion plane, not the delivery,
-identity, or AI Gateway plane.
+`email-fast-py` is the Python binding for deterministic EML and MSG extraction,
+on top of the native `email-fast-core` parser.
 
 ## Contract
 
@@ -11,31 +10,21 @@ identity, or AI Gateway plane.
   attachment-content extraction.
 - **Output:** an in-memory Python dictionary containing parsed metadata and
   permitted content. The binding sends no message and writes no attachment.
-- **Arrow boundary:** the current binding returns a structured Python object.
-  A pipeline must apply an explicit schema before Arrow IPC/Flight transport or
-  promotion into a governed observation.
-- **Authority:** all extracted sender, recipient, body, header, and attachment
-  fields remain unsigned. Parsing does not verify identity, consent, source
-  ownership, delivery authenticity, or business meaning.
-
-The source/records owner is accountable for lawful access and retention; the
-domain steward owns interpretation; the parser maintainer owns bounded,
-deterministic extraction. See the
-[information-ownership model](../../docs/atlas/atlas-information-ownership.md)
-and [data-pipeline contract](../../docs/atlas/atlas-data-pipelines.md).
+- **Arrow boundary:** the current binding returns a structured Python object;
+  a consumer applies an explicit schema before Arrow IPC transport or any
+  downstream processing.
+- **Determinism:** parsing the same bytes always yields the same result.
+  Extraction does not verify identity, consent, source ownership, or delivery
+  authenticity; those remain the caller's responsibility.
 
 Invalid messages, unsupported structures, and attachment-budget violations
-fail loudly. Callers must retain source provenance and must not treat
-extraction success as a signature or fact-promotion decision.
-
-The approved proof-carrying OWL2-RL/Datalog reasoner is downstream of that
-promotion boundary; this parser neither evaluates nor signs semantics.
+fail loudly rather than producing a partial result. Callers should preserve
+source provenance when it matters downstream.
 
 ## Verify
 
 ```bash
-cargo test --manifest-path office-parsers-rs/Cargo.toml -p email-fast-py
-cd app && uv run python scripts/verify_upload.py
+cargo test -p email-fast-py
 ```
 
 Licensed under MIT.

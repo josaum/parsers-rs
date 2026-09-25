@@ -58,7 +58,7 @@ repository into a component of one product.
 | --- | --- |
 | `owl-fast-core` (one consumer's reasoner projection) | It depends on that consumer's reasoner crate and emits its `RulePackage` `owl_axiom` rows. A shared crate cannot depend on one consumer. |
 | `owl-fast-core` (another consumer's ontology chunker) | Entity extraction and subject chunking for RAG grounding. Product component, not a parser. |
-| Consumer components such as `gliner-core`, `gliner2-core`, OCR models, `geom-core`, `layout-fast-*`, `web-fast-core`, `chunk-fast-core`, `fca-fast-*` | Product components — NER, OCR, layout and chunking — not parsers. |
+| Consumer product crates (NER, OCR, layout, geometry, chunking, web extraction) | Product components — not parsers. |
 
 `pdf-fast-py` carries one consumer-shaped feature: `reading-order` enables a
 reading-order policy that needs the consumer's layout engine. It declares no
@@ -75,18 +75,18 @@ rather than a component of any one product.
 `gliner` and `embed` are **optional features** that some consumers enable on
 the docx/pdf/email/xlsx/pptx crates, and both must be removed when a core moves
 here. They are not only feature flags: each gates a whole module
-(`adapter.rs`, `embed.rs`) that depends on a consumer-side crate such as
-`gliner-core` or a consumer's client crate. Removed so far from docx, email,
-xlsx, and pptx; `pdf` still carries them.
+(`adapter.rs`, `embed.rs`) that depends on a consumer-side crate supplied from
+the consumer's own workspace. Removed so far from docx, email, xlsx, and
+pptx; `pdf` still carries them.
 
 ### The `owl-fast-core` name collision — measured, and not ours to merge
 
 Two crates in two consumer repositories share this name and are **different
 products**:
 
-* one is an entity extractor and RAG chunker (`Entity`, `EntityType`,
-  `SubjectChunk`); its module doc states it is not a reasoner;
-* the other emits Arrow IPC `RulePackage` rows and depends on the consumer's
+* one is an entity extractor and RAG chunker; its module doc states it is not
+  a reasoner;
+* the other emits Arrow IPC rule-package rows and depends on the consumer's
   reasoner crate.
 
 The plan recorded here was **one crate with two features**:
@@ -96,23 +96,21 @@ owl-fast-core = { version = "x.y.z", features = ["reasoner-rows"] }
 ```
 
 Measurement retired that plan. The two crates share **no public API at all** —
-one exposes three functions (`from_name`, `parse_ontology_to_arrow_ipc`,
-`parse_ontology_to_arrow_ipc_with_limits`), the other exposes sixteen, and not
-one name appears on both sides. A single shared function exists in the whole
+one exposes three functions, the other exposes sixteen, and not one name
+appears on both sides. A single shared function exists in the whole
 pair. A two-feature crate needs a common core for the features to wrap, and
 there is none: this would be a merger of two products, not a reconciliation.
 
 Both stay where they are, for the same reason in two directions: reasoner
 projection is consumer semantics, and a RAG chunker is a product component.
 
-**What is real is the packaging collision.** Both repositories publish the
-distribution `owl-fast`, importing as `owl_fast`, with different contracts —
-`parse_ontology_ipc` against `parse_file` / `chunk_by_subject`. On the flat
-module namespace the last wheel installed wins silently, and an upload
-boundary that calls `owl_fast.parse_ontology_ipc` breaks every `.ttl`, `.nt`,
-and `.nq` upload while the module still imports. Consumers guard against that
-at runtime by asserting each parser's entry points rather than its
-importability.
+**What is real is the packaging collision.** Two consumers publish a
+distribution under the same name, importing as the same module, with different
+contracts. On the flat module namespace the last wheel installed wins
+silently, and a boundary that calls the other consumer's entry point breaks
+every `.ttl`, `.nt`, and `.nq` upload while the module still imports.
+Consumers guard against that at runtime by asserting each parser's entry
+points rather than its importability.
 
 The names are the defect — neither describes what its crate does. Renaming is a
 consumer decision for the owning repositories, not something this one can
@@ -123,7 +121,7 @@ settle.
 The crate that *does* describe reading ontologies is `ontology-fast-core`: it
 depends only on `oxrdf` and `oxrdfio`, carries no consumer dependency, has no
 name collision, and is already the declared migration target for a consumer's
-`catalog._subject_blocks`. It is the right candidate for this repository in this
+ontology-catalog reader. It is the right candidate for this repository in this
 area — not `owl-fast-core`. Its Python binding is not yet wired into any
 consumer's app path.
 
@@ -260,10 +258,10 @@ wheel a consumer installs is whatever bytes that consumer actually runs, which
 Consumers removed their in-tree copies of the seven cores, their bindings and
 `ooxml-archive`; where a consumer links a core directly, it does so from the
 vendored source pinned to the commit this manifest names. The remaining
-consumer-side gaps (a retired glyph persistence API some extractors call, the
-TISS shredder inside `xsd-fast-core`, the `gliner`/`embed` adapters inside some
-cores, and the four generic Node bindings) are product work in the consumers or
-additions here, not forks.
+consumer-side gaps (a retired glyph persistence API some extractors call,
+consumer-specific XML shredding inside `xsd-fast-core`, `gliner`/`embed`
+adapters inside some cores, and the four generic Node bindings) are product
+work in the consumers or additions here, not forks.
 
 Consumers install a release through a vendored `parsers-rs/` directory, with
 the version and a SHA-256 recorded in their pinned requirements. Because a
@@ -276,7 +274,7 @@ after:
 
 | API | Verified against |
 | --- | --- |
-| `json_fast.loads`, `loads_many` | Document, margin and dataplane call sites (`_jsonl.py`, `margin.py`, `feeds/pacvue.py`, `dataplane.py`) |
-| `xsd_fast.list_elements_bytes`, `describe_element_bytes` | Upload entry points that derive schema descriptions |
-| `docx_fast`, `email_fast` | Upload suites |
+| `json_fast.loads`, `loads_many` | JSON/JSONL loading and streaming paths across consumer pipelines |
+| `xsd_fast.list_elements_bytes`, `describe_element_bytes` | Schema-driven discovery and upload flows |
+| `docx_fast`, `email_fast` | Document upload and extraction workflows |
 | `xlsx_fast`, `pptx_fast` | Compared wheel-to-wheel against the artifact each replaced, byte-identical on every case exercised; their NDJSON and Arrow surfaces cross-checked against the document projection on a fixture where no surface is vacuously empty |

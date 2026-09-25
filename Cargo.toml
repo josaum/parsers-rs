@@ -26,7 +26,7 @@ members = [
 #
 # These are pinned exactly where a wire or contract format is involved, so a
 # consumer's bytes cannot shift under a caret range. `arrow*` is pinned to the
-# same version Atlas and the semantic dataplane use: an Arrow IPC payload
+# same version the consumers already use: an Arrow IPC payload
 # written here must be readable there without a conversion step.
 [workspace.dependencies]
 arrow-array = "=58.3.0"
@@ -35,7 +35,7 @@ arrow-ipc = { version = "=58.3.0", features = ["lz4", "zstd"] }
 arrow-schema = "=58.3.0"
 pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py38"] }
 # Node-API 2 bindings. napi 2 is the line the consumer shells were built
-# against; the `.node` ABI is what `@mycelia/*-fast-node` loads, so the major
+# against; the `.node` ABI is what the consumer shells load, so the major
 # stays put until every shell moves with it.
 napi = { version = "2.16", features = ["serde-json"] }
 napi-derive = "2.16"
@@ -47,7 +47,7 @@ serde_json = "1.0"
 # this repository: a consumer must be able to tell which project produced an
 # artifact, and an artifact that names its consumer cannot.
 [workspace.package]
-authors = ["parsers-rs maintainers"]
+authors = ["Dionisio Chiuratto Agourakis"]
 edition = "2021"
 license = "MIT"
 # Every published artifact inherits this remote, so it must never point at a

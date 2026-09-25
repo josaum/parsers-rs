@@ -21,8 +21,8 @@
 //!    table 1:1.
 //!
 //! Column types supported in v1: `Boolean`, `Int64`, `Float64`, `Utf8`.
-//! Explicit schemas may additionally use `Timestamp(Microsecond, UTC)` (the
-//! Atlas pin, matching a Databricks Delta `TIMESTAMP` column) or the naive
+//! Explicit schemas may additionally use `Timestamp(Microsecond, UTC)` (a
+//! UTC pin, matching a Databricks Delta `TIMESTAMP` column) or the naive
 //! `Timestamp(Microsecond, None)` alias for `TIMESTAMP_NTZ`: values are
 //! RFC-3339 / ISO-8601 strings, parsed to UTC epoch microseconds. Timestamps
 //! are never *inferred* — a string column stays `Utf8` unless the caller

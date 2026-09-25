@@ -18,7 +18,7 @@ High-performance Word (.docx) parser with a native Rust core.
 ## Installation
 
 ```bash
-pnpm add docx-fast-node  # or the @mycelia/docx-fast-node consumer shell
+pnpm add docx-fast-node
 ```
 
 ## Quick Start

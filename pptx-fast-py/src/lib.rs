@@ -3,8 +3,8 @@
 //! Two entry points, two callers:
 //!
 //! - `parse_pptx_bytes_py` — parse an in-memory presentation and return the
-//!   document JSON as a string. This is the Atlas path: an upload is parsed
-//!   where it already is, with no temp file and no subprocess.
+//!   document JSON as a string. An upload is parsed where it already is, with
+//!   no temp file and no subprocess.
 //! - the path-based functions — parse a presentation already on disk and
 //!   either return its JSON or stream it to NDJSON, Arrow IPC, or a directory
 //!   of Arrow tables.

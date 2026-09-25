@@ -2,7 +2,7 @@
 # Build the Node-API `.node` binary for every `*-node` crate (or the ones named
 # as arguments) and place it next to that crate's `index.js`, which loads it by
 # the fixed name `<napi.name>.node`. That file name is the contract between a
-# release tarball and the consumer shells (`@mycelia/*-fast-node`), so it never
+# release tarball and the consumer shells that package it, so it never
 # carries a platform token; the tarball name does.
 #
 # Usage: scripts/build-node.sh [crate ...]

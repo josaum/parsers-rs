@@ -12,7 +12,7 @@ categories = ["parser-implementations", "email"]
 [lib]
 name = "email_fast_core"
 
-# `arrow` emits the Arrow IPC contract. The GLiNER and mycelia-api integrations
+# `arrow` emits the Arrow IPC contract. The GLiNER and embed-service integrations
 # that lived here are consumer concerns and stay in the consumer repository: a
 # shared parser cannot depend on one product's SDK.
 [features]
