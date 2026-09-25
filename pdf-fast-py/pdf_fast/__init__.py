@@ -85,7 +85,11 @@ def parse_pdf_page_table_layout_arrow_ipc(path, page_index, epsilon=2.0):
 
 def parse_pdf_page_table_layout_c_data(path, page_index, epsilon=2.0):
     """Deprecated: prefer ``FastPdfPageScanner.get_page_table_batch``."""
-    return scan_pdf_page_table_layout_c_data_py(path, page_index, epsilon)
+    return scan_pdf_page_table_layout_c_data_py(
+               path,
+               page_index,
+               epsilon=epsilon,
+           )
 
 
 def ocr_runs_record_batch(ocr_runs):
@@ -150,8 +154,12 @@ def parse_pdf_page_table_layout_from_ocr_c_data(
     """Deprecated: prefer
     ``FastPdfPageScanner.get_page_table_batch_from_ocr``."""
     return scan_pdf_page_table_layout_from_ocr_c_data_py(
-        path, page_index, ocr_runs, epsilon, dpi
-    )
+               path,
+               page_index,
+               ocr_runs,
+               epsilon=epsilon,
+               dpi=dpi,
+           )
 
 
 def parse_pdf_page_table_arrow_ipc(path, page_index, epsilon=2.0):
@@ -160,7 +168,11 @@ def parse_pdf_page_table_arrow_ipc(path, page_index, epsilon=2.0):
 
 def parse_pdf_page_table_c_data(path, page_index, epsilon=2.0):
     """Deprecated: prefer ``FastPdfPageScanner.get_page_tables_batch``."""
-    return scan_pdf_page_table_c_data_py(path, page_index, epsilon)
+    return scan_pdf_page_table_c_data_py(
+               path,
+               page_index,
+               epsilon=epsilon,
+           )
 
 
 def parse_pdf_page_table_from_ocr_arrow_ipc(
@@ -177,8 +189,12 @@ def parse_pdf_page_table_from_ocr_c_data(
     """Deprecated: prefer
     ``FastPdfPageScanner.get_page_tables_batch_from_ocr``."""
     return scan_pdf_page_table_from_ocr_c_data_py(
-        path, page_index, ocr_runs, epsilon, dpi
-    )
+               path,
+               page_index,
+               ocr_runs,
+               epsilon=epsilon,
+               dpi=dpi,
+           )
 
 
 def parse_pdf_page_count(path):

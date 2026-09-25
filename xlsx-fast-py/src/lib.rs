@@ -63,6 +63,7 @@ fn build_options(
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, decode_dates=None, include_formulas=None, raw_values=None, max_inflate=None))]
 fn parse_xlsx_json_py(
     path: &Bound<'_, PyAny>,
     decode_dates: Option<bool>,
@@ -77,6 +78,7 @@ fn parse_xlsx_json_py(
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, out_path, decode_dates=None, include_formulas=None, raw_values=None, max_inflate=None))]
 fn parse_xlsx_ndjson_py(
     path: &Bound<'_, PyAny>,
     out_path: &Bound<'_, PyAny>,
@@ -91,6 +93,7 @@ fn parse_xlsx_ndjson_py(
 }
 
 #[pyfunction]
+#[pyo3(signature = (bytes, decode_dates=None, include_formulas=None, raw_values=None, max_inflate=None))]
 fn parse_xlsx_bytes_py(
     bytes: &[u8],
     decode_dates: Option<bool>,
@@ -105,6 +108,7 @@ fn parse_xlsx_bytes_py(
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, out_path, decode_dates=None, include_formulas=None, raw_values=None, max_inflate=None, batch_size=None))]
 fn parse_xlsx_arrow_ipc_py(
     path: &Bound<'_, PyAny>,
     out_path: &Bound<'_, PyAny>,

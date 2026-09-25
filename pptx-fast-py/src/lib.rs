@@ -57,6 +57,7 @@ fn build_options(max_inflate: Option<usize>) -> ParseOptions {
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, max_inflate=None))]
 fn parse_pptx_json_py(path: &Bound<'_, PyAny>, max_inflate: Option<usize>) -> PyResult<String> {
     let doc = parse_pptx(fs_path(path)?, build_options(max_inflate))
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
@@ -64,6 +65,7 @@ fn parse_pptx_json_py(path: &Bound<'_, PyAny>, max_inflate: Option<usize>) -> Py
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, out_path, max_inflate=None))]
 fn parse_pptx_ndjson_py(
     path: &Bound<'_, PyAny>,
     out_path: &Bound<'_, PyAny>,
@@ -80,6 +82,7 @@ fn parse_pptx_ndjson_py(
 /// Encode one named shredded table to `out_path` as an in-memory-built Arrow
 /// IPC stream; return the number of bytes written.
 #[pyfunction]
+#[pyo3(signature = (path, out_path, table, max_inflate=None, batch_size=None))]
 fn parse_pptx_arrow_ipc_bytes_py(
     path: &Bound<'_, PyAny>,
     out_path: &Bound<'_, PyAny>,
@@ -104,6 +107,7 @@ fn parse_pptx_arrow_ipc_bytes_py(
 
 /// Write every shredded table into `out_dir`; return the paths written.
 #[pyfunction]
+#[pyo3(signature = (path, out_dir, max_inflate=None, batch_size=None))]
 fn parse_pptx_arrow_dataset_py(
     path: &Bound<'_, PyAny>,
     out_dir: &Bound<'_, PyAny>,
@@ -132,6 +136,7 @@ fn parse_pptx_arrow_dataset_py(
 /// extraction that used its own constant would be a way around the caller's
 /// budget.
 #[pyfunction]
+#[pyo3(signature = (path, out_dir, max_inflate=None))]
 fn extract_pptx_images_py(
     path: &Bound<'_, PyAny>,
     out_dir: &Bound<'_, PyAny>,
@@ -150,6 +155,7 @@ fn extract_pptx_images_py(
 }
 
 #[pyfunction]
+#[pyo3(signature = (bytes, max_inflate=None))]
 fn parse_pptx_bytes_py(bytes: &[u8], max_inflate: Option<usize>) -> PyResult<String> {
     let doc = pptx_fast_core::parse_pptx_bytes(bytes.to_vec(), build_options(max_inflate))
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;

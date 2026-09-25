@@ -15,7 +15,10 @@ from ._core import (
 
 def parse_docx(path, max_inflate=None):
     """Parse a DOCX path without producing filesystem output."""
-    return json.loads(parse_docx_py(path, max_inflate))
+    return json.loads(parse_docx_py(
+                          path,
+                          max_inflate=max_inflate,
+                      ))
 
 
 def parse_docx_bytes(data, max_inflate=None):
@@ -24,23 +27,43 @@ def parse_docx_bytes(data, max_inflate=None):
     A caller holding an upload should prefer this: the document never has to
     touch the filesystem to be read.
     """
-    return json.loads(parse_docx_bytes_py(data, max_inflate))
+    return json.loads(parse_docx_bytes_py(
+                          data,
+                          max_inflate=max_inflate,
+                      ))
 
 
 def parse_docx_json(path, max_inflate=None):
-    return json.loads(parse_docx_json_py(path, max_inflate))
+    return json.loads(parse_docx_json_py(
+                          path,
+                          max_inflate=max_inflate,
+                      ))
 
 
 def parse_docx_ndjson(path, out_path, max_inflate=None):
-    return parse_docx_ndjson_py(path, out_path, max_inflate)
+    return parse_docx_ndjson_py(
+               path,
+               out_path,
+               max_inflate=max_inflate,
+           )
 
 
 def parse_docx_arrow_ipc(path, out_path, max_inflate=None, batch_size=None):
-    return parse_docx_arrow_ipc_py(path, out_path, max_inflate, batch_size)
+    return parse_docx_arrow_ipc_py(
+               path,
+               out_path,
+               max_inflate=max_inflate,
+               batch_size=batch_size,
+           )
 
 
 def parse_docx_arrow_dataset(path, out_dir, max_inflate=None, batch_size=None):
-    return parse_docx_arrow_dataset_py(path, out_dir, max_inflate, batch_size)
+    return parse_docx_arrow_dataset_py(
+               path,
+               out_dir,
+               max_inflate=max_inflate,
+               batch_size=batch_size,
+           )
 
 
 def extract_docx_images(path, out_dir):

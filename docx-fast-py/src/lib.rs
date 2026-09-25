@@ -4,6 +4,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 #[pyfunction]
+#[pyo3(signature = (path, max_inflate=None))]
 fn parse_docx_json_py(path: &str, max_inflate: Option<usize>) -> PyResult<String> {
     let options = ParseOptions {
         max_inflate: max_inflate.unwrap_or(128 * 1024 * 1024),
@@ -14,6 +15,7 @@ fn parse_docx_json_py(path: &str, max_inflate: Option<usize>) -> PyResult<String
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, out_path, max_inflate=None))]
 fn parse_docx_ndjson_py(path: &str, out_path: &str, max_inflate: Option<usize>) -> PyResult<()> {
     let options = ParseOptions {
         max_inflate: max_inflate.unwrap_or(128 * 1024 * 1024),
@@ -24,6 +26,7 @@ fn parse_docx_ndjson_py(path: &str, out_path: &str, max_inflate: Option<usize>) 
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, out_path, max_inflate=None, batch_size=None))]
 fn parse_docx_arrow_ipc_py(
     path: &str,
     out_path: &str,
@@ -42,6 +45,7 @@ fn parse_docx_arrow_ipc_py(
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, out_dir, max_inflate=None, batch_size=None))]
 fn parse_docx_arrow_dataset_py(
     path: &str,
     out_dir: &str,
@@ -74,6 +78,7 @@ fn extract_docx_images_py(path: &str, out_dir: &str) -> PyResult<Vec<String>> {
 }
 
 #[pyfunction]
+#[pyo3(signature = (bytes, max_inflate=None))]
 fn parse_docx_bytes_py(bytes: &[u8], max_inflate: Option<usize>) -> PyResult<String> {
     let options = ParseOptions {
         max_inflate: max_inflate.unwrap_or(128 * 1024 * 1024),

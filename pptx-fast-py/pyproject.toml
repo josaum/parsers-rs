@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pptx-fast"
-version = "0.2.4"
+version = "0.2.5"
 description = "High-performance PowerPoint (.pptx) parser powered by Rust"
 readme = "README.md"
 license = { text = "MIT" }

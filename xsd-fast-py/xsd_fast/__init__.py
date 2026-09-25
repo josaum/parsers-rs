@@ -37,12 +37,18 @@ from ._core import (
 
 def list_elements(schema_path: str, max_includes: int = 64) -> list[str]:
     """Return all global element names defined in the schema."""
-    return list_elements_py(schema_path, max_includes)
+    return list_elements_py(
+               schema_path,
+               max_includes=max_includes,
+           )
 
 
 def list_elements_bytes(schema_bytes: bytes, max_includes: int = 64) -> list[str]:
     """Return global element names from in-memory XSD bytes."""
-    return list_elements_bytes_py(schema_bytes, max_includes)
+    return list_elements_bytes_py(
+               schema_bytes,
+               max_includes=max_includes,
+           )
 
 
 def describe_element(
@@ -57,8 +63,12 @@ def describe_element(
     Each dict has keys: ``path``, ``arrow_type``, ``nullable``.
     """
     payload = describe_element_json_py(
-        schema_path, element, max_depth, map_dates, include_attributes
-    )
+                  schema_path,
+                  element,
+                  max_depth=max_depth,
+                  map_dates=map_dates,
+                  include_attributes=include_attributes,
+              )
     return json.loads(payload)
 
 
@@ -71,8 +81,12 @@ def describe_element_bytes(
 ) -> list[dict]:
     """Return an Arrow field description from in-memory XSD bytes."""
     payload = describe_element_bytes_json_py(
-        schema_bytes, element, max_depth, map_dates, include_attributes
-    )
+                  schema_bytes,
+                  element,
+                  max_depth=max_depth,
+                  map_dates=map_dates,
+                  include_attributes=include_attributes,
+              )
     return json.loads(payload)
 
 
@@ -89,8 +103,12 @@ def validate(
     An empty list means the document is valid.
     """
     payload = validate_json_py(
-        schema_path, xml_path, max_errors, check_facets, check_cardinality
-    )
+                  schema_path,
+                  xml_path,
+                  max_errors=max_errors,
+                  check_facets=check_facets,
+                  check_cardinality=check_cardinality,
+              )
     return json.loads(payload)
 
 
@@ -118,7 +136,12 @@ def schema_ipc_bytes(
     map_dates: bool = True,
 ) -> bytes:
     """Return Arrow IPC schema description bytes for a root element."""
-    return schema_ipc_bytes_py(schema_path, element, max_depth, map_dates)
+    return schema_ipc_bytes_py(
+               schema_path,
+               element,
+               max_depth=max_depth,
+               map_dates=map_dates,
+           )
 
 
 

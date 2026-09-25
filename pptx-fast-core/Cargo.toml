@@ -1,6 +1,6 @@
 [package]
 name = "pptx-fast-core"
-version = "0.2.4"
+version = "0.2.5"
 edition.workspace = true
 authors.workspace = true
 description = "High-performance PowerPoint (.pptx) parser with full slide extraction"

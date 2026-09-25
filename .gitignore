@@ -14,6 +14,9 @@ __pycache__/
 *.tgz
 
 # Repository doctors are source; local caches/build outputs are not.
+# Local worktrees (e.g. a reviewer's scratch checkout) are working state,
+# never part of a released tree.
+/.worktrees/
 /.leio-code/rust-doctors/target/
 /.leio-code/index.json
 /.leio-code/index-summary.json

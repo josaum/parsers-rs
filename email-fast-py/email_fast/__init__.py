@@ -228,7 +228,12 @@ def extract_attachments(
     Returns:
         List of paths to extracted files
     """
-    return extract_attachments_py(path, out_dir, max_attachment_size, max_total_attachment_bytes)
+    return extract_attachments_py(
+               path,
+               out_dir,
+               max_attachment_size=max_attachment_size,
+               max_total_attachment_bytes=max_total_attachment_bytes,
+           )
 
 
 

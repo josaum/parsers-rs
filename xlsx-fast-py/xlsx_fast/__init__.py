@@ -20,15 +20,25 @@ def parse_xlsx(
     path, decode_dates=True, include_formulas=False, raw_values=False, max_inflate=None
 ):
     payload = parse_xlsx_json_py(
-        path, decode_dates, include_formulas, raw_values, max_inflate
-    )
+                  path,
+                  decode_dates=decode_dates,
+                  include_formulas=include_formulas,
+                  raw_values=raw_values,
+                  max_inflate=max_inflate,
+              )
     return json.loads(payload)
 
 
 def parse_xlsx_json(
     path, decode_dates=True, include_formulas=False, raw_values=False, max_inflate=None
 ):
-    return parse_xlsx_json_py(path, decode_dates, include_formulas, raw_values, max_inflate)
+    return parse_xlsx_json_py(
+               path,
+               decode_dates=decode_dates,
+               include_formulas=include_formulas,
+               raw_values=raw_values,
+               max_inflate=max_inflate,
+           )
 
 
 def parse_xlsx_ndjson(
@@ -40,8 +50,13 @@ def parse_xlsx_ndjson(
     max_inflate=None,
 ):
     return parse_xlsx_ndjson_py(
-        path, out_path, decode_dates, include_formulas, raw_values, max_inflate
-    )
+               path,
+               out_path,
+               decode_dates=decode_dates,
+               include_formulas=include_formulas,
+               raw_values=raw_values,
+               max_inflate=max_inflate,
+           )
 
 
 def parse_xlsx_bytes(
@@ -49,8 +64,12 @@ def parse_xlsx_bytes(
 ):
     """Parse an XLSX workbook from raw bytes (no temp file needed)."""
     payload = parse_xlsx_bytes_py(
-        data, decode_dates, include_formulas, raw_values, max_inflate
-    )
+                  data,
+                  decode_dates=decode_dates,
+                  include_formulas=include_formulas,
+                  raw_values=raw_values,
+                  max_inflate=max_inflate,
+              )
     return json.loads(payload)
 
 
@@ -65,14 +84,14 @@ def parse_xlsx_arrow_ipc(
 ):
     """Stream cell batches to `out_path` as Arrow IPC; return the byte count."""
     return parse_xlsx_arrow_ipc_py(
-        path,
-        out_path,
-        decode_dates,
-        include_formulas,
-        raw_values,
-        max_inflate,
-        batch_size,
-    )
+               path,
+               out_path,
+               decode_dates=decode_dates,
+               include_formulas=include_formulas,
+               raw_values=raw_values,
+               max_inflate=max_inflate,
+               batch_size=batch_size,
+           )
 
 
 __all__ = [
