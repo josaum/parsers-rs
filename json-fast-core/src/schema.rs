@@ -433,12 +433,7 @@ fn apply_object<'v>(
     evaluated
 }
 
-fn check_type<'v>(
-    value: &'v Value,
-    obj: &Map<String, Value>,
-    path: &mut String,
-    findings: &mut Vec<Finding>,
-) {
+fn check_type(value: &Value, obj: &Map<String, Value>, path: &str, findings: &mut Vec<Finding>) {
     if let Some(t) = obj.get("type") {
         if !value_matches_type(value, t) {
             findings.push(Finding::error(
@@ -456,7 +451,7 @@ fn check_type<'v>(
 fn check_enum_const(
     value: &Value,
     obj: &Map<String, Value>,
-    path: &mut String,
+    path: &str,
     findings: &mut Vec<Finding>,
 ) {
     if let Some(en) = obj.get("enum").and_then(|e| e.as_array()) {
@@ -477,7 +472,7 @@ fn check_enum_const(
     }
 }
 
-fn check_numeric(n: f64, obj: &Map<String, Value>, path: &mut String, findings: &mut Vec<Finding>) {
+fn check_numeric(n: f64, obj: &Map<String, Value>, path: &str, findings: &mut Vec<Finding>) {
     if let Some(min) = obj.get("minimum").and_then(|m| m.as_f64()) {
         if n < min {
             findings.push(Finding::error(path, format!("{n} < minimum {min}")));
@@ -494,7 +489,7 @@ fn check_numeric(n: f64, obj: &Map<String, Value>, path: &mut String, findings: 
     match obj.get("exclusiveMinimum") {
         Some(Value::Number(num)) => {
             if let Some(min) = num.as_f64() {
-                if !(n > min) {
+                if n <= min {
                     findings.push(Finding::error(
                         path,
                         format!("{n} <= exclusiveMinimum {min}"),
@@ -509,7 +504,7 @@ fn check_numeric(n: f64, obj: &Map<String, Value>, path: &mut String, findings: 
         }
         Some(Value::Bool(true)) => {
             if let Some(min) = obj.get("minimum").and_then(|m| m.as_f64()) {
-                if !(n > min) {
+                if n <= min {
                     findings.push(Finding::error(
                         path,
                         format!("{n} <= minimum {min} (exclusive)"),
@@ -533,7 +528,7 @@ fn check_numeric(n: f64, obj: &Map<String, Value>, path: &mut String, findings: 
     match obj.get("exclusiveMaximum") {
         Some(Value::Number(num)) => {
             if let Some(max) = num.as_f64() {
-                if !(n < max) {
+                if n >= max {
                     findings.push(Finding::error(
                         path,
                         format!("{n} >= exclusiveMaximum {max}"),
@@ -548,7 +543,7 @@ fn check_numeric(n: f64, obj: &Map<String, Value>, path: &mut String, findings: 
         }
         Some(Value::Bool(true)) => {
             if let Some(max) = obj.get("maximum").and_then(|m| m.as_f64()) {
-                if !(n < max) {
+                if n >= max {
                     findings.push(Finding::error(
                         path,
                         format!("{n} >= maximum {max} (exclusive)"),
@@ -591,7 +586,7 @@ fn check_numeric(n: f64, obj: &Map<String, Value>, path: &mut String, findings: 
 fn check_string(
     s: &str,
     obj: &Map<String, Value>,
-    path: &mut String,
+    path: &str,
     ctx: &mut Ctx<'_>,
     findings: &mut Vec<Finding>,
 ) {
@@ -742,7 +737,7 @@ fn check_array<'v>(
 /// `uniqueItems` in O(n): a canonical hash prefilter plus exact `Value`
 /// equality inside the bucket, so distinct numbers that collide in f64 never
 /// produce a false duplicate.
-fn check_unique_items(arr: &[Value], path: &mut String, findings: &mut Vec<Finding>) {
+fn check_unique_items(arr: &[Value], path: &str, findings: &mut Vec<Finding>) {
     let mut buckets: HashMap<u64, Vec<usize>> = HashMap::with_capacity(64);
     'outer: for (i, item) in arr.iter().enumerate() {
         let hash = hash_value(item);
