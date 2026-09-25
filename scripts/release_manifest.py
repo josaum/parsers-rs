@@ -33,6 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +43,8 @@ MANIFEST_NAME = "release-manifest.json"
 SCHEMA_VERSION = "parsers-rs.release.v1"
 
 # Wheel file name -> the crate directory whose version it must report.
+NODE_CRATES: set[str] = {"docx-fast-node", "xlsx-fast-node", "pptx-fast-node", "email-fast-node"}
+
 CRATES: dict[str, str] = {
     "json_fast": "json-fast-py",
     "xsd_fast": "xsd-fast-py",
@@ -118,6 +121,25 @@ def wheel_sbom(path: Path) -> dict[str, str] | None:
     }
 
 
+
+def tarball_distribution(path: Path) -> tuple[str, str, str | None]:
+    with tarfile.open(path, "r:gz") as archive:
+        try:
+            member = archive.getmember("package/package.json")
+            f = archive.extractfile(member)
+            if f is None:
+                raise KeyError
+            metadata = json.loads(f.read().decode("utf-8"))
+        except KeyError:
+            raise SystemExit(f"{path.name} carries no package/package.json")
+        name = metadata.get("name")
+        version = metadata.get("version")
+        author = metadata.get("author")
+        if not name or not version:
+            raise SystemExit(f"{path.name} package.json is missing name/version")
+        return name, version, author
+
+
 def digest(path: Path) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
@@ -142,11 +164,9 @@ def main() -> int:
 
     out = (ROOT / arguments.out).resolve()
     wheels = sorted(out.glob("*.whl"))
-    if not wheels:
-        raise SystemExit(
-            f"no wheels in {out}; build them first:\n"
-            "  (cd json-fast-py && maturin build --release --out ../dist)"
-        )
+    tarballs = sorted(out.glob("*.tgz"))
+    if not wheels and not tarballs:
+        raise SystemExit(f"no artifacts in {out}; build them first")
 
     dirty = source_is_dirty()
     if dirty and not arguments.allow_dirty:
@@ -157,33 +177,42 @@ def main() -> int:
         )
 
     artifacts = []
-    for wheel in wheels:
-        distribution, version, author = wheel_distribution(wheel)
-        key = distribution.replace("-", "_")
-        crate = CRATES.get(key)
+    for artifact_path in wheels + tarballs:
+        is_wheel = artifact_path.name.endswith(".whl")
+        if is_wheel:
+            distribution, version, author = wheel_distribution(artifact_path)
+            key = distribution.replace("-", "_")
+            crate = CRATES.get(key)
+        else:
+            distribution, version, author = tarball_distribution(artifact_path)
+            crate = distribution
+            if crate not in NODE_CRATES:
+                crate = None
+
         if crate is None:
-            raise SystemExit(f"{wheel.name}: no crate maps to distribution {distribution!r}")
+            raise SystemExit(f"{artifact_path.name}: no crate maps to distribution {distribution!r}")
+        
         declared = crate_version(crate)
         if version != declared:
             raise SystemExit(
-                f"{wheel.name} reports version {version} but {crate} declares "
+                f"{artifact_path.name} reports version {version} but {crate} declares "
                 f"{declared}; a consumer pinning {version} would get other bytes"
             )
         if author and author.strip() != "Dionisio Chiuratto Agourakis":
             raise SystemExit(
-                f"{wheel.name} is attributed to {author!r}. A shared artifact must "
+                f"{artifact_path.name} is attributed to {author!r}. A shared artifact must "
                 "name this repository, so a consumer can trace it back."
             )
         artifacts.append(
             {
-                "sbom": wheel_sbom(wheel),
+                "sbom": wheel_sbom(artifact_path) if is_wheel else None,
                 "distribution": distribution,
                 "crate": crate,
                 "version": version,
                 "author": author,
-                "file": wheel.name,
-                "sha256": digest(wheel),
-                "bytes": wheel.stat().st_size,
+                "file": artifact_path.name,
+                "sha256": digest(artifact_path),
+                "bytes": artifact_path.stat().st_size,
             }
         )
 
@@ -202,10 +231,10 @@ def main() -> int:
         },
         "sbom": {
             "tool": "cargo-cyclonedx" if cyclonedx_available() else None,
-            "embedded": all(artifact["sbom"] for artifact in artifacts),
+            "embedded": all(artifact["sbom"] for artifact in artifacts if artifact["file"].endswith(".whl")),
             "note": (
                 None
-                if all(artifact["sbom"] for artifact in artifacts)
+                if all(artifact["sbom"] for artifact in artifacts if artifact["file"].endswith(".whl"))
                 else "One or more wheels carry no embedded SBOM. Run "
                 "scripts/inject_sbom.py before generating this manifest."
             ),

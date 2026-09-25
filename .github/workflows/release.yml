@@ -116,15 +116,9 @@ jobs:
           name: node-${{ matrix.target }}
           path: dist-node/*.tgz
           if-no-files-found: error
-      - name: Attach the tarballs to the release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist-node/*.tgz
-          fail_on_unmatched_files: true
 
   manifest:
-    needs: wheels
+    needs: [wheels, node]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -135,6 +129,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-*
           path: dist
           merge-multiple: true
       - name: Embed exactly one CycloneDX SBOM per wheel
@@ -153,13 +152,14 @@ jobs:
           python3 scripts/release_manifest.py --out dist
           python3 -m pip install pytest
           python3 -m pytest tests -q
-          (cd dist && sha256sum *.whl release-manifest.json > SHA256SUMS)
+          (cd dist && sha256sum *.whl *.tgz release-manifest.json > SHA256SUMS)
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.whl
+            dist/*.tgz
             dist/release-manifest.json
             dist/SHA256SUMS
           fail_on_unmatched_files: true
@@ -169,5 +169,6 @@ jobs:
           name: release
           path: |
             dist/*.whl
+            dist/*.tgz
             dist/release-manifest.json
             dist/SHA256SUMS
