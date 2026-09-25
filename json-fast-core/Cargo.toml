@@ -24,6 +24,9 @@ arrow = [
     "dep:arrow-ipc",
     "dep:chrono",
 ]
+# Zero-cpu-copy file entry points: the document is memory-mapped and parsed
+# straight out of the page cache instead of being read into a caller buffer.
+mmap = ["dep:memmap2"]
 
 [dependencies]
 base64 = "0.22"
@@ -33,6 +36,10 @@ serde = { version = "1.0", features = ["derive"] }
 # the documented Arrow contract (union of keys in document order).
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sonic-rs = "0.5"
+
+[dependencies.memmap2]
+version = "0.9"
+optional = true
 
 [dependencies.chrono]
 version = "0.4"

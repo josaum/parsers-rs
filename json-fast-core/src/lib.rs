@@ -7,7 +7,7 @@
 //! |-----------------|-------------------------|-------|
 //! | JSON (6 types)  | [`parse`], [`parse_value`], [`stringify`], [`types`] | SIMD via sonic-rs |
 //! | JSONL / NDJSON  | [`jsonl`]               | line-delimited streaming |
-//! | JSON Schema     | [`schema`]              | focused draft-07 subset, fail-loud on unsupported keywords |
+//! | JSON Schema     | [`schema`]              | draft-07 through 2020-12 constraint keywords, local `$ref`, allocation-free walk |
 //! | JSON-RPC 2.0    | [`jsonrpc`]             | request / response envelopes |
 //! | JSON:API        | [`jsonapi`]             | resource envelope (`data` XOR `errors`) |
 //! | JWK / JWT       | [`jwt`]                 | header/payload split + base64url decode (no crypto) |
@@ -251,6 +251,49 @@ pub fn query_with_limits<T: serde::de::DeserializeOwned>(
     serde_json::from_value(node.clone()).map_err(JsonError::from)
 }
 
+#[cfg(feature = "mmap")]
+use std::path::Path;
+
+/// Parse a UTF-8 JSON file into a generic value by memory-mapping it (feature
+/// `mmap`). The bytes are read straight out of the page cache; the parsed
+/// value owns its own storage, so the mapping is dropped on return.
+///
+/// Resource limits apply before the parse, exactly as for [`parse_with_limits`].
+#[cfg(feature = "mmap")]
+pub fn parse_file(path: impl AsRef<Path>) -> Result<serde_json::Value> {
+    parse_file_with_limits(path, &JsonLimits::default())
+}
+
+/// [`parse_file`] after enforcing explicit resource limits.
+#[cfg(feature = "mmap")]
+pub fn parse_file_with_limits(
+    path: impl AsRef<Path>,
+    limits: &JsonLimits,
+) -> Result<serde_json::Value> {
+    let path = path.as_ref();
+    let file = std::fs::File::open(path)
+        .map_err(|e| JsonError::Structure(format!("cannot open {}: {e}", path.display())))?;
+    // SAFETY: the mapping is read-only and lives until the parse completes;
+    // the mapping itself holds the file handle. Concurrent truncation of the
+    // file is the caller's hazard, as with any mmap consumer.
+    let map = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| JsonError::Structure(format!("cannot map {}: {e}", path.display())))?;
+    let input = std::str::from_utf8(&map)
+        .map_err(|e| JsonError::Structure(format!("{} is not UTF-8: {e}", path.display())))?;
+    scan_json(input, limits)?;
+    parse_preflighted(input)
+}
+
+/// Validate a JSON file against a schema by memory-mapping the document
+/// (feature `mmap`). Equivalent to [`schema::validate`] with the file's
+/// content parsed under default resource limits.
+#[cfg(feature = "mmap")]
+pub fn validate_file(path: impl AsRef<Path>, schema: &str) -> Result<Vec<schema::Finding>> {
+    let doc = parse_file(path)?;
+    let sch: serde_json::Value = parse(schema)?;
+    Ok(schema::validate(&doc, &sch))
+}
+
 /// Prelude for convenient imports.
 pub mod prelude {
     pub use crate::error::{JsonError, JsonResource, Result};
@@ -263,6 +306,9 @@ pub mod prelude {
 
     #[cfg(feature = "arrow")]
     pub use crate::arrow::{self, ArrowOptions};
+
+    #[cfg(feature = "mmap")]
+    pub use crate::{parse_file, parse_file_with_limits, validate_file};
 }
 
 #[cfg(test)]
@@ -362,5 +408,37 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn parses_and_validates_a_mapped_file() {
+        use std::io::Write;
+
+        let path =
+            std::env::temp_dir().join(format!("json-fast-core-mmap-{}.json", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(file, r#"{{"id": 1, "name": "x"}}"#).unwrap();
+
+        let value = parse_file(&path).unwrap();
+        assert_eq!(value["id"], 1);
+        assert!(parse_file_with_limits(
+            &path,
+            &JsonLimits {
+                max_input_bytes: 4,
+                ..Default::default()
+            }
+        )
+        .is_err());
+
+        let findings = validate_file(&path, r#"{"type": "object", "required": ["id"]}"#).unwrap();
+        assert!(findings.is_empty());
+        let findings =
+            validate_file(&path, r#"{"type": "object", "required": ["missing"]}"#).unwrap();
+        assert!(findings
+            .iter()
+            .any(|f| f.severity == crate::schema::Severity::Error));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

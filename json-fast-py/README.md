@@ -46,10 +46,12 @@ assert not any(issue["severity"] == "error" for issue in issues)
 ```
 
 The package also exposes focused JSON-RPC, JSON:API, JWT, and JSON-LD helpers.
-Schema validation is deliberately bounded and reports unsupported behavior
-instead of implying full standards coverage. BSON, JSON5, and HJSON remain out
-of scope. Parse and validation failures remain caller-visible rather than
-yielding a partial result.
+JSON Schema validation covers the draft-07 through 2020-12 constraint keywords
+(validation, applicator and unevaluated vocabularies, local `$ref`, boolean
+schemas, and a bounded `format` assertion set). Dynamic refs, remote refs,
+unknown formats, and unknown keywords are surfaced as warnings, never silent
+passes. BSON, JSON5, and HJSON remain out of scope. Parse and validation
+failures remain caller-visible rather than yielding a partial result.
 
 ## Verify
 
