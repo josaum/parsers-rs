@@ -1,7 +1,7 @@
 # parsers-rs
 
-Sovereign, versioned, compiled parsers shared by **Atlas Brain** and
-**Mycelia**, and available to any other consumer.
+Sovereign, versioned, compiled parsers shared by multiple consumers, and
+available to any other consumer.
 
 This repository exists because the same parser crate names were being built
 independently in two product repositories from sources that had drifted apart.
@@ -19,7 +19,7 @@ interop contract** — the same purpose in every consumer.
 
 | In `parsers-rs` | Because |
 | --- | --- |
-| `json-fast-core`, `json-fast-py` | SIMD JSON/JSONL and JSON-family decode; same in both consumers |
+| `json-fast-core`, `json-fast-py` | SIMD JSON/JSONL and JSON-family decode; same in every consumer |
 | `xsd-fast-core`, `xsd-fast-py` | XSD schema reading and Arrow derivation; no consumer semantics |
 | `docx-fast-core`, `docx-fast-py` | Read-only DOCX structure extraction and NDJSON streaming |
 | `email-fast-core`, `email-fast-py` | Read-only EML/MSG/mbox extraction, with a bounded attachment budget |
@@ -27,7 +27,7 @@ interop contract** — the same purpose in every consumer.
 | `pptx-fast-core`, `pptx-fast-py` | Read-only PPTX extraction, NDJSON, Arrow dataset, embedded media |
 | `ooxml-archive` | Shared OOXML ZIP, bounded inflate, and relationship resolution |
 | `pdf-fast-core`, `pdf-fast-py` | Read-only PDF extraction: text, structure, tables, raster, Arrow |
-| `docx-fast-node`, `xlsx-fast-node`, `pptx-fast-node`, `email-fast-node` | Thin Node-API 2 bindings over the same cores, one `.node` per platform, versioned with the core; the `@mycelia/*-fast-node` packages are consumer shells around these tarballs |
+| `docx-fast-node`, `xlsx-fast-node`, `pptx-fast-node`, `email-fast-node` | Thin Node-API 2 bindings over the same cores, one `.node` per platform, versioned with the core; consumer shells package these tarballs |
 
 `ooxml-archive` is the load-bearing one. `max_inflate` is an **aggregate**
 budget for one archive view, not a per-part cap: a package with many
@@ -56,9 +56,9 @@ repository into a component of one product.
 
 | Stays in | Because |
 | --- | --- |
-| **Atlas**: `owl-fast-core` (reasoner projection) | It depends on `atlas-reasoner` and emits `RulePackage` `owl_axiom` rows. A shared crate cannot depend on one consumer. |
-| **Mycelia**: `owl-fast-core` (ontology chunker) | Entity extraction and subject chunking for RAG grounding. Product component, not a parser. |
-| **Mycelia**: `gliner-core`, `gliner2-core`, OCR models, `geom-core`, `layout-fast-*`, `web-fast-core`, `chunk-fast-core`, `fca-fast-*` | Product components — NER, OCR, layout and chunking — not parsers. |
+| `owl-fast-core` (one consumer's reasoner projection) | It depends on that consumer's reasoner crate and emits its `RulePackage` `owl_axiom` rows. A shared crate cannot depend on one consumer. |
+| `owl-fast-core` (another consumer's ontology chunker) | Entity extraction and subject chunking for RAG grounding. Product component, not a parser. |
+| Consumer components such as `gliner-core`, `gliner2-core`, OCR models, `geom-core`, `layout-fast-*`, `web-fast-core`, `chunk-fast-core`, `fca-fast-*` | Product components — NER, OCR, layout and chunking — not parsers. |
 
 `pdf-fast-py` carries one consumer-shaped feature: `reading-order` enables a
 reading-order policy that needs the consumer's layout engine. It declares no
@@ -67,61 +67,65 @@ so a consumer enables it and supplies the crate from its own workspace. Asking
 for reading order on a build without it is an error rather than a silent fall
 back to stream order.
 
-The same rule is why `owl-fast-core` is absent: its Atlas form depends on
-`atlas-reasoner`, and a shared crate cannot depend on one consumer. Applied
-consistently, that rule is what keeps this repository a shared plane rather than
-a component of either product.
+The same rule is why `owl-fast-core` is absent: its reasoner form depends on a
+consumer's reasoner crate, and a shared crate cannot depend on one consumer.
+Applied consistently, that rule is what keeps this repository a shared plane
+rather than a component of any one product.
 
-`gliner` and `embed` are **optional features** on Mycelia's docx/pdf/email/
-xlsx/pptx crates, and both must be removed when a core moves here. They are not
-only feature flags: each gates a whole module (`adapter.rs`, `embed.rs`) that
-depends on `gliner-core` or `mycelia-client`. Removed so far from docx, email,
+`gliner` and `embed` are **optional features** that some consumers enable on
+the docx/pdf/email/xlsx/pptx crates, and both must be removed when a core moves
+here. They are not only feature flags: each gates a whole module
+(`adapter.rs`, `embed.rs`) that depends on a consumer-side crate such as
+`gliner-core` or a consumer's client crate. Removed so far from docx, email,
 xlsx, and pptx; `pdf` still carries them.
 
 ### The `owl-fast-core` name collision — measured, and not ours to merge
 
-Two crates in two repositories share this name and are **different products**:
+Two crates in two consumer repositories share this name and are **different
+products**:
 
-* Mycelia's is an entity extractor and RAG chunker (`Entity`, `EntityType`,
-  `SubjectChunk`); its module doc states it is not a reasoner.
-* Atlas's emits Arrow IPC `RulePackage` rows and depends on `atlas-reasoner`.
+* one is an entity extractor and RAG chunker (`Entity`, `EntityType`,
+  `SubjectChunk`); its module doc states it is not a reasoner;
+* the other emits Arrow IPC `RulePackage` rows and depends on the consumer's
+  reasoner crate.
 
 The plan recorded here was **one crate with two features**:
 
 ```toml
-owl-fast-core = { version = "x.y.z", features = ["atlas-reasoner-rows"] }
+owl-fast-core = { version = "x.y.z", features = ["reasoner-rows"] }
 ```
 
 Measurement retired that plan. The two crates share **no public API at all** —
-Atlas exposes three functions (`from_name`, `parse_ontology_to_arrow_ipc`,
-`parse_ontology_to_arrow_ipc_with_limits`), Mycelia exposes sixteen, and not one
-name appears on both sides. A single shared function exists in the whole pair.
-A two-feature crate needs a common core for the features to wrap, and there is
-none: this would be a merger of two products, not a reconciliation.
+one exposes three functions (`from_name`, `parse_ontology_to_arrow_ipc`,
+`parse_ontology_to_arrow_ipc_with_limits`), the other exposes sixteen, and not
+one name appears on both sides. A single shared function exists in the whole
+pair. A two-feature crate needs a common core for the features to wrap, and
+there is none: this would be a merger of two products, not a reconciliation.
 
 Both stay where they are, for the same reason in two directions: reasoner
 projection is consumer semantics, and a RAG chunker is a product component.
 
 **What is real is the packaging collision.** Both repositories publish the
 distribution `owl-fast`, importing as `owl_fast`, with different contracts —
-Atlas's `parse_ontology_ipc` against Mycelia's `parse_file` /
-`chunk_by_subject`. On the flat module namespace the last wheel installed wins
-silently, and Atlas's upload boundary calls `owl_fast.parse_ontology_ipc`, so
-the wrong package breaks every `.ttl`, `.nt`, and `.nq` upload while the module
-still imports. Atlas now guards against that at runtime by asserting each
-parser's entry points rather than its importability.
+`parse_ontology_ipc` against `parse_file` / `chunk_by_subject`. On the flat
+module namespace the last wheel installed wins silently, and an upload
+boundary that calls `owl_fast.parse_ontology_ipc` breaks every `.ttl`, `.nt`,
+and `.nq` upload while the module still imports. Consumers guard against that
+at runtime by asserting each parser's entry points rather than its
+importability.
 
 The names are the defect — neither describes what its crate does. Renaming is a
-consumer decision for the two repositories, not something this one can settle.
+consumer decision for the owning repositories, not something this one can
+settle.
 
 ### The neutral reader here is `ontology-fast-core`
 
 The crate that *does* describe reading ontologies is `ontology-fast-core`: it
 depends only on `oxrdf` and `oxrdfio`, carries no consumer dependency, has no
-name collision, and is already the declared migration target for Atlas's
+name collision, and is already the declared migration target for a consumer's
 `catalog._subject_blocks`. It is the right candidate for this repository in this
-area — not `owl-fast-core`. Its Python binding is not yet wired into Atlas's app
-path.
+area — not `owl-fast-core`. Its Python binding is not yet wired into any
+consumer's app path.
 
 ## Build
 
@@ -233,55 +237,46 @@ and live in the manifest, because the crates do not move in lockstep.
 workspace and the release scripts on every push. `.github/workflows/release.yml`
 builds every binding for Apple Silicon, Linux x86_64 and Linux aarch64 on a
 `v*` tag, embeds one SBOM per wheel, stamps the manifest, and publishes the set
-with `SHA256SUMS` as release assets. Linux aarch64 is not optional: Mycelia's API
-image is multi-arch and cannot take a release that lacks it.
+with `SHA256SUMS` as release assets. Linux aarch64 is not optional: the API
+image that consumes the wheels is multi-arch and cannot take a release that
+lacks it.
 
 `repository` in `Cargo.toml` is the remote every artifact inherits;
 it must not point at a consumer.
 
 ## Provenance and cutover state
 
-`json-fast` and `xsd-fast` were extracted from Atlas Brain's
+`json-fast` and `xsd-fast` were extracted from a consumer's
 `office-parsers-rs/`; `docx-fast`, `email-fast`, and `xlsx-fast` were
 reconciled from the two repositories that had been building them independently.
 Every artifact in `dist/release-manifest.json` names its source commit.
 
 A wheel in `dist/` is not the same claim as a wheel a consumer installs. The
 distinction is recorded here because it is the difference between "released"
-and "in use":
+and "in use": a wheel in `dist/` is what this repository built and signed; a
+wheel a consumer installs is whatever bytes that consumer actually runs, which
+`verify_consumer_pin.py` checks against the manifest's SHA-256.
 
-| Wheel | Atlas | Mycelia |
-| --- | --- | --- |
-| `json_fast` | installs this release; links the pinned source | builds from its own source |
-| `xsd_fast` | installs this release | builds from its own source |
-| `docx_fast` | installs this release | builds from its own source |
-| `email_fast` | installs this release | builds from its own source |
-| `xlsx_fast` | installs this release | builds from its own source |
-| `pptx_fast` | installs this release | builds from its own source |
-| `pdf_fast` | installs this release | builds from its own source |
-
-Atlas removed its in-tree copies of all seven cores, their bindings and
-`ooxml-archive` on 2026-09-17; its `json-fast-{flight,node,zerobus}` link
-`json-fast-core` from the submodule `vendor/parsers-rs/src`, pinned to the
-commit this manifest names. Mycelia's cutover is specified in Atlas's
-`docs/atlas/specs/2026-09-17-parser-single-source-spec.md`; its four measured
-gaps (a retired glyph-atlas persistence API the extractor calls, the TISS
-shredder inside `xsd-fast-core`, the `gliner`/`embed` adapters inside five
-cores, and the four generic Node bindings) are product work on that side or
+Consumers removed their in-tree copies of the seven cores, their bindings and
+`ooxml-archive`; where a consumer links a core directly, it does so from the
+vendored source pinned to the commit this manifest names. The remaining
+consumer-side gaps (a retired glyph persistence API some extractors call, the
+TISS shredder inside `xsd-fast-core`, the `gliner`/`embed` adapters inside some
+cores, and the four generic Node bindings) are product work in the consumers or
 additions here, not forks.
 
-Atlas consumes these through `vendor/parsers-rs/` with a version and a SHA-256
-in `app/requirements/parsers-rs-pinned.txt`. Because a find-links source records
-no hash in `uv.lock`, a hash-verifying install is a separate documented command
-rather than something `uv sync` does for you — see `vendor/parsers-rs/README.md`
-in the consumer.
+Consumers install a release through a vendored `parsers-rs/` directory, with
+the version and a SHA-256 recorded in their pinned requirements. Because a
+find-links source records no hash in `uv.lock`, a hash-verifying install is a
+separate documented command rather than something `uv sync` does for you — see
+the vendored `parsers-rs/README.md` in the consumer.
 
 Public surface is verified against consumer call sites before a cutover, not
 after:
 
 | API | Verified against |
 | --- | --- |
-| `json_fast.loads`, `loads_many` | Atlas `cartridges/atlas/_jsonl.py`, `margin.py`, `feeds/pacvue.py`, `dataplane.py` |
-| `xsd_fast.list_elements_bytes`, `describe_element_bytes` | Atlas `app/atlas_demo/uploads.py` |
-| `docx_fast`, `email_fast` | Atlas upload suite |
+| `json_fast.loads`, `loads_many` | Document, margin and dataplane call sites (`_jsonl.py`, `margin.py`, `feeds/pacvue.py`, `dataplane.py`) |
+| `xsd_fast.list_elements_bytes`, `describe_element_bytes` | Upload entry points that derive schema descriptions |
+| `docx_fast`, `email_fast` | Upload suites |
 | `xlsx_fast`, `pptx_fast` | Compared wheel-to-wheel against the artifact each replaced, byte-identical on every case exercised; their NDJSON and Arrow surfaces cross-checked against the document projection on a fixture where no surface is vacuously empty |
