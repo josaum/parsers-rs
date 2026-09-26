@@ -23,6 +23,7 @@ members = [
   "xsd-fast-py",
   "ontology-fast-core",
   "ontology-fast-py",
+  "web-fast-core",
 ]
 
 # Shared dependency versions for every parser crate in this repository.

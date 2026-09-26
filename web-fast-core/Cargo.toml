@@ -1,0 +1,33 @@
+[package]
+name = "web-fast-core"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+description = "Deterministic, side-effect-free HTML parser with Arrow support"
+license.workspace = true
+repository.workspace = true
+keywords = ["html", "web", "parser", "arrow", "deterministic"]
+categories = ["parser-implementations", "web-programming"]
+rust-version.workspace = true
+
+[lib]
+name = "web_fast_core"
+
+[features]
+default = []
+arrow = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema"]
+
+[dependencies]
+arrow-array = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+encoding_rs = "0.8"
+scraper = { version = "0.27", features = ["atomic"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = "2.0"
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3.10"
