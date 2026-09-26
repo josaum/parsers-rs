@@ -59,6 +59,7 @@ CRATES: dict[str, str] = {
     "xlsx_fast": "xlsx-fast-py",
     "pptx_fast": "pptx-fast-py",
     "pdf_fast": "pdf-fast-py",
+    "ontology_fast": "ontology-fast-py",
 }
 
 
