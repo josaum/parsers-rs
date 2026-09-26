@@ -34,7 +34,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 sys.path.insert(0, str(ROOT / "scripts"))
-from release_manifest import CRATES, crate_version, wheel_distribution  # noqa: E402
+from release_manifest import (  # noqa: E402
+    CRATES,
+    NODE_CRATES,
+    crate_version,
+    tarball_distribution,
+    wheel_distribution,
+)
 
 
 @pytest.fixture(scope="module")
@@ -63,17 +69,18 @@ def test_every_recorded_artifact_exists_and_hashes_as_recorded(manifest: dict) -
 
 def test_no_artifact_is_missing_from_the_manifest(manifest: dict) -> None:
     recorded = {artifact["file"] for artifact in manifest["artifacts"]}
-    present = {wheel.name for wheel in DIST.glob("*.whl")}
+    present = {p.name for p in DIST.glob("*.whl")} | {p.name for p in DIST.glob("*.tgz")}
     assert present - recorded == set(), (
-        f"unrecorded wheels present: {sorted(present - recorded)}; they have no "
+        f"unrecorded artifacts present: {sorted(present - recorded)}; they have no "
         "provenance and must not be published alongside a stamped release"
     )
 
 
 def test_manifest_versions_match_the_crate_manifests(manifest: dict) -> None:
+    all_crates = set(CRATES.values()) | set(NODE_CRATES)
     for artifact in manifest["artifacts"]:
         crate = artifact["crate"]
-        assert crate in CRATES.values(), f"{crate} is not a known crate"
+        assert crate in all_crates, f"{crate} is not a known crate"
         assert artifact["version"] == crate_version(crate), (
             f"{artifact['file']} claims {artifact['version']} but {crate} "
             "declares a different version"
@@ -111,15 +118,18 @@ def test_artifacts_are_attributed_to_this_repository(manifest: dict) -> None:
         )
 
 
-def test_wheel_metadata_agrees_with_the_manifest(manifest: dict) -> None:
+def test_artifact_metadata_agrees_with_the_manifest(manifest: dict) -> None:
     for artifact in manifest["artifacts"]:
-        wheel = DIST / artifact["file"]
-        with zipfile.ZipFile(wheel) as archive:
-            metadata_name = next(
-                name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
-            )
-            metadata = archive.read(metadata_name).decode("utf-8")
-        distribution, version, _author = wheel_distribution(wheel)
+        path = DIST / artifact["file"]
+        if artifact["file"].endswith(".whl"):
+            with zipfile.ZipFile(path) as archive:
+                metadata_name = next(
+                    name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+                )
+                metadata = archive.read(metadata_name).decode("utf-8")
+            distribution, version, _author = wheel_distribution(path)
+            assert f"Version: {version}" in metadata
+        else:
+            distribution, version, _author = tarball_distribution(path)
         assert distribution == artifact["distribution"]
         assert version == artifact["version"]
-        assert f"Version: {version}" in metadata

@@ -37,11 +37,9 @@ so there is no fast path that inflates first and checks afterwards — a faster
 decoder can only be reinstated by keeping that ordering.
 
 The shipped surface is **33 artifacts**: seven Python wheels and four Node
-tarballs × macOS arm64, Linux x86_64 and Linux aarch64. The wheels are bound
-to the commit by `release-manifest.json` and `SHA256SUMS`; the Node tarballs
-are attached to the same release by their own job and are in neither yet
-(a documented gap: extend `scripts/release_manifest.py` before a consumer
-pins a tarball by manifest rather than by the tag it downloads from).
+tarballs × macOS arm64, Linux x86_64 and Linux aarch64. Both the wheels and
+the Node tarballs are bound to the commit by `release-manifest.json` and
+`SHA256SUMS`.
 
 Node bindings build with `scripts/build-node.sh [crate ...]` (cargo, no
 `@napi-rs/cli`) and are smoked with `node scripts/smoke-node.mjs`, which
@@ -73,11 +71,11 @@ Applied consistently, that rule is what keeps this repository a shared plane
 rather than a component of any one product.
 
 `gliner` and `embed` are **optional features** that some consumers enable on
-the docx/pdf/email/xlsx/pptx crates, and both must be removed when a core moves
-here. They are not only feature flags: each gates a whole module
-(`adapter.rs`, `embed.rs`) that depends on a consumer-side crate supplied from
-the consumer's own workspace. Removed so far from docx, email, xlsx, and
-pptx; `pdf` still carries them.
+their document crates, and both must be removed when a core moves here.
+They are not only feature flags: each gates a whole module (`adapter.rs`,
+`embed.rs`) that depends on a consumer-side crate supplied from the consumer's
+own workspace. Both have been removed from all cores here (docx, email, xlsx,
+pptx, and pdf).
 
 ### The `owl-fast-core` name collision — measured, and not ours to merge
 
@@ -257,11 +255,9 @@ wheel a consumer installs is whatever bytes that consumer actually runs, which
 
 Consumers removed their in-tree copies of the seven cores, their bindings and
 `ooxml-archive`; where a consumer links a core directly, it does so from the
-vendored source pinned to the commit this manifest names. The remaining
-consumer-side gaps (a retired glyph persistence API some extractors call,
-consumer-specific XML shredding inside `xsd-fast-core`, `gliner`/`embed`
-adapters inside some cores, and the four generic Node bindings) are product
-work in the consumers or additions here, not forks.
+vendored source pinned to the commit this manifest names. The remaining consumer-side gaps (a retired glyph persistence API some
+consumer extractors still call, and consumer-specific XML shredding inside
+downstream consumers) are product work in the consumers, not forks here.
 
 Consumers install a release through a vendored `parsers-rs/` directory, with
 the version and a SHA-256 recorded in their pinned requirements. Because a
