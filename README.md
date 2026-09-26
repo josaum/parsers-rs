@@ -27,7 +27,9 @@ interop contract** — the same purpose in every consumer.
 | `pptx-fast-core`, `pptx-fast-py` | Read-only PPTX extraction, NDJSON, Arrow dataset, embedded media |
 | `ooxml-archive` | Shared OOXML ZIP, bounded inflate, and relationship resolution |
 | `pdf-fast-core`, `pdf-fast-py` | Read-only PDF extraction: text, structure, tables, raster, Arrow |
-| `docx-fast-node`, `xlsx-fast-node`, `pptx-fast-node`, `email-fast-node` | Thin Node-API 2 bindings over the same cores, one `.node` per platform, versioned with the core; consumer shells package these tarballs |
+| `ontology-fast-core`, `ontology-fast-py` | Canonical Turtle reading and indexed triple view with strict resource budgets |
+| `web-fast-core` | Deterministic, side-effect-free HTML parser with Apache Arrow IPC/batches |
+| `docx-fast-node`, `xlsx-fast-node`, `pptx-fast-node`, `email-fast-node`, `json-fast-node` | Thin Node-API 2 bindings over the same cores, one `.node` per platform, versioned with the core; consumer shells package these tarballs |
 
 `ooxml-archive` is the load-bearing one. `max_inflate` is an **aggregate**
 budget for one archive view, not a per-part cap: a package with many
@@ -36,7 +38,7 @@ restricted decoder that bounds output before exposing bytes is the `flate2` one,
 so there is no fast path that inflates first and checks afterwards — a faster
 decoder can only be reinstated by keeping that ordering.
 
-The shipped surface is **33 artifacts**: seven Python wheels and four Node
+The shipped surface is **39 artifacts**: eight Python wheels and five Node
 tarballs × macOS arm64, Linux x86_64 and Linux aarch64. Both the wheels and
 the Node tarballs are bound to the commit by `release-manifest.json` and
 `SHA256SUMS`.

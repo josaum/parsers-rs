@@ -20,10 +20,10 @@ env:
   CARGO_TERM_COLOR: always
   # Every Python binding crate in the workspace. Adding a crate means adding it
   # here and to the shipped-surface count in README.md.
-  BINDINGS: docx-fast-py xlsx-fast-py pptx-fast-py pdf-fast-py email-fast-py xsd-fast-py json-fast-py
+  BINDINGS: docx-fast-py xlsx-fast-py pptx-fast-py pdf-fast-py email-fast-py xsd-fast-py json-fast-py ontology-fast-py
   # Every Node-API binding crate. Same rule: a new crate is added here and to
   # the shipped-surface count in README.md.
-  NODE_BINDINGS: docx-fast-node xlsx-fast-node pptx-fast-node email-fast-node
+  NODE_BINDINGS: docx-fast-node xlsx-fast-node pptx-fast-node email-fast-node json-fast-node
 
 jobs:
   wheels:
