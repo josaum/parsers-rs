@@ -101,12 +101,23 @@ def verify(vendor: Path, source: Path | None) -> Report:
         report.fail("manifest records a dirty source tree; that is not a release")
 
     declared = {a["file"]: a for a in manifest.get("artifacts", [])}
-    present = {p.name: p for p in vendor.glob("*.whl")}
+    declared_wheels = {k: v for k, v in declared.items() if k.endswith(".whl")}
+    declared_tarballs = {k: v for k, v in declared.items() if k.endswith(".tgz")}
+
+    present_wheels = {p.name: p for p in vendor.glob("*.whl")}
+    present_tarballs = {p.name: p for p in vendor.glob("*.tgz")}
+    present = {**present_wheels, **present_tarballs}
 
     for name in sorted(present.keys() - declared.keys()):
-        report.fail(f"vendored wheel not named by the manifest: {name}")
-    for name in sorted(declared.keys() - present.keys()):
-        report.fail(f"manifest names a wheel that is not vendored: {name}")
+        report.fail(f"vendored artifact not named by the manifest: {name}")
+
+    if present_wheels or (not present_tarballs):
+        for name in sorted(declared_wheels.keys() - present_wheels.keys()):
+            report.fail(f"manifest names a wheel that is not vendored: {name}")
+
+    if present_tarballs:
+        for name in sorted(declared_tarballs.keys() - present_tarballs.keys()):
+            report.fail(f"manifest names a tarball that is not vendored: {name}")
 
     for name in sorted(declared.keys() & present.keys()):
         expected = declared[name]["sha256"]

@@ -112,6 +112,32 @@ def test_an_uninitialised_submodule_is_named_not_guessed(tmp_path: Path) -> None
     assert any("submodule update --init" in f for f in report.failures), report.failures
 
 
+def test_tarballs_and_wheels_together_pass(tmp_path: Path) -> None:
+    vendor = _vendor(
+        tmp_path,
+        commit=COMMIT,
+        wheels={
+            "a_fast-0.1.0-py3-none-any.whl": b"a",
+            "a-fast-node-0.1.0-darwin-arm64.tgz": b"pkg",
+        },
+    )
+    report = vcp.verify(vendor, None)
+    assert report.ok, report.failures
+    assert report.checked_wheels == 2
+
+
+def test_missing_declared_tarball_fails_when_tarballs_present(tmp_path: Path) -> None:
+    vendor = _vendor(
+        tmp_path,
+        commit=COMMIT,
+        wheels={"a-fast-node-0.1.0-darwin-arm64.tgz": b"pkg1"},
+        extra_declared={"b-fast-node-0.1.0-darwin-arm64.tgz": b"pkg2"},
+    )
+    report = vcp.verify(vendor, None)
+    assert any("manifest names a tarball that is not vendored" in f for f in report.failures), report.failures
+
+
+
 @pytest.mark.skipif(not (Path(__file__).resolve().parents[1] / "dist" / vcp.MANIFEST_NAME).is_file(), reason="no local release in dist/")
 def test_the_local_release_directory_is_self_consistent() -> None:
     repo = Path(__file__).resolve().parents[1]
