@@ -1208,6 +1208,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "json-fast-node"
+version = "0.1.5"
+dependencies = [
+ "json-fast-core",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "serde_json",
+]
+
+[[package]]
 name = "json-fast-py"
 version = "0.1.5"
 dependencies = [

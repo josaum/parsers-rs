@@ -6,7 +6,7 @@
 // Usage: node scripts/smoke-node.mjs [docx|xlsx|pptx|email ...]
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { mkdtempSync, writeFileSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { crc32 } from 'node:zlib';
 import path from 'node:path';
@@ -93,6 +93,7 @@ const fixtures = {
     'Hello EML body',
     '',
   ].join('\r\n')),
+  json: () => Buffer.from('{"hello":"Hello JSON","nested":{"a":1}}\n{"hello":"JSONL","nested":{"a":2}}\n'),
 };
 
 // Each check must be non-vacuous: a fixture string round-trips through the parse.
@@ -135,9 +136,20 @@ const checks = {
     if (m.extractAttachments(file, path.join(dir, 'att'), 1024).length !== 0) throw new Error('unexpected attachments');
     return `subject=${e.subject}`;
   },
+  json(m, file, dir) {
+    const text = readFileSync(file, 'utf8');
+    const firstLine = text.split('\n')[0];
+    const val = m.parseJson(firstLine);
+    if (val.hello !== 'Hello JSON') throw new Error('json parse failed');
+    const rows = m.parseJsonl(text);
+    if (rows.length !== 2) throw new Error('jsonl parse count mismatch');
+    const count = m.countLines(text);
+    if (count !== 2) throw new Error(`count lines mismatch: ${count}`);
+    return `version=${m.version()}, lines=${count}`;
+  },
 };
 
-const ext = { docx: 'docx', xlsx: 'xlsx', pptx: 'pptx', email: 'eml' };
+const ext = { docx: 'docx', xlsx: 'xlsx', pptx: 'pptx', email: 'eml', json: 'json' };
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(checks);
 let failures = 0;
 for (const name of wanted) {

@@ -43,7 +43,13 @@ MANIFEST_NAME = "release-manifest.json"
 SCHEMA_VERSION = "parsers-rs.release.v1"
 
 # Wheel file name -> the crate directory whose version it must report.
-NODE_CRATES: set[str] = {"docx-fast-node", "xlsx-fast-node", "pptx-fast-node", "email-fast-node"}
+NODE_CRATES: set[str] = {
+    "docx-fast-node",
+    "xlsx-fast-node",
+    "pptx-fast-node",
+    "email-fast-node",
+    "json-fast-node",
+}
 
 CRATES: dict[str, str] = {
     "json_fast": "json-fast-py",
