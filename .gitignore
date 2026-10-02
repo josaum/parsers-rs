@@ -24,3 +24,4 @@ __pycache__/
 /.leio-code/events/
 /.leio-code/exports/
 /.leio-code/*.lock
+/.leio-code/sessions/

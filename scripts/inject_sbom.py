@@ -19,6 +19,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
+import hashlib
+import io
 import json
 import shutil
 import tempfile
@@ -36,6 +40,7 @@ SBOM_SOURCES: dict[str, str] = {
     "xlsx_fast": "xlsx-fast-core",
     "pptx_fast": "pptx-fast-core",
     "pdf_fast": "pdf-fast-core",
+    "ontology_fast": "ontology-fast-core",
 }
 
 
@@ -67,19 +72,19 @@ def inject(wheel: Path, sbom: Path) -> bool:
 
         # dist-info keeps the dashed distribution name as published.
         info = next(
-            name.split("/")[0] for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+            name.split("/")[0]
+            for name in archive.namelist()
+            if name.endswith(".dist-info/METADATA")
         )
         member = f"{info}/sboms/{crate}.cyclonedx.json"
-        if member in archive.namelist():
-            return False
-
         payload = sbom.read_bytes()
         # A malformed SBOM must not be shipped as if it were valid.
         json.loads(payload)
 
+        original_entries = {name: archive.read(name) for name in archive.namelist()}
         entries = {
-            name: archive.read(name)
-            for name in archive.namelist()
+            name: blob
+            for name, blob in original_entries.items()
             # Drop any SBOM that reached the wheel another way — a stray
             # `cargo cyclonedx` in the binding crate before `maturin build` is
             # enough for one to be packaged. Injection owns this set, so what a
@@ -88,8 +93,29 @@ def inject(wheel: Path, sbom: Path) -> bool:
         }
 
     entries[member] = payload
+    record = f"{info}/RECORD"
+    rows = [
+        (
+            name,
+            "sha256="
+            + base64.urlsafe_b64encode(hashlib.sha256(blob).digest())
+            .rstrip(b"=")
+            .decode("ascii"),
+            str(len(blob)),
+        )
+        for name, blob in sorted(entries.items())
+        if name != record
+    ]
+    rows.append((record, "", ""))
+    output = io.StringIO(newline="")
+    csv.writer(output, lineterminator="\n").writerows(rows)
+    entries[record] = output.getvalue().encode("utf-8")
+    if entries == original_entries:
+        return False
 
-    with tempfile.NamedTemporaryFile(dir=wheel.parent, suffix=".whl", delete=False) as handle:
+    with tempfile.NamedTemporaryFile(
+        dir=wheel.parent, suffix=".whl", delete=False
+    ) as handle:
         temporary = Path(handle.name)
 
     with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as out:
@@ -103,10 +129,10 @@ def inject(wheel: Path, sbom: Path) -> bool:
     return True
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist", default="dist")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
 
     dist = (ROOT / arguments.dist).resolve()
     wheels = sorted(dist.glob("*.whl"))
@@ -129,7 +155,9 @@ def main() -> int:
             )
             continue
         changed = inject(wheel, sbom)
-        print(f"  {'injected' if changed else 'already present'}: {wheel.name} <- {sbom.name}")
+        print(
+            f"  {'injected' if changed else 'already present'}: {wheel.name} <- {sbom.name}"
+        )
 
     if failures:
         for failure in failures:
@@ -137,10 +165,11 @@ def main() -> int:
         raise SystemExit("SBOM injection incomplete")
 
     # The archive changed, so any hash recorded earlier is now stale.
-    manifest = dist / "release-manifest.json"
-    if manifest.is_file():
-        manifest.unlink()
-        print("  removed release-manifest.json; regenerate it after this step")
+    for name in ("release-manifest.json", "SHA256SUMS"):
+        stamp = dist / name
+        if stamp.is_file():
+            stamp.unlink()
+            print(f"  removed {name}; regenerate it after this step")
     return 0
 
 

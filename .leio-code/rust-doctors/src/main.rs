@@ -11,6 +11,10 @@ const NAMES: &[&str] = &[
 ];
 const PY: &[&str] = &["docx", "xlsx", "pptx", "pdf", "email", "json", "xsd"];
 const NODE: &[&str] = &["docx", "xlsx", "pptx", "email"];
+const PY_BINDINGS: &[&str] = &[
+    "docx", "xlsx", "pptx", "pdf", "email", "json", "xsd", "ontology",
+];
+const NODE_BINDINGS: &[&str] = &["docx", "xlsx", "pptx", "email", "json"];
 #[derive(Deserialize)]
 struct Request {
     protocol: u32,
@@ -187,7 +191,7 @@ fn check(root: &Path, name: &str) -> Value {
                 }
             }
             "parsers-binding-contract" => {
-                for parser in PY {
+                for parser in PY_BINDINGS {
                     let core = toml_file(root, &format!("{parser}-fast-core/Cargo.toml"))?;
                     let path = format!("{parser}-fast-py/Cargo.toml");
                     let binding = toml_file(root, &path)?;
@@ -197,7 +201,7 @@ fn check(root: &Path, name: &str) -> Value {
                         "published Python binding version must match its core",
                     );
                 }
-                for parser in NODE {
+                for parser in NODE_BINDINGS {
                     let core = toml_file(root, &format!("{parser}-fast-core/Cargo.toml"))?;
                     let path = format!("{parser}-fast-node/Cargo.toml");
                     let binding = toml_file(root, &path)?;
@@ -312,6 +316,27 @@ mod tests {
 mod regression {
     use super::*;
     #[test]
+    fn repository_ci_covers_every_declared_arrow_feature() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workflow: serde_yaml::Value =
+            serde_yaml::from_str(&text(&root, ".github/workflows/ci.yml").unwrap()).unwrap();
+        assert!(
+            workflow["on"]
+                .as_mapping()
+                .unwrap()
+                .contains_key(serde_yaml::Value::String("workflow_call".to_owned()))
+        );
+        let result = check(&root, "parsers-clippy-gate");
+        assert_eq!(result["warnings"], json!([]), "{result}");
+        assert!(
+            result["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["detail"] == "Arrow CI must cover web-fast-core" })
+        );
+    }
+    #[test]
     fn ci_contract_detects_missing_feature_and_warning_gate() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -353,14 +378,14 @@ mod regression {
     fn binding_contract_does_not_invent_missing_node_products() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        for parser in PY {
+        for parser in PY_BINDINGS {
             for suffix in ["core", "py"] {
                 let dir = root.join(format!("{parser}-fast-{suffix}"));
                 fs::create_dir_all(&dir).unwrap();
                 fs::write(dir.join("Cargo.toml"), "[package]\nversion = \"1.2.3\"\n").unwrap();
             }
         }
-        for parser in NODE {
+        for parser in NODE_BINDINGS {
             let dir = root.join(format!("{parser}-fast-node"));
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("Cargo.toml"), "[package]\nversion = \"1.2.3\"\n").unwrap();
@@ -380,5 +405,29 @@ mod regression {
                 .len(),
             1
         );
+        fs::write(root.join("docx-fast-node/package.json"),json!({"version":"1.2.3","repository":{"url":"https://github.com/josaum/parsers-rs.git"}}).to_string()).unwrap();
+        for path in ["ontology-fast-py/Cargo.toml", "json-fast-node/Cargo.toml"] {
+            fs::write(root.join(path), "[package]\nversion = \"1.2.2\"\n").unwrap();
+            let result = check(root, "parsers-binding-contract");
+            assert_eq!(result["warnings"].as_array().unwrap().len(), 1, "{result}");
+            fs::write(root.join(path), "[package]\nversion = \"1.2.3\"\n").unwrap();
+        }
+    }
+    #[test]
+    fn release_bindings_include_ontology_python_and_json_node() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let result = check(&root, "parsers-binding-contract");
+        assert_eq!(result["warnings"], json!([]), "{result}");
+        let evidence = result["evidence"].as_array().unwrap();
+        for path in [
+            "ontology-fast-py/Cargo.toml",
+            "json-fast-node/Cargo.toml",
+            "json-fast-node/package.json",
+        ] {
+            assert!(
+                evidence.iter().any(|entry| entry["path"] == path),
+                "missing binding evidence for {path}"
+            );
+        }
     }
 }

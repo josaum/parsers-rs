@@ -18,7 +18,7 @@
 //! Python extension and holds only the conversion to and from Python objects.
 
 use ontology_fast_core::{
-    OntologyError, OntologyLimits, TermView, declared_prefixes, parse_turtle, parse_turtle_terms,
+    declared_prefixes, parse_turtle, parse_turtle_terms, OntologyError, OntologyLimits, TermView,
 };
 use pyo3::{
     create_exception,

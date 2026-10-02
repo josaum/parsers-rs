@@ -38,10 +38,17 @@ restricted decoder that bounds output before exposing bytes is the `flate2` one,
 so there is no fast path that inflates first and checks afterwards — a faster
 decoder can only be reinstated by keeping that ordering.
 
-The shipped surface is **39 artifacts**: eight Python wheels and five Node
-tarballs × macOS arm64, Linux x86_64 and Linux aarch64. Both the wheels and
-the Node tarballs are bound to the commit by `release-manifest.json` and
-`SHA256SUMS`.
+The current source declares a release surface of **39 artifacts**: eight Python
+wheels and five Node tarballs × macOS arm64, Linux x86_64 and Linux aarch64.
+Release publication requires the complete matrix after the reusable CI gate
+passes. Both artifact families are bound to the commit by
+`release-manifest.json` and the generator's `SHA256SUMS`; each artifact records
+its own target rather than inheriting the manifest runner's host.
+
+Observed on 2026-09-29, published `v2026.09.25.1` predates this expanded matrix:
+it contains 21 wheels and 12 Node tarballs, without `ontology-fast` wheels or
+`json-fast-node` tarballs. Its manifest and checksum file cover only wheels.
+The source changes here do not retroactively certify or replace that release.
 
 Node bindings build with `scripts/build-node.sh [crate ...]` (cargo, no
 `@napi-rs/cli`) and are smoked with `node scripts/smoke-node.mjs`, which
@@ -122,8 +129,10 @@ The crate that *does* describe reading ontologies is `ontology-fast-core`: it
 depends only on `oxrdf` and `oxrdfio`, carries no consumer dependency, has no
 name collision, and is already the declared migration target for a consumer's
 ontology-catalog reader. It is the right candidate for this repository in this
-area — not `owl-fast-core`. Its Python binding is not yet wired into any
-consumer's app path.
+area — not `owl-fast-core`. The sovereign release observed on 2026-09-29 did
+not yet contain this binding's wheels. A consumer's local `ontology_fast`
+import does not by itself prove adoption of a published sovereign release:
+its wheel hash, release manifest and source pin must agree.
 
 ## Build
 
@@ -146,7 +155,7 @@ cd xsd-fast-py  && maturin build --release --out ../dist
 # owns what a wheel carries), then stamp the manifest
 cargo cyclonedx --manifest-path json-fast-core/Cargo.toml -f json --describe crate
 python3 scripts/inject_sbom.py --dist dist
-python3 scripts/release_manifest.py --out dist
+python3 scripts/release_manifest.py --out dist --require-complete
 ```
 
 Cross-platform wheels use the toolchain the native reader already relies on:
@@ -157,7 +166,7 @@ rustup target add x86_64-unknown-linux-gnu
    --target x86_64-unknown-linux-gnu --zig --out ../dist)
 ```
 
-This writes `dist/release-manifest.json`, which binds every wheel to its
+This writes `dist/release-manifest.json` and `dist/SHA256SUMS`, which bind every wheel and Node tarball to its
 SHA-256, reported version, the **source commit**, the build toolchain, and the
 target triple. It refuses to write a manifest when:
 
@@ -167,12 +176,63 @@ target triple. It refuses to write a manifest when:
   drift that produced two different `json_fast-0.1.0` artifacts,
 * a wheel is attributed to a consumer rather than to this repository.
 
+ARM64 release wheels are built on `ubuntu-24.04-arm` inside an immutable
+digest-pinned PyPA `manylinux2014_aarch64` container, using the repository's
+exact Rust 1.98.1 toolchain and native GCC with the Cortex-A53 mitigation flag
+preserved. The artifact gate installs and imports all eight wheels, verifies
+their native target headers, and executes the existing Python binding contract
+tests on the native Ubuntu host with PyArrow 25.0.1. This workflow contract has
+local regression coverage; its actual cloud build has not been run by the
+local verification below.
+
+`--require-complete` additionally rejects missing or duplicate crate/target
+pairs and missing or incorrectly attributed core SBOMs. It is mandatory in the
+publication workflow. Omit it only for a partial local build, which is not proof
+of the cross-platform release surface. `--allow-dirty` records local source
+changes explicitly and must not be treated as a published release.
+Every target stamp also checks the native payload: Linux requires a matching
+64-bit little-endian ELF shared object, and macOS requires an ARM64 Mach-O
+library. A filename or metadata tag cannot substitute for that architecture.
+
 `cargo-cyclonedx` is required for a release. Each wheel carries **exactly one**
 CycloneDX SBOM, for the core crate that defines its dependencies;
 `scripts/inject_sbom.py` is authoritative about that and strips any SBOM that
 arrived by another route, because a stray `cargo cyclonedx` in a binding
 directory is enough for the wheel builder to package a second one. A missing or
 duplicate SBOM fails the release rather than being recorded as an absence.
+Injection replaces the SBOM set and regenerates wheel `RECORD` hashes and sizes
+so the resulting wheel remains internally verifiable.
+
+### Local packaging verification, 2026-09-29–2026-09-30
+
+Local verification passed workspace tests and strict clippy both with default
+features and the complete CI Arrow feature set, workspace formatting, and the
+repository doctor. Release-generator regressions exercise a complete fixture
+matrix and reject missing targets, duplicate targets, incorrect SBOMs, filename
+drift and unusable source commits. The fixture matrix is not a cross-platform
+binary build.
+
+New macOS ARM64 `ontology-fast` and `json-fast-node` artifacts were built with
+locked dependencies under `dist/local-build-2026-09-29/`. The ontology wheel
+passed its Python contract suite in an isolated environment; the packed Node
+tarball passed a native parse smoke after extraction. Linux x86_64 and ARM64
+ontology wheels and JSON Node tarballs were also cross-built and
+checked for archive integrity, native ELF architecture and artifact metadata.
+The generated local manifest and checksums cover those artifacts and explicitly
+record dirty source state.
+
+Linux artifacts have not been executed: this Mac had no reachable local Docker
+daemon during verification. ARM64 Zig builds have an additional safety limit:
+upstream cargo-zigbuild filters Rust's `--fix-cortex-a53-843419` linker argument.
+Their package checks do not establish that CPU-erratum mitigation. A release
+must use a compatible native ARM64 linker and pass native execution tests;
+running a cross-built binary on newer ARM hardware alone does not prove the
+mitigation. See [the upstream filter change](https://github.com/rust-cross/cargo-zigbuild/pull/452)
+and [Rust's mitigation requirement](https://github.com/rust-lang/rust/pull/155453).
+
+These artifacts are development evidence, not publishable consumer pins. The
+complete cross-platform release still requires the release workflow to run on
+a clean committed revision; no release was published by this verification.
 
 ```bash
 cargo install cargo-cyclonedx

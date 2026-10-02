@@ -5,7 +5,7 @@
 //! module uses, and each way the reader refuses a document.
 
 use ontology_fast_core::{
-    OntologyError, OntologyLimits, TermView, TripleText, parse_turtle, parse_turtle_terms,
+    parse_turtle, parse_turtle_terms, OntologyError, OntologyLimits, TermView, TripleText,
 };
 
 #[expect(

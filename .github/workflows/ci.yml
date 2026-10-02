@@ -6,11 +6,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  ARROW_FEATURES: docx-fast-core/arrow,xlsx-fast-core/arrow,pptx-fast-core/arrow,pdf-fast-core/arrow,email-fast-core/arrow,json-fast-core/arrow,xsd-fast-core/arrow
+  ARROW_FEATURES: docx-fast-core/arrow,xlsx-fast-core/arrow,pptx-fast-core/arrow,pdf-fast-core/arrow,email-fast-core/arrow,json-fast-core/arrow,xsd-fast-core/arrow,web-fast-core/arrow
 
 jobs:
   rust:

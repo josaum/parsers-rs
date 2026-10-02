@@ -18,6 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  ARM_MANYLINUX_IMAGE: quay.io/pypa/manylinux2014_aarch64@sha256:d36e257b4f7b1130a1442a5cd28022307645a92b8093ab65543205426354cfd2
   # Every Python binding crate in the workspace. Adding a crate means adding it
   # here and to the shipped-surface count in README.md.
   BINDINGS: docx-fast-py xlsx-fast-py pptx-fast-py pdf-fast-py email-fast-py xsd-fast-py json-fast-py ontology-fast-py
@@ -26,14 +27,18 @@ env:
   NODE_BINDINGS: docx-fast-node xlsx-fast-node pptx-fast-node email-fast-node json-fast-node
 
 jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   wheels:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: macos-14,      target: aarch64-apple-darwin,       compat: "" }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu,  compat: "--zig --compatibility manylinux_2_17" }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, compat: "--zig --compatibility manylinux_2_17" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, compat: "--compatibility manylinux_2_17" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -44,37 +49,69 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # manylinux 2_17 via zig is what the hand-built releases shipped, so
-      # existing consumer pins keep resolving; zig also cross-compiles the
-      # aarch64 Linux set without an emulated runner.
-      - run: python3 -m pip install --upgrade "maturin>=1.6,<2.0" ziglang
+      - if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: python3 -m pip install "maturin==1.15.0" "ziglang==0.15.2"
       - name: Build every binding for ${{ matrix.target }}
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euo pipefail
+          CARGO_ZIGBUILD_PYTHON_PATH="$(command -v python3)"
+          CARGO_ZIGBUILD_ZIG_PATH="$(python3 -c 'import ziglang; from pathlib import Path; print(Path(ziglang.__file__).with_name("zig"))')"
+          export CARGO_ZIGBUILD_PYTHON_PATH CARGO_ZIGBUILD_ZIG_PATH
           for crate in $BINDINGS; do
-            (cd "$crate" && maturin build --release --target "${{ matrix.target }}" ${{ matrix.compat }} --out ../dist)
+            (cd "$crate" && maturin build --release --locked --target "${{ matrix.target }}" ${{ matrix.compat }} --out ../dist)
           done
           ls -1 dist
+      - name: Build native ARM manylinux wheels
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          task_rustc_path="$(rustup which --toolchain 1.98.1 rustc)"
+          task_rust_toolchain="${task_rustc_path%/bin/rustc}"
+          docker run --rm -i --platform linux/arm64 \
+            --env BINDINGS \
+            --env CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=gcc \
+            --env RUSTFLAGS='-C link-arg=-Wl,--fix-cortex-a53-843419' \
+            --volume "${task_rust_toolchain}:/opt/rust:ro" \
+            --volume "$PWD:/io" --workdir /io \
+            "${{ env.ARM_MANYLINUX_IMAGE }}" bash -euo pipefail <<'ARM_NATIVE_BUILD'
+          export PATH="/opt/rust/bin:/opt/python/cp312-cp312/bin:$PATH"
+          test "$(uname -m)" = aarch64
+          test "$(rustc --version | cut -d ' ' -f 2)" = 1.98.1
+          gcc --version
+          cargo --version
+          python -m pip install "maturin==1.15.0"
+          for crate in $BINDINGS; do
+            maturin build --release --locked --target aarch64-unknown-linux-gnu \
+              --compatibility manylinux_2_17 --manifest-path "$crate/Cargo.toml" \
+              --interpreter /opt/python/cp312-cp312/bin/python --out dist
+          done
+          ARM_NATIVE_BUILD
+      - name: Smoke native ARM wheel artifacts
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          read -r -a task_bindings <<< "$BINDINGS"
+          python3 -c "import sys; from pathlib import Path; sys.path.insert(0, 'scripts'); from release_manifest import artifact_target; wheels = list(Path('dist').glob('*.whl')); assert len(wheels) == len(sys.argv) - 1; assert all(artifact_target(wheel) == 'aarch64-unknown-linux-gnu' for wheel in wheels)" "${task_bindings[@]}"
+          python3 -m pip install "pytest==9.1.1" "pyarrow==25.0.1"
+          python3 -m pip install --no-index --no-deps dist/*.whl
+          python3 -I -c "import importlib, os; [importlib.import_module(crate.removesuffix('-py').replace('-', '_')) for crate in os.environ['BINDINGS'].split()]"
+          python3 -I -m pytest --import-mode=importlib -q \
+            email-fast-py/tests json-fast-py/tests ontology-fast-py/tests \
+            pdf-fast-py/tests xsd-fast-py/tests
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
           if-no-files-found: error
 
-  # One `.node` per (crate, platform), packed as `<crate>-<version>-<platform>.tgz`
-  # with the same layout `pnpm pack` gives the crate directory: index.js,
-  # index.d.ts, the binary, README and LICENSE. The platform token follows the
-  # napi convention the consumer shells already key on. Linux aarch64 builds on
-  # a native arm runner rather than cross-linking a cdylib through zig, which
-  # also lets the smoke run on all three platforms before anything is uploaded.
-  #
-  # This job publishes its own assets and nothing waits on it: the wheel
-  # release is what consumers pin today, and a Node leg that queues or fails
-  # (the arm runner label is unverified for this repository) must not hold
-  # the wheels back. The cost is that tarballs are not in SHA256SUMS or the
-  # manifest; they are verified by the smoke that ran before the pack.
   node:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -97,7 +134,9 @@ jobs:
           node-version: "22"
       - name: Build every Node binding for ${{ matrix.target }}
         shell: bash
-        run: scripts/build-node.sh $NODE_BINDINGS
+        run: |
+          read -r -a node_bindings <<< "$NODE_BINDINGS"
+          scripts/build-node.sh "${node_bindings[@]}"
       - name: Load and parse a generated fixture through each binding
         run: node scripts/smoke-node.mjs
       - name: Pack one tarball per binding
@@ -149,10 +188,9 @@ jobs:
         # and a wheel attributed to a consumer. The tag is the commit it names.
         run: |
           set -euo pipefail
-          python3 scripts/release_manifest.py --out dist
+          python3 scripts/release_manifest.py --out dist --require-complete
           python3 -m pip install pytest
           python3 -m pytest tests -q
-          (cd dist && sha256sum *.whl *.tgz release-manifest.json > SHA256SUMS)
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
