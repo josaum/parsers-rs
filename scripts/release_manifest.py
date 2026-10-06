@@ -67,6 +67,12 @@ TARGET_PLATFORMS = {
     "linux-arm64-gnu": "aarch64-unknown-linux-gnu",
 }
 
+# Targets that ship Python wheels only: the Node bindings have no Windows lane,
+# the Claude Desktop toolkit's Windows bundle needs the wheels.
+WHEEL_ONLY_TARGETS = {
+    "win32-x64-msvc": "x86_64-pc-windows-msvc",
+}
+
 
 def validate_native_architecture(header: bytes, target: str, path: Path) -> None:
     actual = None
@@ -86,6 +92,13 @@ def validate_native_architecture(header: bytes, target: str, path: Path) -> None
         and int.from_bytes(header[12:16], "little") in {6, 8}
     ):
         actual = "aarch64-apple-darwin"
+    elif len(header) >= 64 and header[:2] == b"MZ":
+        # PE: e_lfanew at 0x3C points at "PE\0\0" followed by the COFF machine field.
+        pe_offset = int.from_bytes(header[0x3C:0x40], "little")
+        if 0 < pe_offset <= len(header) - 6 and header[pe_offset:pe_offset + 4] == b"PE\0\0":
+            actual = {0x8664: "x86_64-pc-windows-msvc", 0xAA64: "aarch64-pc-windows-msvc"}.get(
+                int.from_bytes(header[pe_offset + 4:pe_offset + 6], "little")
+            )
     if actual != target:
         raise SystemExit(
             f"{path.name}: native architecture disagrees with declared target {target}"
@@ -111,7 +124,7 @@ def artifact_target(path: Path) -> str:
                             f"{path.name}: expected exactly one nonempty regular Node binary"
                         )
                     with archive.extractfile(binaries[0]) as native:
-                        validate_native_architecture(native.read(64), target, path)
+                        validate_native_architecture(native.read(4096), target, path)
                 return target
     else:
         with zipfile.ZipFile(path) as archive:
@@ -149,21 +162,24 @@ def artifact_target(path: Path) -> str:
             for platform in platforms
         ):
             target = TARGET_PLATFORMS["linux-arm64-gnu"]
+        elif platforms == {"win_amd64"}:
+            target = WHEEL_ONLY_TARGETS["win32-x64-msvc"]
         else:
             raise SystemExit(f"{path.name}: unsupported release platform")
         distribution = path.name.split("-", 1)[0]
+        native_suffix = ".pyd" if target.endswith("windows-msvc") else ".so"
         with zipfile.ZipFile(path) as archive:
             binaries = [
                 name
                 for name in archive.namelist()
-                if name.startswith(f"{distribution}/") and name.endswith(".so")
+                if name.startswith(f"{distribution}/") and name.endswith(native_suffix)
             ]
             if len(binaries) != 1:
                 raise SystemExit(
                     f"{path.name}: expected exactly one distribution native extension"
                 )
             with archive.open(binaries[0]) as native:
-                validate_native_architecture(native.read(64), target, path)
+                validate_native_architecture(native.read(4096), target, path)
         return target
     raise SystemExit(f"{path.name}: unsupported release platform")
 
@@ -177,6 +193,10 @@ def validate_release_matrix(artifacts: list[dict], *, complete: bool) -> None:
             (crate, target)
             for crate in set(CRATES.values()) | NODE_CRATES
             for target in TARGET_PLATFORMS.values()
+        } | {
+            (crate, target)
+            for crate in set(CRATES.values())
+            for target in WHEEL_ONLY_TARGETS.values()
         }
         missing = sorted(expected - set(actual))
         if missing:

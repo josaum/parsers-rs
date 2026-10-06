@@ -38,8 +38,9 @@ restricted decoder that bounds output before exposing bytes is the `flate2` one,
 so there is no fast path that inflates first and checks afterwards — a faster
 decoder can only be reinstated by keeping that ordering.
 
-The current source declares a release surface of **39 artifacts**: eight Python
-wheels and five Node tarballs × macOS arm64, Linux x86_64 and Linux aarch64.
+The current source declares a release surface of **47 artifacts**: eight Python
+wheels × macOS arm64, Linux x86_64, Linux aarch64 and Windows x64, plus five
+Node tarballs × macOS arm64, Linux x86_64 and Linux aarch64.
 Release publication requires the complete matrix after the reusable CI gate
 passes. Both artifact families are bound to the commit by
 `release-manifest.json` and the generator's `SHA256SUMS`; each artifact records

@@ -28,11 +28,26 @@ PLATFORMS = {
     "aarch64-apple-darwin": "macosx_11_0_arm64",
     "x86_64-unknown-linux-gnu": "manylinux_2_17_x86_64.manylinux2014_x86_64",
     "aarch64-unknown-linux-gnu": "manylinux_2_17_aarch64.manylinux2014_aarch64",
+    "x86_64-pc-windows-msvc": "win_amd64",
 }
+
+
+def targets_for(crate):
+    """Every target a crate ships on: Node bindings skip the wheel-only targets."""
+    targets = list(release.TARGET_PLATFORMS.values())
+    if not crate.endswith("-node"):
+        targets += list(release.WHEEL_ONLY_TARGETS.values())
+    return targets
 
 
 def native_header(target):
     header = bytearray(64)
+    if target == "x86_64-pc-windows-msvc":
+        # Minimal PE: "MZ", e_lfanew -> "PE\0\0", COFF machine = AMD64.
+        header[:2] = b"MZ"
+        header[0x3C:0x40] = (0x40).to_bytes(4, "little")
+        header += b"PE\0\0" + (0x8664).to_bytes(2, "little") + bytes(18)
+        return bytes(header)
     if target == "aarch64-apple-darwin":
         header[:4] = b"\xcf\xfa\xed\xfe"
         header[4:8] = (0x0100000C).to_bytes(4, "little")
@@ -72,7 +87,8 @@ def wheel(directory, distribution="ontology_fast", platform="macosx_11_0_arm64")
             if platform.startswith("macosx_")
             else next(target for target, tag in PLATFORMS.items() if tag == platform)
         )
-        archive.writestr(f"{distribution}/_native.abi3.so", native_header(target))
+        suffix = ".pyd" if target.endswith("windows-msvc") else ".so"
+        archive.writestr(f"{distribution}/_native.abi3{suffix}", native_header(target))
     return path
 
 
@@ -126,7 +142,7 @@ def test_complete_matrix_stamps_wheels_and_node_provenance(tmp_path, generator):
             node_package(tmp_path, crate, platform)
     assert generator.main(["--out", str(tmp_path), "--require-complete"]) == 0
     manifest = json.loads((tmp_path / release.MANIFEST_NAME).read_text())
-    assert len(manifest["artifacts"]) == 39
+    assert len(manifest["artifacts"]) == 47  # 8 Python bindings x 4 targets + 5 Node bindings x 3
     assert manifest["source"] == {"commit": "a" * 40, "dirty": False}
     for artifact in manifest["artifacts"]:
         path = tmp_path / artifact["file"]
@@ -214,7 +230,7 @@ def test_each_new_binding_is_required_on_every_target(missing_crate):
     artifacts = [
         {"crate": crate, "target": target, "file": f"{crate}-{target}.tgz"}
         for crate in set(release.CRATES.values()) | release.NODE_CRATES
-        for target in release.TARGET_PLATFORMS.values()
+        for target in targets_for(crate)
         if (crate, target) != (missing_crate, "aarch64-unknown-linux-gnu")
     ]
     with pytest.raises(SystemExit, match=missing_crate):
@@ -230,7 +246,7 @@ def test_complete_release_requires_core_sbom_identity():
             "sbom": {"format": "CycloneDX", "component": "incorrect"},
         }
         for crate in set(release.CRATES.values()) | release.NODE_CRATES
-        for target in release.TARGET_PLATFORMS.values()
+        for target in targets_for(crate)
     ]
     with pytest.raises(SystemExit, match="incorrect core CycloneDX SBOM"):
         release.validate_release_matrix(artifacts, complete=True)
@@ -247,7 +263,7 @@ def test_duplicate_embedded_sboms_are_rejected(tmp_path):
 def test_stale_core_sbom_version_prevents_complete_release():
     artifacts = []
     for crate in set(release.CRATES.values()) | release.NODE_CRATES:
-        for target in release.TARGET_PLATFORMS.values():
+        for target in targets_for(crate):
             is_wheel = crate.endswith("-py")
             artifacts.append(
                 {
