@@ -8,6 +8,7 @@ members = [
   "xlsx-fast-core",
   "xlsx-fast-py",
   "xlsx-fast-node",
+  "xlsx-fast-write",
   "pptx-fast-core",
   "pptx-fast-py",
   "pptx-fast-node",

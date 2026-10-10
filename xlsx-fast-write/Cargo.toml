@@ -1,0 +1,24 @@
+[package]
+name = "xlsx-fast-write"
+version = "0.2.0"
+edition = "2021"
+authors = ["Mycelia Team"]
+description = "Sovereign XLSX writer — generates .xlsx files without external dependencies"
+license = "MIT"
+repository = "https://github.com/mycelia/office-parsers-rs"
+keywords = ["xlsx", "excel", "writer", "ooxml", "office"]
+categories = ["encoding", "api-bindings"]
+rust-version = "1.94"
+
+[lib]
+name = "xlsx_fast_write"
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde = { version = "1.0", features = ["derive"] }
+quick-xml = "0.36"
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+xlsx-fast-core = { path = "../xlsx-fast-core" }
