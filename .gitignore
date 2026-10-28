@@ -12,6 +12,10 @@ __pycache__/
 # and pnpm pack; index.js loads the binary by name, so they sit next to it.
 *.node
 *.tgz
+*.so
+*.pyd
+*.dylib
+*.dll
 
 # Repository doctors are source; local caches/build outputs are not.
 # Local worktrees (e.g. a reviewer's scratch checkout) are working state,
