@@ -1,6 +1,6 @@
 [package]
 name = "json-fast-node"
-version = "0.1.6"
+version = "0.1.7"
 edition.workspace = true
 authors.workspace = true
 description = "Node.js bindings for json-fast-core"

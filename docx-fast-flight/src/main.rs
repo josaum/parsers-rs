@@ -175,9 +175,10 @@ impl FlightService for DocxFlightService {
                     Ok(rel) => rel,
                     Err(_) => continue,
                 };
-                let rel_str = rel.to_string_lossy().to_string();
-                let ticket = Ticket::new(rel_str.clone());
-                let descriptor = FlightDescriptor::new_path(path_components(rel));
+                let components = path_components(rel);
+                let rel_str = components.join("/");
+                let ticket = Ticket::new(rel_str);
+                let descriptor = FlightDescriptor::new_path(components);
                 let endpoint = FlightEndpoint::new().with_ticket(ticket);
 
                 let mut info = match FlightInfo::new().try_with_schema(schema.as_ref()) {
@@ -428,7 +429,7 @@ impl FlightService for DocxFlightService {
 fn path_to_ticket(root: &Path, path: &Path) -> String {
     if let Ok(root_canon) = root.canonicalize() {
         if let Ok(rel) = path.strip_prefix(&root_canon) {
-            return rel.to_string_lossy().to_string();
+            return path_components(rel).join("/");
         }
     }
     path.to_string_lossy().to_string()
@@ -514,7 +515,10 @@ fn to_status(err: impl std::fmt::Display) -> Status {
 #[cfg(test)]
 mod symlink_listing_tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_file;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file;
 
     #[test]
     fn collect_docx_paths_skips_symlinks() {
@@ -526,7 +530,13 @@ mod symlink_listing_tests {
         let real = outside.path().join("escape.docx");
         std::fs::write(&real, b"PK").expect("write");
         let link = root.path().join("escape.docx");
-        symlink(&real, &link).expect("symlink");
+        if let Err(err) = symlink_file(&real, &link) {
+            #[cfg(windows)]
+            if err.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("symlink: {err}");
+        }
         let inside = root.path().join("ok.docx");
         std::fs::write(&inside, b"PK").expect("write inside");
 

@@ -413,12 +413,9 @@ mod tests {
     #[cfg(feature = "mmap")]
     #[test]
     fn parses_and_validates_a_mapped_file() {
-        use std::io::Write;
-
         let path =
             std::env::temp_dir().join(format!("json-fast-core-mmap-{}.json", std::process::id()));
-        let mut file = std::fs::File::create(&path).unwrap();
-        write!(file, r#"{{"id": 1, "name": "x"}}"#).unwrap();
+        std::fs::write(&path, br#"{"id": 1, "name": "x"}"#).unwrap();
 
         let value = parse_file(&path).unwrap();
         assert_eq!(value["id"], 1);

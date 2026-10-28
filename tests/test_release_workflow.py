@@ -85,7 +85,7 @@ def assert_native_arm_release_contract(workflow: str) -> None:
 
 
 def test_arm_wheel_release_uses_native_compatible_linker_and_artifact_smoke():
-    assert_native_arm_release_contract(WORKFLOW.read_text())
+    assert_native_arm_release_contract(WORKFLOW.read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize(
@@ -125,7 +125,7 @@ def test_arm_wheel_release_uses_native_compatible_linker_and_artifact_smoke():
     ],
 )
 def test_arm_release_contract_rejects_regressions(original: str, replacement: str):
-    workflow = WORKFLOW.read_text()
+    workflow = WORKFLOW.read_text(encoding="utf-8")
     assert original in workflow
     with pytest.raises(AssertionError):
         assert_native_arm_release_contract(workflow.replace(original, replacement))

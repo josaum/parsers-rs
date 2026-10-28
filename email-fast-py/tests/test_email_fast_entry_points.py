@@ -90,13 +90,13 @@ def test_parse_email_bytes_is_callable_with_defaults() -> None:
 def test_parse_email_ndjson_is_callable_with_defaults(eml_path: str, tmp_path: Path) -> None:
     out = tmp_path / "out.ndjson"
     email_fast.parse_email_ndjson(eml_path, str(out))
-    assert out.read_text().strip(), "ndjson output must not be empty"
+    assert out.read_text(encoding="utf-8").strip(), "ndjson output must not be empty"
 
 
 def test_parse_mbox_ndjson_is_callable_with_defaults(mbox_path: str, tmp_path: Path) -> None:
     out = tmp_path / "box.ndjson"
     email_fast.parse_mbox_ndjson(mbox_path, str(out))
-    assert out.read_text().strip(), "ndjson output must not be empty"
+    assert out.read_text(encoding="utf-8").strip(), "ndjson output must not be empty"
 
 
 def test_parse_mbox_arrow_is_callable_with_defaults(mbox_path: str, tmp_path: Path) -> None:
@@ -121,7 +121,7 @@ def test_wrappers_forward_optionals_by_keyword() -> None:
     """
     import re
 
-    source = (Path(__file__).resolve().parents[1] / "email_fast" / "__init__.py").read_text()
+    source = (Path(__file__).resolve().parents[1] / "email_fast" / "__init__.py").read_text(encoding="utf-8")
     optionals = (
         "max_attachment_size",
         "include_raw_headers",

@@ -1,6 +1,6 @@
 [package]
 name = "docx-fast-flight"
-version = "0.2.1"
+version = "0.2.2"
 edition.workspace = true
 authors.workspace = true
 description = "Apache Arrow Flight server for docx-fast-core"

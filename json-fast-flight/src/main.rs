@@ -226,7 +226,7 @@ fn resolve_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
 fn path_to_ticket(root: &Path, path: &Path) -> String {
     if let Ok(root_canon) = root.canonicalize() {
         if let Ok(rel) = path.strip_prefix(&root_canon) {
-            return rel.to_string_lossy().to_string();
+            return path_components(rel).join("/");
         }
     }
     path.to_string_lossy().to_string()
@@ -339,9 +339,10 @@ impl FlightService for JsonFlightService {
                     Ok(rel) => rel,
                     Err(_) => continue,
                 };
-                let rel_str = rel.to_string_lossy().to_string();
-                let ticket = Ticket::new(rel_str.clone());
-                let descriptor = FlightDescriptor::new_path(path_components(rel));
+                let components = path_components(rel);
+                let rel_str = components.join("/");
+                let ticket = Ticket::new(rel_str);
+                let descriptor = FlightDescriptor::new_path(components);
                 let endpoint = FlightEndpoint::new().with_ticket(ticket);
 
                 let schema = match file_schema(&path, &options) {

@@ -196,9 +196,10 @@ impl FlightService for XsdFlightService {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
-                let rel_str = rel.to_string_lossy().to_string();
-                let ticket = Ticket::new(rel_str.clone());
-                let descriptor = FlightDescriptor::new_path(path_components(rel));
+                let components = path_components(rel);
+                let rel_str = components.join("/");
+                let ticket = Ticket::new(rel_str);
+                let descriptor = FlightDescriptor::new_path(components);
                 let endpoint = FlightEndpoint::new().with_ticket(ticket);
 
                 // Use a generic schema for listing (no element name yet).
@@ -581,7 +582,7 @@ fn resolve_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
 fn path_to_ticket(root: &Path, path: &Path, query: &FlightQuery) -> String {
     let rel = if let Ok(rc) = root.canonicalize() {
         if let Ok(r) = path.strip_prefix(&rc) {
-            r.to_string_lossy().to_string()
+            path_components(r).join("/")
         } else {
             path.to_string_lossy().to_string()
         }
@@ -693,7 +694,10 @@ fn to_status(err: impl std::fmt::Display) -> Status {
 #[cfg(test)]
 mod symlink_listing_tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_file;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file;
 
     #[test]
     fn collect_xsd_paths_skips_symlinks() {
@@ -705,7 +709,13 @@ mod symlink_listing_tests {
         let real = outside.path().join("escape.xsd");
         std::fs::write(&real, b"<xs:schema/>").expect("write");
         let link = root.path().join("escape.xsd");
-        symlink(&real, &link).expect("symlink");
+        if let Err(err) = symlink_file(&real, &link) {
+            #[cfg(windows)]
+            if err.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("symlink: {err}");
+        }
         let inside = root.path().join("ok.xsd");
         std::fs::write(&inside, b"<xs:schema/>").expect("write inside");
 

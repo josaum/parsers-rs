@@ -54,16 +54,31 @@ def platform_wheels(wheel_dir: Path) -> list[Path]:
     plat = sysconfig.get_platform().replace("-", "_").replace(".", "_")
     is_mac = plat.startswith("macosx")
     is_linux = plat.startswith("linux")
+    is_win = plat.startswith("win")
     arch = plat.split("_")[-1]
     chosen: dict[str, Path] = {}
     for w in sorted(wheel_dir.glob("*.whl")):
         tag = w.stem.split("-")[-1]
-        ok = (is_mac and "macosx" in tag and arch in tag) or (
-            is_linux and "manylinux" in tag and (arch in tag or (arch == "x86_64" and "x86_64" in tag))
+        ok = (
+            (is_mac and "macosx" in tag and arch in tag)
+            or (is_linux and "manylinux" in tag and (arch in tag or (arch == "x86_64" and "x86_64" in tag)))
+            or (is_win and plat in tag)
         )
         if ok:
             chosen.setdefault(w.name.split("-")[0], w)
     return list(chosen.values())
+
+
+def venv_python(env: Path) -> Path:
+    if sys.platform == "win32":
+        return env / "Scripts" / "python.exe"
+    return env / "bin" / "python"
+
+
+def venv_pip(env: Path) -> Path:
+    if sys.platform == "win32":
+        return env / "Scripts" / "pip.exe"
+    return env / "bin" / "pip"
 
 
 def collect_references(sources: list[Path], exclude: list[str], packages: set[str]) -> dict[str, dict[str, set[str]]]:
@@ -71,14 +86,16 @@ def collect_references(sources: list[Path], exclude: list[str], packages: set[st
     for root in sources:
         for path in root.rglob("*.py"):
             rel = str(path)
-            if any(part in ("/.venv/", "/node_modules/", "/target/", "/__pycache__/") for part in (rel,)) and (
-                "/.venv/" in rel or "/node_modules/" in rel or "/target/" in rel or "/__pycache__/" in rel
+            rel_posix = f"/{path.as_posix().strip('/')}/"
+            if any(
+                skip in rel_posix
+                for skip in ("/.venv/", "/node_modules/", "/target/", "/__pycache__/")
             ):
                 continue
-            if any(ex in rel for ex in exclude):
+            if any(ex in rel or ex.replace("\\", "/") in rel_posix for ex in exclude):
                 continue
             try:
-                text = path.read_text(errors="replace")
+                text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             for pkg, attr in REF_RE.findall(text):
@@ -99,12 +116,14 @@ def install_and_probe(wheels: list[Path], packages: set[str]) -> dict[str, dict[
     tmp = Path(tempfile.mkdtemp(prefix="parsers-surface-"))
     env = tmp / "venv"
     uv = shutil.which("uv")
+    py_bin = venv_python(env)
+    pip_bin = venv_pip(env)
     if uv:
         subprocess.run([uv, "venv", "-q", str(env)], check=True)
-        subprocess.run([uv, "pip", "install", "-q", "--python", str(env / "bin" / "python"), *map(str, wheels)], check=True)
+        subprocess.run([uv, "pip", "install", "-q", "--python", str(py_bin), *map(str, wheels)], check=True)
     else:
         subprocess.run([sys.executable, "-m", "venv", str(env)], check=True)
-        subprocess.run([str(env / "bin" / "pip"), "install", "-q", *map(str, wheels)], check=True)
+        subprocess.run([str(pip_bin), "install", "-q", *map(str, wheels)], check=True)
     probe = (
         "import importlib, json, sys\n"
         "out = {}\n"
@@ -121,7 +140,7 @@ def install_and_probe(wheels: list[Path], packages: set[str]) -> dict[str, dict[
         "print(json.dumps(out))\n"
     )
     result = subprocess.run(
-        [str(env / "bin" / "python"), "-c", probe, *sorted(packages)],
+        [str(py_bin), "-c", probe, *sorted(packages)],
         check=True,
         capture_output=True,
         text=True,

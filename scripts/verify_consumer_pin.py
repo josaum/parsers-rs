@@ -87,7 +87,7 @@ def verify(vendor: Path, source: Path | None) -> Report:
         report.fail(f"missing {manifest_path}")
         return report
 
-    manifest = json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != SCHEMA:
         report.fail(
             f"manifest schema is {manifest.get('schema_version')!r}, expected {SCHEMA!r}"

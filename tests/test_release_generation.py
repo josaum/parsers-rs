@@ -146,7 +146,7 @@ def test_complete_matrix_stamps_wheels_and_node_provenance(tmp_path, generator):
         for platform in release.TARGET_PLATFORMS:
             node_package(tmp_path, crate, platform)
     assert generator.main(["--out", str(tmp_path), "--require-complete"]) == 0
-    manifest = json.loads((tmp_path / release.MANIFEST_NAME).read_text())
+    manifest = json.loads((tmp_path / release.MANIFEST_NAME).read_text(encoding="utf-8"))
     assert len(manifest["artifacts"]) == 84  # 11 Python bindings x 4 targets + 10 Node bindings x 4
     assert manifest["source"] == {"commit": "a" * 40, "dirty": False}
     for artifact in manifest["artifacts"]:
@@ -156,7 +156,7 @@ def test_complete_matrix_stamps_wheels_and_node_provenance(tmp_path, generator):
         assert artifact["target"] in PLATFORMS
     sums = dict(
         line.split("  ", 1)[::-1]
-        for line in (tmp_path / "SHA256SUMS").read_text().splitlines()
+        for line in (tmp_path / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
     )
     assert set(sums) == {artifact["file"] for artifact in manifest["artifacts"]} | {
         release.MANIFEST_NAME
@@ -304,7 +304,7 @@ def test_dirty_local_build_is_explicitly_attributed(tmp_path, generator, monkeyp
     monkeypatch.setattr(generator, "source_is_dirty", lambda: True)
     assert generator.main(["--out", str(tmp_path), "--allow-dirty"]) == 0
     assert (
-        json.loads((tmp_path / release.MANIFEST_NAME).read_text())["source"]["dirty"]
+        json.loads((tmp_path / release.MANIFEST_NAME).read_text(encoding="utf-8"))["source"]["dirty"]
         is True
     )
 
@@ -322,7 +322,8 @@ def test_ontology_sbom_injection_rebuilds_record_and_removes_duplicates(tmp_path
                     "component": {"name": "ontology-fast-core", "version": version}
                 },
             }
-        )
+        ),
+        encoding="utf-8",
     )
     assert injection.inject(path, sbom)
     first_hash = release.digest(path)
@@ -353,7 +354,7 @@ def test_ontology_sbom_injection_rebuilds_record_and_removes_duplicates(tmp_path
 
 
 def test_release_workflow_requires_ci_and_complete_joint_publication():
-    workflow = (ROOT / ".github/workflows/release.yml").read_text()
+    workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
     assert "uses: ./.github/workflows/ci.yml" in workflow
     assert workflow.count("needs: verify") == 2
     assert "needs: [wheels, node]" in workflow
@@ -371,10 +372,10 @@ def test_release_workflow_requires_ci_and_complete_joint_publication():
 def test_sbom_rewrite_invalidates_manifest_and_checksums(tmp_path, monkeypatch):
     wheel(tmp_path)
     sbom = tmp_path / "ontology-fast-core.cdx.json"
-    sbom.write_text(json.dumps({"bomFormat": "CycloneDX"}))
+    sbom.write_text(json.dumps({"bomFormat": "CycloneDX"}), encoding="utf-8")
     monkeypatch.setattr(injection, "crate_sbom", lambda crate: sbom)
-    (tmp_path / "release-manifest.json").write_text("{}")
-    (tmp_path / "SHA256SUMS").write_text("stale")
+    (tmp_path / "release-manifest.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "SHA256SUMS").write_text("stale", encoding="utf-8")
     assert injection.main(["--dist", str(tmp_path)]) == 0
     assert not (tmp_path / "release-manifest.json").exists()
     assert not (tmp_path / "SHA256SUMS").exists()

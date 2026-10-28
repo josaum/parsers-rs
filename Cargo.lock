@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "docx-fast-flight"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "email-fast-flight"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1989,7 +1989,7 @@ checksum = "574b0cd5e90ee2ba03a66d0611fc9a09c9a0c28b2ecc2dc8a181dd31a53ca5d7"
 
 [[package]]
 name = "json-fast-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -2005,7 +2005,7 @@ dependencies = [
 
 [[package]]
 name = "json-fast-flight"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "json-fast-node"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "json-fast-core",
  "napi",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "json-fast-py"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "json-fast-core",
  "pyo3",
@@ -3037,7 +3037,7 @@ dependencies = [
 
 [[package]]
 name = "pptx-fast-flight"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4872,7 +4872,7 @@ dependencies = [
 
 [[package]]
 name = "xlsx-fast-flight"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4960,7 +4960,7 @@ dependencies = [
 
 [[package]]
 name = "xsd-fast-flight"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow-array",

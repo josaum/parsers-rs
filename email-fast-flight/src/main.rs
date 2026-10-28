@@ -189,16 +189,17 @@ impl FlightService for EmailFlightService {
         let root = self.root.clone();
 
         let stream = stream::iter(files.into_iter().map(move |path| {
-            let relative = path
-                .strip_prefix(&root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
+            let rel = path.strip_prefix(&root).unwrap_or(&path);
+            let components: Vec<String> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
 
             let descriptor = FlightDescriptor {
                 r#type: DescriptorType::Path as i32,
                 cmd: Bytes::new(),
-                path: vec![relative],
+                path: components,
             };
 
             let endpoint = FlightEndpoint {
@@ -410,7 +411,10 @@ fn empty_handshake_stream() -> Pin<Box<dyn Stream<Item = Result<HandshakeRespons
 #[cfg(test)]
 mod symlink_listing_tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_file;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file;
 
     #[test]
     fn list_email_files_skips_symlinks() {
@@ -422,7 +426,13 @@ mod symlink_listing_tests {
         let real = outside.path().join("escape.eml");
         std::fs::write(&real, b"From: a@b\n\n").expect("write");
         let link = root.path().join("escape.eml");
-        symlink(&real, &link).expect("symlink");
+        if let Err(err) = symlink_file(&real, &link) {
+            #[cfg(windows)]
+            if err.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("symlink: {err}");
+        }
         let inside = root.path().join("ok.eml");
         std::fs::write(&inside, b"From: a@b\n\n").expect("write inside");
 
