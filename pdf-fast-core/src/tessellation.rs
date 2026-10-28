@@ -1051,8 +1051,8 @@ impl PageExtraction {
     /// other on both axes.
     pub fn to_rdf_triples(&self, base_iri: &str) -> Vec<SemanticTriple> {
         let mut triples = Vec::new();
-        let ui_ns = "urn:atlas:tessellation:ui:";
-        let layout_ns = "urn:atlas:tessellation:layout:";
+        let ui_ns = "urn:pdf:tessellation:ui:";
+        let layout_ns = "urn:pdf:tessellation:layout:";
         let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
         let owl_adjacent = "http://www.w3.org/2002/07/owl#adjacentTo";
 

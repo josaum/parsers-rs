@@ -1,5 +1,5 @@
 //! A text-only page must still produce no outlines, with or without the glyph
-//! atlas compiled in.
+//! catalog compiled in.
 //!
 //! Text-operator support was added for Type 3 fonts, whose glyphs *are*
 //! outlines. For every other font the glyphs live in a font program this parser
@@ -12,7 +12,7 @@
 //! outline API and once through the semantic API that reads the characters — so
 //! it separates "produced no outlines" from "read no text", which are different
 //! facts and a test asserting only the first would not notice losing the second.
-#![cfg(feature = "glyph-atlas")]
+#![cfg(feature = "glyph-catalog")]
 
 use pdf_fast_core::{ParseOptions, PdfDocument};
 

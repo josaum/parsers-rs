@@ -6,7 +6,7 @@
 //! `web-fast-core` accepts bytes or text that the caller already owns. It never
 //! performs network requests, executes JavaScript, loads subresources, or
 //! consults ambient process state. The resulting [`WebDocument`] preserves a
-//! source digest and stable document-order evidence suitable for Mycelia's
+//! source digest and stable document-order evidence suitable for downstream
 //! provenance and Arrow pipelines.
 
 use encoding_rs::{Encoding, UTF_8};

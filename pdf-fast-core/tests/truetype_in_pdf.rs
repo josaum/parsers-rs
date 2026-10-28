@@ -1,6 +1,6 @@
-//! An embedded TrueType font yields outlines for the atlas.
+//! An embedded TrueType font yields outlines for the catalog.
 //!
-//! This is the case the atlas was blind to: a document embedding a font
+//! This is the case the catalog was blind to: a document embedding a font
 //! program, which is what anything from a word processor does. Real documents
 //! on this machine embed 8-10 `/FontFile2` subsets each, and until the `glyf`
 //! reader landed, every one of them produced zero outlines.
@@ -10,7 +10,7 @@
 //! the character code mapped through `cmap` to a glyph, the outline emitted,
 //! and placed by the text matrix.
 
-#![cfg(feature = "glyph-atlas")]
+#![cfg(feature = "glyph-catalog")]
 
 use pdf_fast_core::{ParseOptions, PdfDocument};
 
@@ -89,7 +89,7 @@ fn an_embedded_program_yields_glyph_outlines() {
     );
     assert!(
         glyphs.iter().all(|g| !g.normalized.is_empty()),
-        "each glyph must carry normalized geometry, or the atlas has nothing to key on"
+        "each glyph must carry normalized geometry, or the catalog has nothing to key on"
     );
 }
 
@@ -160,7 +160,7 @@ fn a_font_without_a_program_yields_no_outlines() {
     let glyphs: usize = runs.iter().map(|r| r.glyphs.len()).sum();
     assert_eq!(
         glyphs, 0,
-        "without an embedded program there is no outline to read, and the atlas \
+        "without an embedded program there is no outline to read, and the catalog \
          must get nothing rather than a shape derived from the widths"
     );
 }
@@ -168,7 +168,7 @@ fn a_font_without_a_program_yields_no_outlines() {
 /// An embedded CFF program yields outlines too.
 ///
 /// OpenType fonts produced by design tools and by LaTeX wrap CFF rather than
-/// `glyf`, so a PDF embedding one gives the atlas nothing until the charstrings
+/// `glyf`, so a PDF embedding one gives the catalog nothing until the charstrings
 /// are read. This is the third route to the same outlines: Type 3 glyphs are
 /// content streams, `glyf` glyphs are a table, CFF glyphs are a bytecode.
 ///
@@ -207,7 +207,7 @@ fn an_embedded_cff_program_yields_glyph_outlines() {
     );
     assert!(
         glyphs.iter().all(|g| !g.normalized.is_empty()),
-        "each glyph must carry normalized geometry for the atlas"
+        "each glyph must carry normalized geometry for the catalog"
     );
     let gap = (glyphs[1].x_offset - glyphs[0].x_offset).abs();
     assert!(

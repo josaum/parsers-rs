@@ -1,6 +1,6 @@
 {
   "name": "json-fast-node",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "High-performance SIMD JSON/JSONL parsing and JSON-family helpers with native Rust core",
   "main": "index.js",
   "types": "index.d.ts",
@@ -8,12 +8,12 @@
   "author": "Dionisio Chiuratto Agourakis",
   "repository": {
     "type": "git",
-    "url": "https://github.com/josaum/parsers-rs.git",
+    "url": "https://github.com/fast-parser-inc/parsers-rs.git",
     "directory": "json-fast-node"
   },
-  "homepage": "https://github.com/josaum/parsers-rs#readme",
+  "homepage": "https://github.com/fast-parser-inc/parsers-rs#readme",
   "bugs": {
-    "url": "https://github.com/josaum/parsers-rs/issues"
+    "url": "https://github.com/fast-parser-inc/parsers-rs/issues"
   },
   "keywords": [
     "json",

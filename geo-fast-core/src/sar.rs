@@ -1,0 +1,541 @@
+//! SAR (Synthetic Aperture Radar) image parser.
+//!
+//! Reads ESA SAFE format (Sentinel-1) manifest and annotation XML,
+//! and basic CEOS leader file format.
+//!
+//! Extracts: metadata, bounding box, polarization, GCP grid.
+
+use crate::error::GeoError;
+use crate::types::{BBox, Coordinate};
+
+/// Metadata extracted from a SAR product.
+#[derive(Debug, Clone)]
+pub struct SarMetadata {
+    /// Sensor name, e.g. "Sentinel-1A".
+    pub sensor: String,
+    /// ISO-8601 acquisition timestamp.
+    pub acquisition_date: String,
+    /// Polarization channels, e.g. `["VV", "VH"]`.
+    pub polarization: Vec<String>,
+    /// Geographic bounding box of the scene.
+    pub bbox: BBox,
+    /// Ground resolution in metres.
+    pub resolution_m: f64,
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// Orbit direction: `"ascending"` or `"descending"`.
+    pub orbit_direction: String,
+    /// Mean incidence angle in degrees.
+    pub incidence_angle_deg: f64,
+    /// Product type code: `SLC`, `GRD`, or `OCN`.
+    pub product_type: String,
+}
+
+/// A Ground Control Point mapping pixel (line, sample) to geographic position.
+#[derive(Debug, Clone)]
+pub struct GroundControlPoint {
+    /// Geographic coordinate associated with this image-space sample.
+    pub geo: Coordinate,
+    /// Image line / row coordinate.
+    pub line: f64,
+    /// Image sample / column coordinate.
+    pub sample: f64,
+    /// Height above the ellipsoid in metres.
+    pub height: f64,
+}
+
+/// Parser for SAR metadata formats (SAFE manifest, CEOS leader, annotation GCPs).
+pub struct SarParser;
+
+impl SarParser {
+    /// Parse SAR metadata from an ESA Sentinel-1 SAFE manifest.safe XML.
+    ///
+    /// The manifest contains `<metadataObject>` elements with platform info,
+    /// acquisition dates, footprint coordinates, and product type.
+    pub fn parse_safe_manifest(xml_bytes: &[u8]) -> Result<SarMetadata, GeoError> {
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+
+        let mut reader = Reader::from_reader(xml_bytes);
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::with_capacity(4096);
+
+        let mut sensor = String::new();
+        let mut acquisition_date = String::new();
+        let mut polarization: Vec<String> = Vec::new();
+        let mut orbit_direction = String::new();
+        let mut product_type = String::new();
+        let mut footprint_coords: Vec<Coordinate> = Vec::new();
+        let mut resolution_m: f64 = 0.0;
+        let mut width: u32 = 0;
+        let mut height: u32 = 0;
+        let mut incidence_angle_deg: f64 = 0.0;
+
+        // Track the current element path for context
+        let mut current_tag = String::new();
+        let mut in_platform = false;
+        let mut in_acquisition = false;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) => {
+                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    current_tag = tag_name.clone();
+
+                    match tag_name.as_str() {
+                        "safe:platform" | "platform" => in_platform = true,
+                        "safe:acquisitionPeriod" | "acquisitionPeriod" => in_acquisition = true,
+                        _ => {}
+                    }
+                }
+                Ok(Event::End(ref e)) => {
+                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    match tag_name.as_str() {
+                        "safe:platform" | "platform" => in_platform = false,
+                        "safe:acquisitionPeriod" | "acquisitionPeriod" => in_acquisition = false,
+                        _ => {}
+                    }
+                    current_tag.clear();
+                }
+                Ok(Event::Text(ref e)) => {
+                    let text = e.unescape().unwrap_or_default().to_string();
+                    let text = text.trim().to_string();
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    match current_tag.as_str() {
+                        // Platform / sensor
+                        "safe:familyName" | "familyName" if in_platform => {
+                            sensor = text;
+                        }
+                        "safe:number" | "number" if in_platform => {
+                            if !sensor.is_empty() {
+                                sensor = format!("{}{}", sensor, text);
+                            }
+                        }
+                        // Acquisition date
+                        "safe:startTime" | "startTime" if in_acquisition => {
+                            acquisition_date = text;
+                        }
+                        // Product type
+                        "s1sarl1:productType" | "productType" => {
+                            product_type = text;
+                        }
+                        // Polarization
+                        "s1sarl1:transmitterReceiverPolarisation"
+                        | "transmitterReceiverPolarisation" => {
+                            if !polarization.contains(&text) {
+                                polarization.push(text);
+                            }
+                        }
+                        // Pass direction
+                        "s1:pass" | "pass" => {
+                            orbit_direction = text.to_lowercase();
+                        }
+                        // Resolution
+                        "s1sarl1:resolution" | "resolution" => {
+                            if let Ok(v) = text.parse::<f64>() {
+                                resolution_m = v;
+                            }
+                        }
+                        // Image dimensions
+                        "s1sarl1:numberOfSamples" | "numberOfSamples" => {
+                            if let Ok(v) = text.parse::<u32>() {
+                                width = v;
+                            }
+                        }
+                        "s1sarl1:numberOfLines" | "numberOfLines" => {
+                            if let Ok(v) = text.parse::<u32>() {
+                                height = v;
+                            }
+                        }
+                        // Incidence angle
+                        "s1sarl1:incidenceAngleMidSwath" | "incidenceAngleMidSwath" => {
+                            if let Ok(v) = text.parse::<f64>() {
+                                incidence_angle_deg = v;
+                            }
+                        }
+                        // GML footprint coordinates (lat lon pairs)
+                        "gml:coordinates" | "coordinates" => {
+                            Self::parse_gml_coordinates(&text, &mut footprint_coords);
+                        }
+                        // posList variant
+                        "gml:posList" | "posList" => {
+                            Self::parse_gml_pos_list(&text, &mut footprint_coords);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => {
+                    return Err(GeoError::Xml(format!(
+                        "Error parsing SAFE manifest at position {}: {}",
+                        reader.buffer_position(),
+                        e
+                    )));
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        if sensor.is_empty() {
+            return Err(GeoError::InvalidFormat(
+                "No platform/sensor found in SAFE manifest".into(),
+            ));
+        }
+
+        let bbox = if footprint_coords.is_empty() {
+            BBox::new(0.0, 0.0, 0.0, 0.0)
+        } else {
+            let min_lon = footprint_coords
+                .iter()
+                .map(|p| p.lon)
+                .fold(f64::INFINITY, f64::min);
+            let max_lon = footprint_coords
+                .iter()
+                .map(|p| p.lon)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_lat = footprint_coords
+                .iter()
+                .map(|p| p.lat)
+                .fold(f64::INFINITY, f64::min);
+            let max_lat = footprint_coords
+                .iter()
+                .map(|p| p.lat)
+                .fold(f64::NEG_INFINITY, f64::max);
+            BBox::new(min_lon, min_lat, max_lon, max_lat)
+        };
+
+        Ok(SarMetadata {
+            sensor,
+            acquisition_date,
+            polarization,
+            bbox,
+            resolution_m,
+            width,
+            height,
+            orbit_direction,
+            incidence_angle_deg,
+            product_type,
+        })
+    }
+
+    /// Parse SAR metadata from a CEOS leader file.
+    ///
+    /// CEOS (Committee on Earth Observation Satellites) format stores metadata
+    /// as fixed-width ASCII records.  The leader file has record type 10
+    /// (File Descriptor) followed by record type 20 (Scene Header).
+    pub fn parse_ceos_leader(data: &[u8]) -> Result<SarMetadata, GeoError> {
+        // CEOS leader files are structured as fixed-length records.
+        // Record header: 12 bytes (sequence, type-code sub1-3, length)
+        // Scene header record starts after the file descriptor record.
+        if data.len() < 720 {
+            return Err(GeoError::InvalidFormat(
+                "CEOS leader file too short (need at least 720 bytes)".into(),
+            ));
+        }
+
+        // File Descriptor Record length is in bytes 8-11 (big-endian u32)
+        let fdr_len = Self::read_be_u32(data, 8) as usize;
+        if fdr_len == 0 || fdr_len >= data.len() {
+            return Err(GeoError::InvalidFormat(
+                "Invalid CEOS file descriptor record length".into(),
+            ));
+        }
+
+        let scene = &data[fdr_len..];
+        if scene.len() < 720 {
+            return Err(GeoError::InvalidFormat(
+                "CEOS scene header record too short".into(),
+            ));
+        }
+
+        // Extract ASCII fields from the scene header record.
+        // Offsets are 0-based within the scene record.
+        let sensor = Self::ceos_ascii(scene, 20, 16);
+        let acquisition_date = Self::ceos_ascii(scene, 68, 32);
+        let product_type = Self::ceos_ascii(scene, 228, 16);
+        let orbit_direction = Self::ceos_ascii(scene, 100, 16).to_lowercase();
+
+        let width = Self::ceos_int(scene, 248, 8) as u32;
+        let height = Self::ceos_int(scene, 256, 8) as u32;
+        let resolution_m = Self::ceos_float(scene, 264, 16);
+        let incidence_angle_deg = Self::ceos_float(scene, 484, 8);
+
+        // Corner coordinates: 4 lat/lon pairs starting at offset 116
+        // Each is 16 chars (lat then lon), 8 chars each
+        let mut corners: Vec<Coordinate> = Vec::new();
+        for i in 0..4 {
+            let base = 116 + i * 16;
+            let lat = Self::ceos_float(scene, base, 8);
+            let lon = Self::ceos_float(scene, base + 8, 8);
+            if lat != 0.0 || lon != 0.0 {
+                corners.push(Coordinate::new(lon, lat));
+            }
+        }
+
+        let bbox = if corners.is_empty() {
+            BBox::new(0.0, 0.0, 0.0, 0.0)
+        } else {
+            let min_lon = corners.iter().map(|p| p.lon).fold(f64::INFINITY, f64::min);
+            let max_lon = corners
+                .iter()
+                .map(|p| p.lon)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_lat = corners.iter().map(|p| p.lat).fold(f64::INFINITY, f64::min);
+            let max_lat = corners
+                .iter()
+                .map(|p| p.lat)
+                .fold(f64::NEG_INFINITY, f64::max);
+            BBox::new(min_lon, min_lat, max_lon, max_lat)
+        };
+
+        // Polarization is typically embedded in the data set summary
+        // For basic CEOS we report it as unknown
+        let polarization = Vec::new();
+
+        Ok(SarMetadata {
+            sensor,
+            acquisition_date,
+            polarization,
+            bbox,
+            resolution_m,
+            width,
+            height,
+            orbit_direction,
+            incidence_angle_deg,
+            product_type,
+        })
+    }
+
+    /// Extract Ground Control Points from a Sentinel-1 annotation XML.
+    ///
+    /// Annotation files contain `<geolocationGridPoint>` elements with
+    /// `<line>`, `<pixel>`, `<latitude>`, `<longitude>`, `<height>`.
+    pub fn extract_gcps(annotation_xml: &[u8]) -> Result<Vec<GroundControlPoint>, GeoError> {
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+
+        let mut reader = Reader::from_reader(annotation_xml);
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::with_capacity(2048);
+
+        let mut gcps: Vec<GroundControlPoint> = Vec::new();
+
+        let mut in_gcp = false;
+        let mut current_tag = String::new();
+        let mut gcp_line: f64 = 0.0;
+        let mut gcp_sample: f64 = 0.0;
+        let mut gcp_lat: f64 = 0.0;
+        let mut gcp_lon: f64 = 0.0;
+        let mut gcp_height: f64 = 0.0;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) => {
+                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    if tag == "geolocationGridPoint" {
+                        in_gcp = true;
+                        gcp_line = 0.0;
+                        gcp_sample = 0.0;
+                        gcp_lat = 0.0;
+                        gcp_lon = 0.0;
+                        gcp_height = 0.0;
+                    }
+                    current_tag = tag;
+                }
+                Ok(Event::End(ref e)) => {
+                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    if tag == "geolocationGridPoint" && in_gcp {
+                        gcps.push(GroundControlPoint {
+                            geo: Coordinate::new(gcp_lon, gcp_lat),
+                            line: gcp_line,
+                            sample: gcp_sample,
+                            height: gcp_height,
+                        });
+                        in_gcp = false;
+                    }
+                    current_tag.clear();
+                }
+                Ok(Event::Text(ref e)) if in_gcp => {
+                    let text = e.unescape().unwrap_or_default().to_string();
+                    let text = text.trim();
+                    match current_tag.as_str() {
+                        "line" => gcp_line = text.parse().unwrap_or(0.0),
+                        "pixel" => gcp_sample = text.parse().unwrap_or(0.0),
+                        "latitude" => gcp_lat = text.parse().unwrap_or(0.0),
+                        "longitude" => gcp_lon = text.parse().unwrap_or(0.0),
+                        "height" => gcp_height = text.parse().unwrap_or(0.0),
+                        _ => {}
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => {
+                    return Err(GeoError::Xml(format!(
+                        "Error parsing annotation XML at position {}: {}",
+                        reader.buffer_position(),
+                        e
+                    )));
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        Ok(gcps)
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────
+
+    /// Parse GML `coordinates` element: "lat,lon lat,lon ..." (space-separated)
+    fn parse_gml_coordinates(text: &str, out: &mut Vec<Coordinate>) {
+        for pair in text.split_whitespace() {
+            let parts: Vec<&str> = pair.split(',').collect();
+            if parts.len() >= 2 {
+                if let (Ok(lat), Ok(lon)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                    out.push(Coordinate::new(lon, lat));
+                }
+            }
+        }
+    }
+
+    /// Parse GML `posList`: "lat lon lat lon ..." (flat list, pairs)
+    fn parse_gml_pos_list(text: &str, out: &mut Vec<Coordinate>) {
+        let nums: Vec<f64> = text
+            .split_whitespace()
+            .filter_map(|s| s.parse::<f64>().ok())
+            .collect();
+        for chunk in nums.chunks(2) {
+            if chunk.len() == 2 {
+                out.push(Coordinate::new(chunk[1], chunk[0])); // lat, lon order
+            }
+        }
+    }
+
+    /// Read a big-endian u32 from data at offset.
+    fn read_be_u32(data: &[u8], offset: usize) -> u32 {
+        if offset + 4 > data.len() {
+            return 0;
+        }
+        u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ])
+    }
+
+    /// Read a trimmed ASCII string from CEOS fixed-width field.
+    fn ceos_ascii(data: &[u8], offset: usize, len: usize) -> String {
+        if offset + len > data.len() {
+            return String::new();
+        }
+        String::from_utf8_lossy(&data[offset..offset + len])
+            .trim()
+            .to_string()
+    }
+
+    /// Read a CEOS integer field (ASCII decimal, fixed width).
+    fn ceos_int(data: &[u8], offset: usize, len: usize) -> i64 {
+        Self::ceos_ascii(data, offset, len)
+            .parse::<i64>()
+            .unwrap_or(0)
+    }
+
+    /// Read a CEOS floating-point field (ASCII, fixed width).
+    fn ceos_float(data: &[u8], offset: usize, len: usize) -> f64 {
+        Self::ceos_ascii(data, offset, len)
+            .parse::<f64>()
+            .unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_safe_manifest_minimal() {
+        let xml = br#"<?xml version="1.0"?>
+<xfdu:XFDU xmlns:xfdu="urn:ccsds:schema:xfdu:1"
+            xmlns:safe="http://www.esa.int/safe/sentinel-1.0"
+            xmlns:s1sarl1="http://www.esa.int/safe/sentinel-1.0/sentinel-1/sar/level-1"
+            xmlns:s1="http://www.esa.int/safe/sentinel-1.0/sentinel-1"
+            xmlns:gml="http://www.opengis.net/gml">
+  <metadataSection>
+    <metadataObject>
+      <metadataWrap>
+        <xmlData>
+          <safe:platform>
+            <safe:familyName>SENTINEL-1</safe:familyName>
+            <safe:number>A</safe:number>
+          </safe:platform>
+        </xmlData>
+      </metadataWrap>
+    </metadataObject>
+    <metadataObject>
+      <metadataWrap>
+        <xmlData>
+          <safe:acquisitionPeriod>
+            <safe:startTime>2024-01-15T10:30:00.000Z</safe:startTime>
+          </safe:acquisitionPeriod>
+        </xmlData>
+      </metadataWrap>
+    </metadataObject>
+    <metadataObject>
+      <metadataWrap>
+        <xmlData>
+          <s1sarl1:productType>GRD</s1sarl1:productType>
+          <s1sarl1:transmitterReceiverPolarisation>VV</s1sarl1:transmitterReceiverPolarisation>
+          <s1sarl1:transmitterReceiverPolarisation>VH</s1sarl1:transmitterReceiverPolarisation>
+          <s1:pass>ASCENDING</s1:pass>
+          <gml:coordinates>-10.0,-60.0 -10.0,-58.0 -12.0,-58.0 -12.0,-60.0</gml:coordinates>
+        </xmlData>
+      </metadataWrap>
+    </metadataObject>
+  </metadataSection>
+</xfdu:XFDU>"#;
+
+        let meta = SarParser::parse_safe_manifest(xml).unwrap();
+        assert_eq!(meta.sensor, "SENTINEL-1A");
+        assert_eq!(meta.acquisition_date, "2024-01-15T10:30:00.000Z");
+        assert_eq!(meta.polarization, vec!["VV", "VH"]);
+        assert_eq!(meta.product_type, "GRD");
+        assert_eq!(meta.orbit_direction, "ascending");
+        assert!(meta.bbox.min_lon < meta.bbox.max_lon);
+    }
+
+    #[test]
+    fn test_extract_gcps() {
+        let xml = br#"<?xml version="1.0"?>
+<product>
+  <geolocationGrid>
+    <geolocationGridPointList>
+      <geolocationGridPoint>
+        <line>0</line>
+        <pixel>0</pixel>
+        <latitude>-10.5</latitude>
+        <longitude>-59.2</longitude>
+        <height>150.0</height>
+      </geolocationGridPoint>
+      <geolocationGridPoint>
+        <line>100</line>
+        <pixel>200</pixel>
+        <latitude>-11.0</latitude>
+        <longitude>-58.8</longitude>
+        <height>120.0</height>
+      </geolocationGridPoint>
+    </geolocationGridPointList>
+  </geolocationGrid>
+</product>"#;
+
+        let gcps = SarParser::extract_gcps(xml).unwrap();
+        assert_eq!(gcps.len(), 2);
+        assert!((gcps[0].geo.lat - (-10.5)).abs() < 1e-6);
+        assert!((gcps[1].sample - 200.0).abs() < 1e-6);
+    }
+}

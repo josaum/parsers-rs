@@ -3,7 +3,7 @@ use web_fast_core::{parse_html, parse_html_bytes, BlockKind, ParseOptions, WebPa
 const HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
-  <title>  Mycelia   Web  </title>
+  <title>  Example   Web  </title>
   <base href="https://example.test/docs/">
   <link rel="canonical" href="guide">
   <meta name="description" content="A deterministic page">
@@ -43,7 +43,7 @@ fn parses_deterministically_with_structural_evidence() {
     assert_eq!(first.links, second.links);
     assert_eq!(first.images, second.images);
     assert_eq!(first.tables, second.tables);
-    assert_eq!(first.title.as_deref(), Some("Mycelia Web"));
+    assert_eq!(first.title.as_deref(), Some("Example Web"));
     assert_eq!(first.language.as_deref(), Some("en"));
     assert_eq!(
         first.canonical_url.as_deref(),

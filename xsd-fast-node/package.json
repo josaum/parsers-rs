@@ -1,0 +1,54 @@
+{
+  "name": "xsd-fast-node",
+  "version": "0.2.5",
+  "description": "High-performance XSD validation and Arrow schema N-API bindings, full parity with the Rust core",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "author": "Dionisio Chiuratto Agourakis",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fast-parser-inc/parsers-rs.git",
+    "directory": "xsd-fast-node"
+  },
+  "homepage": "https://github.com/fast-parser-inc/parsers-rs#readme",
+  "bugs": {
+    "url": "https://github.com/fast-parser-inc/parsers-rs/issues"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "napi": {
+    "name": "xsd_fast_node"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "keywords": [
+    "xsd",
+    "xml",
+    "validation",
+    "arrow",
+    "rust",
+    "native",
+    "napi",
+    "performance"
+  ],
+  "scripts": {
+    "smoke": "node -e \"const m=require('./'); console.log(Object.keys(m).join(','))\"",
+    "pack:dry": "npm pack --dry-run"
+  }
+}

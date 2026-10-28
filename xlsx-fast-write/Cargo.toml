@@ -1,14 +1,14 @@
 [package]
 name = "xlsx-fast-write"
 version = "0.2.0"
-edition = "2021"
-authors = ["Mycelia Team"]
+edition.workspace = true
+authors.workspace = true
 description = "Sovereign XLSX writer — generates .xlsx files without external dependencies"
-license = "MIT"
-repository = "https://github.com/mycelia/office-parsers-rs"
+license.workspace = true
+repository.workspace = true
 keywords = ["xlsx", "excel", "writer", "ooxml", "office"]
 categories = ["encoding", "api-bindings"]
-rust-version = "1.94"
+rust-version.workspace = true
 
 [lib]
 name = "xlsx_fast_write"

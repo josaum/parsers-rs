@@ -5,8 +5,12 @@
 //! (MS-CFB + MS-OXMSG). That keeps the hot path as slice indexing plus
 //! explicit bounds checks, and it cannot return the whole OLE file as a body.
 
-use crate::{parse_email_address, Email, EmailAddress, EmailBody, ParseOptions, ThreadInfo};
+use crate::{
+    html_to_text, parse_email_address, Attachment, Email, EmailAddress, EmailBody, ParseOptions,
+    ThreadInfo,
+};
 use anyhow::{anyhow, Result};
+use base64::Engine;
 
 const OLE_SIGNATURE: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 const FREESECT: u32 = 0xFFFF_FFFF;
@@ -26,17 +30,24 @@ const TAG_SUBJECT: &str = "0037";
 const TAG_SENDER_EMAIL: &str = "0C1F";
 const TAG_SENDER_NAME: &str = "0C1A";
 const TAG_SENT_REPRESENTING_EMAIL: &str = "0065";
+const TAG_DISPLAY_CC: &str = "0E03";
 const TAG_DISPLAY_TO: &str = "0E04";
 const TAG_BODY: &str = "1000";
 const TAG_BODY_HTML: &str = "1013";
 const TAG_INTERNET_MESSAGE_ID: &str = "1035";
+const TAG_DISPLAY_NAME: &str = "3001";
+const TAG_ATTACH_DATA_BIN: &str = "3701";
+const TAG_ATTACH_FILENAME: &str = "3704";
+const TAG_ATTACH_LONG_FILENAME: &str = "3707";
+const TAG_ATTACH_MIME_TAG: &str = "370E";
+const TAG_ATTACH_CONTENT_ID: &str = "3712";
 
-pub(crate) fn parse_msg_bytes(bytes: &[u8], _options: ParseOptions) -> Result<Email> {
+pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
     if bytes.len() < HEADER_SIZE || bytes[..8] != OLE_SIGNATURE {
         return Err(anyhow!("Not a valid MSG file"));
     }
     let file = CfbFile::parse(bytes)?;
-    let streams = file.root_substg_streams()?;
+    let (streams, attach_storages) = file.root_streams_and_attachments()?;
     if streams.is_empty() {
         return Err(anyhow!(
             "MSG file has no root __substg1.0_ property streams (not a message object)"
@@ -48,8 +59,23 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], _options: ParseOptions) -> Result<Em
         .or_else(|| first_string(&streams, TAG_SENT_REPRESENTING_EMAIL));
     let from_name = first_string(&streams, TAG_SENDER_NAME);
     let to_raw = first_string(&streams, TAG_DISPLAY_TO);
-    let body_text = first_string(&streams, TAG_BODY);
-    let body_html = first_string(&streams, TAG_BODY_HTML);
+    let cc_raw = first_string(&streams, TAG_DISPLAY_CC);
+    let mut body_text = first_string(&streams, TAG_BODY);
+    let body_html = first_string(&streams, TAG_BODY_HTML).or_else(|| {
+        first_binary(&streams, TAG_BODY_HTML)
+            .map(|b| {
+                String::from_utf8_lossy(b)
+                    .trim_matches('\0')
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+    });
+    if options.html_to_text && body_text.is_none() {
+        if let Some(html) = &body_html {
+            body_text = Some(html_to_text(html));
+        }
+    }
     let message_id = first_string(&streams, TAG_INTERNET_MESSAGE_ID);
 
     let from = match (from_addr, from_name) {
@@ -61,27 +87,70 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], _options: ParseOptions) -> Result<Em
         (None, None) => EmailAddress::default(),
     };
 
-    let to = to_raw
-        .map(|raw| {
-            raw.split(';')
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .map(|part| {
-                    parse_email_address(part).unwrap_or(EmailAddress {
-                        name: None,
-                        address: part.to_string(),
+    let parse_addr_list = |raw_opt: Option<String>| -> Vec<EmailAddress> {
+        raw_opt
+            .map(|raw| {
+                raw.split(';')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        parse_email_address(part).unwrap_or(EmailAddress {
+                            name: None,
+                            address: part.to_string(),
+                        })
                     })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let to = parse_addr_list(to_raw);
+    let cc = parse_addr_list(cc_raw);
+
+    let mut attachments = Vec::new();
+    let mut total_attachment_bytes = 0usize;
+    for (idx, att_streams) in attach_storages.into_iter().enumerate() {
+        let Some(raw_bytes) = first_binary(&att_streams, TAG_ATTACH_DATA_BIN) else {
+            continue;
+        };
+        let size = raw_bytes.len();
+        if size > options.max_attachment_size {
+            continue;
+        }
+        let filename = first_string(&att_streams, TAG_ATTACH_LONG_FILENAME)
+            .or_else(|| first_string(&att_streams, TAG_ATTACH_FILENAME))
+            .or_else(|| first_string(&att_streams, TAG_DISPLAY_NAME))
+            .unwrap_or_else(|| format!("attachment_{idx}.bin"));
+        let content_type = first_string(&att_streams, TAG_ATTACH_MIME_TAG)
+            .unwrap_or_else(|| infer_mime_type(&filename, raw_bytes));
+        let content_id = first_string(&att_streams, TAG_ATTACH_CONTENT_ID);
+        let is_inline = content_id.is_some();
+
+        let content = if options.extract_attachment_content
+            && total_attachment_bytes.saturating_add(size) <= options.max_total_attachment_bytes
+        {
+            total_attachment_bytes += size;
+            Some(base64::engine::general_purpose::STANDARD.encode(raw_bytes))
+        } else {
+            None
+        };
+
+        attachments.push(Attachment {
+            filename,
+            content_type,
+            size,
+            content_id,
+            is_inline,
+            content,
+        });
+    }
 
     Ok(Email {
         message_id,
         from,
         reply_to: None,
         to,
-        cc: vec![],
+        cc,
         bcc: vec![],
         subject,
         date: None,
@@ -89,11 +158,30 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], _options: ParseOptions) -> Result<Em
             text: body_text,
             html: body_html,
         },
-        attachments: vec![],
+        attachments,
         thread_info: ThreadInfo::default(),
         priority: None,
         headers: None,
     })
+}
+
+fn infer_mime_type(filename: &str, bytes: &[u8]) -> String {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".pdf") || bytes.starts_with(b"%PDF") {
+        "application/pdf".to_string()
+    } else if lower.ends_with(".png") || bytes.starts_with(b"\x89PNG") {
+        "image/png".to_string()
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg".to_string()
+    } else if lower.ends_with(".docx") {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string()
+    } else if lower.ends_with(".xlsx") {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()
+    } else if lower.ends_with(".csv") {
+        "text/csv".to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
 }
 
 struct CfbFile<'a> {
@@ -126,6 +214,7 @@ struct PropStream {
 enum PropKind {
     Unicode,
     Ansi,
+    Binary,
 }
 
 impl<'a> CfbFile<'a> {
@@ -182,19 +271,25 @@ impl<'a> CfbFile<'a> {
         })
     }
 
+    #[cfg(test)]
     fn root_substg_streams(&self) -> Result<Vec<PropStream>> {
+        self.root_streams_and_attachments().map(|(s, _)| s)
+    }
+
+    fn root_streams_and_attachments(&self) -> Result<(Vec<PropStream>, Vec<Vec<PropStream>>)> {
         let Some(root) = self.directory.first() else {
             return Err(anyhow!("MSG CFB: empty directory"));
         };
         let mut out = Vec::new();
+        let mut attachments = Vec::new();
         // A malformed CFB can point `left`/`right`/`child` back into the tree.
         // Without this, `walk_dir` recurses until the stack dies on a file we
         // do not control.
         let mut visited = vec![false; self.directory.len()];
         if root.child != NOSTREAM {
-            self.walk_dir(root.child, true, &mut out, &mut visited)?;
+            self.walk_dir(root.child, true, &mut out, &mut attachments, &mut visited)?;
         }
-        Ok(out)
+        Ok((out, attachments))
     }
 
     fn walk_dir(
@@ -202,6 +297,7 @@ impl<'a> CfbFile<'a> {
         idx: u32,
         take_streams: bool,
         out: &mut Vec<PropStream>,
+        attachments: &mut Vec<Vec<PropStream>>,
         visited: &mut [bool],
     ) -> Result<()> {
         if idx == NOSTREAM {
@@ -218,11 +314,24 @@ impl<'a> CfbFile<'a> {
             .directory
             .get(idx as usize)
             .ok_or_else(|| anyhow!("MSG CFB: directory index {idx} out of range"))?;
-        self.walk_dir(entry.left, take_streams, out, visited)?;
+        self.walk_dir(entry.left, take_streams, out, attachments, visited)?;
         if entry.obj_type == TYPE_STORAGE && entry.child != NOSTREAM {
-            // Recipients / attachments have their own substg streams; ignore
-            // them so attachment bodies cannot masquerade as the message body.
-            self.walk_dir(entry.child, false, out, visited)?;
+            if take_streams && entry.name.starts_with("__attach_version1.0_") {
+                let mut att_streams = Vec::new();
+                let mut dummy_nested = Vec::new();
+                self.walk_dir(
+                    entry.child,
+                    true,
+                    &mut att_streams,
+                    &mut dummy_nested,
+                    visited,
+                )?;
+                attachments.push(att_streams);
+            } else {
+                // Recipients / other storages have their own substg streams; ignore
+                // them so attachment/recipient bodies cannot masquerade as the message body.
+                self.walk_dir(entry.child, false, out, attachments, visited)?;
+            }
         }
         if take_streams && entry.obj_type == TYPE_STREAM {
             if let Some((tag, kind)) = parse_substg_name(&entry.name) {
@@ -230,7 +339,7 @@ impl<'a> CfbFile<'a> {
                 out.push(PropStream { tag, kind, bytes });
             }
         }
-        self.walk_dir(entry.right, take_streams, out, visited)?;
+        self.walk_dir(entry.right, take_streams, out, attachments, visited)?;
         Ok(())
     }
 
@@ -482,9 +591,17 @@ fn parse_substg_name(name: &str) -> Option<(String, PropKind)> {
     let kind = match rest[4..8].to_ascii_uppercase().as_str() {
         "001F" => PropKind::Unicode,
         "001E" => PropKind::Ansi,
+        "0102" => PropKind::Binary,
         _ => return None,
     };
     Some((tag, kind))
+}
+
+fn first_binary<'a>(streams: &'a [PropStream], tag: &str) -> Option<&'a [u8]> {
+    streams
+        .iter()
+        .find(|s| s.tag.eq_ignore_ascii_case(tag) && matches!(s.kind, PropKind::Binary))
+        .map(|s| s.bytes.as_slice())
 }
 
 fn first_string(streams: &[PropStream], tag: &str) -> Option<String> {
@@ -515,6 +632,7 @@ fn decode_prop(bytes: &[u8], kind: &PropKind) -> Option<String> {
             String::from_utf16_lossy(&units)
         }
         PropKind::Ansi => String::from_utf8_lossy(bytes).into_owned(),
+        PropKind::Binary => return None,
     };
     let trimmed = text.trim_matches('\0').trim();
     if trimmed.is_empty() {

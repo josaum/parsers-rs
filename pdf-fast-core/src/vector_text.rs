@@ -6,7 +6,7 @@
 //! [`VectorGlyph`] (normalized contours + a stable `shape_hash`) grouped into
 //! page-local [`GlyphRun`]s for the table/text reconstruction layer above.
 //!
-//! With the `glyph-atlas` feature, [`learn_page_glyph_mappings`] correlates
+//! With the `glyph-catalog` feature, [`learn_page_glyph_mappings`] correlates
 //! these shape hashes against CMap-resolved (`/ToUnicode`) text so the
 //! scanner can learn glyph→grapheme mappings for downstream pages that lack
 //! a CMap.
@@ -176,7 +176,7 @@ pub struct GlyphRun {
 ///
 /// `normalized` holds that normalized geometry, kept alongside the hash rather
 /// than recomputed on demand. The hash alone cannot carry identity — see
-/// [`crate::glyph_atlas`] — so a shape lookup needs the points, and recomputing
+/// [`crate::glyph_catalog`] — so a shape lookup needs the points, and recomputing
 /// normalization at every lookup would both cost more and risk disagreeing with
 /// the normalization the hash was taken from.
 #[derive(Debug, Clone)]
@@ -227,7 +227,7 @@ enum TjPart {
 /// — each glyph is a content stream, so drawing them means executing them. An
 /// embedded TrueType program carries its outlines in `glyf`, so drawing them
 /// means emitting points. Everything else keeps its outlines in a form this
-/// crate does not read, and the atlas gets nothing rather than an approximation.
+/// crate does not read, and the catalog gets nothing rather than an approximation.
 #[derive(Debug, Clone)]
 pub(crate) enum DrawableFont {
     /// Glyphs are content streams in `/CharProcs`.
@@ -238,7 +238,7 @@ pub(crate) enum DrawableFont {
     ///
     /// A third route to the same outlines, because OpenType fonts produced by
     /// design tools and by LaTeX wrap CFF rather than `glyf`, and a PDF that
-    /// embeds one gives the atlas nothing until the charstrings are read.
+    /// embeds one gives the catalog nothing until the charstrings are read.
     ///
     /// The encoding travels with the program because CFF is reached by glyph
     /// *name*, and the name comes from the font's `/Encoding` — so a font whose
@@ -263,7 +263,7 @@ enum GlyphSource {
 ///
 /// The two are the same shape — points in font units, y-up, with a flag for
 /// on-curve — but they live in different modules because the readers are
-/// independent. Keeping the conversion in one place means the atlas sees one
+/// independent. Keeping the conversion in one place means the catalog sees one
 /// representation regardless of which program the glyph came from.
 fn cff_to_outline(outline: &crate::truetype::GlyphOutline) -> crate::truetype::GlyphOutline {
     crate::truetype::GlyphOutline {
@@ -1384,30 +1384,30 @@ pub fn extract_page_vector_text_runs_checked(
     Ok(all_runs)
 }
 
-/// Resolve a glyph through the shape atlas, or `None` when the atlas is not
-/// compiled in (feature `glyph-atlas` disabled).
+/// Resolve a glyph through the shape catalog, or `None` when the catalog is not
+/// compiled in (feature `glyph-catalog` disabled).
 ///
 /// Takes the glyph's geometry, not just its hash. The hash cannot carry shape
-/// identity — see [`crate::glyph_atlas`] — so a lookup keyed on it alone misses
-/// glyphs the atlas has already learned, which is why recovery never worked.
+/// identity — see [`crate::glyph_catalog`] — so a lookup keyed on it alone misses
+/// glyphs the catalog has already learned, which is why recovery never worked.
 ///
 /// Returns the mapped grapheme (multi-codepoint safe) rather than a single
 /// `char` so ligatures and composed accents round-trip through the scanner.
 #[inline]
-fn atlas_lookup(glyph: &VectorGlyph) -> Option<String> {
-    #[cfg(feature = "glyph-atlas")]
+fn catalog_lookup(glyph: &VectorGlyph) -> Option<String> {
+    #[cfg(feature = "glyph-catalog")]
     {
         if glyph.normalized.is_empty() {
             return None;
         }
-        crate::glyph_atlas::lookup_entry(
+        crate::glyph_catalog::lookup_entry(
             glyph.shape_hash,
             &glyph.normalized,
             glyph.size,
-            crate::glyph_atlas::DEFAULT_EPS,
+            crate::glyph_catalog::DEFAULT_EPS,
         )
     }
-    #[cfg(not(feature = "glyph-atlas"))]
+    #[cfg(not(feature = "glyph-catalog"))]
     {
         let _ = glyph;
         None
@@ -1432,7 +1432,7 @@ pub struct LearningStats {
 
 /// Correlate vector-glyph runs with semantic (CMap-resolved) text runs and
 /// push high-confidence `(shape_hash → grapheme)` pairs into the process
-/// learning sink (`crate::glyph_atlas::record_learned`).
+/// learning sink (`crate::glyph_catalog::record_learned`).
 ///
 /// # Correlation strategy
 ///
@@ -1455,9 +1455,9 @@ pub struct LearningStats {
 /// geometry), when the char is whitespace (the vector path does not emit
 /// glyph shapes for spaces), or when CMap fallback occurred.
 ///
-/// The emitted entries use `AtlasSource::Corpus` and a conservative 0.85
+/// The emitted entries use `CatalogSource::Corpus` and a conservative 0.85
 /// confidence — real ground-truth but subject to our correlation heuristic.
-#[cfg(feature = "glyph-atlas")]
+#[cfg(feature = "glyph-catalog")]
 pub fn learn_page_glyph_mappings(doc: &PdfDocument, page: &PdfPage) -> LearningStats {
     learn_page_glyph_mappings_checked(doc, page).unwrap_or_else(|_| LearningStats {
         nothing_to_learn: true,
@@ -1467,12 +1467,12 @@ pub fn learn_page_glyph_mappings(doc: &PdfDocument, page: &PdfPage) -> LearningS
 
 /// Checked page glyph-learning surface. Governed vector extraction failures
 /// abort before any mapping is promoted to the process learning sink.
-#[cfg(feature = "glyph-atlas")]
+#[cfg(feature = "glyph-catalog")]
 pub fn learn_page_glyph_mappings_checked(
     doc: &PdfDocument,
     page: &PdfPage,
 ) -> Result<LearningStats> {
-    use crate::glyph_atlas::{record_learned, AtlasSource};
+    use crate::glyph_catalog::{record_learned, CatalogSource};
 
     let glyph_runs = extract_page_vector_text_runs_checked(doc, page)?;
     let semantic_runs = doc.semantic_text_runs_for_page(page);
@@ -1516,7 +1516,7 @@ pub fn learn_page_glyph_mappings_checked(
                     &s,
                     glyph.size,
                     0.85,
-                    AtlasSource::Corpus,
+                    CatalogSource::Corpus,
                 );
                 stats.emitted += 1;
             }
@@ -1547,7 +1547,7 @@ pub fn learn_page_glyph_mappings_checked(
                 &s,
                 glyph.size,
                 0.80,
-                AtlasSource::Corpus,
+                CatalogSource::Corpus,
             );
             stats.emitted += 1;
         }
@@ -1561,7 +1561,7 @@ pub fn learn_page_glyph_mappings_checked(
 /// Page-iteration convenience: run the learner across every page of a
 /// document and return the aggregate stats. Pages that cannot be learned
 /// from are quietly skipped.
-#[cfg(feature = "glyph-atlas")]
+#[cfg(feature = "glyph-catalog")]
 pub fn learn_document_glyph_mappings(doc: &PdfDocument) -> LearningStats {
     learn_document_glyph_mappings_checked(doc).unwrap_or_else(|_| LearningStats {
         nothing_to_learn: true,
@@ -1571,7 +1571,7 @@ pub fn learn_document_glyph_mappings(doc: &PdfDocument) -> LearningStats {
 
 /// Checked document-wide glyph learning. Any page resource or bounded Form
 /// traversal failure aborts the document operation.
-#[cfg(feature = "glyph-atlas")]
+#[cfg(feature = "glyph-catalog")]
 pub fn learn_document_glyph_mappings_checked(doc: &PdfDocument) -> Result<LearningStats> {
     let mut agg = LearningStats::default();
     for page in doc.pages() {
@@ -1586,7 +1586,7 @@ pub fn learn_document_glyph_mappings_checked(doc: &PdfDocument) -> Result<Learni
 }
 
 /// Render a sequence of [`GlyphRun`]s back into approximate text by looking
-/// each glyph up in the atlas (feature `glyph-atlas`). Unknown glyphs render
+/// each glyph up in the catalog (feature `glyph-catalog`). Unknown glyphs render
 /// as `_`. Newlines are inserted on >6pt y-jumps and spaces on >6pt x-gaps —
 /// a coarse heuristic intended for diagnostic / preview output, not for
 /// extraction-quality text.
@@ -1604,7 +1604,7 @@ pub fn runs_to_string(runs: &[GlyphRun]) -> String {
         }
 
         for glyph in &run.glyphs {
-            match atlas_lookup(glyph) {
+            match catalog_lookup(glyph) {
                 Some(grapheme) if !grapheme.is_empty() && grapheme != "?" => {
                     text.push_str(&grapheme);
                 }
@@ -1620,10 +1620,10 @@ pub fn runs_to_string(runs: &[GlyphRun]) -> String {
 }
 
 #[cfg(test)]
-#[cfg(feature = "glyph-atlas")]
+#[cfg(feature = "glyph-catalog")]
 mod learning_tests {
     use super::*;
-    use crate::glyph_atlas;
+    use crate::glyph_catalog;
     use crate::{ParseOptions, PdfDocument};
 
     #[test]
@@ -1677,11 +1677,11 @@ endobj
     ///
     /// This is the end-to-end shape of the bug: the learner always recorded
     /// something, and the lookup never found it. The unit tests in
-    /// `glyph_atlas` cover the comparison itself; this covers the wiring, using
+    /// `glyph_catalog` cover the comparison itself; this covers the wiring, using
     /// the same public functions the parser does.
     #[test]
     fn a_learned_shape_is_recovered_through_geometry() {
-        glyph_atlas::clear_learned();
+        glyph_catalog::clear_learned();
 
         let glyph = |jitter: f32| VectorGlyph {
             x_offset: 0.0,
@@ -1710,20 +1710,20 @@ endobj
 
         // Learn from one rendering of the shape.
         let learned = glyph(0.0);
-        glyph_atlas::record_learned(
+        glyph_catalog::record_learned(
             learned.shape_hash,
             &learned.normalized,
             "\u{03a9}",
             learned.size,
             0.9,
-            glyph_atlas::AtlasSource::Corpus,
+            glyph_catalog::CatalogSource::Corpus,
         );
-        assert_eq!(glyph_atlas::learned_shape_count(), 1, "one shape kept");
+        assert_eq!(glyph_catalog::learned_shape_count(), 1, "one shape kept");
 
         // Recover it from a different rendering of the same shape, whose hash
         // is deliberately not the learned one — the case that used to fail.
         let later = glyph(0.6 / 255.0);
-        let found = atlas_lookup(&later);
+        let found = catalog_lookup(&later);
         assert_eq!(
             found.as_deref(),
             Some("\u{03a9}"),
@@ -1735,18 +1735,18 @@ endobj
             normalized: Vec::new(),
             ..later
         };
-        assert!(atlas_lookup(&blank).is_none());
+        assert!(catalog_lookup(&blank).is_none());
 
-        glyph_atlas::clear_learned();
+        glyph_catalog::clear_learned();
     }
 
     /// One letter stays one entry no matter how many renderings are learned.
     ///
     /// The measured defect was 7.4k hashes for 15.7k glyphs on one contract;
-    /// the atlas is expected to converge on the alphabet instead.
+    /// the catalog is expected to converge on the alphabet instead.
     #[test]
     fn repeated_learning_converges_on_one_entry_per_shape() {
-        glyph_atlas::clear_learned();
+        glyph_catalog::clear_learned();
         let shape = vec![vec![
             BezPt {
                 x: 0.0,
@@ -1772,20 +1772,20 @@ endobj
                     p.x += jitter;
                 }
             }
-            glyph_atlas::record_learned(
+            glyph_catalog::record_learned(
                 1000 + i,
                 &jittered,
                 "A",
                 12.0,
                 0.8,
-                glyph_atlas::AtlasSource::Corpus,
+                glyph_catalog::CatalogSource::Corpus,
             );
         }
         assert_eq!(
-            glyph_atlas::learned_shape_count(),
+            glyph_catalog::learned_shape_count(),
             1,
             "200 renderings of one letter must collapse to one entry"
         );
-        glyph_atlas::clear_learned();
+        glyph_catalog::clear_learned();
     }
 }

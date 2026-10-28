@@ -219,7 +219,7 @@ fn check(root: &Path, name: &str) -> Value {
                     );
                     require(
                         package["repository"]["url"].as_str()
-                            == Some("https://github.com/josaum/parsers-rs.git"),
+                            == Some("https://github.com/fast-parser-inc/parsers-rs.git"),
                         &path,
                         "Node package provenance must identify sovereign parsers-rs",
                     );
@@ -389,7 +389,7 @@ mod regression {
             let dir = root.join(format!("{parser}-fast-node"));
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("Cargo.toml"), "[package]\nversion = \"1.2.3\"\n").unwrap();
-            fs::write(dir.join("package.json"),json!({"version":"1.2.3","repository":{"url":"https://github.com/josaum/parsers-rs.git"}}).to_string()).unwrap();
+            fs::write(dir.join("package.json"),json!({"version":"1.2.3","repository":{"url":"https://github.com/fast-parser-inc/parsers-rs.git"}}).to_string()).unwrap();
         }
         assert!(
             check(root, "parsers-binding-contract")["warnings"]
@@ -397,7 +397,7 @@ mod regression {
                 .unwrap()
                 .is_empty()
         );
-        fs::write(root.join("docx-fast-node/package.json"),json!({"version":"1.2.2","repository":{"url":"https://github.com/josaum/parsers-rs.git"}}).to_string()).unwrap();
+        fs::write(root.join("docx-fast-node/package.json"),json!({"version":"1.2.2","repository":{"url":"https://github.com/fast-parser-inc/parsers-rs.git"}}).to_string()).unwrap();
         assert_eq!(
             check(root, "parsers-binding-contract")["warnings"]
                 .as_array()
@@ -405,7 +405,7 @@ mod regression {
                 .len(),
             1
         );
-        fs::write(root.join("docx-fast-node/package.json"),json!({"version":"1.2.3","repository":{"url":"https://github.com/josaum/parsers-rs.git"}}).to_string()).unwrap();
+        fs::write(root.join("docx-fast-node/package.json"),json!({"version":"1.2.3","repository":{"url":"https://github.com/fast-parser-inc/parsers-rs.git"}}).to_string()).unwrap();
         for path in ["ontology-fast-py/Cargo.toml", "json-fast-node/Cargo.toml"] {
             fs::write(root.join(path), "[package]\nversion = \"1.2.2\"\n").unwrap();
             let result = check(root, "parsers-binding-contract");

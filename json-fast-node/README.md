@@ -2,9 +2,7 @@
 
 This is the current crate guide for the Node.js N-API bindings to
 [`json-fast-core`](../json-fast-core). See the
-[repository README](../../README.md) for Atlas Brain's product contract and the
-[transport overview](../../docs/atlas/json-fast-arrow.md) for the shared data
-plane.
+[repository README](../README.md) for the workspace contract.
 
 The package provides native JSON/JSONL parsing and focused helpers for JSON
 Schema, JSON-RPC 2.0, JSON:API, JWT structure, and JSON-LD metadata. It is a
@@ -17,9 +15,7 @@ apply an explicit schema before moving a projection over Arrow IPC/Flight or
 presenting it for governed promotion. All parsed values and helper results are
 unsigned. JWT structure parsing does not verify identity, JSON-LD metadata does
 not approve ontology meaning, and schema validation does not certify business
-truth. See [information ownership](../../docs/atlas/atlas-information-ownership.md)
-and the [data-pipeline contract](../../docs/atlas/atlas-data-pipelines.md).
-The approved proof-carrying reasoner is downstream of separate fact/rule
+truth. The approved proof-carrying reasoner is downstream of separate fact/rule
 promotion; this binding never evaluates or strengthens semantic assurance.
 
 ## Build
@@ -85,5 +81,4 @@ cd office-parsers-rs/json-fast-node && node build.mjs --debug && node --test smo
 The Rust unit tests call the exported functions as plain Rust and need no Node
 runtime. They do not cover the generated N-API glue, the camelCase export
 names, or JS value conversion; `smoke.test.mjs` covers those through
-`index.js` and needs Node 18 or newer plus a built addon. It is not part of
-`scripts/verify-atlas.sh`.
+`index.js` and needs Node 18 or newer plus a built addon.

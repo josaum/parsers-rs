@@ -1,7 +1,7 @@
 # Sovereign parser verification policy
 
-This Rust crate owns parser-specific checks. It has no dependency on Mycelia,
-Atlas, their directory layouts, or LEIO's implementation. It implements LEIO's
+This Rust crate owns parser-specific checks. It has no dependency on downstream
+consumers, their directory layouts, or LEIO's implementation. It implements LEIO's
 version-1 native doctor JSON protocol and can also run independently:
 
 ```sh

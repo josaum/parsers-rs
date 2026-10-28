@@ -1,0 +1,23 @@
+[package]
+name = "pdf-fast-write"
+version = "0.2.0"
+edition.workspace = true
+authors.workspace = true
+description = "Sovereign PDF page manipulation — subset and merge PDFs without external dependencies"
+license.workspace = true
+repository.workspace = true
+keywords = ["pdf", "writer", "subset", "manipulation", "office"]
+categories = ["encoding", "api-bindings"]
+rust-version.workspace = true
+
+[lib]
+name = "pdf_fast_write"
+
+[dependencies]
+anyhow = "1.0"
+memmap2 = "0.9"
+crc32fast = "1.4"
+flate2 = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"

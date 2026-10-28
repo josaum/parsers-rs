@@ -45,9 +45,14 @@ SCHEMA_VERSION = "parsers-rs.release.v1"
 NODE_CRATES: set[str] = {
     "docx-fast-node",
     "xlsx-fast-node",
+    "xlsx-fast-write-node",
     "pptx-fast-node",
+    "pdf-fast-node",
+    "pdf-fast-write-node",
     "email-fast-node",
+    "xsd-fast-node",
     "json-fast-node",
+    "geo-fast-node",
 }
 
 CRATES: dict[str, str] = {
@@ -56,22 +61,23 @@ CRATES: dict[str, str] = {
     "docx_fast": "docx-fast-py",
     "email_fast": "email-fast-py",
     "xlsx_fast": "xlsx-fast-py",
+    "xlsx_fast_write": "xlsx-fast-write-py",
     "pptx_fast": "pptx-fast-py",
     "pdf_fast": "pdf-fast-py",
+    "pdf_fast_write": "pdf-fast-write-py",
     "ontology_fast": "ontology-fast-py",
+    "geo_fast": "geo-fast-py",
 }
 
 TARGET_PLATFORMS = {
     "darwin-arm64": "aarch64-apple-darwin",
     "linux-x64-gnu": "x86_64-unknown-linux-gnu",
     "linux-arm64-gnu": "aarch64-unknown-linux-gnu",
-}
-
-# Targets that ship Python wheels only: the Node bindings have no Windows lane,
-# the Claude Desktop toolkit's Windows bundle needs the wheels.
-WHEEL_ONLY_TARGETS = {
     "win32-x64-msvc": "x86_64-pc-windows-msvc",
 }
+
+# Targets that ship Python wheels only (none: all targets ship both wheels and Node tarballs).
+WHEEL_ONLY_TARGETS: dict[str, str] = {}
 
 
 def validate_native_architecture(header: bytes, target: str, path: Path) -> None:
@@ -163,7 +169,7 @@ def artifact_target(path: Path) -> str:
         ):
             target = TARGET_PLATFORMS["linux-arm64-gnu"]
         elif platforms == {"win_amd64"}:
-            target = WHEEL_ONLY_TARGETS["win32-x64-msvc"]
+            target = TARGET_PLATFORMS["win32-x64-msvc"]
         else:
             raise SystemExit(f"{path.name}: unsupported release platform")
         distribution = path.name.split("-", 1)[0]
@@ -208,7 +214,11 @@ def validate_release_matrix(artifacts: list[dict], *, complete: bool) -> None:
         for artifact in artifacts:
             if artifact["file"].endswith(".whl"):
                 sbom = artifact["sbom"]
-                core = artifact["crate"].replace("-py", "-core")
+                core = (
+                    artifact["crate"].removesuffix("-py")
+                    if artifact["crate"].endswith("-write-py")
+                    else artifact["crate"].replace("-py", "-core")
+                )
                 if (
                     not sbom
                     or sbom["format"] != "CycloneDX"

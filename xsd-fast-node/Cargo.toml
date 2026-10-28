@@ -1,0 +1,24 @@
+[package]
+name = "xsd-fast-node"
+version = "0.2.5"
+edition.workspace = true
+authors.workspace = true
+description = "Node.js bindings for xsd-fast-core"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "xsd_fast_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+arrow = { workspace = true, features = ["ipc"] }
+napi = { workspace = true }
+napi-derive = { workspace = true }
+serde_json = { workspace = true }
+xsd-fast-core = { path = "../xsd-fast-core", features = ["arrow"] }
+
+[build-dependencies]
+napi-build = { workspace = true }

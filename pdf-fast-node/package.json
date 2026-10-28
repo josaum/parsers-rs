@@ -1,0 +1,55 @@
+{
+  "name": "pdf-fast-node",
+  "version": "0.2.5",
+  "description": "High-performance PDF parser/table/text N-API bindings, full parity with the Rust core using Arrow IPC Buffers",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "author": "Dionisio Chiuratto Agourakis",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fast-parser-inc/parsers-rs.git",
+    "directory": "pdf-fast-node"
+  },
+  "homepage": "https://github.com/fast-parser-inc/parsers-rs#readme",
+  "bugs": {
+    "url": "https://github.com/fast-parser-inc/parsers-rs/issues"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "napi": {
+    "name": "pdf_fast_node"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "keywords": [
+    "pdf",
+    "parser",
+    "text-extraction",
+    "tables",
+    "arrow",
+    "rust",
+    "native",
+    "napi",
+    "performance"
+  ],
+  "scripts": {
+    "smoke": "node -e \"const m=require('./'); console.log(Object.keys(m).join(','))\"",
+    "pack:dry": "npm pack --dry-run"
+  }
+}

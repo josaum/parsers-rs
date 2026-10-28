@@ -1,0 +1,25 @@
+[package]
+name = "flight-ipc-config"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
+futures = "0.3"
+jsonwebtoken = { workspace = true }
+prost = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = "2"
+tonic = { workspace = true }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

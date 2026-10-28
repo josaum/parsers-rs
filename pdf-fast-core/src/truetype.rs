@@ -2,12 +2,12 @@
 //!
 //! # Why this exists
 //!
-//! A glyph atlas recovers a character from an outline. Type 3 fonts reach their
+//! A glyph catalog recovers a character from an outline. Type 3 fonts reach their
 //! outlines because those outlines are content streams the parser can execute.
 //! Every other font keeps them in a *font program*, and until now this crate
 //! only classified those streams — it never read one. So a document embedding
 //! TrueType, which is the ordinary case for anything produced by a word
-//! processor, gave the atlas nothing to work with.
+//! processor, gave the catalog nothing to work with.
 //!
 //! This module reads the four tables needed to turn a character code into an
 //! outline, and nothing else:
@@ -25,7 +25,7 @@
 //! charstrings, and no OpenType layout. A font whose outlines live in `CFF`
 //! (an `OTTO` sfnt) returns `None` rather than a guess, because guessing at an
 //! outline produces a *plausible* shape, and a plausible wrong shape is exactly
-//! what the atlas compares against.
+//! what the catalog compares against.
 //!
 //! # Coordinate space
 //!
@@ -210,7 +210,7 @@ impl TrueTypeFont {
     /// Advance width for a character code, in font units.
     ///
     /// Without it text cannot advance, and text that does not advance collapses
-    /// onto one position — the failure the atlas cannot see, because the shapes
+    /// onto one position — the failure the catalog cannot see, because the shapes
     /// are all correct.
     ///
     /// `hmtx` stores one entry per glyph up to `numberOfHMetrics`, then repeats
@@ -395,7 +395,7 @@ impl TrueTypeFont {
                 });
             }
             // Close the contour explicitly. TrueType implies the closing
-            // segment, and an atlas comparing point sequences needs the same
+            // segment, and an catalog comparing point sequences needs the same
             // point count from two renderings of one shape.
             if let Some(first_point) = contour.first().copied() {
                 contour.push(first_point);

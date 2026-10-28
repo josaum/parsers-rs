@@ -1,18 +1,13 @@
-//! Canonical Turtle reader and indexed triple view for the Atlas routing core.
+//! Canonical Turtle reader and indexed triple view for RDF ontology routing.
 //!
-//! The routing core reads `app/cartridge/ontology/atlas.ttl` through a regular
-//! expression over one authoring style (`catalog._subject_blocks`). That is a
-//! faithful subset of the live cartridge today, but it cannot read the module
-//! corpus, and a valid Turtle edit can be invisible to it — or worse, mint a
-//! triple the file never asserts. This crate is the real parser the plan moves
-//! to, and it renders terms in exactly the text form the Python core already
-//! consumes so the change is measurable rather than hopeful.
+//! This crate parses Turtle documents into a canonical text-triple view and an
+//! indexed `(subject, predicate, object)` lookup table.
 //!
 //! Text form, derived from the document's own prefix declarations (`@prefix`
 //! or SPARQL-style `PREFIX`, as the Turtle parser reports them — see
 //! [`declared_prefixes`]):
 //!
-//! * a prefixed name stays a prefixed name (`atlas:ROAS`)
+//! * a prefixed name stays a prefixed name (`ex:ROAS`)
 //! * `rdf:type` renders as `a`
 //! * a literal renders as its lexical form, without quotes
 //! * an IRI no declared prefix covers stays `<...>`, never a guess
@@ -706,14 +701,14 @@ mod tests {
     #[test]
     fn renders_type_as_a_and_abbreviates_declared_prefixes() {
         let ontology = parse(
-            "@prefix atlas: <https://atlas.example/ns#> .\n\
+            "@prefix ex: <https://example.org/ns#> .\n\
              @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
-             atlas:ROAS a atlas:Metric ;\n    atlas:label \"Return on ad spend\" .\n",
+             ex:ROAS a ex:Metric ;\n    ex:label \"Return on ad spend\" .\n",
         );
         let rendered: Vec<String> = ontology.triples().iter().map(TripleText::to_line).collect();
-        assert!(rendered.contains(&"atlas:ROAS\ta\tatlas:Metric".to_owned()));
+        assert!(rendered.contains(&"ex:ROAS\ta\tex:Metric".to_owned()));
         assert!(
-            rendered.contains(&"atlas:ROAS\tatlas:label\tReturn on ad spend".to_owned()),
+            rendered.contains(&"ex:ROAS\tex:label\tReturn on ad spend".to_owned()),
             "{rendered:?}"
         );
     }
@@ -721,13 +716,12 @@ mod tests {
     #[test]
     fn leaves_an_undeclared_namespace_as_a_full_iri() {
         let ontology =
-            parse("<https://atlas.example/ns> a <http://www.w3.org/2002/07/owl#Ontology> .\n");
+            parse("<https://example.org/ns> a <http://www.w3.org/2002/07/owl#Ontology> .\n");
         let rendered: Vec<String> = ontology.triples().iter().map(TripleText::to_line).collect();
         assert_eq!(
             rendered,
             vec![
-                "<https://atlas.example/ns>\ta\t<http://www.w3.org/2002/07/owl#Ontology>"
-                    .to_owned()
+                "<https://example.org/ns>\ta\t<http://www.w3.org/2002/07/owl#Ontology>".to_owned()
             ]
         );
     }
@@ -735,8 +729,8 @@ mod tests {
     #[test]
     fn reads_a_multi_line_literal_the_subset_parser_corrupts() {
         let ontology = parse(
-            "@prefix atlas: <https://atlas.example/ns#> .\n\
-             atlas:ROAS a atlas:Metric ;\n    atlas:note \"\"\"line one\n    line two\"\"\" .\n",
+            "@prefix ex: <https://example.org/ns#> .\n\
+             ex:ROAS a ex:Metric ;\n    ex:note \"\"\"line one\n    line two\"\"\" .\n",
         );
         let rendered: Vec<String> = ontology.triples().iter().map(TripleText::to_line).collect();
         assert!(
@@ -754,15 +748,15 @@ mod tests {
     #[test]
     fn index_answers_subject_predicate_and_object_lookups() {
         let ontology = parse(
-            "@prefix atlas: <https://atlas.example/ns#> .\n\
-             atlas:ROAS a atlas:Metric .\n\
-             atlas:ROAS atlas:owner \"revops\" .\n",
+            "@prefix ex: <https://example.org/ns#> .\n\
+             ex:ROAS a ex:Metric .\n\
+             ex:ROAS ex:owner \"revops\" .\n",
         );
         let index = ontology.index();
-        assert_eq!(index.by_subject("atlas:ROAS").len(), 2);
+        assert_eq!(index.by_subject("ex:ROAS").len(), 2);
         assert_eq!(index.by_predicate("a").len(), 1);
-        assert_eq!(index.by_object("atlas:Metric").len(), 1);
-        assert!(index.by_subject("atlas:absent").is_empty());
+        assert_eq!(index.by_object("ex:Metric").len(), 1);
+        assert!(index.by_subject("ex:absent").is_empty());
     }
 
     #[test]
@@ -771,8 +765,8 @@ mod tests {
         // meaning, so this asserts the node is *represented*, not that any
         // particular label was chosen.
         let ontology = parse_turtle(
-            b"@prefix atlas: <https://atlas.example/ns#> .\n\
-              [] a atlas:Metric ; atlas:owner \"revops\" .\n",
+            b"@prefix ex: <https://example.org/ns#> .\n\
+              [] a ex:Metric ; ex:owner \"revops\" .\n",
             OntologyLimits::default(),
         )
         .expect("blank nodes must read");
@@ -795,7 +789,7 @@ mod tests {
 
     #[test]
     fn enforces_the_statement_budget() {
-        let source = b"@prefix atlas: <https://atlas.example/ns#> .\natlas:a a atlas:B .\natlas:c a atlas:D .\n";
+        let source = b"@prefix ex: <https://example.org/ns#> .\nex:a a ex:B .\nex:c a ex:D .\n";
         let error = parse_turtle(
             source,
             OntologyLimits {
@@ -819,12 +813,12 @@ mod tests {
     #[test]
     fn term_view_keeps_full_iris_and_literal_typing() {
         let triples = parse_turtle_terms(
-            b"@prefix atlas: <https://atlas.example/ns#> .\n\
+            b"@prefix ex: <https://example.org/ns#> .\n\
               @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
-              atlas:ROAS a atlas:Metric ;\n\
-              atlas:note \"plain\" ;\n\
-              atlas:since \"2026-09-16\"^^xsd:date ;\n\
-              atlas:summary \"Hello\"@EN .\n",
+              ex:ROAS a ex:Metric ;\n\
+              ex:note \"plain\" ;\n\
+              ex:since \"2026-09-16\"^^xsd:date ;\n\
+              ex:summary \"Hello\"@EN .\n",
             OntologyLimits::default(),
         )
         .expect("parses");
@@ -836,14 +830,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing predicate {predicate}: {triples:?}"))
         };
         let type_triple = by_predicate("rdf-syntax-ns#type");
-        assert_eq!(type_triple.subject, "https://atlas.example/ns#ROAS");
+        assert_eq!(type_triple.subject, "https://example.org/ns#ROAS");
         assert_eq!(
             type_triple.predicate, "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
             "rdf:type stays a full IRI in the term view"
         );
         assert_eq!(
             type_triple.object,
-            TermView::Iri("https://atlas.example/ns#Metric".to_owned())
+            TermView::Iri("https://example.org/ns#Metric".to_owned())
         );
         assert_eq!(
             by_predicate("#note").object,

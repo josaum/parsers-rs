@@ -46,10 +46,10 @@ function zipStore(parts) {
   return Buffer.concat([...local, cdBuf, end]);
 }
 
-const RELS = 'http://schemas.openxmlformats.org/package/2006/relationships';
-const OFFICE_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
-const rels = (entries) => `<?xml version="1.0" encoding="UTF-8"?>\n<Relationships xmlns="${RELS}">${
-  entries.map(([id, type, target]) => `<Relationship Id="${id}" Type="${OFFICE_REL}/${type}" Target="${target}"/>`).join('')
+const relsNs = 'http://schemas.openxmlformats.org/package/2006/relationships';
+const officeRelNs = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+const rels = (entries) => `<?xml version="1.0" encoding="UTF-8"?>\n<Relationships xmlns="${relsNs}">${
+  entries.map(([id, type, target]) => `<Relationship Id="${id}" Type="${officeRelNs}/${type}" Target="${target}"/>`).join('')
 }</Relationships>`;
 
 const fixtures = {
@@ -65,7 +65,7 @@ const fixtures = {
   xlsx: () => zipStore([
     ['_rels/.rels', rels([['rId1', 'officeDocument', 'xl/workbook.xml']])],
     ['xl/workbook.xml', `<?xml version="1.0" encoding="UTF-8"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="${OFFICE_REL}"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>`],
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="${officeRelNs}"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>`],
     ['xl/_rels/workbook.xml.rels', rels([['rId1', 'worksheet', 'worksheets/sheet1.xml'], ['rId2', 'sharedStrings', 'sharedStrings.xml']])],
     ['xl/sharedStrings.xml', `<?xml version="1.0" encoding="UTF-8"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1"><si><t>Hello XLSX</t></si></sst>`],
@@ -75,7 +75,7 @@ const fixtures = {
   pptx: () => zipStore([
     ['_rels/.rels', rels([['rId1', 'officeDocument', 'ppt/presentation.xml']])],
     ['ppt/presentation.xml', `<?xml version="1.0" encoding="UTF-8"?>
-<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="${OFFICE_REL}"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>`],
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="${officeRelNs}"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>`],
     ['ppt/_rels/presentation.xml.rels', rels([['rId1', 'slide', 'slides/slide1.xml']])],
     ['ppt/slides/slide1.xml', `<?xml version="1.0" encoding="UTF-8"?>
 <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld name="Intro"><p:spTree>

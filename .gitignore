@@ -20,6 +20,7 @@ __pycache__/
 /.leio-code/rust-doctors/target/
 /.leio-code/index.json
 /.leio-code/index-summary.json
+/.leio-code/playbook.json
 /.leio-code/search.arrow
 /.leio-code/events/
 /.leio-code/exports/

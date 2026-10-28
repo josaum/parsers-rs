@@ -1,0 +1,20 @@
+[package]
+name = "xlsx-fast-write-py"
+version = "0.2.0"
+edition.workspace = true
+authors.workspace = true
+description = "Python bindings for xlsx-fast-write (sovereign XLSX writer)"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "xlsx_fast_write_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+xlsx-fast-write = { path = "../xlsx-fast-write" }
+
+[build-dependencies]
+pyo3-build-config = "0.28.3"

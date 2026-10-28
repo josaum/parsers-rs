@@ -2,12 +2,12 @@
 //!
 //! # Why this exists
 //!
-//! The glyph atlas recovers a character from an outline. A Type 3 font reaches
+//! The glyph catalog recovers a character from an outline. A Type 3 font reaches
 //! its outlines because they are content streams; a `glyf`-based TrueType font
 //! reaches them through a table; an OpenType font with **CFF outlines** keeps
 //! them as *charstrings*, a bytecode of its own. Without an interpreter those
 //! outlines are unreachable, and a document embedding an OpenType font — which
-//! is what LaTeX and most design tools produce — gives the atlas nothing.
+//! is what LaTeX and most design tools produce — gives the catalog nothing.
 //!
 //! # What is read
 //!
@@ -22,13 +22,13 @@
 //! No hinting beyond skipping it (hints adjust rasterization, not the designed
 //! outline), no `seac` accent composition, no `FDArray`/`FDSelect` per-glyph
 //! private dicts, and no CID-keyed fonts. Each of those returns `None` rather
-//! than an approximation: a plausible wrong outline is exactly what the atlas
+//! than an approximation: a plausible wrong outline is exactly what the catalog
 //! compares against, so a refusal is safer than a guess.
 
 use std::collections::HashMap;
 
 /// CFF draws the same outlines TrueType does, so it reuses that type rather
-/// than defining a parallel one: the atlas compares point sequences, and two
+/// than defining a parallel one: the catalog compares point sequences, and two
 /// representations of one shape would only invite them to drift.
 pub use crate::truetype::{GlyphOutline, OutlinePoint};
 

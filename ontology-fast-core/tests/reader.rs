@@ -25,38 +25,37 @@ fn lines(source: &str) -> Vec<String> {
 fn a_sparql_style_prefix_directive_abbreviates_like_an_at_prefix() {
     // Turtle 1.1 §6.5 `sparqlPrefix`: keyword case-insensitive, no trailing dot.
     for keyword in ["PREFIX", "prefix", "PrEfIx"] {
-        let source =
-            format!("{keyword} atlas: <https://atlas.example/ns#>\natlas:ROAS a atlas:Metric .\n");
+        let source = format!("{keyword} ex: <https://example.org/ns#>\nex:ROAS a ex:Metric .\n");
         assert_eq!(
             lines(&source),
-            vec!["atlas:ROAS\ta\tatlas:Metric".to_owned()],
+            vec!["ex:ROAS\ta\tex:Metric".to_owned()],
             "{keyword}"
         );
         let ontology =
             parse_turtle(source.as_bytes(), OntologyLimits::default()).expect("document parses");
         assert_eq!(
-            ontology.prefixes().get("atlas").map(String::as_str),
-            Some("https://atlas.example/ns#")
+            ontology.prefixes().get("ex").map(String::as_str),
+            Some("https://example.org/ns#")
         );
-        assert_eq!(ontology.index().by_subject("atlas:ROAS").len(), 1);
+        assert_eq!(ontology.index().by_subject("ex:ROAS").len(), 1);
     }
 }
 
 #[test]
 fn a_directive_looking_line_inside_a_long_literal_declares_nothing() {
-    let source = "@prefix atlas: <https://atlas.example/ns#> .\n\
-                  atlas:check atlas:query \"\"\"\n\
-                  @prefix bogus: <https://atlas.example/ns#RO> .\n\
-                  PREFIX other: <https://atlas.example/> \n\
+    let source = "@prefix ex: <https://example.org/ns#> .\n\
+                  ex:check ex:query \"\"\"\n\
+                  @prefix bogus: <https://example.org/ns#RO> .\n\
+                  PREFIX other: <https://example.org/> \n\
                   \"\"\" .\n\
-                  atlas:ROAS a atlas:Metric .\n";
+                  ex:ROAS a ex:Metric .\n";
     let ontology =
         parse_turtle(source.as_bytes(), OntologyLimits::default()).expect("document parses");
     let declared: Vec<&str> = ontology.prefixes().keys().map(String::as_str).collect();
-    assert_eq!(declared, vec!["atlas"], "only the real directive declares");
+    assert_eq!(declared, vec!["ex"], "only the real directive declares");
     let rendered: Vec<String> = ontology.triples().iter().map(TripleText::to_line).collect();
     assert!(
-        rendered.contains(&"atlas:ROAS\ta\tatlas:Metric".to_owned()),
+        rendered.contains(&"ex:ROAS\ta\tex:Metric".to_owned()),
         "a longer namespace minted from literal text must not re-abbreviate: {rendered:?}"
     );
 }
@@ -107,9 +106,9 @@ fn the_longest_declared_namespace_wins_and_ties_break_by_prefix_order() {
 
 #[test]
 fn blank_labels_are_identical_across_parses_and_across_views() {
-    let source = b"@prefix atlas: <https://atlas.example/ns#> .\n\
-                   [] a atlas:Metric ; atlas:owner [ atlas:name \"revops\" ] .\n\
-                   _:authored atlas:items ( 1 2 ) .\n";
+    let source = b"@prefix ex: <https://example.org/ns#> .\n\
+                   [] a ex:Metric ; ex:owner [ ex:name \"revops\" ] .\n\
+                   _:authored ex:items ( 1 2 ) .\n";
     let first = parse_turtle(source, OntologyLimits::default()).expect("parses");
     let second = parse_turtle(source, OntologyLimits::default()).expect("parses");
     assert_eq!(
@@ -438,7 +437,7 @@ fn declared_prefixes_reads_the_parser_table_and_refuses_what_parse_refuses() {
     use ontology_fast_core::declared_prefixes;
 
     let source =
-        b"@base <https://atlas.example/dir/> .\n@prefix rel: <ns#> .\nPREFIX abs: <urn:abs:>\n";
+        b"@base <https://example.org/dir/> .\n@prefix rel: <ns#> .\nPREFIX abs: <urn:abs:>\n";
     let table = declared_prefixes(source, OntologyLimits::default()).expect("parses");
     let pairs: Vec<(&str, &str)> = table
         .iter()
@@ -446,10 +445,7 @@ fn declared_prefixes_reads_the_parser_table_and_refuses_what_parse_refuses() {
         .collect();
     assert_eq!(
         pairs,
-        vec![
-            ("abs", "urn:abs:"),
-            ("rel", "https://atlas.example/dir/ns#")
-        ]
+        vec![("abs", "urn:abs:"), ("rel", "https://example.org/dir/ns#")]
     );
 
     assert!(matches!(

@@ -1,0 +1,6 @@
+src/
+Cargo.toml
+build.rs
+target/
+node_modules/
+*.tgz

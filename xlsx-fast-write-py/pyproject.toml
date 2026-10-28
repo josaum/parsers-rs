@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.6,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "xlsx-fast-write"
+version = "0.2.0"
+description = "Sovereign XLSX writer powered by Rust (no external deps)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Dionisio Chiuratto Agourakis" }]
+keywords = ["excel", "xlsx", "writer", "spreadsheet", "office", "ooxml", "rust"]
+
+[tool.maturin]
+module-name = "xlsx_fast_write._core"
+python-source = "."
+features = ["pyo3/extension-module"]

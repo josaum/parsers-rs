@@ -69,8 +69,8 @@ pub mod vector_text;
 pub use vector_text::*;
 
 pub mod encoding;
-#[cfg(feature = "glyph-atlas")]
-pub mod glyph_atlas;
+#[cfg(feature = "glyph-catalog")]
+pub mod glyph_catalog;
 pub mod lzw;
 
 #[cfg(feature = "rasterize")]
@@ -2477,12 +2477,12 @@ impl PdfDocument {
             .collect())
     }
 
-    /// Extract text from `page_index` using the glyph-shape atlas, bypassing
+    /// Extract text from `page_index` using the glyph-shape catalog, bypassing
     /// the CMap/ToUnicode path entirely.  Useful as a fallback when
     /// [`semantic_text_runs_for_page`] returns a high `cmap_fallback_chars`
     /// ratio, indicating the font uses a custom encoding without a proper
     /// ToUnicode entry.  Returns `None` if the page has no vector glyph runs
-    /// or if no glyph in the runs is known to the atlas.
+    /// or if no glyph in the runs is known to the catalog.
     pub fn page_vector_text_as_string(&self, page_index: usize) -> Option<String> {
         self.page_vector_text_as_string_checked(page_index)
             .ok()
@@ -2497,7 +2497,7 @@ impl PdfDocument {
             return Ok(None);
         }
         let text = vector_text::runs_to_string(&runs);
-        // Only return if at least some glyphs were resolved by the atlas.
+        // Only return if at least some glyphs were resolved by the catalog.
         if text.trim().is_empty() || text.chars().all(|c| c == '_' || c == '\n' || c == ' ') {
             return Ok(None);
         }
@@ -3051,7 +3051,7 @@ impl PdfDocument {
     /// `glyf`, so reaching them means reading that table. Every other subtype
     /// keeps its outlines in a form this crate does not read, and returning
     /// `None` is the honest answer: a plausible wrong shape is exactly what the
-    /// atlas would then compare against.
+    /// catalog would then compare against.
     fn resolve_drawable_font(
         &self,
         resources: Option<&PdfDictionary>,

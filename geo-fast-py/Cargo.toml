@@ -1,0 +1,21 @@
+[package]
+name = "geo-fast-py"
+version = "0.2.1"
+edition.workspace = true
+authors.workspace = true
+description = "Python bindings for geo-fast-core"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "geo_fast_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+geo-fast-core = { path = "../geo-fast-core" }
+pyo3 = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = "0.28.3"

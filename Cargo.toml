@@ -4,27 +4,44 @@ members = [
   "docx-fast-core",
   "docx-fast-py",
   "docx-fast-node",
+  "docx-fast-flight",
   "ooxml-archive",
   "xlsx-fast-core",
   "xlsx-fast-py",
   "xlsx-fast-node",
+  "xlsx-fast-flight",
   "xlsx-fast-write",
+  "xlsx-fast-write-py",
+  "xlsx-fast-write-node",
   "pptx-fast-core",
   "pptx-fast-py",
   "pptx-fast-node",
+  "pptx-fast-flight",
   "pdf-fast-core",
   "pdf-fast-py",
+  "pdf-fast-node",
+  "pdf-fast-write",
+  "pdf-fast-write-py",
+  "pdf-fast-write-node",
   "email-fast-core",
   "email-fast-py",
   "email-fast-node",
+  "email-fast-flight",
   "json-fast-core",
   "json-fast-py",
   "json-fast-node",
+  "json-fast-flight",
   "xsd-fast-core",
   "xsd-fast-py",
+  "xsd-fast-node",
+  "xsd-fast-flight",
   "ontology-fast-core",
   "ontology-fast-py",
   "web-fast-core",
+  "geo-fast-core",
+  "geo-fast-py",
+  "geo-fast-node",
+  "flight-ipc-config",
 ]
 
 # Shared dependency versions for every parser crate in this repository.
@@ -36,8 +53,10 @@ members = [
 [workspace.dependencies]
 arrow-array = "=58.3.0"
 arrow = "=58.3.0"
+arrow-flight = "=58.3.0"
 arrow-ipc = { version = "=58.3.0", features = ["lz4", "zstd"] }
 arrow-schema = "=58.3.0"
+jsonwebtoken = "=9.3.1"
 pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py38", "generate-import-lib"] }
 # Node-API 2 bindings. napi 2 is the line the consumer shells were built
 # against; the `.node` ABI is what the consumer shells load, so the major
@@ -47,6 +66,8 @@ napi-derive = "2.16"
 napi-build = "2.2"
 regex = "1.12"
 serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tonic = { version = "0.14.2", features = ["transport"] }
 
 # Inherited by every member that does not override it. Attribution stays with
 # this repository: a consumer must be able to tell which project produced an
@@ -57,5 +78,5 @@ edition = "2021"
 license = "MIT"
 # Every published artifact inherits this remote, so it must never point at a
 # consumer of this repository.
-repository = "https://github.com/josaum/parsers-rs"
+repository = "https://github.com/fast-parser-inc/parsers-rs"
 rust-version = "1.94"

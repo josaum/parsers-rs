@@ -1,4 +1,4 @@
-//! Type 3 outline extraction, and the atlas recovering text through it.
+//! Type 3 outline extraction, and the catalog recovering text through it.
 //!
 //! # The case
 //!
@@ -8,7 +8,7 @@
 //! `Tf` and the font's encoding. When such a font also has no `/ToUnicode`, the
 //! characters are not recoverable from the encoding either: the parser can
 //! decode byte codes, but it cannot say whether the result is right. The
-//! outlines are the only real evidence, which is what the glyph atlas consumes.
+//! outlines are the only real evidence, which is what the glyph catalog consumes.
 //!
 //! # What the document looks like
 //!
@@ -23,14 +23,14 @@
 //!
 //! # What is covered where
 //!
-//! The atlas comparison itself is unit-tested in `glyph_atlas.rs` against the
+//! The catalog comparison itself is unit-tested in `glyph_catalog.rs` against the
 //! same function the parser calls. This file covers the pipeline: that a text
-//! operator produces outlines at all, that they reach the atlas, and that a
+//! operator produces outlines at all, that they reach the catalog, and that a
 //! learned shape is found again through the parser's own lookup.
 
-#![cfg(feature = "glyph-atlas")]
+#![cfg(feature = "glyph-catalog")]
 
-use pdf_fast_core::glyph_atlas;
+use pdf_fast_core::glyph_catalog;
 use pdf_fast_core::vector_text::BezPt;
 use pdf_fast_core::{ParseOptions, PdfDocument};
 
@@ -185,7 +185,7 @@ fn quote_pdf() -> Vec<u8> {
 
 #[test]
 fn type3_outlines_are_extracted_and_their_text_is_recovered_by_shape() {
-    glyph_atlas::clear_learned();
+    glyph_catalog::clear_learned();
     let doc = PdfDocument::from_slice(&two_page_pdf(), ParseOptions::default())
         .expect("the Type 3 document must parse");
 
@@ -204,7 +204,7 @@ fn type3_outlines_are_extracted_and_their_text_is_recovered_by_shape() {
         "the page shows two glyphs, drawn from /CharProcs"
     );
 
-    // Step 2: they carry geometry, without which the atlas has nothing to key
+    // Step 2: they carry geometry, without which the catalog has nothing to key
     // on even once outlines exist.
     let with_geometry = runs
         .iter()
@@ -239,8 +239,8 @@ fn type3_outlines_are_extracted_and_their_text_is_recovered_by_shape() {
         "the learner must correlate outlines with decoded text: {stats:?}"
     );
     assert!(
-        glyph_atlas::learned_shape_count() > 0,
-        "correlation must leave the atlas holding shapes"
+        glyph_catalog::learned_shape_count() > 0,
+        "correlation must leave the catalog holding shapes"
     );
 
     // Step 5: the text is read back through the shapes learned in step 4. This
@@ -254,18 +254,18 @@ fn type3_outlines_are_extracted_and_their_text_is_recovered_by_shape() {
         "page two's glyphs must be recovered by shape; got {recovered:?}"
     );
 
-    glyph_atlas::clear_learned();
+    glyph_catalog::clear_learned();
 }
 
 /// The wiring, on a document that does produce outlines.
 ///
 /// `page_vector_text_as_string_checked` already refuses to return a string of
 /// placeholders — it answers `None` when nothing was resolved. This asserts
-/// that property holds with an empty atlas, so a later recovery cannot be
+/// that property holds with an empty catalog, so a later recovery cannot be
 /// confused with a fixture that was readable all along.
 #[test]
-fn an_empty_atlas_reports_unknown_rather_than_guessing() {
-    glyph_atlas::clear_learned();
+fn an_empty_catalog_reports_unknown_rather_than_guessing() {
+    glyph_catalog::clear_learned();
     let doc = PdfDocument::from_slice(&two_page_pdf(), ParseOptions::default())
         .expect("the outline document must parse");
 
@@ -282,7 +282,7 @@ fn an_empty_atlas_reports_unknown_rather_than_guessing() {
         text.as_deref()
             .map(|t| t.chars().all(|c| c == '_' || c == '\n' || c == ' '))
             .unwrap_or(true),
-        "with an empty atlas every glyph is unknown; got {text:?}"
+        "with an empty catalog every glyph is unknown; got {text:?}"
     );
 }
 
@@ -295,7 +295,7 @@ fn an_empty_atlas_reports_unknown_rather_than_guessing() {
 /// rendering of the same shape.
 #[test]
 fn a_shape_learned_from_outlines_is_recovered_for_a_different_rendering() {
-    glyph_atlas::clear_learned();
+    glyph_catalog::clear_learned();
 
     let outline = |jitter: f32| {
         vec![vec![
@@ -317,27 +317,31 @@ fn a_shape_learned_from_outlines_is_recovered_for_a_different_rendering() {
         ]]
     };
 
-    glyph_atlas::record_learned(
+    glyph_catalog::record_learned(
         0xa110_00bb,
         &outline(0.0),
         "A",
         12.0,
         0.9,
-        glyph_atlas::AtlasSource::Corpus,
+        glyph_catalog::CatalogSource::Corpus,
     );
-    assert_eq!(glyph_atlas::learned_shape_count(), 1);
+    assert_eq!(glyph_catalog::learned_shape_count(), 1);
 
     // A later rendering: same shape, different hash. The old lookup returned
     // None here even though the shape had been learned.
-    let recovered =
-        glyph_atlas::lookup_entry(0x0000_0000, &outline(0.002), 12.0, glyph_atlas::DEFAULT_EPS);
+    let recovered = glyph_catalog::lookup_entry(
+        0x0000_0000,
+        &outline(0.002),
+        12.0,
+        glyph_catalog::DEFAULT_EPS,
+    );
     assert_eq!(
         recovered.as_deref(),
         Some("A"),
         "a shape learned from outlines must survive a re-rendering"
     );
 
-    glyph_atlas::clear_learned();
+    glyph_catalog::clear_learned();
 }
 
 /// A `TJ` array is shown in order, with its kerning applied.
@@ -350,7 +354,7 @@ fn a_shape_learned_from_outlines_is_recovered_for_a_different_rendering() {
 /// count, because a count passes with the kerning ignored.
 #[test]
 fn a_tj_array_shows_every_string_with_its_kerning_applied() {
-    glyph_atlas::clear_learned();
+    glyph_catalog::clear_learned();
     let doc = PdfDocument::from_slice(&tj_pdf(), ParseOptions::default())
         .expect("the document must parse");
 
@@ -375,17 +379,17 @@ fn a_tj_array_shows_every_string_with_its_kerning_applied() {
          ignored: {gap}"
     );
 
-    glyph_atlas::clear_learned();
+    glyph_catalog::clear_learned();
 }
 
 /// `'` and `"` show their string, so their glyphs are drawn too.
 #[test]
 fn the_quote_operators_show_their_string() {
-    glyph_atlas::clear_learned();
+    glyph_catalog::clear_learned();
     let doc = PdfDocument::from_slice(&quote_pdf(), ParseOptions::default())
         .expect("the document must parse");
     let runs = doc.page_vector_text_runs(0).expect("vector runs");
     let glyphs: usize = runs.iter().map(|r| r.glyphs.len()).sum();
     assert_eq!(glyphs, 2, "both quote operators must draw their string");
-    glyph_atlas::clear_learned();
+    glyph_catalog::clear_learned();
 }

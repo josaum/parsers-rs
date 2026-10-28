@@ -571,7 +571,12 @@ mod tests {
         // Numeric cells must round-trip through our own reader: a number written
         // without its <v> wrapper parses back as empty, so counting cells alone
         // hides the loss.
-        let at = |row: u32, col: u32| read_back.sheets[0].cells.iter().find(|c| c.row == row && c.col == col);
+        let at = |row: u32, col: u32| {
+            read_back.sheets[0]
+                .cells
+                .iter()
+                .find(|c| c.row == row && c.col == col)
+        };
         match at(2, 2).map(|c| c.value.clone()) {
             Some(xlsx_fast_core::CellValue::Number { v }) => assert_eq!(v, 100.0),
             other => panic!("expected 100.0 at (row 2, col 2), got {other:?}"),
@@ -595,7 +600,10 @@ mod tests {
             0,
             0,
             "Header",
-            &Format::new().bold().background_color(0x4472C4).font_color(0xFFFFFF),
+            &Format::new()
+                .bold()
+                .background_color(0x4472C4)
+                .font_color(0xFFFFFF),
         );
         s.write_with_format(1, 0, "long text", &Format::new().wrap().zebra());
         s.set_freeze_rows(1);
@@ -609,7 +617,10 @@ mod tests {
             .read_to_string(&mut sheet)
             .unwrap();
         assert!(sheet.contains("state=\"frozen\""), "expected a frozen pane");
-        assert!(sheet.contains("<col min=\"1\" max=\"1\" width=\"30\""), "expected column width");
+        assert!(
+            sheet.contains("<col min=\"1\" max=\"1\" width=\"30\""),
+            "expected column width"
+        );
 
         let mut styles = String::new();
         ar.by_name("xl/styles.xml")

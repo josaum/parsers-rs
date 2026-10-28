@@ -1,4 +1,4 @@
-//! Bounded glyph-shape atlas: recover a grapheme from a glyph's outline.
+//! Bounded glyph-shape catalog: recover a grapheme from a glyph's outline.
 //!
 //! # Why this exists
 //!
@@ -28,7 +28,7 @@
 //! 5. a scale ratio within [`SIZE_RATIO`].
 //!
 //! This is the rule [`crate::PdfDocument::vector_glyph_clusters`] already
-//! applies, which is why glyph clustering worked while the atlas did not.
+//! applies, which is why glyph clustering worked while the catalog did not.
 //!
 //! # Scope, stated plainly
 //!
@@ -37,16 +37,16 @@
 //! the case this module is for, where one document draws one font and the same
 //! letter recurs across pages. It is *not* invariant across different fonts,
 //! whose outlines break the same character into different numbers of contours
-//! and points. A cross-font atlas needs a genuinely perceptual representation;
+//! and points. A cross-font catalog needs a genuinely perceptual representation;
 //! this is not one, and claiming otherwise would be the plausible-but-wrong
 //! result this repository refuses elsewhere.
 //!
 //! # What is deliberately absent
 //!
 //! Nothing here reads or writes a user cache, and nothing derives a path from
-//! `$HOME`. The atlas is in memory for the life of the process, and a caller
+//! `$HOME`. The catalog is in memory for the life of the process, and a caller
 //! that wants persistence supplies the path and the format. The earlier
-//! implementation defaulted to `~/.cache/<a consumer>/atlas.tsv`, which a
+//! implementation defaulted to `~/.cache/<a consumer>/catalog.tsv`, which a
 //! read-only parser plane has no business doing and which named a consumer
 //! inside a shared repository.
 
@@ -77,7 +77,7 @@ pub const DEFAULT_EPS: f32 = 0.0025;
 /// correlation harvested out of the same document, and because a reviewer will
 /// ask where an entry came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AtlasSource {
+pub enum CatalogSource {
     /// Derived by correlating this document's outlines with its own resolved
     /// text. Highest trust: both sides came from the same content stream.
     Corpus,
@@ -87,7 +87,7 @@ pub enum AtlasSource {
     UserOverride,
 }
 
-impl AtlasSource {
+impl CatalogSource {
     /// Higher wins when two entries describe the same shape.
     #[inline]
     pub fn priority(self) -> u8 {
@@ -104,7 +104,7 @@ impl AtlasSource {
 /// `shape` is the normalized outline — the same points `shape_hash` was taken
 /// from — because a hash cannot be compared with tolerance and points can.
 #[derive(Debug, Clone)]
-pub struct AtlasEntry {
+pub struct CatalogEntry {
     /// The grapheme this shape draws. Multi-codepoint safe, so a ligature or a
     /// composed accent survives as one entry.
     pub grapheme: String,
@@ -117,10 +117,10 @@ pub struct AtlasEntry {
     /// Confidence in `[0.0, 1.0]`.
     pub confidence: f32,
     /// Provenance.
-    pub source: AtlasSource,
+    pub source: CatalogSource,
 }
 
-impl AtlasEntry {
+impl CatalogEntry {
     /// Build an entry from a glyph's normalized outline.
     pub fn new(
         grapheme: impl Into<String>,
@@ -128,7 +128,7 @@ impl AtlasEntry {
         shape: Vec<Vec<BezPt>>,
         size: f32,
         confidence: f32,
-        source: AtlasSource,
+        source: CatalogSource,
     ) -> Self {
         Self {
             grapheme: grapheme.into(),
@@ -148,7 +148,7 @@ impl AtlasEntry {
 /// 3-contour glyph against a 4-contour one would compare unrelated points and
 /// could report a match between two different letters.
 #[inline]
-pub fn matches(entry: &AtlasEntry, query: &[Vec<BezPt>], size: f32, eps: f32) -> bool {
+pub fn matches(entry: &CatalogEntry, query: &[Vec<BezPt>], size: f32, eps: f32) -> bool {
     if entry.shape.len() != query.len() {
         return false;
     }
@@ -190,12 +190,12 @@ fn size_agrees(a: f32, b: f32) -> bool {
 /// metric tree, and at this scale (a few hundred entries for a whole document)
 /// a linear pass is cheaper than the structure that would avoid it.
 #[derive(Debug, Default)]
-pub struct GlyphAtlas {
-    entries: Vec<AtlasEntry>,
+pub struct GlyphCatalog {
+    entries: Vec<CatalogEntry>,
 }
 
-impl GlyphAtlas {
-    /// An empty atlas.
+impl GlyphCatalog {
+    /// An empty catalog.
     pub fn new() -> Self {
         Self::default()
     }
@@ -206,7 +206,7 @@ impl GlyphAtlas {
         self.entries.len()
     }
 
-    /// Whether the atlas holds nothing.
+    /// Whether the catalog holds nothing.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -214,19 +214,19 @@ impl GlyphAtlas {
 
     /// Every entry, for inspection.
     #[inline]
-    pub fn entries(&self) -> &[AtlasEntry] {
+    pub fn entries(&self) -> &[CatalogEntry] {
         &self.entries
     }
 
     /// Record a mapping, replacing a weaker entry for the same shape.
     ///
     /// "Same shape" is the tolerant comparison, not hash equality — otherwise
-    /// the atlas accumulates near-duplicates of one letter, which is how the
+    /// the catalog accumulates near-duplicates of one letter, which is how the
     /// previous table came to hold 7,358 entries for 158 characters.
     ///
     /// An entry that only restates what is already known does not raise
     /// confidence: repeated correlation of the same page is not evidence.
-    pub fn insert(&mut self, entry: AtlasEntry) {
+    pub fn insert(&mut self, entry: CatalogEntry) {
         if entry.shape.is_empty() || entry.grapheme.is_empty() {
             return;
         }
@@ -253,8 +253,8 @@ impl GlyphAtlas {
             .position(|entry| matches(entry, query, size, eps))
     }
 
-    /// The entry for this shape, if the atlas knows it.
-    pub fn lookup(&self, query: &[Vec<BezPt>], size: f32, eps: f32) -> Option<&AtlasEntry> {
+    /// The entry for this shape, if the catalog knows it.
+    pub fn lookup(&self, query: &[Vec<BezPt>], size: f32, eps: f32) -> Option<&CatalogEntry> {
         self.find(query, size, eps).map(|i| &self.entries[i])
     }
 
@@ -269,7 +269,7 @@ impl GlyphAtlas {
         query: &[Vec<BezPt>],
         size: f32,
         eps: f32,
-    ) -> Option<&AtlasEntry> {
+    ) -> Option<&CatalogEntry> {
         if shape_hash != 0 {
             if let Some(exact) = self
                 .entries
@@ -283,14 +283,14 @@ impl GlyphAtlas {
     }
 }
 
-/// The process-wide atlas populated by [`record_learned`].
+/// The process-wide catalog populated by [`record_learned`].
 ///
 /// A process global is the shape that fits: learning happens while parsing page
 /// N and pays off on page N+1, and the two do not share a borrow. Memory only —
 /// no path is derived from the environment and nothing is written to disk.
-fn process_atlas() -> &'static Mutex<GlyphAtlas> {
-    static ATLAS: OnceLock<Mutex<GlyphAtlas>> = OnceLock::new();
-    ATLAS.get_or_init(|| Mutex::new(GlyphAtlas::new()))
+fn process_catalog() -> &'static Mutex<GlyphCatalog> {
+    static CATALOG: OnceLock<Mutex<GlyphCatalog>> = OnceLock::new();
+    CATALOG.get_or_init(|| Mutex::new(GlyphCatalog::new()))
 }
 
 /// Record a shape → grapheme mapping observed while parsing.
@@ -308,12 +308,12 @@ pub fn record_learned(
     grapheme: &str,
     size: f32,
     confidence: f32,
-    source: AtlasSource,
+    source: CatalogSource,
 ) {
     if shape.is_empty() || grapheme.is_empty() {
         return;
     }
-    let entry = AtlasEntry::new(
+    let entry = CatalogEntry::new(
         grapheme,
         shape_hash,
         shape.to_vec(),
@@ -321,21 +321,21 @@ pub fn record_learned(
         confidence,
         source,
     );
-    if let Ok(mut atlas) = process_atlas().lock() {
-        atlas.insert(entry);
+    if let Ok(mut catalog) = process_catalog().lock() {
+        catalog.insert(entry);
     }
 }
 
-/// Resolve a glyph through the process atlas.
+/// Resolve a glyph through the process catalog.
 ///
 /// Returns the mapped grapheme, which may be multi-codepoint. `None` means the
 /// shape is not known, and the caller should say so rather than guess: an
 /// invented character is worse than a visible gap.
 pub fn lookup_entry(shape_hash: u64, shape: &[Vec<BezPt>], size: f32, eps: f32) -> Option<String> {
-    process_atlas()
+    process_catalog()
         .lock()
         .ok()
-        .and_then(|atlas| atlas.resolve(shape_hash, shape, size, eps).cloned())
+        .and_then(|catalog| catalog.resolve(shape_hash, shape, size, eps).cloned())
         .map(|entry| entry.grapheme)
 }
 
@@ -346,18 +346,18 @@ pub fn lookup_entry(shape_hash: u64, shape: &[Vec<BezPt>], size: f32, eps: f32) 
 /// means shapes that should have matched did not — the symptom the tolerant
 /// comparison exists to remove.
 pub fn learned_shape_count() -> usize {
-    process_atlas().lock().map(|a| a.len()).unwrap_or(0)
+    process_catalog().lock().map(|a| a.len()).unwrap_or(0)
 }
 
 /// Drop every learned mapping, returning how many were dropped.
 ///
-/// For tests that need a clean process atlas.
+/// For tests that need a clean process catalog.
 #[doc(hidden)]
 pub fn clear_learned() -> usize {
-    match process_atlas().lock() {
-        Ok(mut atlas) => {
-            let n = atlas.len();
-            atlas.entries.clear();
+    match process_catalog().lock() {
+        Ok(mut catalog) => {
+            let n = catalog.len();
+            catalog.entries.clear();
             n
         }
         Err(_) => 0,
@@ -396,17 +396,17 @@ mod tests {
 
     #[test]
     fn an_identical_shape_matches_regardless_of_the_hash() {
-        let mut atlas = GlyphAtlas::new();
-        atlas.insert(AtlasEntry::new(
+        let mut catalog = GlyphCatalog::new();
+        catalog.insert(CatalogEntry::new(
             "A",
             0xdead_beef,
             shape(0.0),
             10.0,
             1.0,
-            AtlasSource::Corpus,
+            CatalogSource::Corpus,
         ));
         // A hash that matches nothing: identity must come from geometry.
-        let found = atlas.resolve(0x0000_0000, &shape(0.0), 10.0, DEFAULT_EPS);
+        let found = catalog.resolve(0x0000_0000, &shape(0.0), 10.0, DEFAULT_EPS);
         assert_eq!(found.map(|e| e.grapheme.as_str()), Some("A"));
     }
 
@@ -421,20 +421,20 @@ mod tests {
     /// code. The points here sit just below a bucket edge on purpose.
     #[test]
     fn a_jittered_shape_matches_where_the_hash_cannot() {
-        let mut atlas = GlyphAtlas::new();
+        let mut catalog = GlyphCatalog::new();
         let base = vec![vec![
             // 0.003 * 255 = 0.765 -> bucket 0.
             pt(0.003, 0.0),
             pt(0.5, 0.25),
             pt(1.0, 0.0),
         ]];
-        atlas.insert(AtlasEntry::new(
+        catalog.insert(CatalogEntry::new(
             "e",
             0x1111,
             base.clone(),
             10.0,
             1.0,
-            AtlasSource::Corpus,
+            CatalogSource::Corpus,
         ));
 
         // +0.002 moves that point to 0.005 * 255 = 1.275 -> bucket 1, while
@@ -450,163 +450,166 @@ mod tests {
         );
 
         // The hash would have missed; the tolerant path recovers it anyway.
-        let found = atlas.resolve(fnv_over_grid(&jittered), &jittered, 10.0, DEFAULT_EPS);
+        let found = catalog.resolve(fnv_over_grid(&jittered), &jittered, 10.0, DEFAULT_EPS);
         assert_eq!(found.map(|e| e.grapheme.as_str()), Some("e"));
     }
 
     #[test]
     fn a_different_shape_does_not_match() {
-        let mut atlas = GlyphAtlas::new();
-        atlas.insert(AtlasEntry::new(
+        let mut catalog = GlyphCatalog::new();
+        catalog.insert(CatalogEntry::new(
             "A",
             1,
             shape(0.0),
             10.0,
             1.0,
-            AtlasSource::Corpus,
+            CatalogSource::Corpus,
         ));
         let other = vec![vec![pt(0.0, 0.0), pt(0.5, 0.9), pt(1.0, 0.4)]];
-        assert!(atlas.resolve(0xbeef, &other, 10.0, DEFAULT_EPS).is_none());
+        assert!(catalog.resolve(0xbeef, &other, 10.0, DEFAULT_EPS).is_none());
     }
 
     #[test]
     fn different_contour_structure_does_not_match() {
-        let mut atlas = GlyphAtlas::new();
-        atlas.insert(AtlasEntry::new(
+        let mut catalog = GlyphCatalog::new();
+        catalog.insert(CatalogEntry::new(
             "i",
             1,
             shape(0.0),
             10.0,
             1.0,
-            AtlasSource::Corpus,
+            CatalogSource::Corpus,
         ));
         // The same points split across two contours is a different glyph, and
         // the comparison must not zip them together and call it a match.
         let split = vec![vec![pt(0.0, 0.0), pt(0.5, 0.25)], vec![pt(1.0, 0.0)]];
-        assert!(atlas.resolve(0xbeef, &split, 10.0, DEFAULT_EPS).is_none());
+        assert!(catalog.resolve(0xbeef, &split, 10.0, DEFAULT_EPS).is_none());
     }
 
     #[test]
     fn a_point_kind_mismatch_does_not_match() {
-        let mut atlas = GlyphAtlas::new();
-        atlas.insert(AtlasEntry::new(
+        let mut catalog = GlyphCatalog::new();
+        catalog.insert(CatalogEntry::new(
             "c",
             1,
             shape(0.0),
             10.0,
             1.0,
-            AtlasSource::Corpus,
+            CatalogSource::Corpus,
         ));
         let mut curved = shape(0.0);
         curved[0][1].kind = 2;
-        assert!(atlas.resolve(2, &curved, 10.0, DEFAULT_EPS).is_none());
+        assert!(catalog.resolve(2, &curved, 10.0, DEFAULT_EPS).is_none());
     }
 
     #[test]
     fn a_clearly_different_size_is_a_different_shape() {
-        let mut atlas = GlyphAtlas::new();
-        atlas.insert(AtlasEntry::new(
+        let mut catalog = GlyphCatalog::new();
+        catalog.insert(CatalogEntry::new(
             "o",
             1,
             shape(0.0),
             10.0,
             1.0,
-            AtlasSource::Corpus,
+            CatalogSource::Corpus,
         ));
-        assert!(atlas.resolve(2, &shape(0.0), 40.0, DEFAULT_EPS).is_none());
+        assert!(catalog.resolve(2, &shape(0.0), 40.0, DEFAULT_EPS).is_none());
     }
 
     #[test]
     fn a_nearby_size_agrees() {
-        let mut atlas = GlyphAtlas::new();
-        atlas.insert(AtlasEntry::new(
+        let mut catalog = GlyphCatalog::new();
+        catalog.insert(CatalogEntry::new(
             "o",
             1,
             shape(0.0),
             10.0,
             1.0,
-            AtlasSource::Corpus,
+            CatalogSource::Corpus,
         ));
-        assert!(atlas.resolve(2, &shape(0.0), 10.5, DEFAULT_EPS).is_some());
+        assert!(catalog.resolve(2, &shape(0.0), 10.5, DEFAULT_EPS).is_some());
     }
 
-    /// Re-inserting near-duplicates must not grow the atlas. This is the
+    /// Re-inserting near-duplicates must not grow the catalog. This is the
     /// property whose absence produced thousands of entries for one alphabet.
     #[test]
     fn reinserting_one_shape_does_not_accumulate_entries() {
-        let mut atlas = GlyphAtlas::new();
+        let mut catalog = GlyphCatalog::new();
         for i in 0..500 {
             let jitter = (i % 7) as f32 * 0.0002;
-            atlas.insert(AtlasEntry::new(
+            catalog.insert(CatalogEntry::new(
                 "x",
                 1000 + i,
                 shape(jitter),
                 10.0,
                 0.8,
-                AtlasSource::Corpus,
+                CatalogSource::Corpus,
             ));
         }
-        assert_eq!(atlas.len(), 1, "one letter must stay one entry");
+        assert_eq!(catalog.len(), 1, "one letter must stay one entry");
     }
 
     #[test]
     fn a_higher_priority_source_replaces_a_lower_one() {
-        let mut atlas = GlyphAtlas::new();
-        atlas.insert(AtlasEntry::new(
+        let mut catalog = GlyphCatalog::new();
+        catalog.insert(CatalogEntry::new(
             "a",
             1,
             shape(0.0),
             10.0,
             0.5,
-            AtlasSource::Bootstrap,
+            CatalogSource::Bootstrap,
         ));
-        atlas.insert(AtlasEntry::new(
+        catalog.insert(CatalogEntry::new(
             "a",
             2,
             shape(0.0),
             10.0,
             0.6,
-            AtlasSource::UserOverride,
+            CatalogSource::UserOverride,
         ));
-        assert_eq!(atlas.len(), 1);
-        assert_eq!(atlas.entries()[0].source, AtlasSource::UserOverride);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog.entries()[0].source, CatalogSource::UserOverride);
     }
 
     /// A better confidence from the same source wins; a worse one does not
     /// erase what is already known.
     #[test]
     fn confidence_only_rises_within_one_source() {
-        let mut atlas = GlyphAtlas::new();
-        atlas.insert(AtlasEntry::new(
+        let mut catalog = GlyphCatalog::new();
+        catalog.insert(CatalogEntry::new(
             "b",
             1,
             shape(0.0),
             10.0,
             0.9,
-            AtlasSource::Corpus,
+            CatalogSource::Corpus,
         ));
-        atlas.insert(AtlasEntry::new(
+        catalog.insert(CatalogEntry::new(
             "b",
             2,
             shape(0.0),
             10.0,
             0.4,
-            AtlasSource::Corpus,
+            CatalogSource::Corpus,
         ));
-        assert_eq!(atlas.entries()[0].confidence, 0.9);
+        assert_eq!(catalog.entries()[0].confidence, 0.9);
     }
 
     #[test]
     fn an_entry_without_geometry_is_refused() {
-        let mut atlas = GlyphAtlas::new();
-        atlas.insert(AtlasEntry::new(
+        let mut catalog = GlyphCatalog::new();
+        catalog.insert(CatalogEntry::new(
             "z",
             7,
             Vec::new(),
             10.0,
             1.0,
-            AtlasSource::Corpus,
+            CatalogSource::Corpus,
         ));
-        assert!(atlas.is_empty(), "a hash without points is the old defect");
+        assert!(
+            catalog.is_empty(),
+            "a hash without points is the old defect"
+        );
     }
 }

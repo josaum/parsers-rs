@@ -1,4 +1,4 @@
-//! Bytes-only Python binding for the canonical Atlas ontology reader.
+//! Bytes-only Python binding for the canonical RDF/Turtle ontology reader.
 //!
 //! Four functions, each a thin projection of `ontology-fast-core`:
 //! `parse_triples` for the frozen text contract, `parse_terms` for the lossless

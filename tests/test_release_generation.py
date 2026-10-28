@@ -65,11 +65,16 @@ def wheel(directory, distribution="ontology_fast", platform="macosx_11_0_arm64")
     version = release.crate_version(crate)
     info = f"{distribution}-{version}.dist-info"
     path = directory / f"{distribution}-{version}-cp38-abi3-{platform}.whl"
+    core_name = (
+        crate.removesuffix("-py")
+        if crate.endswith("-write-py")
+        else crate.replace("-py", "-core")
+    )
     sbom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
         "metadata": {
-            "component": {"name": crate.replace("-py", "-core"), "version": version}
+            "component": {"name": core_name, "version": version}
         },
     }
     with zipfile.ZipFile(path, "w") as archive:
@@ -142,7 +147,7 @@ def test_complete_matrix_stamps_wheels_and_node_provenance(tmp_path, generator):
             node_package(tmp_path, crate, platform)
     assert generator.main(["--out", str(tmp_path), "--require-complete"]) == 0
     manifest = json.loads((tmp_path / release.MANIFEST_NAME).read_text())
-    assert len(manifest["artifacts"]) == 47  # 8 Python bindings x 4 targets + 5 Node bindings x 3
+    assert len(manifest["artifacts"]) == 84  # 11 Python bindings x 4 targets + 10 Node bindings x 4
     assert manifest["source"] == {"commit": "a" * 40, "dirty": False}
     for artifact in manifest["artifacts"]:
         path = tmp_path / artifact["file"]
@@ -156,7 +161,7 @@ def test_complete_matrix_stamps_wheels_and_node_provenance(tmp_path, generator):
     assert set(sums) == {artifact["file"] for artifact in manifest["artifacts"]} | {
         release.MANIFEST_NAME
     }
-    assert sum(name.endswith(".tgz") for name in sums) == 15
+    assert sum(name.endswith(".tgz") for name in sums) == 40
     for name, digest in sums.items():
         assert digest == hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
 
@@ -272,7 +277,11 @@ def test_stale_core_sbom_version_prevents_complete_release():
                     "file": f"{crate}-{target}.{'whl' if is_wheel else 'tgz'}",
                     "sbom": {
                         "format": "CycloneDX",
-                        "component": crate.replace("-py", "-core"),
+                        "component": (
+                            crate.removesuffix("-py")
+                            if crate.endswith("-write-py")
+                            else crate.replace("-py", "-core")
+                        ),
                         "component_version": "999.0.0",
                     }
                     if is_wheel

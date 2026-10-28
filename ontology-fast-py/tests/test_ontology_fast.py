@@ -23,21 +23,21 @@ from ontology_fast import (
 )
 
 DOC = (
-    b"@prefix atlas: <https://atlas.example/ns#> .\n"
+    b"@prefix ex: <https://example.org/ns#> .\n"
     b"@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
-    b'atlas:ROAS a atlas:Metric ; atlas:label "Return"@EN ;\n'
-    b'  atlas:since "2026-09-16"^^xsd:date ; atlas:note "plain" ;\n'
-    b"  atlas:owner [ atlas:name \"revops\" ] .\n"
+    b'ex:ROAS a ex:Metric ; ex:label "Return"@EN ;\n'
+    b'  ex:since "2026-09-16"^^xsd:date ; ex:note "plain" ;\n'
+    b"  ex:owner [ ex:name \"revops\" ] .\n"
 )
-NS = "https://atlas.example/ns#"
+NS = "https://example.org/ns#"
 
 
 def test_parse_triples_returns_text_tuples() -> None:
     rows = ontology_fast.parse_triples(DOC)
     assert type(rows) is list
     assert all(type(row) is tuple and len(row) == 3 for row in rows)
-    assert ("atlas:ROAS", "a", "atlas:Metric") in rows
-    assert ("atlas:ROAS", "atlas:label", "Return") in rows
+    assert ("ex:ROAS", "a", "ex:Metric") in rows
+    assert ("ex:ROAS", "ex:label", "Return") in rows
     assert len(rows) == 6
 
 
@@ -83,11 +83,11 @@ def test_prefixes_come_from_the_parser_not_from_the_text() -> None:
 
 def test_query_selects_by_any_bound_position() -> None:
     rows = ontology_fast.query(
-        DOC, [("atlas:ROAS", "a", None), (None, None, "plain"), ("atlas:absent", None, None)]
+        DOC, [("ex:ROAS", "a", None), (None, None, "plain"), ("ex:absent", None, None)]
     )
     assert rows == [
-        ("atlas:ROAS", "a", "atlas:Metric"),
-        ("atlas:ROAS", "atlas:note", "plain"),
+        ("ex:ROAS", "a", "ex:Metric"),
+        ("ex:ROAS", "ex:note", "plain"),
     ]
 
 
@@ -122,7 +122,7 @@ def test_the_statement_budget_raises_the_resource_subclass(call: str) -> None:
     with pytest.raises(OntologyResourceError, match="statements"):
         getattr(ontology_fast, call)(DOC, max_statements=1)
     with pytest.raises(OntologyResourceError, match="statements"):
-        ontology_fast.query(DOC, [("atlas:ROAS", None, None)], max_statements=1)
+        ontology_fast.query(DOC, [("ex:ROAS", None, None)], max_statements=1)
 
 
 def test_unrepresentable_terms_raise_the_base_contract_error() -> None:

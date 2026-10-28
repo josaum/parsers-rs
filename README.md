@@ -14,22 +14,25 @@ artifact, with provenance.**
 
 ## What belongs here
 
-A crate belongs here when it is a **generic, read-only parse or a generic
+A crate belongs here when it is a **generic, read-only parse, a generic writer, or a generic
 interop contract** — the same purpose in every consumer.
 
 | In `parsers-rs` | Because |
 | --- | --- |
-| `json-fast-core`, `json-fast-py` | SIMD JSON/JSONL and JSON-family decode; same in every consumer |
-| `xsd-fast-core`, `xsd-fast-py` | XSD schema reading and Arrow derivation; no consumer semantics |
-| `docx-fast-core`, `docx-fast-py` | Read-only DOCX structure extraction and NDJSON streaming |
-| `email-fast-core`, `email-fast-py` | Read-only EML/MSG/mbox extraction, with a bounded attachment budget |
-| `xlsx-fast-core`, `xlsx-fast-py` | Read-only XLSX workbook extraction, NDJSON and Arrow IPC streaming |
-| `pptx-fast-core`, `pptx-fast-py` | Read-only PPTX extraction, NDJSON, Arrow dataset, embedded media |
+| `json-fast-core`, `json-fast-py`, `json-fast-node`, `json-fast-flight` | SIMD JSON/JSONL and JSON-family decode, bindings, and Arrow Flight service |
+| `xsd-fast-core`, `xsd-fast-py`, `xsd-fast-node`, `xsd-fast-flight` | XSD schema reading, Arrow derivation, bindings, and Arrow Flight service |
+| `docx-fast-core`, `docx-fast-py`, `docx-fast-node`, `docx-fast-flight` | Read-only DOCX structure extraction, NDJSON streaming, bindings, and Arrow Flight service |
+| `email-fast-core`, `email-fast-py`, `email-fast-node`, `email-fast-flight` | Read-only EML/MSG/mbox extraction with a bounded attachment budget, bindings, and Arrow Flight service |
+| `xlsx-fast-core`, `xlsx-fast-py`, `xlsx-fast-node`, `xlsx-fast-flight` | Read-only XLSX workbook extraction, NDJSON and Arrow IPC streaming, bindings, and Arrow Flight service |
+| `xlsx-fast-write`, `xlsx-fast-write-py`, `xlsx-fast-write-node` | Streaming XLSX writer with zero-copy XML sheet writing and shared-strings deduplication |
+| `pptx-fast-core`, `pptx-fast-py`, `pptx-fast-node`, `pptx-fast-flight` | Read-only PPTX extraction, NDJSON, Arrow dataset, embedded media, bindings, and Arrow Flight service |
 | `ooxml-archive` | Shared OOXML ZIP, bounded inflate, and relationship resolution |
-| `pdf-fast-core`, `pdf-fast-py` | Read-only PDF extraction: text, structure, tables, raster, Arrow |
+| `pdf-fast-core`, `pdf-fast-py`, `pdf-fast-node` | Read-only PDF extraction: text, structure, tables, raster, Arrow, and bindings |
+| `pdf-fast-write`, `pdf-fast-write-py`, `pdf-fast-write-node` | Direct PDF 1.7 writer for primitives, TrueType subsetting, images, and tables |
+| `geo-fast-core`, `geo-fast-py`, `geo-fast-node` | Zero-copy GeoParquet, Shapefile, FlatGeobuf, and GeoJSON reader/writer to GeoArrow IPC |
 | `ontology-fast-core`, `ontology-fast-py` | Canonical Turtle reading and indexed triple view with strict resource budgets |
 | `web-fast-core` | Deterministic, side-effect-free HTML parser with Apache Arrow IPC/batches |
-| `docx-fast-node`, `xlsx-fast-node`, `pptx-fast-node`, `email-fast-node`, `json-fast-node` | Thin Node-API 2 bindings over the same cores, one `.node` per platform, versioned with the core; consumer shells package these tarballs |
+| `flight-ipc-config` | Shared Arrow Flight IPC compression and JWT authentication configuration |
 
 `ooxml-archive` is the load-bearing one. `max_inflate` is an **aggregate**
 budget for one archive view, not a per-part cap: a package with many
@@ -38,9 +41,9 @@ restricted decoder that bounds output before exposing bytes is the `flate2` one,
 so there is no fast path that inflates first and checks afterwards — a faster
 decoder can only be reinstated by keeping that ordering.
 
-The current source declares a release surface of **47 artifacts**: eight Python
-wheels × macOS arm64, Linux x86_64, Linux aarch64 and Windows x64, plus five
-Node tarballs × macOS arm64, Linux x86_64 and Linux aarch64.
+The current source declares a release surface of **84 artifacts**: eleven Python
+wheels × macOS arm64, Linux x86_64, Linux aarch64 and Windows x64, plus ten
+Node tarballs × macOS arm64, Linux x86_64, Linux aarch64 and Windows x64.
 Release publication requires the complete matrix after the reusable CI gate
 passes. Both artifact families are bound to the commit by
 `release-manifest.json` and the generator's `SHA256SUMS`; each artifact records

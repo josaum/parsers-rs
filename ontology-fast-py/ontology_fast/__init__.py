@@ -1,11 +1,8 @@
-"""Bytes-only access to Atlas's canonical ontology reader.
+"""Bytes-only access to the canonical RDF/Turtle ontology reader.
 
-The routing core reads ``app/cartridge/ontology/atlas.ttl`` through
-``catalog._subject_blocks``, a regular expression over one authoring style. This
-module is the real Turtle reader the ontology-core migration plan moves to, and
-it renders terms in exactly the text form the Python core already consumes so
-the change can be measured against the frozen contract in
-``app/scripts/ontology_triple_contract.py`` rather than argued about.
+This module parses Turtle documents into a canonical text-triple view, a
+lossless term view, and an indexed ``(subject, predicate, object)`` lookup
+table.
 """
 
 from __future__ import annotations

@@ -3,9 +3,9 @@
 # commit, its SHA-256, toolchain and target. Consumers vendor the whole set.
 #
 # Platforms are the ones the consumers actually deploy on: Apple Silicon for
-# workstations, Linux x86_64 and aarch64 for containers. Mycelia's API image is
-# multi-arch, so a release without the aarch64 Linux wheel cannot be its
-# wheelhouse; that target is not optional.
+# workstations, Linux x86_64 and aarch64 for containers. Consumer container images
+# are multi-arch, so a release without the aarch64 Linux wheel cannot be a
+# complete wheelhouse; that target is not optional.
 name: release
 
 on:
@@ -21,10 +21,10 @@ env:
   ARM_MANYLINUX_IMAGE: quay.io/pypa/manylinux2014_aarch64@sha256:d36e257b4f7b1130a1442a5cd28022307645a92b8093ab65543205426354cfd2
   # Every Python binding crate in the workspace. Adding a crate means adding it
   # here and to the shipped-surface count in README.md.
-  BINDINGS: docx-fast-py xlsx-fast-py pptx-fast-py pdf-fast-py email-fast-py xsd-fast-py json-fast-py ontology-fast-py
+  BINDINGS: docx-fast-py xlsx-fast-py xlsx-fast-write-py pptx-fast-py pdf-fast-py pdf-fast-write-py email-fast-py xsd-fast-py json-fast-py ontology-fast-py geo-fast-py
   # Every Node-API binding crate. Same rule: a new crate is added here and to
   # the shipped-surface count in README.md.
-  NODE_BINDINGS: docx-fast-node xlsx-fast-node pptx-fast-node email-fast-node json-fast-node
+  NODE_BINDINGS: docx-fast-node xlsx-fast-node xlsx-fast-write-node pptx-fast-node pdf-fast-node pdf-fast-write-node email-fast-node xsd-fast-node json-fast-node geo-fast-node
 
 jobs:
   verify:
@@ -120,6 +120,7 @@ jobs:
           - { os: macos-14,        target: aarch64-apple-darwin,      platform: darwin-arm64 }
           - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,  platform: linux-x64-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, platform: linux-arm64-gnu }
+          - { os: windows-latest,  target: x86_64-pc-windows-msvc,    platform: win32-x64-msvc }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -180,7 +181,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo install cargo-cyclonedx --locked
-          for core in *-core ooxml-archive; do
+          for core in *-core *-write ooxml-archive; do
             cargo cyclonedx --manifest-path "$core/Cargo.toml" -f json --describe crate
           done
           python3 scripts/inject_sbom.py --dist dist

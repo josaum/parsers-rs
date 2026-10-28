@@ -353,7 +353,7 @@ fn checked_document_cluster_lines_propagate_form_cycle() {
     );
 }
 
-#[cfg(feature = "glyph-atlas")]
+#[cfg(feature = "glyph-catalog")]
 #[test]
 fn checked_document_glyph_learning_propagates_form_cycle() {
     let doc =

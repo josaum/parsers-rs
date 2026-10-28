@@ -1,0 +1,27 @@
+[package]
+name = "xlsx-fast-flight"
+version = "0.2.1"
+edition.workspace = true
+authors.workspace = true
+description = "Apache Arrow Flight server for xlsx-fast-core"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+arrow-flight = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc = { workspace = true }
+futures = "0.3"
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tonic = { workspace = true }
+xlsx-fast-core = { path = "../xlsx-fast-core", features = ["arrow"] }
+flight-ipc-config = { path = "../flight-ipc-config" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+jsonwebtoken = { workspace = true }
+tempfile = "3.10"

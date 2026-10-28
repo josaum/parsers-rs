@@ -156,7 +156,7 @@ fn a_non_glyf_program_is_refused() {
         "a non-sfnt must not parse"
     );
     // `OTTO` marks CFF outlines, which this module does not read. Returning an
-    // approximation here would feed the atlas a plausible wrong shape.
+    // approximation here would feed the catalog a plausible wrong shape.
     let mut otto = vec![0u8; 64];
     otto[0..4].copy_from_slice(b"OTTO");
     assert!(

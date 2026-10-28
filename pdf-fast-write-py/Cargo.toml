@@ -1,0 +1,20 @@
+[package]
+name = "pdf-fast-write-py"
+version = "0.2.0"
+edition.workspace = true
+authors.workspace = true
+description = "Python bindings for pdf-fast-write (sovereign PDF page subsetter)"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pdf_fast_write_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+pdf-fast-write = { path = "../pdf-fast-write" }
+
+[build-dependencies]
+pyo3-build-config = "0.28.3"

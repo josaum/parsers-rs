@@ -1,0 +1,39 @@
+[package]
+name = "geo-fast-core"
+version = "0.2.1"
+edition.workspace = true
+authors.workspace = true
+description = "GIS format parser: GeoTIFF, Shapefile, GeoJSON, WMS/WFS client"
+license.workspace = true
+repository.workspace = true
+keywords = ["gis", "geospatial", "geotiff", "shapefile", "geojson", "wms", "wfs"]
+categories = ["science::geo", "parser-implementations", "encoding"]
+rust-version.workspace = true
+
+[lib]
+name = "geo_fast_core"
+
+[features]
+default = []
+http = ["dep:reqwest", "dep:tokio"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+byteorder = "1"
+tiff = "0.9"
+quick-xml = "0.36"
+
+[dependencies.reqwest]
+version = "0.12"
+features = ["json"]
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "macros"]
+optional = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
