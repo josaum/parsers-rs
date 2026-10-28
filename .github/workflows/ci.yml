@@ -54,3 +54,14 @@ jobs:
           workspaces: .leio-code/rust-doctors
       - run: cargo test --locked --manifest-path .leio-code/rust-doctors/Cargo.toml
       - run: cargo run --locked --manifest-path .leio-code/rust-doctors/Cargo.toml -- --check-root .
+
+  lean-formal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install elan and verify Lean 4 proofs (0 sorry)
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --no-modify-path --default-toolchain none
+          export PATH="$HOME/.elan/bin:$PATH"
+          ./formal/check.sh

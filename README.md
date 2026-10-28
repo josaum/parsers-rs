@@ -98,6 +98,9 @@ cargo test --workspace --locked \
 # Run sovereign repository doctors
 cargo test --locked --manifest-path .leio-code/rust-doctors/Cargo.toml
 cargo run --locked --manifest-path .leio-code/rust-doctors/Cargo.toml -- --check-root .
+
+# Run machine-checked Lean 4 proofs & axiom audit (0 sorry)
+./formal/check.sh
 ```
 
 ### Python Wheels, Node Bindings & Contract Tests
