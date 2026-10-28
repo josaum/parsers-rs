@@ -36,18 +36,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14,      target: aarch64-apple-darwin,       compat: "" }
+          - { os: [self-hosted, macOS, ARM64, macstudio], target: aarch64-apple-darwin, compat: "" }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu,  compat: "--zig --compatibility manylinux_2_17" }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, compat: "--compatibility manylinux_2_17" }
           - { os: windows-latest,  target: x86_64-pc-windows-msvc,     compat: "" }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - if: matrix.target != 'aarch64-unknown-linux-gnu'
@@ -105,7 +105,7 @@ jobs:
           python3 -I -m pytest --import-mode=importlib -q \
             email-fast-py/tests json-fast-py/tests ontology-fast-py/tests \
             pdf-fast-py/tests xsd-fast-py/tests
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
@@ -117,23 +117,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14,        target: aarch64-apple-darwin,      platform: darwin-arm64 }
+          - { os: [self-hosted, macOS, ARM64, macstudio], target: aarch64-apple-darwin, platform: darwin-arm64 }
           - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,  platform: linux-x64-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, platform: linux-arm64-gnu }
           - { os: windows-latest,  target: x86_64-pc-windows-msvc,    platform: win32-x64-msvc }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
       - name: Build every Node binding for ${{ matrix.target }}
         shell: bash
         run: |
@@ -152,7 +152,7 @@ jobs:
             mv "dist-node/$crate-$version.tgz" "dist-node/$crate-$version-${{ matrix.platform }}.tgz"
           done
           ls -1 dist-node
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: node-${{ matrix.target }}
           path: dist-node/*.tgz
@@ -162,17 +162,17 @@ jobs:
     needs: [wheels, node]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98.1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: node-*
           path: dist
@@ -195,7 +195,7 @@ jobs:
           python3 -m pytest tests -q
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.whl
@@ -204,7 +204,7 @@ jobs:
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           generate_release_notes: true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release
           path: |
