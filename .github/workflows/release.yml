@@ -13,8 +13,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Read-only by default. The build jobs, two of them on a self-hosted runner,
+# never hold a token that can write to the repository; only `manifest`, which
+# publishes the release, is granted that below.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,10 +31,17 @@ env:
 
 jobs:
   verify:
+    # The whole of ci.yml, on hosted runners. A called workflow can narrow the
+    # token this job passes it but never widen it, so it is read-only here and
+    # again in ci.yml. A job that calls a workflow cannot carry a timeout;
+    # each job in ci.yml has its own.
     uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
 
   wheels:
     needs: verify
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -42,12 +52,13 @@ jobs:
           - { os: windows-latest,  target: x86_64-pc-windows-msvc,     compat: "" }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v7
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.12"
@@ -123,7 +134,7 @@ jobs:
           python3 -I -m pytest --import-mode=importlib -q \
             email-fast-py/tests json-fast-py/tests ontology-fast-py/tests \
             pdf-fast-py/tests xsd-fast-py/tests
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
@@ -131,6 +142,7 @@ jobs:
 
   node:
     needs: verify
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -141,15 +153,16 @@ jobs:
           - { os: windows-latest,  target: x86_64-pc-windows-msvc,    platform: win32-x64-msvc }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: 10
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
       - name: Build every Node binding for ${{ matrix.target }}
@@ -170,7 +183,7 @@ jobs:
             mv "dist-node/$crate-$version.tgz" "dist-node/$crate-$version-${{ matrix.platform }}.tgz"
           done
           ls -1 dist-node
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: node-${{ matrix.target }}
           path: dist-node/*.tgz
@@ -179,18 +192,24 @@ jobs:
   manifest:
     needs: [wheels, node]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The only job that writes: it creates the GitHub release for the tag.
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: node-*
           path: dist
@@ -217,7 +236,7 @@ jobs:
           python3 -m pytest tests -q
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           files: |
             dist/*.whl
@@ -228,7 +247,7 @@ jobs:
             LICENSE-APACHE
           fail_on_unmatched_files: true
           generate_release_notes: true
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release
           path: |

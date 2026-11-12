@@ -1,5 +1,13 @@
 # Every push and pull request: the workspace must format, lint clean and pass.
 # This is the gate a consumer relies on when it pins a commit of this repository.
+#
+# release.yml calls this file as its `verify` job, so every job here also runs
+# before a release builds. Two consequences bind every job below:
+#   - GitHub-hosted runners only. Pull requests from forks run this file, and a
+#     fork's code must never execute on a machine the project owns.
+#   - No secrets and a read-only token. Nothing here publishes anything.
+# Dependency advisories are deliberately NOT checked here (see audit.yml): a new
+# advisory must not block an unrelated release.
 name: ci
 
 on:
@@ -7,6 +15,16 @@ on:
     branches: [main]
   pull_request:
   workflow_call:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes the run before it. Every other
+# trigger (a push to main, a release calling this file) gets a group of its
+# own, so no commit on main and no release ever loses its result.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,12 +34,15 @@ env:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pinned by commit, so the toolchain is named here instead of in the ref.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: 1.98.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       # Default features, then the generic `arrow` features. Not --all-features:
       # pdf-fast-py's `reading-order` compiles only when a consumer supplies
@@ -31,14 +52,119 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --locked --features ${{ env.ARROW_FEATURES }}
 
+  rust-platforms:
+    # The same tests on the other two operating systems a release ships for.
+    # Formatting and lints do not depend on the host, so they stay on Linux.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    # One shell on every runner: PowerShell, the default on Windows, splits an
+    # unquoted comma-separated argument such as a feature list.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --features ${{ env.ARROW_FEATURES }}
+
+  python-bindings:
+    # Build, install and test the Python bindings the way a release does, so a
+    # binding that only fails as a wheel fails on the pull request and not on
+    # the tag. The tool versions are the ones release.yml pins.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Every Python binding crate that has a tests/ directory.
+      TESTED_BINDINGS: email-fast-py json-fast-py ontology-fast-py pdf-fast-py xsd-fast-py
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "maturin==1.15.0" "pytest==9.1.1" "pyarrow==25.0.1"
+      - name: Build a wheel for every tested binding
+        run: |
+          set -euo pipefail
+          for crate in $TESTED_BINDINGS; do
+            (cd "$crate" && maturin build --release --locked --out ../dist)
+          done
+          ls -1 dist
+      - name: Install the wheels and run their tests
+        run: |
+          set -euo pipefail
+          test_paths=()
+          for crate in $TESTED_BINDINGS; do
+            test_paths+=("$crate/tests")
+          done
+          python -m pip install --no-index --no-deps dist/*.whl
+          python -I -c "import importlib, os; [importlib.import_module(crate.removesuffix('-py').replace('-', '_')) for crate in os.environ['TESTED_BINDINGS'].split()]"
+          python -I -m pytest --import-mode=importlib -q "${test_paths[@]}"
+
+  node-bindings:
+    # Build every Node-API binding, load each one and pack its tarball, as a
+    # release does.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 10
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: Build every Node binding
+        run: scripts/build-node.sh
+      - name: Load and parse a generated fixture through each binding
+        run: node scripts/smoke-node.mjs
+      - name: Pack one tarball per binding
+        run: |
+          set -euo pipefail
+          mkdir -p dist-node
+          for manifest in *-node/package.json; do
+            (cd "$(dirname "$manifest")" && pnpm pack --pack-destination ../dist-node)
+          done
+          ls -1 dist-node
+
   release-tooling:
     # The manifest and SBOM scripts are part of the release contract; they are
     # tested like code because a release that lies about its bytes is worse
     # than no release.
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - run: python3 -m pip install pytest
@@ -46,10 +172,13 @@ jobs:
 
   repository-doctors:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: .leio-code/rust-doctors
       - run: cargo test --locked --manifest-path .leio-code/rust-doctors/Cargo.toml
@@ -57,8 +186,9 @@ jobs:
 
   lean-formal:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install elan and verify Lean 4 proofs (0 sorry)
         run: |
           curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \

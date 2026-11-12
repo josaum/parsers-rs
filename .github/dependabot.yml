@@ -1,0 +1,39 @@
+# Weekly dependency updates. Major versions arrive one pull request each, so
+# each can be judged on its own; everything smaller arrives together.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    # The workspace root: one Cargo.lock resolves every member crate.
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # The Arrow crates share one exact version (Cargo.toml pins them, and the
+      # repository doctors refuse a mismatch), so they only ever move together,
+      # in a pull request of their own, whatever the size of the step.
+      arrow:
+        patterns:
+          - arrow
+          - arrow-*
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - arrow
+          - arrow-*
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    # Every action is pinned by commit SHA with its version in a trailing
+    # comment; Dependabot moves both.
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+      include: scope
