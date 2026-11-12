@@ -174,6 +174,13 @@ impl<'m> ValidationContext<'m> {
                         }
                     }
                 }
+                // A CDATA section is element text written literally: it is
+                // decoded but never entity-unescaped.
+                Ok(Event::CData(ref data)) => {
+                    if let Some(frame) = self.type_stack.last_mut() {
+                        frame.text.push_str(&String::from_utf8_lossy(data));
+                    }
+                }
                 Ok(Event::End(_)) => {
                     if let Some(frame) = self.type_stack.pop() {
                         if let Some(t) = frame.xsd_type {
