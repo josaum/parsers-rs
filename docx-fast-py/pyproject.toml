@@ -40,10 +40,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourorg/office-parsers-rs"
-Repository = "https://github.com/yourorg/office-parsers-rs/tree/main/docx-fast-py"
-Documentation = "https://github.com/yourorg/office-parsers-rs#readme"
-"Bug Tracker" = "https://github.com/yourorg/office-parsers-rs/issues"
+Homepage = "https://github.com/josaum/parsers-rs"
+Repository = "https://github.com/josaum/parsers-rs/tree/main/docx-fast-py"
+Documentation = "https://github.com/josaum/parsers-rs#readme"
+"Bug Tracker" = "https://github.com/josaum/parsers-rs/issues"
 
 [tool.maturin]
 module-name = "docx_fast._core"

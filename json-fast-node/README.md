@@ -21,7 +21,7 @@ promotion; this binding never evaluates or strengthens semantic assurance.
 ## Build
 
 ```bash
-cd office-parsers-rs/json-fast-node
+cd parsers-rs/json-fast-node
 node build.mjs          # or: node build.mjs --debug
 ```
 
@@ -74,8 +74,8 @@ governed record.
 ## Verify
 
 ```bash
-cargo test --locked --manifest-path office-parsers-rs/Cargo.toml -p json-fast-node
-cd office-parsers-rs/json-fast-node && node build.mjs --debug && node --test smoke.test.mjs
+cargo test --locked --manifest-path parsers-rs/Cargo.toml -p json-fast-node
+cd parsers-rs/json-fast-node && node build.mjs --debug && node --test smoke.test.mjs
 ```
 
 The Rust unit tests call the exported functions as plain Rust and need no Node

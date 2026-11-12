@@ -78,5 +78,5 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 # Every published artifact inherits this remote, so it must never point at a
 # consumer of this repository.
-repository = "https://github.com/fast-parser-inc/parsers-rs"
+repository = "https://github.com/josaum/parsers-rs"
 rust-version = "1.94"
