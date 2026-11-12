@@ -66,11 +66,74 @@ pub fn geojson_to_features(geojson: &Value) -> Result<Vec<GeoFeature>, GeoError>
     }
 }
 
+/// Deepest nesting of arrays and objects accepted in a GeoJSON document.
+///
+/// `serde_json` parses, clones, serializes and drops a value recursively and
+/// stops only at 128 levels. In an unoptimized build one level costs a little
+/// over 2 KiB of stack (64 levels were measured at about 148 KiB), so its own
+/// limit sits at the edge of a 256 KiB worker stack and a hostile document
+/// overflows it. The deepest standard GeoJSON structure is 8 levels
+/// (FeatureCollection, `features`, Feature, `geometry`, then the four array
+/// levels of MultiPolygon coordinates); 32 leaves 28 levels for structured
+/// `properties` and uses under a third of that stack. Raising it needs the
+/// small-stack test rerun; lowering it rejects documents with nested
+/// `properties`.
+const MAX_NESTING_DEPTH: usize = 32;
+
 /// Parse a GeoJSON string into a list of features.
+///
+/// # Errors
+///
+/// Returns [`GeoError::InvalidFormat`] when `s` is not valid JSON, nests arrays
+/// and objects deeper than 32 levels, or is not a GeoJSON `FeatureCollection`
+/// or `Feature`, and [`GeoError::UnsupportedFormat`] for a geometry type this
+/// crate does not read.
 pub fn parse_geojson_str(s: &str) -> Result<Vec<GeoFeature>, GeoError> {
+    if exceeds_nesting_depth(s, MAX_NESTING_DEPTH) {
+        return Err(GeoError::InvalidFormat(format!(
+            "GeoJSON nests arrays and objects deeper than {MAX_NESTING_DEPTH} levels"
+        )));
+    }
     let v: Value = serde_json::from_str(s)
         .map_err(|e| GeoError::InvalidFormat(format!("JSON parse error: {e}")))?;
     geojson_to_features(&v)
+}
+
+/// Returns whether arrays and objects in `json` nest deeper than `limit`.
+///
+/// A single pass that does not recurse and does not validate the text: it
+/// tracks string literals so brackets inside them are not counted, and counts
+/// opening brackets everywhere else. Up to the first syntax error a JSON
+/// parser is never nested deeper than this count, which is all the limit
+/// needs.
+fn exceeds_nesting_depth(json: &str, limit: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in json.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

@@ -860,6 +860,28 @@ fn normalize_lon_coord(p: Coordinate) -> Coordinate {
     Coordinate::new(normalize_lon(p.lon), p.lat)
 }
 
+/// Shifts `lon` by whole turns until it is within 180° of `reference`.
+///
+/// Computed in one step. Subtracting 360 in a loop does not terminate for
+/// longitudes that came from a file: beyond about 1e19 the subtraction no
+/// longer changes the value, and well before that it takes billions of steps.
+/// A difference of exactly 180° is left alone, as is a difference that is not
+/// finite (two finite longitudes at opposite ends of the `f64` range).
+fn wrap_lon_near(lon: f64, reference: f64) -> f64 {
+    const TURN: f64 = 360.0;
+    const HALF_TURN: f64 = 180.0;
+    let delta = lon - reference;
+    if !delta.is_finite() {
+        lon
+    } else if delta > HALF_TURN {
+        lon - TURN * ((delta - HALF_TURN) / TURN).ceil()
+    } else if delta < -HALF_TURN {
+        lon + TURN * ((-HALF_TURN - delta) / TURN).ceil()
+    } else {
+        lon
+    }
+}
+
 /// Unwrap consecutive longitudes so jumps stay within ±180° of the previous.
 fn unwrap_ring(ring: &[Coordinate]) -> Vec<Coordinate> {
     let mut out = Vec::with_capacity(ring.len());
@@ -870,16 +892,7 @@ fn unwrap_ring(ring: &[Coordinate]) -> Vec<Coordinate> {
         }
         let lon = match prev_lon {
             None => p.lon,
-            Some(prev) => {
-                let mut lon = p.lon;
-                while lon - prev > 180.0 {
-                    lon -= 360.0;
-                }
-                while lon - prev < -180.0 {
-                    lon += 360.0;
-                }
-                lon
-            }
+            Some(prev) => wrap_lon_near(p.lon, prev),
         };
         prev_lon = Some(lon);
         out.push(Coordinate::new(lon, p.lat));
@@ -1051,13 +1064,7 @@ fn clip_ring_at_dateline(ring: &[Coordinate]) -> (Vec<Coordinate>, Vec<Coordinat
         if (a.lon - b.lon).abs() > 180.0 {
             let cut_a = if a.lon > 0.0 { 180.0 } else { -180.0 };
             let cut_b = -cut_a;
-            let mut b_lon = b.lon;
-            while b_lon - a.lon > 180.0 {
-                b_lon -= 360.0;
-            }
-            while b_lon - a.lon < -180.0 {
-                b_lon += 360.0;
-            }
+            let b_lon = wrap_lon_near(b.lon, a.lon);
             let denom = b_lon - a.lon;
             if denom.abs() > f64::EPSILON {
                 let t = ((cut_a - a.lon) / denom).clamp(0.0, 1.0);
