@@ -49,6 +49,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Pinned by commit, so the toolchain is named here instead of in the ref.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
@@ -78,6 +80,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -111,6 +115,8 @@ jobs:
       TESTED_BINDINGS: email-fast-py json-fast-py ontology-fast-py pdf-fast-py xsd-fast-py
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -155,6 +161,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -186,6 +194,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -197,6 +207,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -211,9 +223,16 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install elan and verify Lean 4 proofs (0 sorry)
         run: |
-          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
-            | sh -s -- -y --no-modify-path --default-toolchain none
+          # The installer is fetched at one commit and run only if its bytes
+          # are the ones reviewed; a branch name can be moved under us.
+          curl -sSfL -o "$RUNNER_TEMP/elan-init.sh" \
+            https://raw.githubusercontent.com/leanprover/elan/55dc2814ca42ace25f05ba4dd7a43a8c701a0549/elan-init.sh
+          echo "a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53  $RUNNER_TEMP/elan-init.sh" \
+            | sha256sum --check --strict
+          sh "$RUNNER_TEMP/elan-init.sh" -y --no-modify-path --default-toolchain none
           export PATH="$HOME/.elan/bin:$PATH"
           ./formal/check.sh

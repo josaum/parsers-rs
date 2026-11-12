@@ -136,6 +136,37 @@ def assert_actions_pinned(text: str) -> None:
     assert seen, "workflow uses no action at all"
 
 
+def assert_checkouts_keep_no_credentials(text: str) -> None:
+    """No job pushes, so no checkout may leave the token in .git/config."""
+    steps = re.split(r"^      - ", code(text), flags=re.MULTILINE)
+    checkouts = [step for step in steps if step.startswith("uses: actions/checkout@")]
+    assert len(checkouts) == code(text).count("actions/checkout@"), "a checkout in a spelling this cannot read"
+    assert checkouts, "workflow checks nothing out"
+    for step in checkouts:
+        assert mapping(step, "with", 8) == {"persist-credentials": "false"}, (
+            "every checkout must set persist-credentials: false and nothing else"
+        )
+
+
+def assert_installers_are_pinned(text: str) -> None:
+    """Nothing is piped from the network into a shell or installed unversioned."""
+    body = code(text)
+    assert not re.search(r"\|\s*(?:ba)?sh\b", body), "a download is piped into a shell"
+    for url in re.findall(r"https://raw\.githubusercontent\.com/\S+", body):
+        assert re.fullmatch(
+            r"https://raw\.githubusercontent\.com/[\w.-]+/[\w.-]+/[0-9a-f]{40}/\S+", url
+        ), f"{url}: not fetched at a full commit SHA"
+        name = url.rsplit("/", 1)[1]
+        assert re.search(
+            rf'echo "[0-9a-f]{{64}}  \$RUNNER_TEMP/{re.escape(name)}" \\\n\s+\| sha256sum --check --strict\n\s+sh "\$RUNNER_TEMP/{re.escape(name)}"',
+            body,
+        ), f"{name}: must be checked against a SHA-256 before it runs"
+    for install in re.findall(r"cargo install [^\n]+", body):
+        assert re.search(r" --locked\b", install) and re.search(
+            r" --version [0-9]+\.[0-9]+\.[0-9]+(?:\s|$)", install
+        ), f"`{install}`: not pinned to an exact version"
+
+
 def assert_toolchain_named(text: str) -> None:
     """A SHA-pinned dtolnay/rust-toolchain installs nothing unless told what."""
     channel = re.search(r'^channel = "([^"]+)"$', read(ROOT / "rust-toolchain.toml"), re.MULTILINE)
@@ -464,6 +495,12 @@ def test_every_action_is_pinned_by_commit_sha(path: Path):
 
 
 @pytest.mark.parametrize("path", ALL_WORKFLOWS, ids=workflow_id)
+def test_checkouts_keep_no_credentials_and_installers_are_pinned(path: Path):
+    assert_checkouts_keep_no_credentials(read(path))
+    assert_installers_are_pinned(read(path))
+
+
+@pytest.mark.parametrize("path", ALL_WORKFLOWS, ids=workflow_id)
 def test_only_the_publishing_job_holds_a_write_token(path: Path):
     assert_least_privilege(read(path), WRITERS.get(path.name))
 
@@ -536,6 +573,16 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_toolchain_named, CI, "          toolchain: 1.98.1\n          components", "          components"),
         (assert_toolchain_named, RELEASE, "          toolchain: 1.98.1\n          targets", "          targets"),
         (assert_toolchain_named, AUDIT, "toolchain: 1.98.1", "toolchain: stable"),
+        # A checkout that keeps the token, an installer from a branch or unchecked, a tool at any version.
+        (assert_checkouts_keep_no_credentials, CI, "          persist-credentials: false\n      - name: Install elan", "          persist-credentials: true\n      - name: Install elan"),
+        (assert_checkouts_keep_no_credentials, RELEASE, "        with:\n          persist-credentials: false\n      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master\n        with:\n          toolchain: 1.98.1\n      - uses: actions/setup-python", "      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master\n        with:\n          toolchain: 1.98.1\n      - uses: actions/setup-python"),
+        (assert_checkouts_keep_no_credentials, AUDIT, "          persist-credentials: false\n", "          persist-credentials: false\n          fetch-depth: 0\n"),
+        (assert_installers_are_pinned, CI, "elan/55dc2814ca42ace25f05ba4dd7a43a8c701a0549/elan-init.sh", "elan/master/elan-init.sh"),
+        (assert_installers_are_pinned, CI, "            | sha256sum --check --strict\n", "            | cat\n"),
+        (assert_installers_are_pinned, CI, '          sh "$RUNNER_TEMP/elan-init.sh" -y', '          curl -sSf https://example.invalid/install.sh | sh -s -- -y'),
+        (assert_installers_are_pinned, RELEASE, "cargo install cargo-cyclonedx --locked --version 0.5.10", "cargo install cargo-cyclonedx --locked"),
+        (assert_installers_are_pinned, RELEASE, "cargo install cargo-cyclonedx --locked --version 0.5.10", "cargo install cargo-cyclonedx --version 0.5.10"),
+        (assert_installers_are_pinned, AUDIT, " --locked --version 0.23.0", " --locked --version 0.23"),
         # A wider default token, a second writer, a spelling that hides a grant.
         (assert_release_token_scopes, RELEASE, "permissions:\n  contents: read", "permissions:\n  contents: write"),
         (assert_release_token_scopes, RELEASE, "permissions:\n  contents: read", "permissions: write-all"),

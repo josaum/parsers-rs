@@ -61,6 +61,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -162,6 +164,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -206,6 +210,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -225,7 +231,7 @@ jobs:
       - name: Embed exactly one CycloneDX SBOM per wheel
         run: |
           set -euo pipefail
-          cargo install cargo-cyclonedx --locked
+          cargo install cargo-cyclonedx --locked --version 0.5.10
           for core in *-core *-write ooxml-archive; do
             cargo cyclonedx --manifest-path "$core/Cargo.toml" -f json --describe crate
           done
