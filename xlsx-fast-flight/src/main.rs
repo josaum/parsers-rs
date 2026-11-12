@@ -817,7 +817,9 @@ fn parse_ref_kind(input: &str) -> Option<RefKind> {
         if b.is_ascii_alphabetic() {
             has_col = true;
             let upper = b & 0xDF;
-            col = col * 26 + (upper - b'A' + 1) as u32;
+            col = col
+                .checked_mul(26)?
+                .checked_add(u32::from(upper - b'A' + 1))?;
         } else {
             break;
         }
@@ -830,7 +832,7 @@ fn parse_ref_kind(input: &str) -> Option<RefKind> {
             }
             if b.is_ascii_digit() {
                 has_row = true;
-                row = row * 10 + (b - b'0') as u32;
+                row = row.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
             } else {
                 break;
             }
@@ -932,6 +934,33 @@ mod range_reference_tests {
             Some((42, all, 1, all))
         );
         assert_eq!(range("A1:5"), None);
+    }
+
+    /// WHY: a range comes straight from the client's query. A column or row
+    /// too large for the arithmetic used to panic in a debug build and wrap
+    /// to an unrelated range in a release build; it is an invalid argument.
+    #[test]
+    fn a_reference_too_large_to_compute_is_an_invalid_argument() {
+        for input in [
+            "AAAAAAAAAAAAAAAA1",
+            "ZZZZZZZ",
+            "A99999999999",
+            "99999999999",
+            "A1:ZZZZZZZZ9",
+            "1:4294967296",
+        ] {
+            let err = parse_range_part(input).expect_err(input);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{input}");
+        }
+        // The largest values that still fit are accepted as before.
+        assert_eq!(
+            range("4294967295"),
+            Some((4_294_967_295, u32::MAX, 1, u32::MAX))
+        );
+    }
+
+    #[test]
+    fn range_queries_reject_malformed_references() {
         assert_eq!(range("A:5"), None);
         assert_eq!(range("A0"), None);
         assert_eq!(range("!!"), None);
