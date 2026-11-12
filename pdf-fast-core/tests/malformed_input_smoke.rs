@@ -52,6 +52,12 @@ fn serial() -> MutexGuard<'static, ()> {
 }
 
 /// Iteration count for a mutation run, scaled by `PDF_SMOKE_SCALE` when set.
+///
+/// The counts in this file keep the whole binary to about a minute in an
+/// unoptimized build, because it runs on every pull request and on three
+/// operating systems. A layered run builds, compresses and parses a document
+/// per iteration, so it is the costly kind. For a deeper sweep, run with
+/// `PDF_SMOKE_SCALE=8` or more.
 fn iterations(base: usize) -> usize {
     let scale = std::env::var("PDF_SMOKE_SCALE")
         .ok()
@@ -715,37 +721,37 @@ fn mutated_content_streams_never_panic_behind_their_filters() {
     layered_run(
         "pdf-fast-core content",
         seed.content.clone(),
-        700,
+        45,
         |payloads, bytes| payloads.content = bytes,
     );
     layered_run(
         "pdf-fast-core table content",
         seed.table_content.clone(),
-        500,
+        30,
         |payloads, bytes| payloads.table_content = bytes,
     );
     layered_run(
         "pdf-fast-core form content",
         seed.form.clone(),
-        300,
+        20,
         |payloads, bytes| payloads.form = bytes,
     );
     layered_run(
         "pdf-fast-core inner form content",
         seed.inner_form.clone(),
-        200,
+        15,
         |payloads, bytes| payloads.inner_form = bytes,
     );
     layered_run(
         "pdf-fast-core char proc",
         seed.char_proc.clone(),
-        300,
+        20,
         |payloads, bytes| payloads.char_proc = bytes,
     );
     layered_run(
         "pdf-fast-core predictor rows",
         seed.predictor_rows.clone(),
-        300,
+        20,
         |payloads, bytes| payloads.predictor_rows = bytes,
     );
 }
@@ -757,7 +763,7 @@ fn mutated_content_streams_never_panic_in_rasterization() {
     smoke::assert_no_panics(
         "pdf-fast-core content raster",
         &[base.content.clone(), base.table_content.clone()],
-        iterations(300),
+        iterations(150),
         |bytes| {
             let mut payloads = base.clone();
             payloads.content = bytes.to_vec();
@@ -773,13 +779,13 @@ fn mutated_cmaps_and_object_streams_never_panic_behind_their_filters() {
     layered_run(
         "pdf-fast-core cmap",
         seed.cmap.clone(),
-        700,
+        45,
         |payloads, bytes| payloads.cmap = bytes,
     );
     layered_run(
         "pdf-fast-core object stream",
         seed.object_stream.clone(),
-        700,
+        45,
         |payloads, bytes| payloads.object_stream = bytes,
     );
 }
@@ -790,13 +796,13 @@ fn mutated_font_programs_never_panic() {
     smoke::assert_no_panics(
         "pdf-fast-core truetype",
         &[TRUETYPE_FIXTURE.to_vec()],
-        iterations(1_500),
+        iterations(100),
         exercise_truetype,
     );
     smoke::assert_no_panics(
         "pdf-fast-core cff",
         &[OPENTYPE_FIXTURE.to_vec()],
-        iterations(3_000),
+        iterations(200),
         exercise_cff,
     );
     // The same programs embedded, so the font dictionary plumbing and the
