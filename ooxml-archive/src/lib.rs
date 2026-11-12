@@ -8,9 +8,12 @@
 use anyhow::{anyhow, Context, Result};
 use flate2::read::DeflateDecoder;
 use memmap2::Mmap;
+use quick_xml::encoding::Decoder;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use rawzip::{CompressionMethod, ZipArchive, ZipArchiveEntryWayfinder, ZipSliceArchive};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read};
@@ -350,8 +353,7 @@ pub struct RelEntry {
 
 /// Parse a `.rels` XML part into Id/Type maps and an entry list.
 pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = xml_reader(Cursor::new(xml));
     let mut buf = Vec::new();
     let mut rels = Relationships::default();
     loop {
@@ -367,20 +369,11 @@ pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
                 for attr in e.attributes().with_checks(false).flatten() {
                     let key = local_name(attr.key.as_ref());
                     if key == b"Id" {
-                        id = Some(
-                            attr.decode_and_unescape_value(reader.decoder())?
-                                .to_string(),
-                        );
+                        id = Some(attr_text(&attr, reader.decoder())?.to_string());
                     } else if key == b"Type" {
-                        rel_type = Some(
-                            attr.decode_and_unescape_value(reader.decoder())?
-                                .to_string(),
-                        );
+                        rel_type = Some(attr_text(&attr, reader.decoder())?.to_string());
                     } else if key == b"Target" {
-                        target = Some(
-                            attr.decode_and_unescape_value(reader.decoder())?
-                                .to_string(),
-                        );
+                        target = Some(attr_text(&attr, reader.decoder())?.to_string());
                     }
                 }
                 if let (Some(id), Some(rel_type), Some(target)) = (id, rel_type, target) {
@@ -507,6 +500,26 @@ fn normalize_join(base_dir: &str, target: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// Creates the XML reader for a relationships part.
+fn xml_reader<R: BufRead>(input: R) -> Reader<R> {
+    let mut reader = Reader::from_reader(input);
+    let config = reader.config_mut();
+    config.trim_text(false);
+    // Only attributes are read here, so a bare `&` in the text between
+    // elements, which is not well-formed, must not cost the relationships.
+    config.allow_dangling_amp = true;
+    reader
+}
+
+/// Decodes one attribute value, resolving references.
+///
+/// The value is normalized as XML 1.0 requires: a literal tab, line feed or
+/// carriage return becomes a space, while one written as a character
+/// reference (`&#9;`) is kept.
+fn attr_text<'a>(attr: &Attribute<'a>, decoder: Decoder) -> Result<Cow<'a, str>> {
+    Ok(attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)?)
 }
 
 fn local_name(name: &[u8]) -> &[u8] {
