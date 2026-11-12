@@ -34,4 +34,4 @@ Pin the version and verify the hash from `dist/release-manifest.json`. Every
 wheel carries exactly one CycloneDX SBOM describing the crate that defines its
 dependencies.
 
-Licensed under MIT.
+Licensed under either of MIT ([LICENSE](LICENSE)) or Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your option.

@@ -7,7 +7,7 @@ name = "pdf-fast-write"
 version = "0.2.0"
 description = "Sovereign PDF page subsetter powered by Rust (no external deps)"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.9"
 authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 keywords = ["pdf", "writer", "subset", "manipulation", "office", "rust"]

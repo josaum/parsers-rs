@@ -26,4 +26,4 @@ should keep the source hash alongside the parsed output.
 cargo test -p docx-fast-py
 ```
 
-Licensed under MIT.
+Licensed under either of MIT ([LICENSE](LICENSE)) or Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your option.

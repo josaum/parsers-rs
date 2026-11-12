@@ -8,7 +8,7 @@ version = "0.2.7"
 description = "High-performance email parser for .eml, .msg, and mbox formats"
 requires-python = ">=3.10"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 
 [project.optional-dependencies]
