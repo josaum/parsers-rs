@@ -320,6 +320,28 @@ fn seeds_parse_cleanly() {
     assert_eq!(msg.attachments.len(), 2);
     assert_eq!(msg.attachments[0].filename, "relatório.pdf");
     assert_eq!(msg.attachments[1].size, 5000);
+    assert_eq!(
+        msg.date.map(|date| date.to_rfc3339()).as_deref(),
+        Some("2024-01-15T14:30:00+00:00")
+    );
+    // Recipients come from the recipient storages, not the display strings:
+    // the first has an SMTP address, the second an address of no stated type.
+    let recipients = |list: &[email_fast_core::EmailAddress]| -> Vec<(Option<String>, String)> {
+        list.iter()
+            .map(|entry| (entry.name.clone(), entry.address.clone()))
+            .collect()
+    };
+    assert_eq!(
+        recipients(&msg.to),
+        [(
+            Some("Maria Souza".to_string()),
+            "maria@example.com".to_string()
+        )]
+    );
+    assert_eq!(
+        recipients(&msg.cc),
+        [(Some("Carlos".to_string()), String::new())]
+    );
 
     let mut subjects = Vec::new();
     let count = parse_mbox_reader(
