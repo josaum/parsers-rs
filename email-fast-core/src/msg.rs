@@ -1024,14 +1024,16 @@ fn encoding_for_codepage(codepage: u32) -> Option<&'static Encoding> {
 
 /// Decodes a non-Unicode (PtypString8 or binary body) value.
 ///
-/// Valid UTF-8 is taken as UTF-8, since writers that ignore the declared code
-/// page almost always emit UTF-8. Otherwise the declared code page decides,
-/// and windows-1252 is the last resort: it maps every byte, so nothing
-/// degrades to U+FFFD the way a UTF-8 lossy read does.
+/// The code page the message declares decides. Bytes in a multi-byte code
+/// page are often valid UTF-8 as well (`D0 BB D0 BB` is two Chinese
+/// characters in code page 936 and two Cyrillic letters in UTF-8), so the
+/// bytes cannot be asked which they are.
+///
+/// Without a declared code page (none written, or one this reader has no
+/// decoder for), and with code page 65001, valid UTF-8 is taken as UTF-8 and
+/// windows-1252 is the last resort: it maps every byte, so nothing degrades
+/// to U+FFFD the way a UTF-8 lossy read does.
 fn decode_ansi(bytes: &[u8], declared: Option<&'static Encoding>) -> String {
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        return text.to_string();
-    }
     match declared {
         Some(encoding) if encoding != encoding_rs::UTF_8 => {
             encoding.decode_without_bom_handling(bytes).0.into_owned()
@@ -1554,16 +1556,53 @@ mod cfb_hardening_tests {
         assert!(!subject.contains(char::REPLACEMENT_CHARACTER));
     }
 
+    /// GBK for two Chinese characters; the same bytes are valid UTF-8 for
+    /// two Cyrillic letters.
+    const GBK_THANKS: [u8; 5] = [0xD0, 0xBB, 0xD0, 0xBB, 0x00];
+
     #[test]
-    fn ansi_strings_that_are_valid_utf8_stay_utf8_despite_the_code_page() {
+    fn a_declared_code_page_decides_even_when_the_bytes_are_valid_utf8() {
+        let email = parse_fixture(&[
+            (
+                "__properties_version1.0",
+                property_stream(&[(PROP_MESSAGE_CODEPAGE, 936)]),
+            ),
+            ("__substg1.0_0037001E", GBK_THANKS.to_vec()),
+            ("__substg1.0_1000001E", GBK_THANKS.to_vec()),
+        ]);
+        assert_eq!(email.subject.as_deref(), Some("\u{8c22}\u{8c22}"));
+        assert_eq!(email.body.text.as_deref(), Some("\u{8c22}\u{8c22}"));
+
+        // The same holds for a single-byte code page: UTF-8 bytes under a
+        // declared windows-1252 are read as windows-1252.
         let email = parse_fixture(&[
             (
                 "__properties_version1.0",
                 property_stream(&[(PROP_MESSAGE_CODEPAGE, 1252)]),
             ),
-            ("__substg1.0_0037001E", "Olá € 日本".as_bytes().to_vec()),
+            ("__substg1.0_0037001E", "Ol\u{e1}".as_bytes().to_vec()),
         ]);
-        assert_eq!(email.subject.as_deref(), Some("Olá € 日本"));
+        assert_eq!(email.subject.as_deref(), Some("Ol\u{c3}\u{a1}"));
+    }
+
+    #[test]
+    fn ansi_strings_that_are_valid_utf8_stay_utf8_without_a_usable_code_page() {
+        let text = "Ol\u{e1} \u{20ac} \u{65e5}\u{672c}";
+        // No code page, code page 65001, and one this reader cannot decode.
+        for properties in [
+            None,
+            Some(property_stream(&[(PROP_MESSAGE_CODEPAGE, 65001)])),
+            Some(property_stream(&[(PROP_MESSAGE_CODEPAGE, 12345)])),
+        ] {
+            let mut streams = vec![("__substg1.0_0037001E", text.as_bytes().to_vec())];
+            if let Some(properties) = properties {
+                streams.push(("__properties_version1.0", properties));
+            }
+            assert_eq!(parse_fixture(&streams).subject.as_deref(), Some(text));
+        }
+        // The bytes that are Chinese under code page 936 are Cyrillic here.
+        let email = parse_fixture(&[("__substg1.0_0037001E", GBK_THANKS.to_vec())]);
+        assert_eq!(email.subject.as_deref(), Some("\u{43b}\u{43b}"));
     }
 
     #[test]
