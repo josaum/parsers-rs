@@ -49,6 +49,9 @@ jobs:
       # its layout crate, by design (see that Cargo.toml).
       - run: cargo clippy --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked --features ${{ env.ARROW_FEATURES }}
+      # The WMS and WFS clients sit behind an optional feature nothing else in
+      # the workspace turns on, so they are built here or not at all.
+      - run: cargo clippy -p geo-fast-core --all-targets --locked --features http
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --locked --features ${{ env.ARROW_FEATURES }}
 
