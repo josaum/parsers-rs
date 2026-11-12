@@ -606,7 +606,7 @@ impl PdfDocument {
             return Err(anyhow!("PDF streams exceed max_total_decoded_bytes"));
         }
 
-        let document = Self {
+        let mut document = Self {
             storage,
             object_index,
             decoded_byte_budget,
@@ -619,6 +619,12 @@ impl PdfDocument {
         };
         if document.pages().len() > options.max_pages {
             return Err(anyhow!("PDF document exceeds max_pages"));
+        }
+        if options.extract_text {
+            document.populate_text_fragments();
+        }
+        if !options.extract_cmaps {
+            document.cmaps.clear();
         }
         Ok(document)
     }
@@ -2812,6 +2818,108 @@ impl PdfDocument {
         None
     }
 
+    fn populate_text_fragments(&mut self) {
+        let mut fallback_bindings = HashMap::new();
+        for object in &self.objects {
+            let Some(dict) = object.dictionary.as_ref() else {
+                continue;
+            };
+            if dict.get("Font").is_some() {
+                fallback_bindings.extend(self.resolve_font_bindings(dict));
+            }
+            if let Some(resources) = dict
+                .get("Resources")
+                .and_then(|value| self.resolve_dictionary(value))
+            {
+                fallback_bindings.extend(self.resolve_font_bindings(resources));
+            }
+        }
+
+        let mut stream_bindings: HashMap<usize, HashMap<String, FontBinding>> = HashMap::new();
+        for page in self.pages() {
+            let Some(object) = self.object_by_id(page.object_number, page.generation) else {
+                continue;
+            };
+            let Some(dictionary) = object.dictionary.as_ref() else {
+                continue;
+            };
+            let resources = page
+                .resources
+                .as_ref()
+                .or_else(|| self.resolve_inherited_resources(dictionary));
+            let Some(resources) = resources else {
+                continue;
+            };
+            let page_bindings = self.resolve_font_bindings(resources);
+            if page_bindings.is_empty() {
+                continue;
+            }
+            for &stream_index in &page.content_streams {
+                stream_bindings
+                    .entry(stream_index)
+                    .or_default()
+                    .extend(page_bindings.clone());
+            }
+        }
+
+        for (stream_index, stream) in self.streams.iter().enumerate() {
+            if let Some(dict) = self
+                .object_by_id(stream.object_number, stream.generation)
+                .and_then(|object| object.dictionary.as_ref())
+            {
+                if let Some(resources) = dict
+                    .get("Resources")
+                    .and_then(|value| self.resolve_dictionary(value))
+                {
+                    let own_bindings = self.resolve_font_bindings(resources);
+                    if !own_bindings.is_empty() {
+                        stream_bindings
+                            .entry(stream_index)
+                            .or_default()
+                            .extend(own_bindings);
+                    }
+                }
+            }
+        }
+
+        let mut fragments = Vec::new();
+        for (stream_index, stream) in self.streams.iter().enumerate() {
+            if stream.kind != PdfStreamKind::Content {
+                continue;
+            }
+            let decoded_bytes = self.stream_decoded_bytes(stream_index).or_else(|| {
+                if stream.filters.is_empty() || matches!(stream.decode_status, DecodeStatus::Raw) {
+                    self.stream_raw_bytes(stream_index)
+                } else {
+                    None
+                }
+            });
+            let Some(decoded_bytes) = decoded_bytes else {
+                continue;
+            };
+            if let Some(specific) = stream_bindings.get(&stream_index) {
+                let mut combined = fallback_bindings.clone();
+                combined.extend(specific.clone());
+                fragments.extend(extract_text_fragments(
+                    decoded_bytes,
+                    stream.object_number,
+                    stream.generation,
+                    stream_index,
+                    &combined,
+                ));
+            } else {
+                fragments.extend(extract_text_fragments(
+                    decoded_bytes,
+                    stream.object_number,
+                    stream.generation,
+                    stream_index,
+                    &fallback_bindings,
+                ));
+            }
+        }
+        self.text_fragments = fragments;
+    }
+
     fn resolve_font_bindings(&self, resources: &PdfDictionary) -> HashMap<String, FontBinding> {
         let Some(font_value) = resources.get("Font") else {
             return HashMap::new();
@@ -4723,16 +4831,12 @@ impl UnicodeMap {
             .iter()
             .filter_map(|range| hex_token_bytes(&range.start).ok().map(|bytes| bytes.len()))
             .collect::<Vec<_>>();
-        map.code_lengths.sort_unstable();
-        map.code_lengths.dedup();
-        if map.code_lengths.is_empty() {
-            map.code_lengths.extend([1, 2]);
-        }
 
         for entry in &cmap.entries {
             match entry {
                 PdfCMapEntry::Char { src, dst } => {
                     if let (Ok(src), Some(dst)) = (hex_token_bytes(src), unicode_hex_token(dst)) {
+                        map.code_lengths.push(src.len());
                         map.chars.insert(src, dst);
                     }
                 }
@@ -4741,18 +4845,28 @@ impl UnicodeMap {
                     end,
                     dst_start,
                 } => {
-                    if let (Some(byte_len), Some(start), Some(end), Some(dst_start)) = (
+                    if let (Some(byte_len), Some(start_val), Some(end_val)) = (
                         hex_token_bytes(start).ok().map(|bytes| bytes.len()),
                         hex_token_u32(start),
                         hex_token_u32(end),
-                        unicode_hex_scalar(dst_start),
                     ) {
-                        map.ranges.push(UnicodeRange {
-                            byte_len,
-                            start,
-                            end,
-                            dst_start,
-                        });
+                        map.code_lengths.push(byte_len);
+                        if start_val == end_val {
+                            if let (Ok(src), Some(dst)) =
+                                (hex_token_bytes(start), unicode_hex_token(dst_start))
+                            {
+                                map.chars.insert(src, dst);
+                                continue;
+                            }
+                        }
+                        if let Some(dst_start) = unicode_hex_scalar(dst_start) {
+                            map.ranges.push(UnicodeRange {
+                                byte_len,
+                                start: start_val,
+                                end: end_val,
+                                dst_start,
+                            });
+                        }
                     }
                 }
                 PdfCMapEntry::RangeArray { start, end, dsts } => {
@@ -4761,6 +4875,7 @@ impl UnicodeMap {
                         hex_token_u32(start),
                         hex_token_u32(end),
                     ) {
+                        map.code_lengths.push(byte_len);
                         map.range_arrays.push(UnicodeRangeArray {
                             byte_len,
                             start,
@@ -4772,6 +4887,34 @@ impl UnicodeMap {
                         });
                     }
                 }
+            }
+        }
+
+        map.code_lengths.sort_unstable();
+        map.code_lengths.dedup();
+        if map.code_lengths.is_empty() {
+            map.code_lengths.extend([1, 2]);
+        }
+
+        // Some Type1 ToUnicode CMaps (e.g. Adobe InDesign) emit 1-byte bfchar
+        // keys for glyphs (`<2E>`, `<41>`) alongside a 2-byte `<0020>` entry
+        // for space while declaring `<0000> <FFFF>` as the codespace range.
+        // When 1-byte codes are active, mirror `<00XX>` entries onto `[XX]`
+        // without overwriting explicit 1-byte mappings.
+        if map.code_lengths.contains(&1) {
+            let zero_prefixed: Vec<(u8, String)> = map
+                .chars
+                .iter()
+                .filter_map(|(k, v)| {
+                    if k.len() == 2 && k[0] == 0 {
+                        Some((k[1], v.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (low_byte, dst) in zero_prefixed {
+                map.chars.entry(vec![low_byte]).or_insert(dst);
             }
         }
 
@@ -6483,8 +6626,8 @@ fn scan_stream(
     dictionary: Option<&PdfDictionary>,
     dictionary_range: Option<ByteRange>,
     options: ParseOptions,
-    stream_index: usize,
-    text_fragments: &mut Vec<PdfTextFragment>,
+    _stream_index: usize,
+    _text_fragments: &mut Vec<PdfTextFragment>,
     cmaps: &mut Vec<PdfCMap>,
     warnings: &mut Vec<PdfWarning>,
     indirect_integers: &HashMap<(u32, u16), i64>,
@@ -6579,15 +6722,7 @@ fn scan_stream(
                 kind = decoded_kind;
             }
         }
-        if options.extract_text && kind == PdfStreamKind::Content {
-            text_fragments.extend(extract_text_fragments(
-                decoded_bytes,
-                header.object_number,
-                header.generation,
-                stream_index,
-            ));
-        }
-        if options.extract_cmaps && kind == PdfStreamKind::CMap {
+        if (options.extract_cmaps || options.extract_text) && kind == PdfStreamKind::CMap {
             if let Some(cmap) = parse_cmap(decoded_bytes, header.object_number, header.generation) {
                 cmaps.push(cmap);
             }
@@ -7761,6 +7896,7 @@ fn extract_text_fragments(
     object_number: u32,
     generation: u16,
     stream_index: usize,
+    font_bindings: &HashMap<String, FontBinding>,
 ) -> Vec<PdfTextFragment> {
     let mut fragments = Vec::new();
     let mut cursor = 0usize;
@@ -7771,7 +7907,14 @@ fn extract_text_fragments(
         match token {
             ContentToken::Value(value) => operands.push(value),
             ContentToken::Operator(operator) => {
+                let binding = current_font
+                    .as_deref()
+                    .and_then(|name| font_bindings.get(name));
                 match operator.as_str() {
+                    "BI" => {
+                        skip_inline_image(bytes, &mut cursor, &operands);
+                        operands.clear();
+                    }
                     "Tf" => {
                         current_font = operands.iter().find_map(|value| match value {
                             ContentValue::Name(name) => Some(name.clone()),
@@ -7781,7 +7924,7 @@ fn extract_text_fragments(
                     "Tj" | "'" => {
                         if let Some(text) = operands
                             .last()
-                            .and_then(|value| content_value_text(value, None))
+                            .and_then(|value| content_value_text(value, binding))
                         {
                             if !text.is_empty() {
                                 fragments.push(PdfTextFragment {
@@ -7798,7 +7941,7 @@ fn extract_text_fragments(
                     "\"" => {
                         if let Some(text) = operands
                             .last()
-                            .and_then(|value| content_value_text(value, None))
+                            .and_then(|value| content_value_text(value, binding))
                         {
                             if !text.is_empty() {
                                 fragments.push(PdfTextFragment {
@@ -7816,7 +7959,7 @@ fn extract_text_fragments(
                         if let Some(ContentValue::Array(items)) = operands.last() {
                             let text = items
                                 .iter()
-                                .filter_map(|value| content_value_text(value, None))
+                                .filter_map(|value| content_value_text(value, binding))
                                 .collect::<Vec<_>>()
                                 .join("");
                             if !text.is_empty() {
@@ -9020,14 +9163,16 @@ fn parse_cmap(bytes: &[u8], object_number: u32, generation: u16) -> Option<PdfCM
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Some((start, end, dst_start)) = parse_bfrange_line(trimmed) {
+                if trimmed.contains('[') {
+                    if let Some((start, end, dsts)) = parse_bfrange_array_line(trimmed) {
+                        entries.push(PdfCMapEntry::RangeArray { start, end, dsts });
+                    }
+                } else if let Some((start, end, dst_start)) = parse_bfrange_line(trimmed) {
                     entries.push(PdfCMapEntry::Range {
                         start,
                         end,
                         dst_start,
                     });
-                } else if let Some((start, end, dsts)) = parse_bfrange_array_line(trimmed) {
-                    entries.push(PdfCMapEntry::RangeArray { start, end, dsts });
                 }
             }
             rest = &after[end_pos..];
@@ -10253,6 +10398,70 @@ endobj
             fallback_total, char_total,
             "All chars should be fallback when no CMap exists"
         );
+    }
+
+    /// A 1-byte Type1 ToUnicode CMap that declares a 2-byte `<0000> <FFFF>`
+    /// codespace range while mapping 1-byte ligature codes (`<1C>` -> `ffi`,
+    /// `<1D>` -> `fl`, `<1E>` -> `ff`, `<1F>` -> `fi`, `<1B>` -> thin space)
+    /// and a 2-byte `<0020>` space entry must decode cleanly on both
+    /// `semantic_text_runs` and `text_fragments` with zero fallback chars.
+    #[test]
+    fn cmap_decodes_one_byte_ligatures_under_two_byte_codespace_and_in_text_fragments() {
+        let cmap = "/CIDInit /ProcSet findresource begin\n\
+            12 dict begin\n\
+            begincmap\n\
+            /CMapName /Adobe-Identity-UCS def\n\
+            /CMapType 2 def\n\
+            1 begincodespacerange\n\
+            <0000> <FFFF>\n\
+            endcodespacerange\n\
+            8 beginbfchar\n\
+            <1B> <2009>\n\
+            <1C> <006600660069>\n\
+            <1D> <0066006C>\n\
+            <1E> <00660066>\n\
+            <1F> <00660069>\n\
+            <0020> <0020>\n\
+            <38> <0038>\n\
+            <B0> <00B0>\n\
+            endbfchar\n\
+            endcmap\n";
+        let content = "BT\n/F1 12 Tf\n<1C201D201E201F20381BB0> Tj\nET";
+        let pdf = build_pdf_with_font_and_stream(Some(cmap), content, "Type1");
+        let doc = PdfDocument::from_slice(&pdf, ParseOptions::default()).unwrap();
+        let runs = doc.semantic_text_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "ffi fl ff fi 8\u{2009}°");
+        assert_eq!(runs[0].cmap_fallback_chars, 0);
+        assert_eq!(doc.text_fragments.len(), 1);
+        assert_eq!(doc.text_fragments[0].text, "ffi fl ff fi 8\u{2009}°");
+    }
+
+    /// A 2-byte Type0 CID font with a ToUnicode CMap mapping `<0210>` -> `.`
+    /// must decode in `doc.text_fragments` as well as `doc.semantic_text_runs()`.
+    #[test]
+    fn text_fragments_decode_cid_font_via_page_font_bindings() {
+        let cmap = "/CIDInit /ProcSet findresource begin\n\
+            12 dict begin\n\
+            begincmap\n\
+            /CMapName /Adobe-Identity-UCS def\n\
+            /CMapType 2 def\n\
+            1 begincodespacerange\n\
+            <0000> <FFFF>\n\
+            endcodespacerange\n\
+            1 beginbfchar\n\
+            <0210> <002E>\n\
+            endbfchar\n\
+            endcmap\n";
+        let content = "BT\n/F1 10 Tf\n<0210> Tj\nET";
+        let pdf = build_pdf_with_font_and_stream(Some(cmap), content, "Type0");
+        let doc = PdfDocument::from_slice(&pdf, ParseOptions::default()).unwrap();
+        assert_eq!(doc.text_fragments.len(), 1);
+        assert_eq!(doc.text_fragments[0].text, ".");
+        let runs = doc.semantic_text_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, ".");
+        assert_eq!(runs[0].cmap_fallback_chars, 0);
     }
 
     // ── Test PDF builders ─────────────────────────────────────────────────
