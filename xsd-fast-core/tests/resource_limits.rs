@@ -35,6 +35,98 @@ fn resource_limit_message<T>(result: anyhow::Result<T>) -> String {
     }
 }
 
+mod inheritance {
+    use super::{load, resource_limit_message, schema_document};
+    use xsd_fast_core::schema::{ContentModel, ElementRef, XsdType};
+
+    /// A base type whose content is `base_content`, and `derived` types that
+    /// extend it without adding anything.
+    fn base_with_derived_types(base_content: &str, derived: usize) -> Vec<u8> {
+        let mut body = format!(
+            "<xs:complexType name=\"Base\"><xs:sequence>{base_content}</xs:sequence>\
+             </xs:complexType>"
+        );
+        for index in 0..derived {
+            body.push_str(&format!(
+                "<xs:complexType name=\"D{index}\"><xs:complexContent>\
+                 <xs:extension base=\"t:Base\"><xs:sequence/></xs:extension>\
+                 </xs:complexContent></xs:complexType>"
+            ));
+        }
+        schema_document(&body)
+    }
+
+    /// An element whose inline simple type lists `values` enumeration values.
+    fn enumerated_element(values: usize) -> String {
+        let mut element = String::from(
+            "<xs:element name=\"code\"><xs:simpleType><xs:restriction base=\"xs:string\">",
+        );
+        for value in 0..values {
+            element.push_str(&format!("<xs:enumeration value=\"{value}\"/>"));
+        }
+        element.push_str("</xs:restriction></xs:simpleType></xs:element>");
+        element
+    }
+
+    #[test]
+    fn copies_of_a_large_enumeration_are_charged() {
+        // 2,000 values copied into 200 derived types is 400,000 enumeration
+        // values, although only 200 particles are copied.
+        let document = base_with_derived_types(&enumerated_element(2_000), 200);
+        assert!(document.len() < 128 * 1024);
+        let message = resource_limit_message(load(&document));
+        assert!(message.contains("inherited_nodes"), "{message}");
+    }
+
+    #[test]
+    fn copies_of_long_text_are_charged() {
+        // One 64 KiB enumeration value copied into 1,100 derived types is
+        // 70 MiB of text in 1,100 particles.
+        let value = "x".repeat(64 * 1024);
+        let element = format!(
+            "<xs:element name=\"code\"><xs:simpleType><xs:restriction base=\"xs:string\">\
+             <xs:enumeration value=\"{value}\"/></xs:restriction></xs:simpleType></xs:element>"
+        );
+        let message = resource_limit_message(load(&base_with_derived_types(&element, 1_100)));
+        assert!(message.contains("inherited_nodes"), "{message}");
+
+        // The same for one element with a 64 KiB name.
+        let element = format!("<xs:element name=\"{value}\" type=\"xs:string\"/>");
+        let message = resource_limit_message(load(&base_with_derived_types(&element, 1_100)));
+        assert!(message.contains("inherited_nodes"), "{message}");
+    }
+
+    #[test]
+    fn ordinary_inheritance_still_folds() {
+        // An enumeration of 20 values inherited by 20 types.
+        let document = base_with_derived_types(&enumerated_element(20), 20);
+        let schema = load(&document).expect("a small enumeration is inherited");
+        let ContentModel::Sequence(particles) = &schema.model().complex_types["D19"].content else {
+            panic!("the derived type has a sequence");
+        };
+        let ElementRef::Inline(code) = &particles[0].element else {
+            panic!("the inherited element is declared inline");
+        };
+        let XsdType::Simple(simple) = &code.type_def else {
+            panic!("the inherited element has a simple type");
+        };
+        assert_eq!(simple.facets.enumerations.len(), 20);
+
+        // 50 plain elements inherited by 1,000 types: 50,000 copies.
+        let mut elements = String::new();
+        for index in 0..50 {
+            elements.push_str(&format!("<xs:element name=\"e{index}\" type=\"xs:int\"/>"));
+        }
+        let schema = load(&base_with_derived_types(&elements, 1_000))
+            .expect("50,000 inherited particles are within the limit");
+        let ContentModel::Sequence(particles) = &schema.model().complex_types["D999"].content
+        else {
+            panic!("the derived type has a sequence");
+        };
+        assert_eq!(particles.len(), 50);
+    }
+}
+
 mod validation {
     use super::{load, schema_document};
     use xsd_fast_core::{SchemaSet, ValidateOptions, ValidationError};
