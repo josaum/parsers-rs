@@ -6,6 +6,12 @@ Machine-checked Lean 4 proofs (`leanprover/lean4:v4.35.0`, pure Lean core librar
 ./formal/check.sh
 ```
 
+## What these proofs cover
+
+Each module is a Lean model of an algorithm, written by hand to mirror the Rust or Python code named beside it. The theorems are proved about that model. Nothing extracts the model from the source or checks the two against each other mechanically, so a proof here shows the design holds, not that the implementation follows it.
+
+The link between model and code is kept by review, and the code itself is checked by its test suites: unit and integration tests, and the malformed-input tests under each crate's `tests/malformed_input_smoke.rs`. When a counterpart changes, its model has to be updated by hand.
+
 ## Verified Modules & Theorems
 
 | Module | Theorems | Rust / Python Counterpart | Invariant |
