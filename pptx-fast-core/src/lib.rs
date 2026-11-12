@@ -762,7 +762,7 @@ enum SlidePart {
     /// A slide, layout or master: shapes, tables, the slide name and
     /// placeholder types.
     Slide,
-    /// A notes slide: shapes only.
+    /// A notes slide: shapes and their placeholder types only.
     Notes,
 }
 
@@ -878,7 +878,8 @@ impl SlideContent {
                     }
                 }
             }
-            b"ph" if is_slide => {
+            // Notes shapes are placeholders too: `body` is the notes text.
+            b"ph" => {
                 if let Some(shape) = self.current_shape.as_mut() {
                     shape.placeholder = attr_value(reader, e, b"type")?;
                 }

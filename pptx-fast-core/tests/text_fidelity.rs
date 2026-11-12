@@ -384,3 +384,27 @@ fn whitespace_only_runs_are_kept() {
     .parse();
     assert_eq!(shape_texts(&doc), [["a b"]]);
 }
+
+#[test]
+fn notes_shapes_carry_their_placeholder_type() {
+    // The notes body is the shape with `type="body"`; without the type a
+    // consumer cannot tell the notes text from the slide number or the date.
+    let deck = Deck {
+        notes: concat!(
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder 2"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>"#,
+            "<p:txBody><a:bodyPr/><a:p><a:r><a:t>speak slowly</a:t></a:r></a:p></p:txBody></p:sp>",
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="3" name="Slide Number Placeholder 3"/><p:cNvSpPr/><p:nvPr><p:ph type="sldNum" sz="quarter" idx="5"></p:ph></p:nvPr></p:nvSpPr>"#,
+            "<p:txBody><a:bodyPr/><a:p><a:fld id=\"{X}\" type=\"slidenum\"><a:t>1</a:t></a:fld></a:p></p:txBody></p:sp>",
+        )
+        .as_bytes()
+        .to_vec(),
+        ..Deck::default()
+    };
+    let doc = deck.parse();
+    let placeholders: Vec<_> = doc.slides[0]
+        .notes
+        .iter()
+        .map(|shape| shape.placeholder.as_deref())
+        .collect();
+    assert_eq!(placeholders, [Some("body"), Some("sldNum")]);
+}
