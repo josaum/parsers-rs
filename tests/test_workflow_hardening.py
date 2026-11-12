@@ -34,6 +34,8 @@ BRANCH_PINNED = {"dtolnay/rust-toolchain": "master"}
 # condition must read an absent input as "run".
 REBUILT_BY_RELEASE = {"python-bindings": "wheels", "node-bindings": "node"}
 SKIP_INPUT = "skip_binding_jobs"
+# The doctors are a package outside the workspace; this is its own lockfile.
+DOCTORS_LOCK = ".leio-code/rust-doctors/Cargo.lock"
 SKIP_CONDITION = "${{ inputs.skip_binding_jobs != true }}"
 
 USES = re.compile(r"^\s*(?:- )?uses:[ ]+(?P<ref>\S+)(?P<rest>.*)$")
@@ -362,7 +364,7 @@ def assert_audit_contract(audit: str) -> None:
     )
     assert paths is not None, "the audit must run on pull requests that change dependencies"
     listed = {line.strip()[2:].strip('"') for line in paths["paths"].splitlines()}
-    assert {"Cargo.lock", "Cargo.toml", "**/Cargo.toml"} <= listed
+    assert {"Cargo.lock", "Cargo.toml", "**/Cargo.toml", DOCTORS_LOCK} <= listed
     assert "workflow_call" not in triggers, "the audit must not be callable from a release"
     assert re.search(
         r"^ +run: cargo install cargo-audit --locked --version [0-9]+\.[0-9]+\.[0-9]+$",
@@ -370,7 +372,12 @@ def assert_audit_contract(audit: str) -> None:
         re.MULTILINE,
     ), "cargo-audit must be installed at a pinned version"
     scans = re.findall(r"^ +run: (cargo audit\b.*)$", body, re.MULTILINE)
-    assert scans == ["cargo audit --deny unsound"], scans
+    # Every lockfile in the repository: the workspace's, then the doctors'.
+    assert (ROOT / DOCTORS_LOCK).is_file()
+    assert scans == [
+        "cargo audit --deny unsound",
+        f"cargo audit --deny unsound --file {DOCTORS_LOCK}",
+    ], scans
     # No advisory is waved through, here or in cargo-audit's own configuration.
     assert "--ignore" not in body
     assert "continue-on-error" not in body
@@ -388,14 +395,27 @@ def assert_dependabot_contract(dependabot: str) -> None:
     body = code(dependabot)
     assert re.search(r"^version: 2$", body, re.MULTILINE)
     parts = re.split(r"^  - package-ecosystem: (\S+)\n", body, flags=re.MULTILINE)
-    updates = dict(zip(parts[1::2], parts[2::2]))
-    assert set(updates) == {"cargo", "github-actions"}
-    for ecosystem, block in updates.items():
-        assert re.search(r"^    directory: /$", block, re.MULTILINE), ecosystem
+    updates = {}
+    for ecosystem, block in zip(parts[1::2], parts[2::2]):
+        directory = re.search(r"^    directory: (\S+)$", block, re.MULTILINE)
+        assert directory is not None, f"{ecosystem}: no directory"
+        assert (ecosystem, directory[1]) not in updates, "the same directory is listed twice"
+        updates[ecosystem, directory[1]] = block
         assert re.search(
             r"^    schedule:\n      interval: weekly$", block, re.MULTILINE
         ), f"{ecosystem}: not weekly"
-    cargo = updates["cargo"]
+    # One cargo entry per lockfile, and the actions.
+    doctors = "/" + str(Path(DOCTORS_LOCK).parent)
+    assert set(updates) == {("cargo", "/"), ("cargo", doctors), ("github-actions", "/")}
+    grouped = re.search(
+        r"^      [A-Za-z][A-Za-z0-9_|-]*:\n(?P<body>(?:        [^\n]*\n)+)",
+        updates["cargo", doctors],
+        re.MULTILINE,
+    )
+    assert grouped is not None, "the doctors' minor and patch updates must arrive together"
+    assert re.search(r'^        patterns:\n          - "\*"$', grouped["body"], re.MULTILINE)
+    assert "ignore:" not in updates["cargo", doctors]
+    cargo = updates["cargo", "/"]
     group = re.search(
         r"^      cargo-minor-and-patch:\n(?P<body>(?:        [^\n]*\n)+)", cargo, re.MULTILINE
     )
@@ -618,12 +638,20 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_audit_contract, AUDIT, "cargo audit --deny unsound", "cargo audit --deny unsound --ignore RUSTSEC-2026-0001"),
         (assert_audit_contract, AUDIT, "cargo audit --deny unsound", "cargo audit --deny unsound || true"),
         (assert_audit_contract, AUDIT, "        run: cargo audit --deny unsound", "        continue-on-error: true\n        run: cargo audit --deny unsound"),
+        (assert_audit_contract, AUDIT, "        run: cargo audit --deny unsound --file .leio-code/rust-doctors/Cargo.lock\n", "        run: cargo audit --version\n"),
+        (assert_audit_contract, AUDIT, "cargo audit --deny unsound --file", "cargo audit --file"),
+        (assert_audit_contract, AUDIT, "--file .leio-code/rust-doctors/Cargo.lock", "--file Cargo.lock"),
+        (assert_audit_contract, AUDIT, "      - .leio-code/rust-doctors/Cargo.lock\n", ""),
         (assert_no_audit_in_the_release_path, CI, "      - run: cargo fmt --all --check", "      - run: cargo audit"),
         (assert_no_audit_in_the_release_path, RELEASE, "    uses: ./.github/workflows/ci.yml", "    uses: ./.github/workflows/audit.yml"),
         # Dependabot left without an ecosystem, a schedule or its grouping.
         (assert_dependabot_contract, DEPENDABOT, "package-ecosystem: github-actions", "package-ecosystem: npm"),
         (assert_dependabot_contract, DEPENDABOT, "interval: weekly", "interval: monthly"),
-        (assert_dependabot_contract, DEPENDABOT, "directory: /\n", "directory: /docx-fast-core\n"),
+        (assert_dependabot_contract, DEPENDABOT, "    directory: /\n    schedule:\n      interval: weekly\n    commit-message:\n      prefix: chore", "    directory: /docx-fast-core\n    schedule:\n      interval: weekly\n    commit-message:\n      prefix: chore"),
+        (assert_dependabot_contract, DEPENDABOT, "    directory: /\n    schedule:\n      interval: weekly\n    commit-message:\n      prefix: ci", "    directory: /.github\n    schedule:\n      interval: weekly\n    commit-message:\n      prefix: ci"),
+        (assert_dependabot_contract, DEPENDABOT, "directory: /.leio-code/rust-doctors\n", "directory: /\n"),
+        (assert_dependabot_contract, DEPENDABOT, "directory: /.leio-code/rust-doctors\n", "directory: /.leio-code\n"),
+        (assert_dependabot_contract, DEPENDABOT, "      doctors-minor-and-patch:\n        patterns:\n          - \"*\"\n", "      doctors-minor-and-patch:\n        patterns:\n          - \"serde*\"\n"),
         (assert_dependabot_contract, DEPENDABOT, "          - minor\n", ""),
         (assert_dependabot_contract, DEPENDABOT, "          - patch\n", "          - patch\n          - major\n"),
         (assert_dependabot_contract, DEPENDABOT, "      cargo-minor-and-patch:", "      everything:"),

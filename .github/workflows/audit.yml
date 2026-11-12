@@ -1,4 +1,6 @@
 # Known advisories against the crates in Cargo.lock, from the RustSec database.
+# The repository doctors are a separate package with a lockfile of their own
+# (.leio-code/rust-doctors/Cargo.lock); it is scanned the same way.
 #
 # This is its own workflow, and ci.yml must never call it or run the scan
 # itself: release.yml calls ci.yml, and an advisory published against a
@@ -17,6 +19,7 @@ on:
   pull_request:
     paths:
       - Cargo.lock
+      - .leio-code/rust-doctors/Cargo.lock
       - Cargo.toml
       - "**/Cargo.toml"
 
@@ -38,3 +41,5 @@ jobs:
         # A vulnerability fails the scan by default; `--deny unsound` makes an
         # unsoundness advisory, which is otherwise only a warning, fail it too.
         run: cargo audit --deny unsound
+      - name: The same for the repository doctors' own lockfile
+        run: cargo audit --deny unsound --file .leio-code/rust-doctors/Cargo.lock
