@@ -35,6 +35,50 @@ fn resource_limit_message<T>(result: anyhow::Result<T>) -> String {
     }
 }
 
+mod includes {
+    use super::{resource_limit_message, schema_document};
+    use xsd_fast_core::{ParseOptions, SchemaSet};
+
+    /// Loads a root schema followed by `includes` files, each of which is
+    /// included by the one before it.
+    fn load_chain(includes: usize) -> anyhow::Result<SchemaSet> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..=includes {
+            let mut body = format!("<xs:element name=\"e{index}\" type=\"xs:string\"/>");
+            if index < includes {
+                body.push_str(&format!(
+                    "<xs:include schemaLocation=\"f{}.xsd\"/>",
+                    index + 1
+                ));
+            }
+            std::fs::write(
+                dir.path().join(format!("f{index}.xsd")),
+                schema_document(&body),
+            )
+            .expect("write schema file");
+        }
+        // Leave the file count out of it: only the chain depth is under test.
+        let options = ParseOptions {
+            max_includes: 1_000,
+            ..ParseOptions::default()
+        };
+        SchemaSet::load(dir.path().join("f0.xsd"), options)
+    }
+
+    #[test]
+    fn the_include_chain_limit_is_the_number_in_its_message() {
+        let schema = load_chain(32).expect("32 files below the root are within the limit");
+        assert_eq!(schema.model().global_elements.len(), 33);
+
+        let message = resource_limit_message(load_chain(33));
+        assert!(message.contains("schema_include_nesting"), "{message}");
+        assert!(
+            message.contains("deeper than 32 files below the root schema"),
+            "{message}"
+        );
+    }
+}
+
 mod inheritance {
     use super::{load, resource_limit_message, schema_document};
     use xsd_fast_core::schema::{ContentModel, ElementRef, XsdType};
