@@ -9,7 +9,8 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use quick_xml::events::Event;
+use quick_xml::escape::resolve_predefined_entity;
+use quick_xml::events::{BytesRef, Event};
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
 
@@ -146,6 +147,10 @@ impl<'m> ValidationContext<'m> {
         // piece would delete the spaces between them. The whole value is
         // trimmed once, at the end tag.
         reader.config_mut().trim_text(false);
+        // A bare `&` is not well-formed, but it is read as the text it is, so
+        // the value is checked as written and the rest of the document is
+        // still validated.
+        reader.config_mut().allow_dangling_amp = true;
         let mut buf = Vec::with_capacity(4096);
 
         // The loop ends with whether it stopped at the finding limit, which
@@ -198,11 +203,18 @@ impl<'m> ValidationContext<'m> {
                         break true;
                     }
                 }
+                // Text arrives without its references, which the reader
+                // reports as events of their own, in document order.
                 Ok(Event::Text(ref t)) => {
-                    if let Ok(text) = t.unescape() {
+                    if let Ok(text) = t.decode() {
                         if let Some(frame) = self.type_stack.last_mut() {
                             frame.text.push_str(&text);
                         }
+                    }
+                }
+                Ok(Event::GeneralRef(ref reference)) => {
+                    if let Some(frame) = self.type_stack.last_mut() {
+                        push_reference(&mut frame.text, reference);
                     }
                 }
                 // A CDATA section is element text written literally: it is
@@ -536,6 +548,36 @@ fn strip_prefix(name: &str) -> &str {
         Some(pos) => &name[pos + 1..],
         None => name,
     }
+}
+
+/// Appends what one `&...;` reference in element text stands for.
+///
+/// A predefined entity (`&amp;`) or a decimal or hex character reference
+/// (`&#233;`, `&#xE9;`) becomes its character. Anything else, an entity this
+/// reader does not know or a character reference to no character (`&#0;`), is
+/// kept as it was written, so the value is refused for what it holds instead
+/// of silently losing part of itself.
+fn push_reference(text: &mut String, reference: &BytesRef<'_>) {
+    match reference.resolve_char_ref() {
+        Ok(Some(character)) => {
+            text.push(character);
+            return;
+        }
+        Ok(None) => {
+            let resolved = reference
+                .decode()
+                .ok()
+                .and_then(|name| resolve_predefined_entity(&name));
+            if let Some(resolved) = resolved {
+                text.push_str(resolved);
+                return;
+            }
+        }
+        Err(_) => {}
+    }
+    text.push('&');
+    text.push_str(&String::from_utf8_lossy(reference));
+    text.push(';');
 }
 
 /// Joins allowed enumeration values for a finding, comma separated.

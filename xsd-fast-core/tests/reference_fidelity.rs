@@ -6,6 +6,12 @@
 //! instance side reads element text. Each case below is one spelling and the
 //! value each side must make of it, so a change of XML reader cannot change
 //! what is read without a test saying so.
+//!
+//! Attribute values are normalized as XML requires: a literal tab, newline or
+//! CR LF pair is one space, while the same character written as a reference
+//! is kept. Element text is not normalized. In element text, a reference that
+//! stands for no character (an unknown entity, `&#0;`) and a bare `&` are kept
+//! as written; an attribute holding one of those is dropped whole.
 
 use xsd_fast_core::{ParseOptions, SchemaSet, ValidateOptions};
 
@@ -52,13 +58,13 @@ const CASES: &[Case] = &[
         label: "unknown entity",
         written: "a&foo;b",
         attribute: None,
-        text: "",
+        text: "a&foo;b",
     },
     Case {
         label: "character reference to NUL",
         written: "a&#0;b",
         attribute: None,
-        text: "",
+        text: "a&#0;b",
     },
     Case {
         label: "reference with only spaces around it",
@@ -70,24 +76,24 @@ const CASES: &[Case] = &[
         label: "bare ampersand",
         written: "a & b",
         attribute: None,
-        text: "",
+        text: "a & b",
     },
     Case {
         label: "literal tab",
         written: "a\tb",
-        attribute: Some("a\tb"),
+        attribute: Some("a b"),
         text: "a\tb",
     },
     Case {
         label: "literal newline",
         written: "a\nb",
-        attribute: Some("a\nb"),
+        attribute: Some("a b"),
         text: "a\nb",
     },
     Case {
         label: "literal CR LF",
         written: "a\r\nb",
-        attribute: Some("a\r\nb"),
+        attribute: Some("a b"),
         text: "a\r\nb",
     },
     Case {
@@ -274,8 +280,10 @@ fn instance_text_keeps_references_next_to_cdata_and_spaces() {
         ("&amp;<![CDATA[ b]]>", "& b"),
         ("<![CDATA[a ]]>&amp;", "a &"),
         (" a &lt; <![CDATA[b]]> &gt; c ", "a < b > c"),
-        ("&foo;", ""),
-        ("x &amp; &foo; y", ""),
+        ("&foo;", "&foo;"),
+        ("x &amp; &foo; y", "x & &foo; y"),
+        ("a & b; c &", "a & b; c &"),
+        ("&#xD800;&#x110000;&#;", "&#xD800;&#x110000;&#;"),
     ];
     for (written, text) in cases {
         assert_eq!(finding_for(written), refused(text), "{written:?}");

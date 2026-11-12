@@ -13,8 +13,9 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 
 use crate::schema::{
     AttributeDecl, ComplexType, ContentModel, ElementDecl, ElementRef, EnumValue,
@@ -280,7 +281,15 @@ impl Loader {
 
     fn parse_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         let mut reader = Reader::from_reader(bytes);
+        // No reader of a schema document collects element text: declarations
+        // are read from attributes alone, and annotations are skipped. So
+        // trimming, which works on each piece of text between references,
+        // cannot change a value here.
         reader.config_mut().trim_text(true);
+        // For the same reason a bare `&` in that text, which is not
+        // well-formed, is passed over and does not fail the load: published
+        // schemas carry them in documentation.
+        reader.config_mut().allow_dangling_amp = true;
 
         let mut file = FileState {
             ns_map: HashMap::new(),
@@ -1039,13 +1048,33 @@ fn is_xs_primitive(type_ref: &str, ns_map: &HashMap<String, String>) -> bool {
     !matches!(SimpleTypeKind::from_local(local), SimpleTypeKind::Other(_))
 }
 
+/// The value of one attribute as an XML processor reports it.
+///
+/// Entity and character references are resolved, and the value is normalized
+/// as the XML specification requires of every attribute value: a literal tab,
+/// newline or carriage return (a CR LF pair counting once) becomes one space.
+/// A tab or newline written as a character reference (`&#9;`, `&#10;`) is
+/// kept. The schema documents read here are XML 1.0, whose rules
+/// [`XmlVersion::Implicit1_0`] selects.
+///
+/// # Errors
+///
+/// Fails on a value that is not UTF-8, names an entity that is not predefined,
+/// holds a character reference to no character (`&#0;`) or holds a bare `&`.
+/// Callers that collect attributes drop such an attribute.
+fn attribute_value<'a>(
+    attribute: &Attribute<'a>,
+) -> Result<std::borrow::Cow<'a, str>, quick_xml::Error> {
+    attribute.normalized_value(XmlVersion::Implicit1_0)
+}
+
 fn collect_attrs(e: &quick_xml::events::BytesStart<'_>) -> HashMap<String, String> {
     e.attributes()
         .with_checks(false)
         .flatten()
         .filter_map(|attr| {
             let key = std::str::from_utf8(attr.key.as_ref()).ok()?.to_string();
-            let val = attr.unescape_value().ok()?.to_string();
+            let val = attribute_value(&attr).ok()?.into_owned();
             Some((key, val))
         })
         .collect()
@@ -1067,8 +1096,7 @@ fn schema_location(
                 "resource_limit: schema_location_bytes: observed {observed} exceeds limit {max_bytes}"
             ));
         }
-        return attribute
-            .unescape_value()
+        return attribute_value(&attribute)
             .map(|value| Some(value.into_owned()))
             .map_err(|error| anyhow::anyhow!("invalid schemaLocation: {error}"));
     }
@@ -1081,8 +1109,8 @@ fn collect_xmlns(e: &quick_xml::events::BytesStart<'_>, ns_map: &mut HashMap<Str
             Ok(k) => k.to_string(),
             Err(_) => continue,
         };
-        let val = match attr.unescape_value() {
-            Ok(v) => v.to_string(),
+        let val = match attribute_value(&attr) {
+            Ok(v) => v.into_owned(),
             Err(_) => continue,
         };
         if key == "xmlns" {
