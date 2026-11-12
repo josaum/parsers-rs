@@ -31,7 +31,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Most memory one test binary may hold before it is aborted.
@@ -45,6 +45,14 @@ pub const ALLOCATION_CAP_BYTES: usize = 1 << 30;
 
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Set once the cap has tripped and its message is being written.
+///
+/// Writing to standard error can itself allocate (on macOS the first write
+/// allocates the stream's lock). Without this flag that allocation would trip
+/// the cap again from inside the report, and the process would die of a stack
+/// overflow with no message instead of naming the cap.
+static REPORTING_CAP: AtomicBool = AtomicBool::new(false);
+
 /// A global allocator that aborts the process once live memory passes
 /// [`ALLOCATION_CAP_BYTES`].
 ///
@@ -56,7 +64,10 @@ impl CappedAllocator {
         let live = LIVE_BYTES
             .fetch_add(size, Ordering::Relaxed)
             .saturating_add(size);
-        if live > ALLOCATION_CAP_BYTES {
+        // The first thread to pass the cap reports and aborts. An allocation
+        // made while it does so, by the report itself or by another thread, is
+        // let through: the process is about to end.
+        if live > ALLOCATION_CAP_BYTES && !REPORTING_CAP.swap(true, Ordering::SeqCst) {
             // `abort` does not allocate, so this is safe to call from inside
             // the allocator; a panic here would try to allocate its message.
             eprintln!(

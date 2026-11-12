@@ -56,9 +56,10 @@ use ooxml_archive::{
     parse_relationships, part_dir, rels_path_for_part, resolve_part, source_part_from_rels,
     OoxmlArchive, PartReader, RelEntry, Relationships,
 };
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::Reader;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, Cursor};
@@ -756,286 +757,293 @@ fn parse_presentation(
 }
 
 fn parse_slide<R: BufRead>(reader: R) -> Result<Slide> {
-    let mut reader = Reader::from_reader(reader);
-    reader.config_mut().trim_text(false);
-    let mut buf = Vec::new();
-    let mut slide = Slide {
-        id: 0,
-        name: None,
-        shapes: Vec::new(),
-        tables: Vec::new(),
-        notes: Vec::new(),
-    };
-    let mut current_shape: Option<ShapeText> = None;
-    let mut current_paragraph: Option<ParagraphBuilder> = None;
-    let mut current_run: Option<Run> = None;
-    let mut current_table: Option<TableBuilder> = None;
-    let mut in_text = false;
-    let mut in_table = false;
-    let mut in_cell = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"cSld" {
-                    if let Some(val) = attr_value(&reader, &e, b"name")? {
-                        slide.name = Some(val);
-                    }
-                } else if name == b"sp" {
-                    current_shape = Some(ShapeText {
-                        shape_id: None,
-                        name: None,
-                        placeholder: None,
-                        paragraphs: Vec::new(),
-                    });
-                } else if name == b"cNvPr" {
-                    if let Some(shape) = current_shape.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"id")? {
-                            shape.shape_id = val.parse::<u32>().ok();
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"name")? {
-                            shape.name = Some(val);
-                        }
-                    }
-                } else if name == b"ph" {
-                    if let Some(shape) = current_shape.as_mut() {
-                        shape.placeholder = attr_value(&reader, &e, b"type")?;
-                    }
-                } else if name == b"p" {
-                    current_paragraph = Some(ParagraphBuilder::default());
-                } else if name == b"pPr" {
-                    if let Some(p) = current_paragraph.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"lvl")? {
-                            p.level = val.parse::<u8>().ok();
-                        }
-                    }
-                } else if name == b"r" {
-                    current_run = Some(Run {
-                        text: String::new(),
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                    });
-                } else if name == b"rPr" {
-                    if let Some(run) = current_run.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"b")? {
-                            run.bold = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"i")? {
-                            run.italic = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"u")? {
-                            run.underline = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                    }
-                } else if name == b"t" {
-                    in_text = true;
-                } else if name == b"tbl" {
-                    in_table = true;
-                    current_table = Some(TableBuilder::default());
-                } else if name == b"tr" && in_table {
-                    if let Some(table) = current_table.as_mut() {
-                        table.rows.push(TableRowBuilder::default());
-                    }
-                } else if name == b"tc" && in_table {
-                    if let Some(table) = current_table.as_mut() {
-                        if let Some(row) = table.rows.last_mut() {
-                            row.cells.push(TableCell {
-                                text: String::new(),
-                            });
-                        }
-                    }
-                    in_cell = true;
-                }
-            }
-            Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"br" {
-                    if let Some(run) = current_run.as_mut() {
-                        run.text.push('\n');
-                    }
-                }
-            }
-            Ok(Event::Text(e)) => {
-                if in_text {
-                    let value = e.unescape()?.to_string();
-                    if in_table {
-                        if let Some(table) = current_table.as_mut() {
-                            if let Some(row) = table.rows.last_mut() {
-                                if in_cell {
-                                    if let Some(cell) = row.cells.last_mut() {
-                                        cell.text.push_str(&value);
-                                    }
-                                }
-                            }
-                        }
-                    } else if let Some(run) = current_run.as_mut() {
-                        run.text.push_str(&value);
-                    }
-                }
-            }
-            Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"t" {
-                    in_text = false;
-                } else if name == b"r" {
-                    if let Some(run) = current_run.take() {
-                        if let Some(p) = current_paragraph.as_mut() {
-                            if !run.text.is_empty() {
-                                p.runs.push(run);
-                            }
-                        }
-                    }
-                } else if name == b"p" {
-                    if let Some(p) = current_paragraph.take() {
-                        let paragraph = p.finish();
-                        if in_table {
-                            if let Some(table) = current_table.as_mut() {
-                                if let Some(row) = table.rows.last_mut() {
-                                    if let Some(cell) = row.cells.last_mut() {
-                                        cell.text.push_str(&paragraph.text);
-                                    }
-                                }
-                            }
-                        } else if let Some(shape) = current_shape.as_mut() {
-                            shape.paragraphs.push(paragraph);
-                        }
-                    }
-                } else if name == b"sp" {
-                    if let Some(shape) = current_shape.take() {
-                        if !shape.paragraphs.is_empty() {
-                            slide.shapes.push(shape);
-                        }
-                    }
-                } else if name == b"tbl" {
-                    in_table = false;
-                    if let Some(table) = current_table.take() {
-                        slide.tables.push(table.finish());
-                    }
-                } else if name == b"tc" {
-                    in_cell = false;
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(anyhow!("parse slide: {err}")),
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    Ok(slide)
+    read_slide_content(reader, SlidePart::Slide, "parse slide")
 }
 
 fn parse_notes<R: BufRead>(reader: R) -> Result<Vec<ShapeText>> {
+    Ok(read_slide_content(reader, SlidePart::Notes, "parse notes")?.shapes)
+}
+
+/// Which kind of part a [`SlideContent`] reader is walking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlidePart {
+    /// A slide, layout or master: shapes, tables, the slide name and
+    /// placeholder types.
+    Slide,
+    /// A notes slide: shapes only.
+    Notes,
+}
+
+fn read_slide_content<R: BufRead>(reader: R, part: SlidePart, context: &str) -> Result<Slide> {
     let mut reader = Reader::from_reader(reader);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
-    let mut shapes = Vec::new();
-    let mut current_shape: Option<ShapeText> = None;
-    let mut current_paragraph: Option<ParagraphBuilder> = None;
-    let mut current_run: Option<Run> = None;
-    let mut in_text = false;
+    let mut content = SlideContent::new(part);
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"sp" {
-                    current_shape = Some(ShapeText {
-                        shape_id: None,
-                        name: None,
-                        placeholder: None,
-                        paragraphs: Vec::new(),
-                    });
-                } else if name == b"cNvPr" {
-                    if let Some(shape) = current_shape.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"id")? {
-                            shape.shape_id = val.parse::<u32>().ok();
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"name")? {
-                            shape.name = Some(val);
-                        }
-                    }
-                } else if name == b"p" {
-                    current_paragraph = Some(ParagraphBuilder::default());
-                } else if name == b"pPr" {
-                    if let Some(p) = current_paragraph.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"lvl")? {
-                            p.level = val.parse::<u8>().ok();
-                        }
-                    }
-                } else if name == b"r" {
-                    current_run = Some(Run {
-                        text: String::new(),
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                    });
-                } else if name == b"rPr" {
-                    if let Some(run) = current_run.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"b")? {
-                            run.bold = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"i")? {
-                            run.italic = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"u")? {
-                            run.underline = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                    }
-                } else if name == b"t" {
-                    in_text = true;
-                }
+            Ok(Event::Start(e)) => content.open(&reader, &e)?,
+            // A self-closed element is an element without children: PowerPoint
+            // writes `cNvPr`, `ph`, `pPr`, `rPr` and `br` that way.
+            Ok(Event::Empty(e)) => {
+                content.open(&reader, &e)?;
+                content.close(local_name(e.name().into_inner()));
             }
-            Ok(Event::Text(e)) => {
-                if in_text {
-                    let value = e.unescape()?.to_string();
-                    if let Some(run) = current_run.as_mut() {
-                        run.text.push_str(&value);
+            Ok(event @ (Event::Text(_) | Event::CData(_))) => {
+                if content.in_text {
+                    if let Some(text) = character_data(&event) {
+                        content.text(&text);
                     }
                 }
             }
-            Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"t" {
-                    in_text = false;
-                } else if name == b"r" {
-                    if let Some(run) = current_run.take() {
-                        if let Some(p) = current_paragraph.as_mut() {
-                            if !run.text.is_empty() {
-                                p.runs.push(run);
-                            }
-                        }
-                    }
-                } else if name == b"p" {
-                    if let Some(p) = current_paragraph.take() {
-                        let paragraph = p.finish();
-                        if let Some(shape) = current_shape.as_mut() {
-                            shape.paragraphs.push(paragraph);
-                        }
-                    }
-                } else if name == b"sp" {
-                    if let Some(shape) = current_shape.take() {
-                        if !shape.paragraphs.is_empty() {
-                            shapes.push(shape);
-                        }
-                    }
-                }
-            }
+            Ok(Event::End(e)) => content.close(local_name(e.name().into_inner())),
             Ok(Event::Eof) => break,
-            Err(err) => return Err(anyhow!("parse notes: {err}")),
+            Err(err) => return Err(anyhow!("{context}: {err}")),
             _ => {}
         }
         buf.clear();
     }
 
-    Ok(shapes)
+    Ok(content.slide)
+}
+
+/// Reader state for the shape tree of a slide, layout, master or notes slide.
+///
+/// The output is flat (shapes and tables, never nested), so element nesting
+/// in the input costs no stack and no recursion.
+#[derive(Debug)]
+struct SlideContent {
+    part: SlidePart,
+    slide: Slide,
+    current_shape: Option<ShapeText>,
+    current_paragraph: Option<ParagraphBuilder>,
+    current_run: Option<Run>,
+    current_table: Option<TableBuilder>,
+    in_text: bool,
+    in_table: bool,
+    in_cell: bool,
+    /// The open table cell already holds a paragraph, so the next one starts
+    /// on a new line.
+    cell_has_paragraph: bool,
+}
+
+impl SlideContent {
+    fn new(part: SlidePart) -> Self {
+        Self {
+            part,
+            slide: Slide {
+                id: 0,
+                name: None,
+                shapes: Vec::new(),
+                tables: Vec::new(),
+                notes: Vec::new(),
+            },
+            current_shape: None,
+            current_paragraph: None,
+            current_run: None,
+            current_table: None,
+            in_text: false,
+            in_table: false,
+            in_cell: false,
+            cell_has_paragraph: false,
+        }
+    }
+
+    /// The table cell being filled, if the reader is inside one.
+    fn open_cell(&mut self) -> Option<&mut TableCell> {
+        if !self.in_cell {
+            return None;
+        }
+        self.current_table
+            .as_mut()
+            .and_then(|table| table.rows.last_mut())
+            .and_then(|row| row.cells.last_mut())
+    }
+
+    fn open<R: BufRead>(&mut self, reader: &Reader<R>, e: &BytesStart<'_>) -> Result<()> {
+        let is_slide = self.part == SlidePart::Slide;
+        match local_name(e.name().into_inner()) {
+            b"cSld" if is_slide => {
+                if let Some(val) = attr_value(reader, e, b"name")? {
+                    self.slide.name = Some(val);
+                }
+            }
+            b"sp" => {
+                self.current_shape = Some(ShapeText {
+                    shape_id: None,
+                    name: None,
+                    placeholder: None,
+                    paragraphs: Vec::new(),
+                });
+            }
+            b"cNvPr" => {
+                if let Some(shape) = self.current_shape.as_mut() {
+                    let [id, name] = attr_values(reader, e, [b"id", b"name"])?;
+                    if let Some(id) = id {
+                        shape.shape_id = id.parse::<u32>().ok();
+                    }
+                    if let Some(name) = name {
+                        shape.name = Some(name);
+                    }
+                }
+            }
+            b"ph" if is_slide => {
+                if let Some(shape) = self.current_shape.as_mut() {
+                    shape.placeholder = attr_value(reader, e, b"type")?;
+                }
+            }
+            b"p" => {
+                self.current_paragraph = Some(ParagraphBuilder::default());
+                // Paragraphs of one cell are lines of its text; without the
+                // separator "Total" and "Revenue" read as "TotalRevenue".
+                let follows_a_paragraph = self.cell_has_paragraph;
+                if let Some(cell) = self.open_cell() {
+                    if follows_a_paragraph {
+                        cell.text.push('\n');
+                    }
+                    self.cell_has_paragraph = true;
+                }
+            }
+            // A field carries its own `pPr`; only the paragraph's own counts.
+            b"pPr" if self.current_run.is_none() => {
+                if let Some(p) = self.current_paragraph.as_mut() {
+                    if let Some(val) = attr_value(reader, e, b"lvl")? {
+                        p.level = val.parse::<u8>().ok();
+                    }
+                }
+            }
+            // A field (`fld`: slide number, date) is a run whose text is the
+            // value PowerPoint last rendered.
+            b"r" | b"fld" => {
+                self.current_run = Some(Run {
+                    text: String::new(),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                });
+            }
+            b"rPr" => {
+                if let Some(run) = self.current_run.as_mut() {
+                    let [bold, italic, underline] = attr_values(reader, e, [b"b", b"i", b"u"])?;
+                    if let Some(val) = bold {
+                        run.bold = is_true(&val);
+                    }
+                    if let Some(val) = italic {
+                        run.italic = is_true(&val);
+                    }
+                    // `u` is an underline style (`sng`, `dbl`, ...), not a
+                    // boolean; every value but `none` underlines.
+                    if let Some(val) = underline {
+                        run.underline = val != "none";
+                    }
+                }
+            }
+            b"t" => self.in_text = true,
+            b"br" => self.line_break(),
+            b"tbl" if is_slide => {
+                self.in_table = true;
+                self.in_cell = false;
+                self.current_table = Some(TableBuilder::default());
+            }
+            b"tr" if is_slide && self.in_table => {
+                if let Some(table) = self.current_table.as_mut() {
+                    table.rows.push(TableRowBuilder::default());
+                }
+            }
+            b"tc" if is_slide && self.in_table => {
+                if let Some(row) = self
+                    .current_table
+                    .as_mut()
+                    .and_then(|table| table.rows.last_mut())
+                {
+                    row.cells.push(TableCell {
+                        text: String::new(),
+                    });
+                }
+                self.in_cell = true;
+                self.cell_has_paragraph = false;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Records a vertical line break (`a:br`), a sibling of the runs.
+    fn line_break(&mut self) {
+        if self.in_table {
+            if let Some(cell) = self.open_cell() {
+                cell.text.push('\n');
+            }
+        } else if let Some(run) = self.current_run.as_mut() {
+            run.text.push('\n');
+        } else if let Some(p) = self.current_paragraph.as_mut() {
+            p.runs.push(Run {
+                text: "\n".to_string(),
+                bold: false,
+                italic: false,
+                underline: false,
+            });
+        }
+    }
+
+    /// Appends character data found inside `a:t`.
+    fn text(&mut self, value: &str) {
+        if self.in_table {
+            // Table text is collected per cell, not per run.
+            if let Some(cell) = self.open_cell() {
+                cell.text.push_str(value);
+            }
+        } else if let Some(run) = self.current_run.as_mut() {
+            run.text.push_str(value);
+        }
+    }
+
+    fn close(&mut self, name: &[u8]) {
+        let is_slide = self.part == SlidePart::Slide;
+        match name {
+            b"t" => self.in_text = false,
+            b"r" | b"fld" => {
+                if let Some(run) = self.current_run.take() {
+                    if let Some(p) = self.current_paragraph.as_mut() {
+                        if !run.text.is_empty() {
+                            p.runs.push(run);
+                        }
+                    }
+                }
+            }
+            b"p" => {
+                if let Some(p) = self.current_paragraph.take() {
+                    // Inside a table the text already went to the cell.
+                    if !self.in_table {
+                        if let Some(shape) = self.current_shape.as_mut() {
+                            shape.paragraphs.push(p.finish());
+                        }
+                    }
+                }
+            }
+            b"sp" => {
+                if let Some(shape) = self.current_shape.take() {
+                    if !shape.paragraphs.is_empty() {
+                        self.slide.shapes.push(shape);
+                    }
+                }
+            }
+            b"tbl" if is_slide => {
+                self.in_table = false;
+                self.in_cell = false;
+                if let Some(table) = self.current_table.take() {
+                    self.slide.tables.push(table.finish());
+                }
+            }
+            b"tc" if is_slide => self.in_cell = false,
+            _ => {}
+        }
+    }
+}
+
+/// Whether an `xsd:boolean` attribute value is true.
+fn is_true(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true")
 }
 
 fn parse_comment_authors(
@@ -1094,8 +1102,10 @@ fn parse_comments(xml: &[u8], authors: &HashMap<u32, String>) -> Result<Vec<Comm
     let mut in_text = false;
 
     loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
+        let event = reader.read_event_into(&mut buf);
+        let self_closed = matches!(event, Ok(Event::Empty(_)));
+        match event {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 let raw = e.name().as_ref().to_vec();
                 let name = local_name(&raw);
                 if name == b"cm" {
@@ -1122,33 +1132,42 @@ fn parse_comments(xml: &[u8], authors: &HashMap<u32, String>) -> Result<Vec<Comm
                         }
                     }
                     let author = author_id.and_then(|id| authors.get(&id).cloned());
-                    current = Some(Comment {
+                    let comment = Comment {
                         id,
                         author,
                         date,
                         text: None,
                         slide_id: 0,
-                    });
-                } else if name == b"t" {
+                    };
+                    if self_closed {
+                        comments.push(comment);
+                    } else {
+                        current = Some(comment);
+                    }
+                // Legacy comments hold their text in `p:text`, modern ones
+                // in DrawingML runs (`a:t`).
+                } else if !self_closed && (name == b"t" || name == b"text") {
                     in_text = true;
                 }
             }
-            Ok(Event::Text(e)) => {
+            Ok(event @ (Event::Text(_) | Event::CData(_))) => {
                 if in_text {
-                    let value = e.unescape()?.to_string();
-                    if let Some(comment) = current.as_mut() {
-                        let mut text = comment.text.take().unwrap_or_default();
-                        text.push_str(&value);
-                        comment.text = Some(text);
+                    if let (Some(comment), Some(value)) = (current.as_mut(), character_data(&event))
+                    {
+                        comment
+                            .text
+                            .get_or_insert_with(String::new)
+                            .push_str(&value);
                     }
                 }
             }
             Ok(Event::End(e)) => {
                 let raw = e.name().as_ref().to_vec();
                 let name = local_name(&raw);
-                if name == b"t" {
+                if name == b"t" || name == b"text" {
                     in_text = false;
                 } else if name == b"cm" {
+                    in_text = false;
                     if let Some(comment) = current.take() {
                         comments.push(comment);
                     }
@@ -1191,9 +1210,8 @@ fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                 let key = local_name(&raw);
                 current_key = Some(String::from_utf8_lossy(key).to_string());
             }
-            Ok(Event::Text(e)) => {
-                if let Some(key) = current_key.take() {
-                    let value = e.unescape()?.to_string();
+            Ok(event @ (Event::Text(_) | Event::CData(_))) => {
+                if let (Some(key), Some(value)) = (current_key.take(), character_data(&event)) {
                     if !value.is_empty() {
                         out.insert(key, normalize_datetime(&value));
                     }
@@ -1232,9 +1250,8 @@ fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                     }
                 }
             }
-            Ok(Event::Text(e)) => {
-                if let Some(name) = current_name.take() {
-                    let value = e.unescape()?.to_string();
+            Ok(event @ (Event::Text(_) | Event::CData(_))) => {
+                if let (Some(name), Some(value)) = (current_name.take(), character_data(&event)) {
                     if !value.is_empty() {
                         out.insert(name, normalize_datetime(&value));
                     }
@@ -1416,6 +1433,57 @@ fn attr_value<R: BufRead>(
         }
     }
     Ok(None)
+}
+
+/// Reads several attributes in one pass over the start tag.
+///
+/// Returns the values in the order of `keys`, matched by local name; the
+/// first occurrence of a name wins, as with [`attr_value`]. One pass matters:
+/// every walk of a tag's attributes costs time quadratic in their number.
+fn attr_values<R: BufRead, const N: usize>(
+    reader: &Reader<R>,
+    e: &BytesStart<'_>,
+    keys: [&[u8]; N],
+) -> Result<[Option<String>; N]> {
+    let mut values: [Option<String>; N] = std::array::from_fn(|_| None);
+    for attr in e.attributes().flatten() {
+        let key = local_name(attr.key.as_ref());
+        if let Some(slot) = keys.iter().position(|candidate| *candidate == key) {
+            if values[slot].is_none() {
+                values[slot] = Some(
+                    attr.decode_and_unescape_value(reader.decoder())?
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(values)
+}
+
+/// Decodes a text event leniently.
+///
+/// A stray non-UTF-8 byte becomes U+FFFD and an unknown entity is kept as
+/// written, so one bad character costs that character rather than the whole
+/// presentation.
+fn text_event_str<'a>(event: &'a BytesText<'_>) -> Cow<'a, str> {
+    let raw = String::from_utf8_lossy(event);
+    let unescaped = match quick_xml::escape::unescape(&raw) {
+        Ok(Cow::Owned(text)) => Some(text),
+        // Nothing to unescape, or an entity this parser does not know.
+        Ok(Cow::Borrowed(_)) | Err(_) => None,
+    };
+    unescaped.map_or(raw, Cow::Owned)
+}
+
+/// Returns the character data of a text or CDATA event, `None` for any other.
+///
+/// CDATA is literal character data: it is decoded, never entity-unescaped.
+fn character_data<'a>(event: &'a Event<'_>) -> Option<Cow<'a, str>> {
+    match event {
+        Event::Text(text) => Some(text_event_str(text)),
+        Event::CData(data) => Some(String::from_utf8_lossy(data)),
+        _ => None,
+    }
 }
 
 fn local_name(name: &[u8]) -> &[u8] {

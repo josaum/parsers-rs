@@ -134,6 +134,65 @@ pub struct HyperspectralMetadata {
     pub bbox: Option<BBox>,
 }
 
+/// Where the pixels of one band lie in a cube's pixel data.
+///
+/// The pixel at (`line`, `sample`) starts at
+/// `first + line * line_stride + sample * sample_stride`.
+struct BandLayout {
+    /// Offset of the band's first pixel.
+    first: usize,
+    /// Bytes from a pixel to the one below it.
+    line_stride: usize,
+    /// Bytes from a pixel to the one on its right.
+    sample_stride: usize,
+    /// One past the last byte of the band's last pixel.
+    end: usize,
+}
+
+impl BandLayout {
+    /// Computes the layout of band `band_index`.
+    ///
+    /// Returns `None` when a position does not fit in `usize`, which no data
+    /// in memory can satisfy. `metadata.lines` and `metadata.samples` must be
+    /// non-zero.
+    fn new(metadata: &HyperspectralMetadata, band_index: u32) -> Option<Self> {
+        let element = metadata.data_type.byte_size();
+        let lines = usize::try_from(metadata.lines).ok()?;
+        let samples = usize::try_from(metadata.samples).ok()?;
+        let bands = usize::try_from(metadata.bands).ok()?;
+        let band = usize::try_from(band_index).ok()?;
+
+        let row = samples.checked_mul(element)?;
+        let (first, line_stride, sample_stride) = match metadata.interleave {
+            // All of band 0, then all of band 1, …
+            Interleave::Bsq => (band.checked_mul(lines)?.checked_mul(row)?, row, element),
+            // Line 0 of every band, then line 1 of every band, …
+            Interleave::Bil => (band.checked_mul(row)?, bands.checked_mul(row)?, element),
+            // Every band of pixel 0, then every band of pixel 1, …
+            Interleave::Bip => {
+                let pixel = bands.checked_mul(element)?;
+                (
+                    band.checked_mul(element)?,
+                    samples.checked_mul(pixel)?,
+                    pixel,
+                )
+            }
+        };
+        let end = lines
+            .checked_sub(1)?
+            .checked_mul(line_stride)?
+            .checked_add(samples.checked_sub(1)?.checked_mul(sample_stride)?)?
+            .checked_add(first)?
+            .checked_add(element)?;
+        Some(Self {
+            first,
+            line_stride,
+            sample_stride,
+            end,
+        })
+    }
+}
+
 /// Parser for ENVI hyperspectral headers and band data.
 pub struct HyperspectralParser;
 
@@ -236,6 +295,15 @@ impl HyperspectralParser {
     /// Read a single band from BSQ/BIL/BIP interleaved binary data.
     ///
     /// Returns pixel values as `Vec<f32>` (converted from the native type).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeoError::InvalidFormat`] when `band_index` is out of range,
+    /// or when `data` is too short to hold every pixel of that band at the
+    /// header's offset, dimensions and interleave. The dimensions come from
+    /// the header, so they are checked against `data` before any output is
+    /// allocated. Returns [`GeoError::UnsupportedFormat`] for complex pixel
+    /// types.
     pub fn read_band(
         data: &[u8],
         metadata: &HyperspectralMetadata,
@@ -247,62 +315,61 @@ impl HyperspectralParser {
                 band_index, metadata.bands
             )));
         }
+        if matches!(
+            metadata.data_type,
+            EnviDataType::ComplexF32 | EnviDataType::ComplexF64
+        ) {
+            return Err(GeoError::UnsupportedFormat(format!(
+                "Reading {:?} pixel data not yet implemented",
+                metadata.data_type
+            )));
+        }
 
-        let elem_size = metadata.data_type.byte_size();
-        let pixels_per_band = (metadata.lines * metadata.samples) as usize;
-        let offset = metadata.header_offset as usize;
         let big_endian = metadata.byte_order == 1;
+        let data = usize::try_from(metadata.header_offset)
+            .ok()
+            .and_then(|offset| data.get(offset..))
+            .ok_or_else(|| {
+                GeoError::InvalidFormat(format!(
+                    "ENVI header offset {} is beyond the {} bytes of data",
+                    metadata.header_offset,
+                    data.len()
+                ))
+            })?;
 
-        let data = &data[offset..];
+        let lines = metadata.lines as usize;
+        let samples = metadata.samples as usize;
+        if lines == 0 || samples == 0 {
+            return Ok(Vec::new());
+        }
+        let layout = BandLayout::new(metadata, band_index)
+            .filter(|layout| layout.end <= data.len())
+            .ok_or_else(|| {
+                GeoError::InvalidFormat(format!(
+                    "ENVI band {band_index} of a {}x{}x{} {} cube does not fit in {} bytes of \
+                     pixel data",
+                    metadata.samples,
+                    metadata.lines,
+                    metadata.bands,
+                    metadata.interleave.as_str(),
+                    data.len()
+                ))
+            })?;
 
-        let mut result = Vec::with_capacity(pixels_per_band);
-
-        match metadata.interleave {
-            Interleave::Bsq => {
-                // Band sequential: band_index * lines * samples * elem_size
-                let band_start = band_index as usize * pixels_per_band * elem_size;
-                for i in 0..pixels_per_band {
-                    let pos = band_start + i * elem_size;
-                    result.push(Self::read_pixel(
-                        data,
-                        pos,
-                        &metadata.data_type,
-                        big_endian,
-                    )?);
-                }
-            }
-            Interleave::Bil => {
-                // Band interleaved by line
-                let samples = metadata.samples as usize;
-                let bands = metadata.bands as usize;
-                let bi = band_index as usize;
-                for line in 0..metadata.lines as usize {
-                    let line_start = line * bands * samples * elem_size;
-                    let band_start = line_start + bi * samples * elem_size;
-                    for s in 0..samples {
-                        let pos = band_start + s * elem_size;
-                        result.push(Self::read_pixel(
-                            data,
-                            pos,
-                            &metadata.data_type,
-                            big_endian,
-                        )?);
-                    }
-                }
-            }
-            Interleave::Bip => {
-                // Band interleaved by pixel
-                let bands = metadata.bands as usize;
-                let bi = band_index as usize;
-                for pixel in 0..pixels_per_band {
-                    let pos = (pixel * bands + bi) * elem_size;
-                    result.push(Self::read_pixel(
-                        data,
-                        pos,
-                        &metadata.data_type,
-                        big_endian,
-                    )?);
-                }
+        // Every pixel of the band lies below `layout.end`, which is inside
+        // `data`: the positions below cannot overflow, and `lines * samples`
+        // pixels of at least one byte each cannot outnumber the bytes of data.
+        let mut result = Vec::with_capacity(lines * samples);
+        for line in 0..lines {
+            let line_start = layout.first + line * layout.line_stride;
+            for sample in 0..samples {
+                let pos = line_start + sample * layout.sample_stride;
+                result.push(Self::read_pixel(
+                    data,
+                    pos,
+                    &metadata.data_type,
+                    big_endian,
+                )?);
             }
         }
 
@@ -459,14 +526,15 @@ impl HyperspectralParser {
         data_type: &EnviDataType,
         big_endian: bool,
     ) -> Result<f32, GeoError> {
-        let end = pos + data_type.byte_size();
-        if end > data.len() {
-            return Err(GeoError::InvalidFormat(format!(
-                "Read past end of data at offset {pos} (data len {})",
-                data.len()
-            )));
-        }
-        let bytes = &data[pos..end];
+        let bytes = pos
+            .checked_add(data_type.byte_size())
+            .and_then(|end| data.get(pos..end))
+            .ok_or_else(|| {
+                GeoError::InvalidFormat(format!(
+                    "Read past end of data at offset {pos} (data len {})",
+                    data.len()
+                ))
+            })?;
 
         let val: f32 = match data_type {
             EnviDataType::U8 => bytes[0] as f32,
