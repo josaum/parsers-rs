@@ -17,17 +17,24 @@ use crate::types::BBox;
 /// A layer description extracted from a WMS `GetCapabilities` response.
 #[derive(Debug, Clone)]
 pub struct WmsLayer {
+    /// Layer identifier, the value a `GetMap` request passes in `LAYERS`.
     pub name: String,
+    /// Human-readable layer title.
     pub title: String,
+    /// Coordinate reference systems the server offers the layer in.
     pub crs_list: Vec<String>,
+    /// Geographic extent of the layer, when the server declares one.
     pub bbox: Option<BBox>,
 }
 
 /// WMS client.
 #[derive(Debug, Clone)]
 pub struct WmsClient {
+    /// Service endpoint, without query parameters.
     pub base_url: String,
+    /// Layer names requested in `LAYERS`.
     pub layers: Vec<String>,
+    /// Coordinate reference system requested, such as `EPSG:4326`.
     pub crs: String,
     client: Client,
 }
@@ -130,6 +137,13 @@ impl WmsClient {
 
 // ── XML capabilities parser ───────────────────────────────────────────────────
 
+/// Reads the named layers out of a WMS `GetCapabilities` document.
+///
+/// A layer without a `<Name>` is a grouping node and is not returned.
+///
+/// # Errors
+///
+/// Returns [`GeoError`] when `xml` is not well-formed.
 pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -228,9 +242,7 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                 capture_name = false;
                 capture_title = false;
                 capture_crs = false;
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
             }
             Ok(Event::Eof) => break,
             Err(e) => {

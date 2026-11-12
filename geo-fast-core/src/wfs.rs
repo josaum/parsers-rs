@@ -17,7 +17,9 @@ use crate::types::{BBox, GeoFeature};
 /// WFS client.
 #[derive(Debug, Clone)]
 pub struct WfsClient {
+    /// Service endpoint, without query parameters.
     pub base_url: String,
+    /// Feature type requested in `TYPENAMES`.
     pub type_name: String,
     client: Client,
 }
