@@ -236,18 +236,74 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
 /// Returns [`GeoError::Io`] when the file cannot be opened,
 /// [`GeoError::Tiff`] or [`GeoError::InvalidFormat`] when it is not a TIFF
 /// the decoder can read, and [`GeoError::UnsupportedFormat`] for 64-bit
-/// integer samples and for a raster of several bands stored as separate
-/// planes (`PlanarConfiguration` 2).
+/// integer samples, for a raster of several bands stored as separate
+/// planes (`PlanarConfiguration` 2), and for a raster whose bands would take
+/// more than 512 MiB as `f32` (134,217,728 samples across all bands).
 pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, GeoError> {
     let file = std::fs::File::open(path.as_ref()).map_err(GeoError::Io)?;
-    let mut decoder = open_decoder(BufReader::new(file))?;
+    read_bands(BufReader::new(file), max_band_bytes())
+}
+
+/// Bytes of band data returned per byte of raster the decoder may decode.
+///
+/// The decoder caps the raster it decodes (`Limits::decoding_buffer_size`,
+/// 256 MiB by default), but the bands are `f32` whatever the samples were,
+/// so an 8-bit raster at that cap would become four times as large again: a
+/// file of a few hundred kilobytes of constant pixels asked for 1 GiB. Two
+/// is the factor of a 16-bit raster, so every 16-, 32- and 64-bit raster the
+/// decoder accepts still fits, among them a 10980×10980 16-bit satellite
+/// band. An 8-bit raster fits up to half the decoder's cap, 128 MiB of
+/// samples.
+const BAND_BYTES_PER_DECODED_BYTE: usize = 2;
+
+/// Most bytes of `f32` band data [`parse_geotiff_bands`] returns.
+///
+/// [`BAND_BYTES_PER_DECODED_BYTE`] times the decoder's own raster cap: 512
+/// MiB, or 134,217,728 samples across all bands.
+fn max_band_bytes() -> usize {
+    Limits::default()
+        .decoding_buffer_size
+        .saturating_mul(BAND_BYTES_PER_DECODED_BYTE)
+}
+
+/// Checks that the bands of a raster fit in `max_band_bytes` as `f32`.
+///
+/// # Errors
+///
+/// Returns [`GeoError::UnsupportedFormat`] when `width` × `height` × `bands`
+/// samples of four bytes each exceed `max_band_bytes` or overflow.
+fn check_band_bytes(
+    width: u32,
+    height: u32,
+    bands: u16,
+    max_band_bytes: usize,
+) -> Result<(), GeoError> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(u64::from(bands)))
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64));
+    let limit = u64::try_from(max_band_bytes).unwrap_or(u64::MAX);
+    match bytes {
+        Some(bytes) if bytes <= limit => Ok(()),
+        _ => Err(GeoError::UnsupportedFormat(format!(
+            "GeoTIFF raster of {width}x{height} pixels in {bands} bands needs more than \
+             the {max_band_bytes} bytes of band data this reader returns"
+        ))),
+    }
+}
+
+/// Reads the bands of a TIFF, returning at most `max_band_bytes` of them.
+///
+/// The size is checked from the header, before anything is decoded.
+fn read_bands<R: Read + Seek>(reader: R, max_band_bytes: usize) -> Result<Vec<Vec<f32>>, GeoError> {
+    let mut decoder = open_decoder(reader)?;
 
     let (width, height) = decoder
         .dimensions()
         .map_err(|e| GeoError::Tiff(e.to_string()))?;
     let n_pixels = pixel_count(width, height)?;
-    // Refuses the layout whose bands the decoder would not all return.
-    band_count(&mut decoder)?;
+    let bands = band_count(&mut decoder)?;
+    check_band_bytes(width, height, bands, max_band_bytes)?;
 
     let result = decoder
         .read_image()
@@ -294,7 +350,7 @@ const PLANAR_CONFIGURATION_SEPARATE: u16 = 2;
 /// band stored a plane per band: the decoder reads the first plane only, and
 /// handing that back would drop the other bands without a word. Returns
 /// [`GeoError::Tiff`] when either tag cannot be read.
-fn band_count<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<usize, GeoError> {
+fn band_count<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<u16, GeoError> {
     let samples = decoder
         .find_tag_unsigned::<u16>(Tag::SamplesPerPixel)
         .map_err(|e| GeoError::Tiff(e.to_string()))?
@@ -308,7 +364,7 @@ fn band_count<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<usize, GeoErro
              (PlanarConfiguration 2); only pixel-interleaved bands are read"
         )));
     }
-    Ok(usize::from(samples))
+    Ok(samples)
 }
 
 /// Opens a TIFF decoder whose allocation limits follow the size of the input.
@@ -1192,5 +1248,44 @@ mod tests {
             matches!(&error, GeoError::UnsupportedFormat(message) if message.contains("3 bands")),
             "{error}"
         );
+    }
+
+    /// The decoder caps the raster it decodes at 256 MiB, but nothing capped
+    /// the `f32` bands made from it: a small, highly compressed 8-bit file
+    /// decoding to that cap went on to allocate four times as much.
+    #[test]
+    fn bands_larger_than_the_output_limit_are_refused_before_decoding() {
+        // 4×4 RGB: 48 samples, 192 bytes as f32.
+        let rgb = raster::<colortype::RGB8>(4, 4, &[7u8; 48]);
+        let bands = read_bands(Cursor::new(rgb.clone()), 192).expect("at the limit");
+        assert_eq!(bands.len(), 3);
+        assert!(bands.iter().all(|band| band.len() == 16));
+        let error = read_bands(Cursor::new(rgb), 191).expect_err("one byte over");
+        assert!(
+            matches!(&error, GeoError::UnsupportedFormat(message)
+                if message.contains("4x4") && message.contains("3 bands") && message.contains("191")),
+            "{error}"
+        );
+        // A float raster is as large decoded as returned, and is held to
+        // the same limit.
+        let float = raster::<colortype::Gray32Float>(2, 2, &[0.5f32; 4]);
+        assert!(read_bands(Cursor::new(float.clone()), 16).is_ok());
+        assert!(read_bands(Cursor::new(float), 15).is_err());
+    }
+
+    #[test]
+    fn output_limit_admits_every_16_bit_raster_the_decoder_accepts() {
+        let limit = max_band_bytes();
+        assert_eq!(limit, 512 * 1024 * 1024);
+        // A 10980×10980 16-bit satellite band: 230 MiB decoded, 460 MiB out.
+        assert!(check_band_bytes(10_980, 10_980, 1, limit).is_ok());
+        // The largest single band, and one row more.
+        assert!(check_band_bytes(16_384, 8_192, 1, limit).is_ok());
+        assert!(check_band_bytes(16_384, 8_193, 1, limit).is_err());
+        // The bands count: three of 8192×8192 are 768 MiB.
+        assert!(check_band_bytes(8_192, 8_192, 2, limit).is_ok());
+        assert!(check_band_bytes(8_192, 8_192, 3, limit).is_err());
+        // Dimensions whose product overflows are refused, not wrapped.
+        assert!(check_band_bytes(u32::MAX, u32::MAX, u16::MAX, usize::MAX).is_err());
     }
 }
