@@ -529,7 +529,7 @@ fn parse_header_footer_refs<R: BufRead>(reader: R) -> Result<Vec<HeaderFooterRef
                 if name == b"headerReference" || name == b"footerReference" {
                     let mut rel_id = None;
                     let mut ref_type = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key_raw = attr.key.as_ref();
                         let key = local_name(key_raw);
                         if key_raw == b"r:id" || key == b"id" {
@@ -1056,7 +1056,7 @@ fn parse_settings(archive: &DocxArchive, max_inflate: usize) -> Result<HashMap<S
                 }
                 let mut value = None;
                 let mut attrs = Vec::new();
-                for attr in e.attributes().flatten() {
+                for attr in e.attributes().with_checks(false).flatten() {
                     let key = local_name(attr.key.as_ref());
                     let val = attr
                         .decode_and_unescape_value(reader.decoder())?
@@ -1129,7 +1129,7 @@ fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
             Ok(Event::Start(e)) => {
                 let raw = e.name().as_ref().to_vec();
                 if local_name(&raw) == b"property" {
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         if local_name(attr.key.as_ref()) == b"name" {
                             current_name = Some(
                                 attr.decode_and_unescape_value(reader.decoder())?
@@ -1191,7 +1191,7 @@ fn parse_styles(xml: &[u8]) -> Result<Vec<Style>> {
                         is_default: false,
                         is_qformat: false,
                     };
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"styleId" {
                             style.id = attr
@@ -1437,7 +1437,7 @@ fn parse_comments(xml: &[u8], styles: &[Style]) -> Result<Vec<Comment>> {
                         parent_id: None,
                         blocks: Vec::new(),
                     };
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"id" {
                             comment.id = attr
@@ -1522,7 +1522,7 @@ fn apply_extended_comments(comments: &mut [Comment], xml: &[u8]) -> Result<()> {
                 if local_name(&raw) == b"comment" {
                     let mut current_id: Option<i32> = None;
                     let mut parent_id: Option<i32> = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"id" {
                             current_id = attr
@@ -1661,7 +1661,7 @@ fn parse_content_types(
                 if name == b"Default" {
                     let mut ext = None;
                     let mut ct = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"Extension" {
                             ext = Some(
@@ -1681,7 +1681,7 @@ fn parse_content_types(
                 } else if name == b"Override" {
                     let mut part_name = None;
                     let mut ct = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"PartName" {
                             part_name = Some(
@@ -1744,7 +1744,7 @@ fn attr_value<R: BufRead>(
     e: &quick_xml::events::BytesStart<'_>,
     key: &[u8],
 ) -> Result<Option<String>> {
-    for attr in e.attributes().flatten() {
+    for attr in e.attributes().with_checks(false).flatten() {
         if local_name(attr.key.as_ref()) == key {
             return Ok(Some(
                 attr.decode_and_unescape_value(reader.decoder())?
@@ -1992,7 +1992,7 @@ impl<'a> DocxBodyParser<'a> {
         match name {
             b"p" => {
                 let mut paragraph = ParagraphBuilder::default();
-                for attr in e.attributes().flatten() {
+                for attr in e.attributes().with_checks(false).flatten() {
                     if local_name(attr.key.as_ref()) == b"paraId" {
                         paragraph.id = Some(
                             attr.decode_and_unescape_value(reader.decoder())?
@@ -2167,7 +2167,7 @@ impl<'a> DocxBodyParser<'a> {
                     author: None,
                     date: None,
                 };
-                for attr in e.attributes().flatten() {
+                for attr in e.attributes().with_checks(false).flatten() {
                     let key = local_name(attr.key.as_ref());
                     if key == b"id" {
                         info.id = attr

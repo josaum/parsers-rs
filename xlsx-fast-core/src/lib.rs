@@ -893,7 +893,7 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
                 let qname = e.name();
                 let name = local_name(qname.as_ref());
                 if name == b"workbookPr" {
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         if local_name(attr.key.as_ref()) == b"date1904" {
                             let value = attr
                                 .decode_and_unescape_value(reader.decoder())?
@@ -903,7 +903,7 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
                     }
                 } else if name == b"sheet" {
                     let mut sheet = SheetInfo::default();
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key_raw = attr.key;
                         let key = local_name(key_raw.as_ref());
                         if key == b"name" {
@@ -1024,7 +1024,7 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
                 if name == b"numFmt" {
                     let mut id = None;
                     let mut code = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key_raw = attr.key;
                         let key = local_name(key_raw.as_ref());
                         if key == b"numFmtId" {
@@ -1044,7 +1044,7 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
                     in_cell_xfs = true;
                 } else if in_cell_xfs && name == b"xf" {
                     let mut num_fmt_id = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         if local_name(attr.key.as_ref()) == b"numFmtId" {
                             let value = attr.decode_and_unescape_value(reader.decoder())?;
                             num_fmt_id = lexical_core::parse::<u32>(value.as_bytes()).ok();
@@ -1230,7 +1230,7 @@ where
                         let mut cell_ref_col: u32 = 0;
                         let mut has_cell_ref = false;
                         let mut invalid_cell_ref = false;
-                        for attr in e.attributes().flatten() {
+                        for attr in e.attributes().with_checks(false).flatten() {
                             let key_raw = attr.key;
                             let key = local_name(key_raw.as_ref());
                             if key == b"r" {
@@ -1482,7 +1482,7 @@ const EXCEL_ROWS: std::ops::RangeInclusive<u32> = 1..=1_048_576;
 /// `r` is optional: without it the row is the one after `previous`. A present
 /// but unreadable `r` yields 0, which no worksheet row has.
 fn row_index(element: &BytesStart<'_>, decoder: quick_xml::Decoder, previous: u32) -> Result<u32> {
-    for attr in element.attributes().flatten() {
+    for attr in element.attributes().with_checks(false).flatten() {
         if attr.key.as_ref() == b"r" {
             let value = attr.decode_and_unescape_value(decoder)?;
             return Ok(lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0));
@@ -1500,7 +1500,7 @@ fn empty_cell_column(
     decoder: quick_xml::Decoder,
     col_cursor: u32,
 ) -> Result<u32> {
-    for attr in element.attributes().flatten() {
+    for attr in element.attributes().with_checks(false).flatten() {
         if local_name(attr.key.as_ref()) == b"r" {
             let value = attr.decode_and_unescape_value(decoder)?;
             return Ok(parse_cell_ref(value.as_ref()).map_or(0, |(_, col)| col));

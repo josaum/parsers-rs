@@ -691,7 +691,7 @@ fn parse_presentation(
                 if name == b"sldId" {
                     let mut id = 0u32;
                     let mut rid = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let raw = attr.key.as_ref();
                         if raw == b"id" {
                             id = attr
@@ -710,7 +710,7 @@ fn parse_presentation(
                     }
                 } else if name == b"sldMasterId" {
                     let mut rid = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         if attr.key.as_ref() == b"r:id" {
                             rid = Some(
                                 attr.decode_and_unescape_value(reader.decoder())?
@@ -728,7 +728,7 @@ fn parse_presentation(
                     }
                 } else if name == b"sldLayoutId" {
                     let mut rid = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         if attr.key.as_ref() == b"r:id" {
                             rid = Some(
                                 attr.decode_and_unescape_value(reader.decoder())?
@@ -1065,7 +1065,7 @@ fn parse_comment_authors(
                 if local_name(&raw) == b"cmAuthor" {
                     let mut id = None;
                     let mut name = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"id" {
                             id = attr
@@ -1112,7 +1112,7 @@ fn parse_comments(xml: &[u8], authors: &HashMap<u32, String>) -> Result<Vec<Comm
                     let mut id = 0u32;
                     let mut author_id = None;
                     let mut date = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"idx" || key == b"id" {
                             id = attr
@@ -1240,7 +1240,7 @@ fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
             Ok(Event::Start(e)) => {
                 let raw = e.name().as_ref().to_vec();
                 if local_name(&raw) == b"property" {
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         if local_name(attr.key.as_ref()) == b"name" {
                             current_name = Some(
                                 attr.decode_and_unescape_value(reader.decoder())?
@@ -1341,7 +1341,7 @@ fn parse_content_types(
                 if name == b"Default" {
                     let mut ext = None;
                     let mut ct = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"Extension" {
                             ext = Some(
@@ -1361,7 +1361,7 @@ fn parse_content_types(
                 } else if name == b"Override" {
                     let mut part_name = None;
                     let mut ct = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"PartName" {
                             part_name = Some(
@@ -1424,7 +1424,7 @@ fn attr_value<R: BufRead>(
     e: &quick_xml::events::BytesStart<'_>,
     key: &[u8],
 ) -> Result<Option<String>> {
-    for attr in e.attributes().flatten() {
+    for attr in e.attributes().with_checks(false).flatten() {
         if local_name(attr.key.as_ref()) == key {
             return Ok(Some(
                 attr.decode_and_unescape_value(reader.decoder())?
@@ -1446,7 +1446,7 @@ fn attr_values<R: BufRead, const N: usize>(
     keys: [&[u8]; N],
 ) -> Result<[Option<String>; N]> {
     let mut values: [Option<String>; N] = std::array::from_fn(|_| None);
-    for attr in e.attributes().flatten() {
+    for attr in e.attributes().with_checks(false).flatten() {
         let key = local_name(attr.key.as_ref());
         if let Some(slot) = keys.iter().position(|candidate| *candidate == key) {
             if values[slot].is_none() {

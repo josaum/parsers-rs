@@ -364,7 +364,7 @@ pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
                 let mut id = None;
                 let mut rel_type = None;
                 let mut target = None;
-                for attr in e.attributes().flatten() {
+                for attr in e.attributes().with_checks(false).flatten() {
                     let key = local_name(attr.key.as_ref());
                     if key == b"Id" {
                         id = Some(

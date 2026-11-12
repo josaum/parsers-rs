@@ -1039,6 +1039,7 @@ fn is_xs_primitive(type_ref: &str, ns_map: &HashMap<String, String>) -> bool {
 
 fn collect_attrs(e: &quick_xml::events::BytesStart<'_>) -> HashMap<String, String> {
     e.attributes()
+        .with_checks(false)
         .flatten()
         .filter_map(|attr| {
             let key = std::str::from_utf8(attr.key.as_ref()).ok()?.to_string();
@@ -1052,7 +1053,7 @@ fn schema_location(
     e: &quick_xml::events::BytesStart<'_>,
     max_bytes: usize,
 ) -> Result<Option<String>> {
-    for attribute in e.attributes() {
+    for attribute in e.attributes().with_checks(false) {
         let attribute =
             attribute.map_err(|error| anyhow::anyhow!("XML attribute error: {error}"))?;
         if attribute.key.as_ref() != b"schemaLocation" {
@@ -1073,7 +1074,7 @@ fn schema_location(
 }
 
 fn collect_xmlns(e: &quick_xml::events::BytesStart<'_>, ns_map: &mut HashMap<String, String>) {
-    for attr in e.attributes().flatten() {
+    for attr in e.attributes().with_checks(false).flatten() {
         let key = match std::str::from_utf8(attr.key.as_ref()) {
             Ok(k) => k.to_string(),
             Err(_) => continue,
