@@ -67,8 +67,10 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo test --workspace --locked
-      - run: cargo test --workspace --locked --features ${{ env.ARROW_FEATURES }}
+      # `--no-fail-fast`: a platform difference tends to show up in several
+      # crates at once, and one run should name all of them.
+      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo test --workspace --locked --no-fail-fast --features ${{ env.ARROW_FEATURES }}
 
   python-bindings:
     # Build, install and test the Python bindings the way a release does, so a

@@ -222,8 +222,11 @@ def assert_ci_exercises_release_paths(ci: str, release: str | None = None) -> No
 
     platforms = blocks["rust-platforms"]
     assert runner_labels(platforms) == {"macos-latest", "windows-latest"}
-    assert "      - run: cargo test --workspace --locked\n" in platforms
-    assert "      - run: cargo test --workspace --locked --features ${{ env.ARROW_FEATURES }}\n" in platforms
+    assert "      - run: cargo test --workspace --locked --no-fail-fast\n" in platforms
+    assert (
+        "      - run: cargo test --workspace --locked --no-fail-fast"
+        " --features ${{ env.ARROW_FEATURES }}\n"
+    ) in platforms
 
     python = blocks["python-bindings"]
     assert runner_labels(python) == HOSTED_RUNNERS
