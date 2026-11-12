@@ -1489,15 +1489,23 @@ const RAW_TEXT_ELEMENTS: [&str; 2] = ["script", "style"];
 /// Converts an HTML body to plain text.
 ///
 /// Tags are removed, the content of `<script>` and `<style>` elements and of
-/// comments is dropped, `<br>`, `<br/>`, `<p>` and `</p>` become line breaks,
-/// and character references are decoded. This is a single pass over the
-/// text, not an HTML parser: it does not build a tree or lay out blocks.
+/// comments is dropped, and character references are decoded. The start and
+/// end tags of `br`, `p`, `div`, `tr`, `li`, `h1` to `h6` and `blockquote`
+/// become line breaks, and each `td` or `th` start tag becomes a tab, so the
+/// cells of a table row are tab-separated. Tag names are matched without
+/// regard to case and end at whitespace or `/`, so `<BR />` and
+/// `<p class="x">` count. A `>` inside a quoted attribute value does not end
+/// its tag. This is a single pass over the text, not an HTML parser: it does
+/// not build a tree or lay out blocks.
 fn html_to_text(html: &str) -> String {
     let mut text = String::with_capacity(html.len());
     let mut rest = html;
     // Set once a search for `>` has failed: no later tag can be closed
     // either, and searching again for each `<` would cost quadratic time.
     let mut no_closing_bracket = false;
+    // Set once a tag's quoted value ran to the end of the text. Quotes are
+    // not honored after that, or every later tag could repeat that scan.
+    let mut unclosed_quote = false;
     while let Some(open) = rest.find('<') {
         text.push_str(&rest[..open]);
         let tag = &rest[open..];
@@ -1539,8 +1547,13 @@ fn html_to_text(html: &str) -> String {
 
         let closing = if no_closing_bracket {
             None
-        } else {
+        } else if unclosed_quote {
             tag.find('>')
+        } else {
+            tag_end(tag).or_else(|| {
+                unclosed_quote = true;
+                tag.find('>')
+            })
         };
         match closing {
             // `<` with nothing to close it, or the empty `<>`, is text.
@@ -1550,8 +1563,8 @@ fn html_to_text(html: &str) -> String {
                 rest = &tag[1..];
             }
             Some(end) => {
-                if matches!(&tag[1..end], "br" | "br/" | "p" | "/p") {
-                    text.push('\n');
+                if let Some(separator) = tag_separator(&tag[1..end]) {
+                    text.push(separator);
                 }
                 rest = &tag[end + 1..];
             }
@@ -1562,6 +1575,65 @@ fn html_to_text(html: &str) -> String {
     // escaped `&lt;b&gt;` survives as the literal text `<b>` instead of being
     // stripped as markup.
     decode_html_entities(&text)
+}
+
+/// Finds the `>` that ends the tag at the start of `tag`, skipping any `>`
+/// inside a single- or double-quoted attribute value.
+///
+/// Returns `None` when the text ends first, inside a quoted value or not.
+fn tag_end(tag: &str) -> Option<usize> {
+    let mut quote = None;
+    for (at, byte) in tag.bytes().enumerate() {
+        match quote {
+            Some(open) if byte == open => quote = None,
+            Some(_) => {}
+            None if byte == b'>' => return Some(at),
+            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None => {}
+        }
+    }
+    None
+}
+
+/// Returns the text a tag stands for, given what is between its `<` and `>`.
+///
+/// A line break for the start or end tag of an element that begins a new
+/// line, a tab for the start of a table cell, nothing for any other tag.
+fn tag_separator(inside: &str) -> Option<char> {
+    /// Elements whose start and end each begin a new line of text.
+    const LINE_ELEMENTS: [&str; 12] = [
+        "br",
+        "p",
+        "div",
+        "tr",
+        "li",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "blockquote",
+    ];
+    /// Table cells, which a tab keeps apart within their row.
+    const CELL_ELEMENTS: [&str; 2] = ["td", "th"];
+
+    let (is_end_tag, after_slash) = match inside.strip_prefix('/') {
+        Some(after_slash) => (true, after_slash),
+        None => (false, inside),
+    };
+    let name_len = after_slash
+        .find(|ch: char| ch.is_ascii_whitespace() || ch == '/')
+        .unwrap_or(after_slash.len());
+    let name = &after_slash[..name_len];
+    let is_one_of = |names: &[&str]| names.iter().any(|known| name.eq_ignore_ascii_case(known));
+    if is_one_of(&LINE_ELEMENTS) {
+        Some('\n')
+    } else if !is_end_tag && is_one_of(&CELL_ELEMENTS) {
+        Some('\t')
+    } else {
+        None
+    }
 }
 
 /// Returns the element name if `tag` opens a `<script>` or `<style>` element.
@@ -2326,8 +2398,40 @@ mod malformed_input_unit_tests {
         assert_eq!(html_to_text("<b>bold</b> < <i>i</i>"), "bold < i");
         assert_eq!(
             html_to_text("<P>one<br>two<br/>three</p>"),
-            "one\ntwo\nthree\n"
+            "\none\ntwo\nthree\n"
         );
+    }
+
+    #[test]
+    fn html_to_text_breaks_lines_at_block_tags_whatever_their_spelling() {
+        assert_eq!(
+            html_to_text("a<br />b<BR>c<p class=\"x\">e</P>f<div>g</div>"),
+            "a\nb\nc\ne\nf\ng\n"
+        );
+        assert_eq!(
+            html_to_text("<h1>T</h1><ul><li>one<li>two</ul><blockquote>q</blockquote>"),
+            "\nT\n\none\ntwo\nq\n"
+        );
+        // Cells are tab-separated and rows are lines.
+        assert_eq!(
+            html_to_text("<table><tr><th>a</th><th>b</th></tr><TR><TD>1<td>2</tr></table>"),
+            "\n\ta\tb\n\n\t1\t2\n"
+        );
+        // Names that only begin like a block tag are not one.
+        assert_eq!(html_to_text("a<president>b<pre>c<tdx>d"), "abcd");
+    }
+
+    #[test]
+    fn html_to_text_keeps_a_quoted_bracket_inside_its_tag() {
+        assert_eq!(html_to_text("<img alt=\"1 > 0\">after"), "after");
+        assert_eq!(html_to_text("<a title='a > b' href=\"x\">link</a>"), "link");
+        // A quote that never closes does not swallow the rest of the text.
+        assert_eq!(html_to_text("<a title=\"x>one</a> <b>two</b>"), "one two");
+        // Many unclosed quotes are still one pass.
+        let hostile = "<img alt=\"".repeat(100_000);
+        assert_eq!(html_to_text(&hostile), hostile);
+        let closed = format!("{}>", "<a \"> ".repeat(100_001));
+        let _ = html_to_text(&closed);
     }
 
     #[test]
