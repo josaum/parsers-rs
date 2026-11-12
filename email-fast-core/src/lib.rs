@@ -538,6 +538,17 @@ pub fn parse_mbox(
 ///   such a mailbox and deliver all of it as one message; the price is that
 ///   an unquoted body line beginning with `From ` splits its message.
 ///
+/// # Quoted `From ` lines
+///
+/// In a mailbox split by the dated rule, a line that begins with `>From `
+/// is delivered as `From `, and `>>From ` as `>From `: one `>` is removed
+/// from a line made of `>` characters followed by `From `. This is the
+/// mboxrd convention, in which the writer adds one `>` to every such line so
+/// that no body line can pass for a separator, and the reader takes it off
+/// again. A mailbox written in the mboxo convention quotes only `From ` and
+/// leaves a body's own `>From ` alone, so such a line loses its `>` here.
+/// Lines are left as written in a mailbox split at every `From ` line.
+///
 /// # Errors
 ///
 /// Returns an error if the reader fails or `callback` returns one. A message
@@ -603,6 +614,9 @@ pub fn parse_mbox_reader(
             if !current_message.is_empty() {
                 current_message.push(b'\n');
             }
+            if separators == Some(SeparatorRule::Dated) {
+                line = unquote_from_line(line);
+            }
             current_message.extend_from_slice(line);
         }
     }
@@ -616,6 +630,19 @@ pub fn parse_mbox_reader(
     }
 
     Ok(count)
+}
+
+/// Removes one level of mboxrd quoting from `line`.
+///
+/// A line of one or more `>` followed by `From ` loses its first `>`; any
+/// other line is returned as it is.
+fn unquote_from_line(line: &[u8]) -> &[u8] {
+    let quotes = line.iter().take_while(|byte| **byte == b'>').count();
+    if quotes > 0 && line[quotes..].starts_with(b"From ") {
+        &line[1..]
+    } else {
+        line
+    }
 }
 
 /// How one mailbox marks where its messages start.
@@ -2486,6 +2513,49 @@ mod malformed_input_unit_tests {
             ),
             None
         );
+    }
+
+    fn mbox_bodies(mailbox: &str) -> Vec<String> {
+        let mut bodies = Vec::new();
+        parse_mbox_reader(
+            std::io::Cursor::new(mailbox.as_bytes()),
+            ParseOptions::default(),
+            |email| {
+                bodies.push(email.body.text.unwrap_or_default());
+                Ok(())
+            },
+        )
+        .expect("mailbox parses");
+        bodies
+    }
+
+    #[test]
+    fn mbox_with_dated_separators_unquotes_from_lines_by_one_level() {
+        let bodies = mbox_bodies(
+            "From a@example.com Mon Jan 15 14:30:00 2024\n\
+             Subject: one\n\n\
+             >From the start\n\
+             >>From a reply\n\
+             > From spaced\n\
+             >Fromage\n\
+             a >From inside\n\
+             From b@example.com Mon Jan 15 14:31:00 2024\n\
+             Subject: two\n\n\
+             >From here\n",
+        );
+        assert_eq!(
+            bodies,
+            [
+                "From the start\n>From a reply\n> From spaced\n>Fromage\na >From inside",
+                "From here",
+            ]
+        );
+    }
+
+    #[test]
+    fn mbox_split_at_every_from_line_leaves_quoted_lines_alone() {
+        let bodies = mbox_bodies("From a@example.com\nSubject: one\n\n>From the start\n");
+        assert_eq!(bodies, [">From the start"]);
     }
 
     #[test]
