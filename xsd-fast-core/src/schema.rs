@@ -411,13 +411,23 @@ impl SchemaModel {
     /// malformed schema can never cause unbounded recursion.
     ///
     /// Folding copies each base into every type derived from it, so the model
-    /// can grow far beyond the schema text. The copies are capped: once the
-    /// cap is reached this method stops and leaves the remaining types
-    /// unfolded. [`SchemaSet`](crate::SchemaSet) loading reports that case as
-    /// an error instead.
+    /// can grow far beyond the schema text, and the copies are capped by a
+    /// budget. **When the budget runs out this method stops quietly**: it
+    /// returns as if it had finished and reports nothing. The derived types it
+    /// had not reached keep only their own particles and attributes, the type
+    /// it was folding may be folded at its top level but not inside its inline
+    /// types, and nothing in the model marks which types were folded.
+    /// Validation and Arrow derivation then treat the missing inherited
+    /// children as undeclared.
+    ///
+    /// The form that reports this is `try_resolve_inheritance`, which is
+    /// internal to this crate. [`SchemaSet::load`](crate::SchemaSet::load) and
+    /// [`SchemaSet::load_bytes`](crate::SchemaSet::load_bytes) call it and
+    /// return its `resource_limit` error, so load through [`SchemaSet`](crate::SchemaSet)
+    /// where that failure must be seen.
     pub fn resolve_inheritance(&mut self) {
         // The only failure is the copy budget, which this signature cannot
-        // report; the types folded so far are complete and stay folded.
+        // report. What was folded before it ran out stays folded.
         let _ = self.try_resolve_inheritance();
     }
 
