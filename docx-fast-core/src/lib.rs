@@ -1099,9 +1099,8 @@ fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                 let key = local_name(&raw);
                 current_key = Some(String::from_utf8_lossy(key).to_string());
             }
-            Ok(Event::Text(e)) => {
-                if let Some(key) = current_key.take() {
-                    let value = e.unescape()?.to_string();
+            Ok(event @ (Event::Text(_) | Event::CData(_))) => {
+                if let (Some(key), Some(value)) = (current_key.take(), character_data(&event)) {
                     if !value.is_empty() {
                         out.insert(key, normalize_datetime(&value));
                     }
@@ -1140,9 +1139,8 @@ fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                     }
                 }
             }
-            Ok(Event::Text(e)) => {
-                if let Some(name) = current_name.take() {
-                    let value = e.unescape()?.to_string();
+            Ok(event @ (Event::Text(_) | Event::CData(_))) => {
+                if let (Some(name), Some(value)) = (current_name.take(), character_data(&event)) {
                     if !value.is_empty() {
                         out.insert(name, normalize_datetime(&value));
                     }
@@ -1770,6 +1768,30 @@ fn text_event_string(event: &BytesText<'_>) -> String {
     }
 }
 
+/// Returns the character data of a text or CDATA event, `None` for any other.
+///
+/// Text is decoded like [`text_event_string`]; CDATA is literal character
+/// data, decoded but never entity-unescaped.
+fn character_data(event: &Event<'_>) -> Option<String> {
+    match event {
+        Event::Text(text) => Some(text_event_string(text)),
+        Event::CData(data) => Some(String::from_utf8_lossy(data).into_owned()),
+        _ => None,
+    }
+}
+
+/// Deepest nesting of tables inside tables the reader accepts.
+///
+/// Nested tables are the one place a parsed document is a tree, and every
+/// consumer of that tree recurses once per level: dropping it, collecting the
+/// table of contents, serializing it, shredding it into Arrow tables. In a
+/// debug build on a 256 KiB thread stack the JSON serializer is the first to
+/// overflow, between 64 and 80 levels; 32 leaves it less than half of that
+/// stack. Real documents nest a handful of levels. Raising this needs the
+/// measurement redone: `tests/malformed_input_smoke.rs` walks a document at
+/// exactly this depth on such a stack.
+const MAX_TABLE_DEPTH: usize = 32;
+
 fn local_name(name: &[u8]) -> &[u8] {
     match name.iter().position(|b| *b == b':') {
         Some(idx) => &name[idx + 1..],
@@ -1790,6 +1812,9 @@ struct DocxBodyParser<'a> {
     current_comment_ids: Vec<i32>,
     pending_comment_refs: Vec<i32>,
     current_revision_stack: Vec<RevisionInfo>,
+    /// Table containers currently on `containers`, kept under
+    /// [`MAX_TABLE_DEPTH`].
+    open_tables: usize,
     in_ppr: bool,
     in_rpr: bool,
     in_numpr: bool,
@@ -1896,6 +1921,7 @@ impl<'a> DocxBodyParser<'a> {
             current_comment_ids: Vec::new(),
             pending_comment_refs: Vec::new(),
             current_revision_stack: Vec::new(),
+            open_tables: 0,
             in_ppr: false,
             in_rpr: false,
             in_numpr: false,
@@ -1912,6 +1938,7 @@ impl<'a> DocxBodyParser<'a> {
         self.current_comment_ids.clear();
         self.pending_comment_refs.clear();
         self.current_revision_stack.clear();
+        self.open_tables = 0;
         self.in_ppr = false;
         self.in_rpr = false;
         self.in_numpr = false;
@@ -2200,6 +2227,12 @@ impl<'a> DocxBodyParser<'a> {
                 });
             }
             b"tbl" => {
+                if self.open_tables >= MAX_TABLE_DEPTH {
+                    return Err(anyhow!(
+                        "tables nested more than {MAX_TABLE_DEPTH} deep are not supported"
+                    ));
+                }
+                self.open_tables += 1;
                 self.containers
                     .push(Container::Table(TableBuilder::default()));
             }
@@ -2280,7 +2313,7 @@ impl<'a> DocxBodyParser<'a> {
                 }
             }
             b"tc" => {
-                if let Some(Container::Cell(cell)) = self.containers.pop() {
+                if let Some(Container::Cell(cell)) = self.pop_container() {
                     if let Some(Container::Row(row)) = self.containers.last_mut() {
                         row.cells.push(TableCell {
                             blocks: cell.blocks,
@@ -2289,14 +2322,14 @@ impl<'a> DocxBodyParser<'a> {
                 }
             }
             b"tr" => {
-                if let Some(Container::Row(row)) = self.containers.pop() {
+                if let Some(Container::Row(row)) = self.pop_container() {
                     if let Some(Container::Table(table)) = self.containers.last_mut() {
                         table.rows.push(TableRow { cells: row.cells });
                     }
                 }
             }
             b"tbl" => {
-                if let Some(Container::Table(table)) = self.containers.pop() {
+                if let Some(Container::Table(table)) = self.pop_container() {
                     let block = Block::Table(Table { rows: table.rows });
                     self.push_block(block);
                 }
@@ -2304,6 +2337,15 @@ impl<'a> DocxBodyParser<'a> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Pops the innermost container, keeping the open-table count in step.
+    fn pop_container(&mut self) -> Option<Container> {
+        let container = self.containers.pop();
+        if matches!(container, Some(Container::Table(_))) {
+            self.open_tables = self.open_tables.saturating_sub(1);
+        }
+        container
     }
 
     fn push_text(&mut self, value: &str) {
@@ -2387,7 +2429,7 @@ impl<'a> DocxBodyParser<'a> {
 
     fn finish(&mut self) -> Vec<Block> {
         while self.containers.len() > 1 {
-            if let Some(container) = self.containers.pop() {
+            if let Some(container) = self.pop_container() {
                 match container {
                     Container::Cell(cell) => {
                         if let Some(Container::Row(row)) = self.containers.last_mut() {

@@ -1,0 +1,40 @@
+# Known advisories against the crates in Cargo.lock, from the RustSec database.
+#
+# This is its own workflow, and ci.yml must never call it or run the scan
+# itself: release.yml calls ci.yml, and an advisory published against a
+# dependency must not block the release of an unrelated fix. It runs weekly
+# because an advisory arrives on the database's schedule and not on a commit's,
+# and on any pull request that changes what the lockfile resolves.
+#
+# No advisory is ignored. A finding is answered by upgrading the dependency.
+name: audit
+
+on:
+  schedule:
+    # Mondays, 06:23 UTC.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - "**/Cargo.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.23.0
+      - name: Fail on a vulnerability or an unsoundness advisory
+        # A vulnerability fails the scan by default; `--deny unsound` makes an
+        # unsoundness advisory, which is otherwise only a warning, fail it too.
+        run: cargo audit --deny unsound

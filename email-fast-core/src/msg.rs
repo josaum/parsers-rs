@@ -21,7 +21,6 @@ const DIFSECT: u32 = 0xFFFF_FFFC;
 const NOSTREAM: u32 = 0xFFFF_FFFF;
 const DIR_ENTRY_SIZE: usize = 128;
 const HEADER_SIZE: usize = 512;
-const MAX_CHAIN: usize = 1 << 20;
 
 const TYPE_STORAGE: u8 = 1;
 const TYPE_STREAM: u8 = 2;
@@ -43,6 +42,8 @@ const TAG_ATTACH_LONG_FILENAME: &str = "3707";
 const TAG_ATTACH_MIME_TAG: &str = "370E";
 const TAG_ATTACH_CONTENT_ID: &str = "3712";
 
+/// Name prefix of the storage that holds one attachment (MS-OXMSG 2.2.2).
+const ATTACHMENT_STORAGE_PREFIX: &str = "__attach_version1.0_";
 /// Name of the stream holding an object's fixed-length properties (MS-OXMSG 2.4).
 const PROPERTY_STREAM_NAME: &str = "__properties_version1.0";
 /// Pseudo-tag under which the root property stream is carried with the
@@ -66,7 +67,10 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Ema
         return Err(anyhow!("Not a valid MSG file"));
     }
     let file = CfbFile::parse(bytes)?;
-    let (streams, attach_storages) = file.root_streams_and_attachments()?;
+    let MessageStreams {
+        root: streams,
+        attachments: attach_storages,
+    } = file.message_streams()?;
     if streams.iter().all(|s| s.tag == TAG_PROPERTY_STREAM) {
         return Err(anyhow!(
             "MSG file has no root __substg1.0_ property streams (not a message object)"
@@ -251,11 +255,85 @@ enum PropKind {
     Binary,
 }
 
+/// The property streams of a message object, grouped by the storage they
+/// were found in.
+#[derive(Default)]
+struct MessageStreams {
+    /// Streams directly under the root storage: the message's own properties.
+    root: Vec<PropStream>,
+    /// One entry per `__attach_version1.0_#*` storage, in directory order.
+    attachments: Vec<Vec<PropStream>>,
+}
+
+/// Marks the sectors one chain has visited, and is reused from chain to chain.
+///
+/// A chain that returns to a sector it already read is a cycle. Each chain
+/// takes a fresh generation number instead of a cleared table, so reading
+/// every stream of a file costs the sectors read, not streams times table
+/// size.
+struct ChainGuard {
+    stamps: Vec<u32>,
+    generation: u32,
+}
+
+impl ChainGuard {
+    /// Creates a guard for chains over `sectors` sectors.
+    ///
+    /// Callers pass a count the file itself bounds (its sectors, or the
+    /// entries of an allocation table already read from it).
+    fn new(sectors: usize) -> Self {
+        Self {
+            stamps: vec![0; sectors],
+            generation: 0,
+        }
+    }
+
+    /// Starts a new chain, forgetting the previous chain's visits.
+    fn start_chain(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // Generation numbers wrapped; stale stamps could match again.
+            self.stamps.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    /// Records a visit and reports whether it is this chain's first.
+    ///
+    /// A sector past the table is always a first visit: it lies outside the
+    /// file or outside the allocation table, so the chain cannot continue
+    /// through it and cannot loop on it.
+    fn first_visit(&mut self, sector: u32) -> bool {
+        match self.stamps.get_mut(sector as usize) {
+            Some(stamp) if *stamp == self.generation => false,
+            Some(stamp) => {
+                *stamp = self.generation;
+                true
+            }
+            None => true,
+        }
+    }
+}
+
+/// What reading the streams of one file shares: cycle guards for both
+/// allocation tables and the bytes streams may still claim.
+struct StreamReader {
+    fat_guard: ChainGuard,
+    mini_guard: ChainGuard,
+    /// Stream bytes that may still be copied out of the file.
+    ///
+    /// Streams of a well-formed file occupy disjoint sectors, so together
+    /// they cannot hold more bytes than the file. Without this, a directory
+    /// whose entries all name the same chain yields one copy of it per entry.
+    budget: usize,
+}
+
 impl<'a> CfbFile<'a> {
     fn parse(data: &'a [u8]) -> Result<Self> {
         if u16_le(data, 0x1C)? != 0xFFFE {
             return Err(anyhow!("MSG CFB: unexpected byte order"));
         }
+        let major_version = u16_le(data, 0x1A)?;
         let sector_shift = u16_le(data, 0x1E)? as u32;
         let mini_shift = u16_le(data, 0x20)? as u32;
         if !(9..=12).contains(&sector_shift) || mini_shift == 0 || mini_shift >= sector_shift {
@@ -267,10 +345,12 @@ impl<'a> CfbFile<'a> {
         let first_dir = u32_le(data, 0x30)?;
         let first_mini_fat = u32_le(data, 0x3C)?;
         let first_difat = u32_le(data, 0x44)?;
-        let num_difat = u32_le(data, 0x48)? as usize;
+        // The header also carries FAT, mini FAT and DIFAT sector counts. They
+        // are not read: the chains themselves say how long they are, and a
+        // count is a number the file's author chose.
 
-        let fat = load_fat(data, sector_size, first_difat, num_difat)?;
-        let directory = load_directory(data, sector_size, &fat, first_dir)?;
+        let fat = load_fat(data, sector_size, first_difat)?;
+        let directory = load_directory(data, sector_size, &fat, first_dir, major_version)?;
         let mini_fat = if first_mini_fat == ENDOFCHAIN || first_mini_fat == FREESECT {
             Vec::new()
         } else {
@@ -286,7 +366,8 @@ impl<'a> CfbFile<'a> {
                     sector_size,
                     &fat,
                     root.start_sector,
-                    root.stream_size as usize,
+                    usize::try_from(root.stream_size).unwrap_or(usize::MAX),
+                    &mut ChainGuard::new(fat.len().min(sector_count(data, sector_size))),
                 )?
             }
         } else {
@@ -307,92 +388,128 @@ impl<'a> CfbFile<'a> {
 
     #[cfg(test)]
     fn root_substg_streams(&self) -> Result<Vec<PropStream>> {
-        self.root_streams_and_attachments().map(|(s, _)| s)
+        self.message_streams().map(|message| message.root)
     }
 
-    fn root_streams_and_attachments(&self) -> Result<(Vec<PropStream>, Vec<Vec<PropStream>>)> {
+    /// Collects the property streams of the message and of its attachments.
+    ///
+    /// Only the root storage and the attachment storages directly under it are
+    /// read. Other storages (recipients, named properties, embedded messages)
+    /// are not entered, so their streams cannot pass for the message's own.
+    fn message_streams(&self) -> Result<MessageStreams> {
         let Some(root) = self.directory.first() else {
             return Err(anyhow!("MSG CFB: empty directory"));
         };
-        let mut out = Vec::new();
-        let mut attachments = Vec::new();
-        // A malformed CFB can point `left`/`right`/`child` back into the tree.
-        // Without this, `walk_dir` recurses until the stack dies on a file we
-        // do not control.
+        // A malformed directory can point `left`/`right`/`child` back into the
+        // tree; every entry may be reached once.
         let mut visited = vec![false; self.directory.len()];
-        if root.child != NOSTREAM {
-            self.walk_dir(root.child, true, &mut out, &mut attachments, &mut visited)?;
+        let mut reader = StreamReader {
+            fat_guard: ChainGuard::new(
+                self.fat
+                    .len()
+                    .min(sector_count(self.data, self.sector_size)),
+            ),
+            mini_guard: ChainGuard::new(
+                self.mini_fat
+                    .len()
+                    .min(self.mini_stream.len() / self.mini_sector_size),
+            ),
+            budget: self.data.len(),
+        };
+        let mut message = MessageStreams::default();
+        for idx in self.siblings_in_order(root.child, &mut visited)? {
+            let entry = &self.directory[idx];
+            if entry.obj_type == TYPE_STREAM {
+                message.root.extend(self.prop_stream(entry, &mut reader)?);
+            } else if entry.obj_type == TYPE_STORAGE
+                && entry.child != NOSTREAM
+                && entry.name.starts_with(ATTACHMENT_STORAGE_PREFIX)
+            {
+                let mut streams = Vec::new();
+                for child_idx in self.siblings_in_order(entry.child, &mut visited)? {
+                    let child = &self.directory[child_idx];
+                    if child.obj_type == TYPE_STREAM {
+                        streams.extend(self.prop_stream(child, &mut reader)?);
+                    }
+                }
+                message.attachments.push(streams);
+            }
         }
-        Ok((out, attachments))
+        Ok(message)
     }
 
-    fn walk_dir(
+    /// Lists the entries of one storage in directory (in-order) sequence.
+    ///
+    /// A storage's entries form a binary tree linked through `left` and
+    /// `right`, rooted at `first`. The tree's shape is the file's choice (a
+    /// writer may emit one long chain), so it is walked with an explicit
+    /// stack rather than by recursion.
+    fn siblings_in_order(&self, first: u32, visited: &mut [bool]) -> Result<Vec<usize>> {
+        let mut order = Vec::new();
+        let mut pending = Vec::new();
+        let mut next = first;
+        loop {
+            while next != NOSTREAM {
+                let idx = next as usize;
+                let (Some(entry), Some(slot)) = (self.directory.get(idx), visited.get_mut(idx))
+                else {
+                    return Err(anyhow!("MSG CFB: directory index {next} out of range"));
+                };
+                if *slot {
+                    return Err(anyhow!("MSG CFB: directory cycle at index {next}"));
+                }
+                *slot = true;
+                pending.push(idx);
+                next = entry.left;
+            }
+            let Some(idx) = pending.pop() else {
+                break;
+            };
+            order.push(idx);
+            next = self.directory[idx].right;
+        }
+        Ok(order)
+    }
+
+    /// Reads `entry` if it is a property stream this parser understands.
+    fn prop_stream(
         &self,
-        idx: u32,
-        take_streams: bool,
-        out: &mut Vec<PropStream>,
-        attachments: &mut Vec<Vec<PropStream>>,
-        visited: &mut [bool],
-    ) -> Result<()> {
-        if idx == NOSTREAM {
-            return Ok(());
-        }
-        let slot = visited
-            .get_mut(idx as usize)
-            .ok_or_else(|| anyhow!("MSG CFB: directory index {idx} out of range"))?;
-        if *slot {
-            return Err(anyhow!("MSG CFB: directory cycle at index {idx}"));
-        }
-        *slot = true;
-        let entry = self
-            .directory
-            .get(idx as usize)
-            .ok_or_else(|| anyhow!("MSG CFB: directory index {idx} out of range"))?;
-        self.walk_dir(entry.left, take_streams, out, attachments, visited)?;
-        if entry.obj_type == TYPE_STORAGE && entry.child != NOSTREAM {
-            if take_streams && entry.name.starts_with("__attach_version1.0_") {
-                let mut att_streams = Vec::new();
-                let mut dummy_nested = Vec::new();
-                self.walk_dir(
-                    entry.child,
-                    true,
-                    &mut att_streams,
-                    &mut dummy_nested,
-                    visited,
-                )?;
-                attachments.push(att_streams);
-            } else {
-                // Recipients / other storages have their own substg streams; ignore
-                // them so attachment/recipient bodies cannot masquerade as the message body.
-                self.walk_dir(entry.child, false, out, attachments, visited)?;
-            }
-        }
-        if take_streams && entry.obj_type == TYPE_STREAM {
-            if let Some((tag, kind)) = parse_substg_name(&entry.name) {
-                let bytes = self.read_stream(entry)?;
-                out.push(PropStream { tag, kind, bytes });
-            } else if entry.name == PROPERTY_STREAM_NAME {
-                out.push(PropStream {
-                    tag: TAG_PROPERTY_STREAM.to_string(),
-                    kind: PropKind::Binary,
-                    bytes: self.read_stream(entry)?,
-                });
-            }
-        }
-        self.walk_dir(entry.right, take_streams, out, attachments, visited)?;
-        Ok(())
+        entry: &DirEntry,
+        reader: &mut StreamReader,
+    ) -> Result<Option<PropStream>> {
+        let (tag, kind) = if let Some(parsed) = parse_substg_name(&entry.name) {
+            parsed
+        } else if entry.name == PROPERTY_STREAM_NAME {
+            (TAG_PROPERTY_STREAM.to_string(), PropKind::Binary)
+        } else {
+            return Ok(None);
+        };
+        let bytes = self.read_stream(entry, reader)?;
+        Ok(Some(PropStream { tag, kind, bytes }))
     }
 
-    fn read_stream(&self, entry: &DirEntry) -> Result<Vec<u8>> {
-        let len = entry.stream_size as usize;
-        if entry.stream_size < self.mini_cutoff && !self.mini_stream.is_empty() {
+    fn read_stream(&self, entry: &DirEntry, reader: &mut StreamReader) -> Result<Vec<u8>> {
+        // The declared size is checked against what the file can still hold
+        // before anything is sized or copied from it.
+        let len = usize::try_from(entry.stream_size)
+            .ok()
+            .filter(|len| *len <= reader.budget)
+            .ok_or_else(|| {
+                anyhow!(
+                    "MSG CFB: stream {:?} declares {} bytes, more than the file holds",
+                    entry.name,
+                    entry.stream_size
+                )
+            })?;
+        let bytes = if entry.stream_size < self.mini_cutoff && !self.mini_stream.is_empty() {
             read_mini_chain(
                 &self.mini_stream,
                 &self.mini_fat,
                 self.mini_sector_size,
                 entry.start_sector,
                 len,
-            )
+                &mut reader.mini_guard,
+            )?
         } else {
             read_fat_chain_len(
                 self.data,
@@ -400,46 +517,74 @@ impl<'a> CfbFile<'a> {
                 &self.fat,
                 entry.start_sector,
                 len,
-            )
-        }
+                &mut reader.fat_guard,
+            )?
+        };
+        reader.budget -= bytes.len();
+        Ok(bytes)
     }
 }
 
-fn load_fat(
-    data: &[u8],
-    sector_size: usize,
-    first_difat: u32,
-    num_difat: usize,
-) -> Result<Vec<u32>> {
-    let mut fat_sectors =
-        Vec::with_capacity(109 + num_difat * ((sector_size / 4).saturating_sub(1)));
-    for i in 0..109 {
-        let sect = u32_le(data, 0x4C + i * 4)?;
-        if sect != FREESECT {
-            fat_sectors.push(sect);
+/// Number of whole sectors `data` holds after the header.
+fn sector_count(data: &[u8], sector_size: usize) -> usize {
+    data.len().saturating_sub(HEADER_SIZE) / sector_size
+}
+
+/// Reads the file allocation table named by the header and the DIFAT chain.
+///
+/// Every FAT and DIFAT sector may be named once, and must lie inside the
+/// file, so the table cannot be larger than the file that holds it. The
+/// header's own sector counts are not trusted for anything.
+fn load_fat(data: &[u8], sector_size: usize, first_difat: u32) -> Result<Vec<u32>> {
+    /// FAT sector slots in the header, before any DIFAT sector (MS-CFB 2.2).
+    const HEADER_DIFAT_ENTRIES: usize = 109;
+
+    let sectors = sector_count(data, sector_size);
+    let mut is_fat_sector = vec![false; sectors];
+    let mut fat_sectors: Vec<u32> = Vec::new();
+    let mut add_fat_sector = |sect: u32| -> Result<()> {
+        if sect == FREESECT {
+            return Ok(());
         }
+        let slot = is_fat_sector
+            .get_mut(sect as usize)
+            .ok_or_else(|| anyhow!("MSG CFB: sector {sect} truncated"))?;
+        if *slot {
+            return Err(anyhow!("MSG CFB: FAT sector {sect} listed twice"));
+        }
+        *slot = true;
+        fat_sectors.push(sect);
+        Ok(())
+    };
+
+    for i in 0..HEADER_DIFAT_ENTRIES {
+        add_fat_sector(u32_le(data, 0x4C + i * 4)?)?;
     }
+    let mut is_difat_sector = vec![false; sectors];
     let mut difat_sect = first_difat;
-    let mut hops = 0usize;
     while difat_sect != ENDOFCHAIN && difat_sect != FREESECT {
-        hops += 1;
-        if hops > MAX_CHAIN {
-            return Err(anyhow!("MSG CFB: DIFAT cycle"));
-        }
         let raw = sector_slice(data, sector_size, difat_sect)?;
-        let entries = raw.len() / 4;
-        if entries == 0 {
-            break;
-        }
-        for i in 0..entries - 1 {
-            let sect = u32_le(raw, i * 4)?;
-            if sect != FREESECT {
-                fat_sectors.push(sect);
+        match is_difat_sector.get_mut(difat_sect as usize) {
+            Some(slot) if *slot => {
+                return Err(anyhow!("MSG CFB: DIFAT cycle at sector {difat_sect}"));
             }
+            Some(slot) => *slot = true,
+            // `sector_slice` succeeded, so the sector is inside the file.
+            None => return Err(anyhow!("MSG CFB: sector {difat_sect} truncated")),
         }
-        difat_sect = u32_le(raw, (entries - 1) * 4)?;
+        let (entries, next) = raw
+            .as_chunks::<4>()
+            .0
+            .split_last()
+            .map(|(next, entries)| (entries, u32::from_le_bytes(*next)))
+            .ok_or_else(|| anyhow!("MSG CFB: empty DIFAT sector"))?;
+        for entry in entries {
+            add_fat_sector(u32::from_le_bytes(*entry))?;
+        }
+        difat_sect = next;
     }
-    let mut fat = Vec::new();
+
+    let mut fat = Vec::with_capacity(fat_sectors.len() * (sector_size / 4));
     for sect in fat_sectors {
         let raw = sector_slice(data, sector_size, sect)?;
         fat.extend(parse_u32_le_table(raw));
@@ -452,6 +597,7 @@ fn load_directory(
     sector_size: usize,
     fat: &[u32],
     first_dir: u32,
+    major_version: u16,
 ) -> Result<Vec<DirEntry>> {
     let raw = read_fat_chain(data, sector_size, fat, first_dir)?;
     if raw.len() < DIR_ENTRY_SIZE {
@@ -471,6 +617,13 @@ fn load_directory(
             }
             String::from_utf16_lossy(&utf16)
         };
+        let mut stream_size = u64_le(chunk, 0x78)?;
+        if major_version == 3 {
+            // A version 3 file stores a 32-bit size; writers are known to
+            // leave the high half uninitialized, and readers are told to
+            // ignore it (MS-CFB 2.6.3).
+            stream_size &= 0xFFFF_FFFF;
+        }
         out.push(DirEntry {
             name,
             obj_type,
@@ -478,7 +631,7 @@ fn load_directory(
             right: u32_le(chunk, 0x48)?,
             child: u32_le(chunk, 0x4C)?,
             start_sector: u32_le(chunk, 0x74)?,
-            stream_size: u64_le(chunk, 0x78)?,
+            stream_size,
         });
     }
     if out.is_empty() || out[0].obj_type != TYPE_ROOT {
@@ -487,91 +640,84 @@ fn load_directory(
     Ok(out)
 }
 
+/// Reads a whole FAT chain: the directory or the mini FAT.
 fn read_fat_chain(data: &[u8], sector_size: usize, fat: &[u32], start: u32) -> Result<Vec<u8>> {
-    read_fat_chain_len(data, sector_size, fat, start, usize::MAX)
+    let mut guard = ChainGuard::new(fat.len().min(sector_count(data, sector_size)));
+    read_fat_chain_len(data, sector_size, fat, start, usize::MAX, &mut guard)
 }
 
+/// Reads up to `max_len` bytes of the FAT chain that begins at `start`.
+///
+/// The result grows only by sectors actually read, and `guard` stops a chain
+/// at the first sector it repeats, so the output is never larger than the
+/// file whatever `max_len` says.
 fn read_fat_chain_len(
     data: &[u8],
     sector_size: usize,
     fat: &[u32],
     start: u32,
     max_len: usize,
+    guard: &mut ChainGuard,
 ) -> Result<Vec<u8>> {
-    if start == ENDOFCHAIN || start == FREESECT {
-        return Ok(Vec::new());
-    }
     let mut out = Vec::new();
+    if max_len == 0 {
+        return Ok(out);
+    }
+    guard.start_chain();
     let mut sect = start;
-    let mut hops = 0usize;
-    // Exact cycle detection, not just a hop ceiling: with `max_len` unbounded a
-    // two-sector loop would otherwise append `sector_size` bytes per hop until
-    // MAX_CHAIN, inflating the buffer into the hundreds of MB before failing.
-    let mut seen = vec![false; fat.len()];
     while sect != ENDOFCHAIN && sect != FREESECT {
-        hops += 1;
-        if hops > MAX_CHAIN {
-            return Err(anyhow!("MSG CFB: FAT chain too long"));
-        }
-        if let Some(slot) = seen.get_mut(sect as usize) {
-            if *slot {
-                return Err(anyhow!("MSG CFB: FAT cycle at sector {sect}"));
-            }
-            *slot = true;
+        // Exact cycle detection, not a hop ceiling: with `max_len` unbounded
+        // a two-sector loop would otherwise append a sector per hop.
+        if !guard.first_visit(sect) {
+            return Err(anyhow!("MSG CFB: FAT cycle at sector {sect}"));
         }
         if sect == FATSECT || sect == DIFSECT {
             return Err(anyhow!("MSG CFB: FAT points at metadata sector"));
         }
         let raw = sector_slice(data, sector_size, sect)?;
-        let remaining = max_len.saturating_sub(out.len());
-        if remaining == 0 {
+        let take = (max_len - out.len()).min(raw.len());
+        out.extend_from_slice(&raw[..take]);
+        if out.len() == max_len {
             break;
         }
-        let take = remaining.min(raw.len());
-        out.extend_from_slice(&raw[..take]);
         sect = fat_next(fat, sect)?;
-    }
-    if max_len != usize::MAX && out.len() > max_len {
-        out.truncate(max_len);
     }
     Ok(out)
 }
 
+/// Reads up to `max_len` bytes of the mini FAT chain that begins at `start`.
+///
+/// Like [`read_fat_chain_len`], the output is bounded by the mini stream it
+/// is copied from, not by `max_len`.
 fn read_mini_chain(
     mini_stream: &[u8],
     mini_fat: &[u32],
     mini_sector_size: usize,
     start: u32,
     max_len: usize,
+    guard: &mut ChainGuard,
 ) -> Result<Vec<u8>> {
-    if start == ENDOFCHAIN || start == FREESECT || max_len == 0 {
-        return Ok(Vec::new());
+    let mut out = Vec::with_capacity(max_len.min(mini_stream.len()));
+    if max_len == 0 {
+        return Ok(out);
     }
-    let mut out = Vec::with_capacity(max_len);
+    guard.start_chain();
     let mut sect = start;
-    let mut hops = 0usize;
     while sect != ENDOFCHAIN && sect != FREESECT {
-        hops += 1;
-        if hops > MAX_CHAIN {
-            return Err(anyhow!("MSG CFB: mini-FAT cycle"));
+        if !guard.first_visit(sect) {
+            return Err(anyhow!("MSG CFB: mini-FAT cycle at sector {sect}"));
         }
-        let off = sect as usize * mini_sector_size;
-        let end = off
-            .checked_add(mini_sector_size)
-            .ok_or_else(|| anyhow!("MSG CFB: mini sector overflow"))?;
-        if end > mini_stream.len() {
-            return Err(anyhow!("MSG CFB: mini sector {sect} past mini stream"));
-        }
-        let remaining = max_len.saturating_sub(out.len());
-        if remaining == 0 {
+        let raw = (sect as usize)
+            .checked_mul(mini_sector_size)
+            .and_then(|off| Some(off..off.checked_add(mini_sector_size)?))
+            .and_then(|range| mini_stream.get(range))
+            .ok_or_else(|| anyhow!("MSG CFB: mini sector {sect} past mini stream"))?;
+        let take = (max_len - out.len()).min(raw.len());
+        out.extend_from_slice(&raw[..take]);
+        if out.len() == max_len {
             break;
         }
-        let take = remaining.min(mini_sector_size);
-        out.extend_from_slice(&mini_stream[off..off + take]);
         sect = fat_next(mini_fat, sect)?;
-    }
-    if out.len() > max_len {
-        out.truncate(max_len);
     }
     Ok(out)
 }
@@ -583,13 +729,11 @@ fn fat_next(fat: &[u32], sect: u32) -> Result<u32> {
 }
 
 fn sector_slice(data: &[u8], sector_size: usize, sect: u32) -> Result<&[u8]> {
-    let off = HEADER_SIZE
-        .checked_add(sect as usize * sector_size)
-        .ok_or_else(|| anyhow!("MSG CFB: sector offset overflow"))?;
-    let end = off
-        .checked_add(sector_size)
-        .ok_or_else(|| anyhow!("MSG CFB: sector end overflow"))?;
-    data.get(off..end)
+    (sect as usize)
+        .checked_mul(sector_size)
+        .and_then(|rel| rel.checked_add(HEADER_SIZE))
+        .and_then(|off| Some(off..off.checked_add(sector_size)?))
+        .and_then(|range| data.get(range))
         .ok_or_else(|| anyhow!("MSG CFB: sector {sect} truncated"))
 }
 
@@ -602,39 +746,43 @@ fn parse_u32_le_table(raw: &[u8]) -> Vec<u32> {
 }
 
 fn u16_le(buf: &[u8], off: usize) -> Result<u16> {
-    buf.get(off..off + 2)
-        .and_then(|s| s.try_into().ok())
-        .map(u16::from_le_bytes)
+    buf.get(off..)
+        .and_then(|tail| tail.first_chunk::<2>())
+        .map(|bytes| u16::from_le_bytes(*bytes))
         .ok_or_else(|| anyhow!("MSG CFB: truncated u16 at {off}"))
 }
 
 fn u32_le(buf: &[u8], off: usize) -> Result<u32> {
-    buf.get(off..off + 4)
-        .and_then(|s| s.try_into().ok())
-        .map(u32::from_le_bytes)
+    buf.get(off..)
+        .and_then(|tail| tail.first_chunk::<4>())
+        .map(|bytes| u32::from_le_bytes(*bytes))
         .ok_or_else(|| anyhow!("MSG CFB: truncated u32 at {off}"))
 }
 
 fn u64_le(buf: &[u8], off: usize) -> Result<u64> {
-    buf.get(off..off + 8)
-        .and_then(|s| s.try_into().ok())
-        .map(u64::from_le_bytes)
+    buf.get(off..)
+        .and_then(|tail| tail.first_chunk::<8>())
+        .map(|bytes| u64::from_le_bytes(*bytes))
         .ok_or_else(|| anyhow!("MSG CFB: truncated u64 at {off}"))
 }
 
+/// Splits a `__substg1.0_<tag><type>` stream name into its tag and type.
 fn parse_substg_name(name: &str) -> Option<(String, PropKind)> {
     let rest = name.strip_prefix("__substg1.0_")?;
-    if rest.len() < 8 {
+    // `get`, not indexing: a directory name is arbitrary UTF-16 text, so byte
+    // 4 or 8 can fall inside a multi-byte character.
+    let tag = rest.get(..4)?;
+    let kind = rest.get(4..8)?;
+    if !tag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    let tag = rest[..4].to_ascii_uppercase();
-    let kind = match rest[4..8].to_ascii_uppercase().as_str() {
+    let kind = match kind.to_ascii_uppercase().as_str() {
         "001F" => PropKind::Unicode,
         "001E" => PropKind::Ansi,
         "0102" => PropKind::Binary,
         _ => return None,
     };
-    Some((tag, kind))
+    Some((tag.to_ascii_uppercase(), kind))
 }
 
 fn first_binary<'a>(streams: &'a [PropStream], tag: &str) -> Option<&'a [u8]> {
@@ -783,6 +931,14 @@ pub fn write_fixture_msg(subject: &str, sender: &str, to: &str, body: &str) -> V
     write_ministream_cfb(&props)
 }
 
+/// Builds a fixture compound file from arbitrary named streams.
+///
+/// See [`write_ministream_cfb`] for the `storage/stream` naming.
+#[doc(hidden)]
+pub fn write_fixture_streams(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    write_ministream_cfb(streams)
+}
+
 fn utf16_le(value: &str) -> Vec<u8> {
     let mut out = Vec::new();
     for unit in value.encode_utf16() {
@@ -792,109 +948,192 @@ fn utf16_le(value: &str) -> Vec<u8> {
     out
 }
 
+/// Fixture streams at least this long are stored in regular sectors; shorter
+/// ones go to the mini stream. This is the cutoff the fixture header declares.
+const FIXTURE_MINI_CUTOFF: usize = 4096;
+
+/// One directory entry of a fixture compound file.
+struct FixtureNode<'a> {
+    name: &'a str,
+    obj_type: u8,
+    /// Index into the caller's stream list, for stream entries.
+    stream: Option<usize>,
+    /// Directory indices of the entries this storage holds, in sibling order.
+    children: Vec<usize>,
+}
+
+/// Builds a version 3 compound file holding `streams`.
+///
+/// A name of the form `storage/stream` puts the stream in a storage directly
+/// under the root, created the first time it is named; that is how attachment
+/// (`__attach_version1.0_#00000000/...`) and recipient storages are written.
+/// Siblings are chained through their `right` links in the order given.
+///
+/// # Panics
+///
+/// Panics if the file would need more FAT sectors than the header can list.
+/// This is a test fixture writer; its inputs are written by hand.
 fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     const SECTOR: usize = 512;
     const MINI: usize = 64;
-    let n = streams.len();
-    let dir_entries = 1 + n;
-    let dir_bytes = dir_entries * DIR_ENTRY_SIZE;
-    let dir_sectors = dir_bytes.div_ceil(SECTOR);
-    let mini_sectors: Vec<Vec<u8>> = streams
-        .iter()
-        .map(|(_, data)| {
-            let mut padded = data.clone();
-            let rem = padded.len() % MINI;
-            if rem != 0 {
-                padded.resize(padded.len() + (MINI - rem), 0);
-            }
-            if padded.is_empty() {
-                padded.resize(MINI, 0);
-            }
-            padded
-        })
-        .collect();
-    let mini_stream: Vec<u8> = mini_sectors.iter().flatten().copied().collect();
-    let mini_stream_sectors = mini_stream.len().div_ceil(SECTOR).max(1);
-    let mini_fat_sectors = 1;
+    const ENTRIES_PER_SECTOR: usize = SECTOR / 4;
+    /// FAT sector slots in the header; the fixture writes no DIFAT sectors.
+    const HEADER_FAT_SLOTS: usize = 109;
 
-    // Layout after the 512-byte header:
-    // 0: FAT
-    // 1..dir_sectors: directory
-    // next: mini FAT
-    // next: mini stream data
-    let fat_sect = 0u32;
-    let dir_start = 1u32;
-    let mini_fat_start = dir_start + dir_sectors as u32;
-    let mini_data_start = mini_fat_start + mini_fat_sectors as u32;
-    let total_sectors = mini_data_start as usize + mini_stream_sectors;
-
-    let mut fat = vec![FREESECT; SECTOR / 4];
-    fat[0] = FATSECT;
-    for i in 0..dir_sectors {
-        let s = dir_start as usize + i;
-        fat[s] = if i + 1 == dir_sectors {
-            ENDOFCHAIN
-        } else {
-            (s + 1) as u32
+    // Directory: entry 0 is the root, the rest follow in creation order.
+    let mut nodes = vec![FixtureNode {
+        name: "Root Entry",
+        obj_type: TYPE_ROOT,
+        stream: None,
+        children: Vec::new(),
+    }];
+    for (index, (path, _)) in streams.iter().enumerate() {
+        let (parent, leaf) = match path.split_once('/') {
+            Some((storage, leaf)) => {
+                let existing =
+                    nodes[0].children.iter().copied().find(|&id| {
+                        nodes[id].obj_type == TYPE_STORAGE && nodes[id].name == storage
+                    });
+                let parent = match existing {
+                    Some(id) => id,
+                    None => {
+                        let id = nodes.len();
+                        nodes.push(FixtureNode {
+                            name: storage,
+                            obj_type: TYPE_STORAGE,
+                            stream: None,
+                            children: Vec::new(),
+                        });
+                        nodes[0].children.push(id);
+                        id
+                    }
+                };
+                (parent, leaf)
+            }
+            None => (0, *path),
         };
-    }
-    fat[mini_fat_start as usize] = ENDOFCHAIN;
-    for i in 0..mini_stream_sectors {
-        let s = mini_data_start as usize + i;
-        fat[s] = if i + 1 == mini_stream_sectors {
-            ENDOFCHAIN
-        } else {
-            (s + 1) as u32
-        };
+        let id = nodes.len();
+        nodes.push(FixtureNode {
+            name: leaf,
+            obj_type: TYPE_STREAM,
+            stream: Some(index),
+            children: Vec::new(),
+        });
+        nodes[parent].children.push(id);
     }
 
-    let mut mini_fat = vec![FREESECT; SECTOR / 4];
-    let mut mini_index = 0u32;
-    for padded in &mini_sectors {
-        let count = (padded.len() / MINI) as u32;
-        for j in 0..count {
-            let idx = mini_index + j;
-            mini_fat[idx as usize] = if j + 1 == count { ENDOFCHAIN } else { idx + 1 };
+    // Stream data: small streams are packed into the mini stream, large ones
+    // into their own run of regular sectors. `starts` is relative to the
+    // owning area until the layout is known.
+    let mut mini_stream: Vec<u8> = Vec::new();
+    let mut mini_fat: Vec<u32> = Vec::new();
+    let mut large_data: Vec<u8> = Vec::new();
+    let mut large_runs: Vec<(usize, usize)> = Vec::new();
+    let mut starts = vec![0usize; streams.len()];
+    for (index, (_, data)) in streams.iter().enumerate() {
+        if data.len() >= FIXTURE_MINI_CUTOFF {
+            let count = data.len().div_ceil(SECTOR);
+            starts[index] = large_data.len() / SECTOR;
+            large_runs.push((starts[index], count));
+            large_data.extend_from_slice(data);
+            large_data.resize((starts[index] + count) * SECTOR, 0);
+        } else {
+            // An empty stream still owns one mini sector.
+            let count = data.len().div_ceil(MINI).max(1);
+            let first = mini_fat.len();
+            starts[index] = first;
+            for offset in 0..count {
+                mini_fat.push(if offset + 1 == count {
+                    ENDOFCHAIN
+                } else {
+                    (first + offset + 1) as u32
+                });
+            }
+            mini_stream.extend_from_slice(data);
+            mini_stream.resize((first + count) * MINI, 0);
         }
-        mini_index += count;
+    }
+
+    // Layout after the 512-byte header: FAT, directory, mini FAT, the mini
+    // stream container, then the large streams.
+    let dir_sectors = (nodes.len() * DIR_ENTRY_SIZE).div_ceil(SECTOR);
+    let mini_fat_sectors = mini_fat.len().div_ceil(ENTRIES_PER_SECTOR).max(1);
+    let mini_stream_sectors = mini_stream.len().div_ceil(SECTOR);
+    let large_sectors = large_data.len() / SECTOR;
+    let payload_sectors = dir_sectors + mini_fat_sectors + mini_stream_sectors + large_sectors;
+    let mut fat_sectors = 1;
+    while fat_sectors * ENTRIES_PER_SECTOR < fat_sectors + payload_sectors {
+        fat_sectors += 1;
+    }
+    assert!(
+        fat_sectors <= HEADER_FAT_SLOTS,
+        "fixture too large for a header-only DIFAT"
+    );
+    let dir_start = fat_sectors;
+    let mini_fat_start = dir_start + dir_sectors;
+    let mini_data_start = mini_fat_start + mini_fat_sectors;
+    let large_start = mini_data_start + mini_stream_sectors;
+    let total_sectors = large_start + large_sectors;
+
+    let mut fat = vec![FREESECT; fat_sectors * ENTRIES_PER_SECTOR];
+    fat[..fat_sectors].fill(FATSECT);
+    let mut chain = |start: usize, count: usize| {
+        for offset in 0..count {
+            fat[start + offset] = if offset + 1 == count {
+                ENDOFCHAIN
+            } else {
+                (start + offset + 1) as u32
+            };
+        }
+    };
+    chain(dir_start, dir_sectors);
+    chain(mini_fat_start, mini_fat_sectors);
+    chain(mini_data_start, mini_stream_sectors);
+    for (first, count) in &large_runs {
+        chain(large_start + first, *count);
     }
 
     let mut dir = vec![0u8; dir_sectors * SECTOR];
-    write_dir_entry(
-        &mut dir,
-        0,
-        DirWrite {
-            name: "Root Entry",
-            obj_type: TYPE_ROOT,
-            left: NOSTREAM,
-            right: NOSTREAM,
-            child: 1,
-            start: mini_data_start,
-            size: mini_stream.len() as u64,
-        },
-    );
-    let mut mini_start = 0u32;
-    for (i, (name, data)) in streams.iter().enumerate() {
-        let idx = i + 1;
-        let right = if idx + 1 < dir_entries {
-            idx as u32 + 1
-        } else {
-            NOSTREAM
+    for (id, node) in nodes.iter().enumerate() {
+        let (start, size) = match node.stream {
+            Some(index) => {
+                let len = streams[index].1.len();
+                let start = if len >= FIXTURE_MINI_CUTOFF {
+                    large_start + starts[index]
+                } else {
+                    starts[index]
+                };
+                (start as u32, len as u64)
+            }
+            None if id == 0 && mini_stream_sectors > 0 => {
+                (mini_data_start as u32, mini_stream.len() as u64)
+            }
+            None if id == 0 => (ENDOFCHAIN, 0),
+            None => (0, 0),
         };
         write_dir_entry(
             &mut dir,
-            idx,
+            id,
             DirWrite {
-                name,
-                obj_type: TYPE_STREAM,
+                name: node.name,
+                obj_type: node.obj_type,
                 left: NOSTREAM,
-                right,
-                child: NOSTREAM,
-                start: mini_start,
-                size: data.len() as u64,
+                right: NOSTREAM,
+                child: node
+                    .children
+                    .first()
+                    .map_or(NOSTREAM, |&child| child as u32),
+                start,
+                size,
             },
         );
-        mini_start += (mini_sectors[i].len() / MINI) as u32;
+    }
+    // Chain each storage's entries through their `right` links.
+    for node in &nodes {
+        for pair in node.children.windows(2) {
+            let off = pair[0] * DIR_ENTRY_SIZE + 0x48;
+            dir[off..off + 4].copy_from_slice(&(pair[1] as u32).to_le_bytes());
+        }
     }
 
     let mut out = vec![0u8; HEADER_SIZE + total_sectors * SECTOR];
@@ -904,25 +1143,34 @@ fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     out[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
     out[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
     out[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
-    out[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
-    out[0x30..0x34].copy_from_slice(&dir_start.to_le_bytes());
-    out[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
-    out[0x3C..0x40].copy_from_slice(&mini_fat_start.to_le_bytes());
-    out[0x40..0x44].copy_from_slice(&1u32.to_le_bytes());
+    out[0x2C..0x30].copy_from_slice(&(fat_sectors as u32).to_le_bytes());
+    out[0x30..0x34].copy_from_slice(&(dir_start as u32).to_le_bytes());
+    out[0x38..0x3C].copy_from_slice(&(FIXTURE_MINI_CUTOFF as u32).to_le_bytes());
+    out[0x3C..0x40].copy_from_slice(&(mini_fat_start as u32).to_le_bytes());
+    out[0x40..0x44].copy_from_slice(&(mini_fat_sectors as u32).to_le_bytes());
     out[0x44..0x48].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
-    out[0x4C..0x50].copy_from_slice(&fat_sect.to_le_bytes());
-    for i in 1..109 {
-        let off = 0x4C + i * 4;
-        out[off..off + 4].copy_from_slice(&FREESECT.to_le_bytes());
+    for slot in 0..HEADER_FAT_SLOTS {
+        let sector = if slot < fat_sectors {
+            slot as u32
+        } else {
+            FREESECT
+        };
+        let off = 0x4C + slot * 4;
+        out[off..off + 4].copy_from_slice(&sector.to_le_bytes());
     }
 
-    write_u32_table(&mut out[HEADER_SIZE..HEADER_SIZE + SECTOR], &fat);
-    let dir_off = HEADER_SIZE + dir_start as usize * SECTOR;
-    out[dir_off..dir_off + dir.len()].copy_from_slice(&dir);
-    let mini_fat_off = HEADER_SIZE + mini_fat_start as usize * SECTOR;
-    write_u32_table(&mut out[mini_fat_off..mini_fat_off + SECTOR], &mini_fat);
-    let mini_data_off = HEADER_SIZE + mini_data_start as usize * SECTOR;
-    out[mini_data_off..mini_data_off + mini_stream.len()].copy_from_slice(&mini_stream);
+    let sector_off = |sector: usize| HEADER_SIZE + sector * SECTOR;
+    write_u32_table(&mut out[sector_off(0)..sector_off(fat_sectors)], &fat);
+    out[sector_off(dir_start)..sector_off(dir_start) + dir.len()].copy_from_slice(&dir);
+    mini_fat.resize(mini_fat_sectors * ENTRIES_PER_SECTOR, FREESECT);
+    write_u32_table(
+        &mut out[sector_off(mini_fat_start)..sector_off(mini_data_start)],
+        &mini_fat,
+    );
+    out[sector_off(mini_data_start)..sector_off(mini_data_start) + mini_stream.len()]
+        .copy_from_slice(&mini_stream);
+    out[sector_off(large_start)..sector_off(large_start) + large_data.len()]
+        .copy_from_slice(&large_data);
     out
 }
 

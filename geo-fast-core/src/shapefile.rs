@@ -14,7 +14,7 @@
 //! M values are stored as `properties["_m"]`. Core [`Geometry`] remains 2-D
 //! (lon/lat) so WKT / Milvus interchange stays XY-only.
 
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Seek, SeekFrom};
 use std::path::Path;
 
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
@@ -145,8 +145,19 @@ fn attach_measures(map: &mut JsonMap<String, Value>, measures: &MeasureArrays) {
 
 // ── .shp parser ──────────────────────────────────────────────────────────────
 
+/// Size of the fixed `.shp` file header; the first record starts here.
+const SHP_HEADER_SIZE: usize = 100;
+/// Size of a record header: record number and content length.
+const SHP_RECORD_HEADER_SIZE: usize = 8;
+/// Bytes one part offset occupies in a PolyLine or Polygon record.
+const SHP_PART_OFFSET_SIZE: usize = 4;
+/// Bytes one XY vertex occupies in a record.
+const SHP_POINT_SIZE: usize = 16;
+/// Bytes one Z or M value occupies; a `[min, max]` range is two of them.
+const SHP_MEASURE_SIZE: usize = 8;
+
 fn parse_shp(data: &[u8]) -> Result<(BBox, Vec<ShpRecord>), GeoError> {
-    if data.len() < 100 {
+    if data.len() < SHP_HEADER_SIZE {
         return Err(GeoError::InvalidFormat("SHP file too short".into()));
     }
     let mut cur = Cursor::new(data);
@@ -167,21 +178,36 @@ fn parse_shp(data: &[u8]) -> Result<(BBox, Vec<ShpRecord>), GeoError> {
     let min_y = cur.read_f64::<LittleEndian>().map_err(io_err)?;
     let max_x = cur.read_f64::<LittleEndian>().map_err(io_err)?;
     let max_y = cur.read_f64::<LittleEndian>().map_err(io_err)?;
-    // Skip Z and M ranges (32 bytes)
-    cur.seek(SeekFrom::Current(32)).map_err(io_err)?;
+    // The Z and M ranges fill the rest of the header.
 
     let bbox = BBox::new(min_x, min_y, max_x, max_y);
 
     let mut records = Vec::new();
-    while (cur.position() as usize) < data.len() {
-        // Record header
-        let record_num = match cur.read_i32::<BigEndian>() {
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        let content_len_words = cur.read_i32::<BigEndian>().map_err(io_err)?; // 16-bit words
-        let content_start = cur.position() as usize;
-        let content_end = content_start + (content_len_words as usize) * 2;
+    let mut record_start = SHP_HEADER_SIZE;
+    // Fewer than four bytes cannot hold a record number: trailing padding.
+    while data.len() - record_start >= 4 {
+        let mut header = Cursor::new(&data[record_start..]);
+        let record_num = header.read_i32::<BigEndian>().map_err(io_err)?;
+        let content_len_words = header.read_i32::<BigEndian>().map_err(io_err)?; // 16-bit words
+
+        // Every record is read from its own content and nothing else. The
+        // length is what moves the cursor, so it must be non-negative and stay
+        // inside the file; a shape that needs more than its record holds is an
+        // error instead of a read into the records that follow.
+        let content_start = record_start + SHP_RECORD_HEADER_SIZE;
+        let content = usize::try_from(content_len_words)
+            .ok()
+            .and_then(|words| words.checked_mul(2))
+            .and_then(|len| content_start.checked_add(len))
+            .and_then(|content_end| data.get(content_start..content_end))
+            .ok_or_else(|| {
+                GeoError::InvalidFormat(format!(
+                    "SHP record {record_num} declares {content_len_words} content words \
+                     but {} bytes follow its header",
+                    data.len() - content_start
+                ))
+            })?;
+        let mut cur = Cursor::new(content);
 
         let shape_type = cur.read_i32::<LittleEndian>().map_err(io_err)?;
         match shape_type {
@@ -189,16 +215,16 @@ fn parse_shp(data: &[u8]) -> Result<(BBox, Vec<ShpRecord>), GeoError> {
                 // Nothing else in a null record.
             }
             SHP_POINT | SHP_POINT_Z | SHP_POINT_M => {
-                let (geom, measures) = read_point(&mut cur, shape_type, content_end)?;
+                let (geom, measures) = read_point(&mut cur, shape_type)?;
                 records.push((record_num, geom, measures));
             }
             SHP_MULTIPOINT | SHP_MULTIPOINT_Z | SHP_MULTIPOINT_M => {
-                let (geom, measures) = read_multipoint(&mut cur, shape_type, content_end)?;
+                let (geom, measures) = read_multipoint(&mut cur, shape_type)?;
                 records.push((record_num, geom, measures));
             }
             SHP_POLYLINE | SHP_POLYLINE_Z | SHP_POLYLINE_M | SHP_POLYGON | SHP_POLYGON_Z
             | SHP_POLYGON_M => {
-                let (geom, measures) = read_poly(&mut cur, shape_type, content_end)?;
+                let (geom, measures) = read_poly(&mut cur, shape_type)?;
                 records.push((record_num, geom, measures));
             }
             other => {
@@ -207,11 +233,9 @@ fn parse_shp(data: &[u8]) -> Result<(BBox, Vec<ShpRecord>), GeoError> {
                 )));
             }
         }
-        // Advance to end of record (guards against optional-M undershoot / overshoot).
-        if (cur.position() as usize) != content_end && content_end <= data.len() {
-            cur.seek(SeekFrom::Start(content_end as u64))
-                .map_err(io_err)?;
-        }
+        // The next record starts where this one's content ends, whether or not
+        // the shape used all of it (an absent optional M array, padding).
+        record_start = content_start + content.len();
     }
     Ok((bbox, records))
 }
@@ -219,7 +243,6 @@ fn parse_shp(data: &[u8]) -> Result<(BBox, Vec<ShpRecord>), GeoError> {
 fn read_point(
     cur: &mut Cursor<&[u8]>,
     shape_type: i32,
-    content_end: usize,
 ) -> Result<(Geometry, MeasureArrays), GeoError> {
     let lon = cur.read_f64::<LittleEndian>().map_err(io_err)?;
     let lat = cur.read_f64::<LittleEndian>().map_err(io_err)?;
@@ -228,14 +251,14 @@ fn read_point(
         SHP_POINT_Z => {
             let z = cur.read_f64::<LittleEndian>().map_err(io_err)?;
             measures.z = Some(vec![z]);
-            if bytes_remaining(cur, content_end) >= 8 {
+            if bytes_remaining(cur) >= SHP_MEASURE_SIZE {
                 let m = cur.read_f64::<LittleEndian>().map_err(io_err)?;
                 if m.is_finite() {
                     measures.m = Some(vec![m]);
                 }
             }
         }
-        SHP_POINT_M if bytes_remaining(cur, content_end) >= 8 => {
+        SHP_POINT_M if bytes_remaining(cur) >= SHP_MEASURE_SIZE => {
             let m = cur.read_f64::<LittleEndian>().map_err(io_err)?;
             if m.is_finite() {
                 measures.m = Some(vec![m]);
@@ -249,25 +272,20 @@ fn read_point(
 fn read_multipoint(
     cur: &mut Cursor<&[u8]>,
     shape_type: i32,
-    content_end: usize,
 ) -> Result<(Geometry, MeasureArrays), GeoError> {
     // Bounding box (skip)
     cur.seek(SeekFrom::Current(32)).map_err(io_err)?;
-    let num_points = cur.read_i32::<LittleEndian>().map_err(io_err)? as usize;
-    let mut pts = Vec::with_capacity(num_points);
-    for _ in 0..num_points {
-        let lon = cur.read_f64::<LittleEndian>().map_err(io_err)?;
-        let lat = cur.read_f64::<LittleEndian>().map_err(io_err)?;
-        pts.push(Coordinate::new(lon, lat));
-    }
+    let declared_points = cur.read_i32::<LittleEndian>().map_err(io_err)?;
+    let num_points = checked_count(cur, declared_points, SHP_POINT_SIZE, "points")?;
+    let pts = read_points(cur, num_points)?;
     let mut measures = MeasureArrays::default();
     match shape_type {
         SHP_MULTIPOINT_Z => {
             measures.z = Some(read_measure_array(cur, num_points)?);
-            measures.m = read_optional_measure_array(cur, num_points, content_end)?;
+            measures.m = read_optional_measure_array(cur, num_points)?;
         }
         SHP_MULTIPOINT_M => {
-            measures.m = Some(read_measure_array(cur, num_points)?);
+            measures.m = read_optional_measure_array(cur, num_points)?;
         }
         _ => {}
     }
@@ -277,46 +295,52 @@ fn read_multipoint(
 fn read_poly(
     cur: &mut Cursor<&[u8]>,
     shape_type: i32,
-    content_end: usize,
 ) -> Result<(Geometry, MeasureArrays), GeoError> {
     // Bounding box (skip)
     cur.seek(SeekFrom::Current(32)).map_err(io_err)?;
-    let num_parts = cur.read_i32::<LittleEndian>().map_err(io_err)? as usize;
-    let num_points = cur.read_i32::<LittleEndian>().map_err(io_err)? as usize;
+    let declared_parts = cur.read_i32::<LittleEndian>().map_err(io_err)?;
+    let declared_points = cur.read_i32::<LittleEndian>().map_err(io_err)?;
 
+    let num_parts = checked_count(cur, declared_parts, SHP_PART_OFFSET_SIZE, "parts")?;
     let mut part_starts = Vec::with_capacity(num_parts);
     for _ in 0..num_parts {
-        part_starts.push(cur.read_i32::<LittleEndian>().map_err(io_err)? as usize);
+        part_starts.push(cur.read_i32::<LittleEndian>().map_err(io_err)?);
     }
 
-    let mut all_points = Vec::with_capacity(num_points);
-    for _ in 0..num_points {
-        let lon = cur.read_f64::<LittleEndian>().map_err(io_err)?;
-        let lat = cur.read_f64::<LittleEndian>().map_err(io_err)?;
-        all_points.push(Coordinate::new(lon, lat));
-    }
+    let num_points = checked_count(cur, declared_points, SHP_POINT_SIZE, "points")?;
+    let all_points = read_points(cur, num_points)?;
 
+    // A part runs from its offset to the next part's offset, the last one to
+    // the end of the points. Requiring every such range to be forward and in
+    // bounds makes the offsets non-decreasing, so the parts are disjoint and
+    // together copy each point at most once.
     let mut parts: Vec<Vec<Coordinate>> = Vec::with_capacity(num_parts);
-    for pi in 0..part_starts.len() {
-        let start = part_starts[pi];
-        let end = if pi + 1 < part_starts.len() {
-            part_starts[pi + 1]
-        } else {
-            all_points.len()
+    for (index, &declared_start) in part_starts.iter().enumerate() {
+        let start = usize::try_from(declared_start).ok();
+        let end = match part_starts.get(index + 1) {
+            Some(&next_start) => usize::try_from(next_start).ok(),
+            None => Some(all_points.len()),
         };
-        if start <= end && end <= all_points.len() {
-            parts.push(all_points[start..end].to_vec());
-        }
+        let part = start
+            .zip(end)
+            .and_then(|(start, end)| all_points.get(start..end))
+            .ok_or_else(|| {
+                GeoError::InvalidFormat(format!(
+                    "SHP part {index} starts at {declared_start}: part offsets must not \
+                     decrease and must stay within the record's {num_points} points"
+                ))
+            })?;
+        parts.push(part.to_vec());
     }
 
     let mut measures = MeasureArrays::default();
     match shape_type {
         SHP_POLYLINE_Z | SHP_POLYGON_Z => {
             measures.z = Some(read_measure_array(cur, num_points)?);
-            measures.m = read_optional_measure_array(cur, num_points, content_end)?;
+            measures.m = read_optional_measure_array(cur, num_points)?;
         }
         SHP_POLYLINE_M | SHP_POLYGON_M => {
-            measures.m = Some(read_measure_array(cur, num_points)?);
+            measures.m = read_optional_measure_array(cur, num_points)?;
         }
         _ => {}
     }
@@ -330,12 +354,56 @@ fn read_poly(
     Ok((geom, measures))
 }
 
-fn bytes_remaining(cur: &Cursor<&[u8]>, content_end: usize) -> usize {
-    content_end.saturating_sub(cur.position() as usize)
+/// Bytes left in the record content `cur` reads from.
+fn bytes_remaining(cur: &Cursor<&[u8]>) -> usize {
+    let consumed = usize::try_from(cur.position()).unwrap_or(usize::MAX);
+    cur.get_ref().len().saturating_sub(consumed)
+}
+
+/// Checks a count read from a record against the bytes left in that record.
+///
+/// A count sizes an allocation, so it is accepted only when the record still
+/// holds `element_size` bytes for each element it announces.
+fn checked_count(
+    cur: &Cursor<&[u8]>,
+    declared: i32,
+    element_size: usize,
+    what: &str,
+) -> Result<usize, GeoError> {
+    let room = bytes_remaining(cur) / element_size;
+    match usize::try_from(declared) {
+        Ok(count) if count <= room => Ok(count),
+        _ => Err(GeoError::InvalidFormat(format!(
+            "SHP record declares {declared} {what} but has room for {room}"
+        ))),
+    }
+}
+
+/// Read `n` XY vertices; `n` has already been checked against the record.
+fn read_points(cur: &mut Cursor<&[u8]>, n: usize) -> Result<Vec<Coordinate>, GeoError> {
+    let mut points = Vec::with_capacity(n);
+    for _ in 0..n {
+        let lon = cur.read_f64::<LittleEndian>().map_err(io_err)?;
+        let lat = cur.read_f64::<LittleEndian>().map_err(io_err)?;
+        points.push(Coordinate::new(lon, lat));
+    }
+    Ok(points)
+}
+
+/// Bytes a Z or M block for `n` vertices occupies: a `[min, max]` range, then
+/// `n` values. `None` when that does not fit in `usize`.
+fn measure_array_len(n: usize) -> Option<usize> {
+    n.checked_mul(SHP_MEASURE_SIZE)?
+        .checked_add(2 * SHP_MEASURE_SIZE)
 }
 
 /// Read `[min, max]` range then `n` f64 values (Z or M array).
 fn read_measure_array(cur: &mut Cursor<&[u8]>, n: usize) -> Result<Vec<f64>, GeoError> {
+    if measure_array_len(n).is_none_or(|need| bytes_remaining(cur) < need) {
+        return Err(GeoError::InvalidFormat(format!(
+            "SHP record is too short for the {n} measure values its shape type requires"
+        )));
+    }
     let _min = cur.read_f64::<LittleEndian>().map_err(io_err)?;
     let _max = cur.read_f64::<LittleEndian>().map_err(io_err)?;
     let mut vals = Vec::with_capacity(n);
@@ -345,14 +413,12 @@ fn read_measure_array(cur: &mut Cursor<&[u8]>, n: usize) -> Result<Vec<f64>, Geo
     Ok(vals)
 }
 
-/// Attempt to read an optional trailing M array bounded by `content_end`.
+/// Read a trailing M array if the record has room for one; M is optional.
 fn read_optional_measure_array(
     cur: &mut Cursor<&[u8]>,
     n: usize,
-    content_end: usize,
 ) -> Result<Option<Vec<f64>>, GeoError> {
-    let need = 16 + 8 * n;
-    if bytes_remaining(cur, content_end) < need {
+    if measure_array_len(n).is_none_or(|need| bytes_remaining(cur) < need) {
         return Ok(None);
     }
     Ok(Some(read_measure_array(cur, n)?))
@@ -368,67 +434,90 @@ fn parse_dbf(data: &[u8]) -> Result<(Vec<FieldDef>, Vec<Vec<String>>), GeoError>
 
     let _version = cur.read_u8().map_err(io_err)?;
     cur.seek(SeekFrom::Current(3)).map_err(io_err)?; // date
-    let num_records = cur.read_u32::<LittleEndian>().map_err(io_err)? as usize;
-    let header_size = cur.read_u16::<LittleEndian>().map_err(io_err)? as usize;
-    let record_size = cur.read_u16::<LittleEndian>().map_err(io_err)? as usize;
-    cur.seek(SeekFrom::Current(20)).map_err(io_err)?; // reserved
+    let declared_records = cur.read_u32::<LittleEndian>().map_err(io_err)?;
+    let header_size = usize::from(cur.read_u16::<LittleEndian>().map_err(io_err)?);
+    let record_size = usize::from(cur.read_u16::<LittleEndian>().map_err(io_err)?);
+    // Twenty reserved bytes complete the fixed header.
+
+    // The header holds the field descriptors and the records start right
+    // after it, so it must lie inside the file. That also bounds the number
+    // of descriptors by the bytes that are really there.
+    if header_size < DBF_HEADER_SIZE || header_size > data.len() {
+        return Err(GeoError::InvalidFormat(format!(
+            "DBF header size {header_size} does not fit a {} byte file",
+            data.len()
+        )));
+    }
 
     // Field descriptors
-    let field_area = header_size.saturating_sub(DBF_HEADER_SIZE);
-    let n_fields = field_area / DBF_FIELD_DESCRIPTOR_SIZE;
+    let n_fields = (header_size - DBF_HEADER_SIZE) / DBF_FIELD_DESCRIPTOR_SIZE;
     let mut schema: Vec<FieldDef> = Vec::with_capacity(n_fields);
+    let mut row_width = 1usize; // the deletion flag
 
-    for _ in 0..n_fields {
-        let mut name_buf = [0u8; 11];
-        cur.read_exact(&mut name_buf).map_err(io_err)?;
-        let name = String::from_utf8_lossy(&name_buf)
-            .trim_end_matches('\0')
-            .to_string();
-        let ft = cur.read_u8().map_err(io_err)? as char;
-        cur.seek(SeekFrom::Current(4)).map_err(io_err)?; // reserved
-        let length = cur.read_u8().map_err(io_err)?;
-        let decimal_count = cur.read_u8().map_err(io_err)?;
-        cur.seek(SeekFrom::Current(14)).map_err(io_err)?; // reserved
-
-        // Detect terminator
-        let pos = cur.position() as usize;
-        if pos < data.len() && data[pos] == DBF_TERMINATOR {
-            cur.seek(SeekFrom::Current(1)).map_err(io_err)?;
-            schema.push(FieldDef {
-                name,
-                field_type: ft,
-                length,
-                decimal_count,
-            });
+    let (descriptors, _) =
+        data[DBF_HEADER_SIZE..header_size].as_chunks::<DBF_FIELD_DESCRIPTOR_SIZE>();
+    for descriptor in descriptors {
+        // A terminator where a descriptor would start ends the field list.
+        if descriptor[0] == DBF_TERMINATOR {
             break;
         }
+        let name = String::from_utf8_lossy(&descriptor[..11])
+            .trim_end_matches('\0')
+            .to_string();
+        let field_type = descriptor[11] as char;
+        let length = descriptor[16];
+        let decimal_count = descriptor[17];
+
+        // A row costs memory for each of its cells, so every cell must cost
+        // the file at least one byte; otherwise a table of zero-width fields
+        // turns each one-byte record into thousands of empty strings.
+        if length == 0 {
+            return Err(GeoError::InvalidFormat(format!(
+                "DBF field '{name}' has zero width"
+            )));
+        }
+        row_width += usize::from(length);
         schema.push(FieldDef {
             name,
-            field_type: ft,
+            field_type,
             length,
             decimal_count,
         });
     }
 
-    // Seek to first record
-    cur.seek(SeekFrom::Start(header_size as u64))
-        .map_err(io_err)?;
+    // Records are `record_size` bytes apart; the fields must fit in one.
+    if record_size < row_width {
+        return Err(GeoError::InvalidFormat(format!(
+            "DBF record size {record_size} is smaller than the {row_width} bytes its fields need"
+        )));
+    }
+    // `record_size >= row_width >= 1`, so the division is defined.
+    let records_present = (data.len() - header_size) / record_size;
+    let num_records = usize::try_from(declared_records)
+        .ok()
+        .filter(|&declared| declared <= records_present)
+        .ok_or_else(|| {
+            GeoError::InvalidFormat(format!(
+                "DBF header declares {declared_records} records but the file holds \
+                 {records_present}"
+            ))
+        })?;
 
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(num_records);
-    for _ in 0..num_records {
-        let delete_flag = cur.read_u8().map_err(io_err)?;
-        if delete_flag == b'*' {
+    for record in data[header_size..]
+        .chunks_exact(record_size)
+        .take(num_records)
+    {
+        if record[0] == b'*' {
             // Deleted record — skip
-            cur.seek(SeekFrom::Current((record_size - 1) as i64))
-                .map_err(io_err)?;
             continue;
         }
         let mut row: Vec<String> = Vec::with_capacity(schema.len());
+        let mut cells = &record[1..];
         for field in &schema {
-            let mut buf = vec![0u8; field.length as usize];
-            cur.read_exact(&mut buf).map_err(io_err)?;
-            let val = String::from_utf8_lossy(&buf).trim().to_string();
-            row.push(val);
+            let (cell, rest) = cells.split_at(usize::from(field.length));
+            row.push(String::from_utf8_lossy(cell).trim().to_string());
+            cells = rest;
         }
         rows.push(row);
     }
