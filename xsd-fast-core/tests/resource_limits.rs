@@ -35,6 +35,99 @@ fn resource_limit_message<T>(result: anyhow::Result<T>) -> String {
     }
 }
 
+mod validation {
+    use super::{load, schema_document};
+    use xsd_fast_core::{SchemaSet, ValidateOptions, ValidationError};
+
+    /// Three `e` values outside the enumeration and no required `req` child.
+    const INVALID: &[u8] = b"<r><e>B</e><e>C</e><e>D</e></r>";
+    /// The end tag of `req` does not match.
+    const NOT_WELL_FORMED: &[u8] = b"<r><req>x</wrong></r>";
+
+    fn schema() -> SchemaSet {
+        load(&schema_document(
+            "<xs:simpleType name=\"E\"><xs:restriction base=\"xs:string\">\
+             <xs:enumeration value=\"A\"/></xs:restriction></xs:simpleType>\
+             <xs:element name=\"r\"><xs:complexType><xs:sequence>\
+             <xs:element name=\"e\" type=\"t:E\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>\
+             <xs:element name=\"req\" type=\"xs:string\"/>\
+             </xs:sequence></xs:complexType></xs:element>",
+        ))
+        .expect("schema loads")
+    }
+
+    fn validate(
+        schema: &SchemaSet,
+        xml: &[u8],
+        max_errors: usize,
+    ) -> anyhow::Result<Vec<ValidationError>> {
+        schema.validate(
+            xml,
+            ValidateOptions {
+                max_errors,
+                ..ValidateOptions::default()
+            },
+        )
+    }
+
+    fn parse_errors(findings: &[ValidationError]) -> usize {
+        findings
+            .iter()
+            .filter(|finding| finding.message.starts_with("XML parse error"))
+            .count()
+    }
+
+    #[test]
+    fn a_limit_of_zero_is_refused_not_reported_as_clean() {
+        let schema = schema();
+        for xml in [INVALID, NOT_WELL_FORMED, b"<r><req>x</req></r>"] {
+            let error = validate(&schema, xml, 0).expect_err("a limit of zero must be refused");
+            let message = error.to_string();
+            assert!(message.contains("max_errors"), "{message}");
+            assert!(message.contains("positive limit"), "{message}");
+        }
+    }
+
+    #[test]
+    fn findings_stop_exactly_at_the_limit() {
+        let schema = schema();
+        // The document has four findings: three values and the missing child.
+        for (max_errors, expected) in [(1, 1), (3, 3), (4, 4), (5, 4), (100, 4)] {
+            let findings = validate(&schema, INVALID, max_errors).expect("validation runs");
+            assert_eq!(findings.len(), expected, "max_errors = {max_errors}");
+            assert_eq!(parse_errors(&findings), 0);
+        }
+    }
+
+    #[test]
+    fn a_parse_error_is_reported_under_every_limit() {
+        let schema = schema();
+        for max_errors in [1, 100] {
+            let findings = validate(&schema, NOT_WELL_FORMED, max_errors).expect("validation runs");
+            assert_eq!(findings.len(), 1, "max_errors = {max_errors}");
+            assert_eq!(parse_errors(&findings), 1);
+        }
+    }
+
+    #[test]
+    fn a_parse_error_past_the_limit_is_still_reported() {
+        let schema = schema();
+        // Two invalid values reach a limit of two; the mismatched end tag
+        // comes after them.
+        let xml = b"<r><e>B</e><e>C</e><req>x</wrong></r>";
+        let findings = validate(&schema, xml, 2).expect("validation runs");
+        assert_eq!(findings.len(), 3, "{findings:?}");
+        assert_eq!(parse_errors(&findings), 1);
+        assert_eq!(findings[2].path, "/r/req");
+
+        // The same document closed properly stays at the limit.
+        let xml = b"<r><e>B</e><e>C</e><req>x</req></r>";
+        let findings = validate(&schema, xml, 2).expect("validation runs");
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert_eq!(parse_errors(&findings), 0);
+    }
+}
+
 #[cfg(feature = "arrow")]
 mod arrow {
     use super::{load, resource_limit_message, schema_document};

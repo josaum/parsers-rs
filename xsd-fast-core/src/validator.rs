@@ -47,7 +47,16 @@ pub struct ValidationError {
 /// Options for the validation phase.
 #[derive(Debug, Clone)]
 pub struct ValidateOptions {
-    /// Stop after this many errors. Default: 100.
+    /// Most findings to report, warnings included. Must be at least 1.
+    /// Default: 100.
+    ///
+    /// Once this many findings are recorded the document is no longer
+    /// checked against the schema, so a result holding exactly this many may
+    /// be incomplete. The rest of the document is still read, and a parse
+    /// error raised there is reported as one more finding.
+    ///
+    /// Zero is refused: with no room for a finding every document would be
+    /// reported as clean.
     pub max_errors: usize,
     /// Validate simple-type facet constraints (enum, length, range). Default: true.
     pub check_facets: bool,
@@ -68,8 +77,24 @@ impl Default for ValidateOptions {
 impl SchemaSet {
     /// Validate an XML document against this schema set.
     ///
-    /// At most [`ValidateOptions::max_errors`] findings are returned.
+    /// Returns the findings, at most [`ValidateOptions::max_errors`] of them
+    /// from checking the document against the schema. A parse error raised
+    /// while reading the document, such as a mismatched end tag, is always
+    /// among the findings, as one more than the limit if the limit was already
+    /// reached. A document that merely ends with elements still open raises
+    /// no parse error and is not reported. A result at the limit may be
+    /// incomplete.
+    ///
+    /// # Errors
+    ///
+    /// Fails when [`ValidateOptions::max_errors`] is zero, because that limit
+    /// would report every document as clean.
     pub fn validate(&self, xml: &[u8], opts: ValidateOptions) -> Result<Vec<ValidationError>> {
+        anyhow::ensure!(
+            opts.max_errors > 0,
+            "max_errors is 0: a limit of zero findings would report every document as clean; \
+             pass a positive limit"
+        );
         let mut ctx = ValidationContext {
             model: &self.model,
             errors: Vec::new(),
@@ -119,7 +144,9 @@ impl<'m> ValidationContext<'m> {
         reader.config_mut().trim_text(true);
         let mut buf = Vec::with_capacity(4096);
 
-        loop {
+        // The loop ends with whether it stopped at the finding limit, which
+        // leaves the rest of the document unread.
+        let stopped_at_limit = loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) => {
                     let local = {
@@ -164,7 +191,7 @@ impl<'m> ValidationContext<'m> {
                     self.path.pop();
 
                     if self.errors.len() >= self.opts.max_errors {
-                        break;
+                        break true;
                     }
                 }
                 Ok(Event::Text(ref t)) => {
@@ -188,20 +215,51 @@ impl<'m> ValidationContext<'m> {
                     self.path.pop();
 
                     if self.errors.len() >= self.opts.max_errors {
-                        break;
+                        break true;
                     }
+                }
+                Ok(Event::Eof) => break false,
+                Err(e) => {
+                    self.push_parse_error(&e);
+                    break false;
+                }
+                _ => {}
+            }
+            buf.clear();
+        };
+
+        if stopped_at_limit {
+            buf.clear();
+            self.report_ill_formed_rest(&mut reader, &mut buf);
+        }
+        Ok(())
+    }
+
+    /// Reads the rest of a document whose findings reached the limit.
+    ///
+    /// Nothing more is checked against the schema, but a parse error must be
+    /// reported whatever the limit, so if the reader raises one it is
+    /// recorded. The element path is kept up to date for it.
+    fn report_ill_formed_rest(&mut self, reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>) {
+        loop {
+            match reader.read_event_into(buf) {
+                Ok(Event::Start(ref e)) => {
+                    let name_bytes = e.name();
+                    let raw = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("?");
+                    self.path.push(strip_prefix(raw).to_owned());
+                }
+                Ok(Event::End(_)) => {
+                    self.path.pop();
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => {
-                    self.push_error(ValidationSeverity::Error, format!("XML parse error: {e}"));
+                    self.push_parse_error(&e);
                     break;
                 }
                 _ => {}
             }
             buf.clear();
         }
-
-        Ok(())
     }
 
     /// Resolve the XSD type for a child element given the current type stack.
@@ -436,6 +494,18 @@ impl<'m> ValidationContext<'m> {
             severity,
             path: self.current_path(),
             message,
+        });
+    }
+
+    /// Records a parse error raised by the reader, whatever the limit.
+    ///
+    /// Reading stops at the first parse error, so this adds at most one
+    /// finding beyond [`ValidateOptions::max_errors`].
+    fn push_parse_error(&mut self, error: &quick_xml::Error) {
+        self.errors.push(ValidationError {
+            severity: ValidationSeverity::Error,
+            path: self.current_path(),
+            message: format!("XML parse error: {error}"),
         });
     }
 
