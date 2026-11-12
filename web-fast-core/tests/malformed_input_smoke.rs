@@ -6,7 +6,9 @@
 #[path = "../../tools/mutation_smoke.rs"]
 mod smoke;
 
-use web_fast_core::{parse_html, parse_html_bytes, ParseOptions, WebDocument};
+use web_fast_core::{
+    parse_html, parse_html_bytes, ParseOptions, WebDocument, WebParseError, MAX_NESTING_DEPTH,
+};
 
 #[global_allocator]
 static ALLOCATOR: smoke::CappedAllocator = smoke::CappedAllocator;
@@ -154,13 +156,75 @@ fn deeply_nested_divs_are_bounded_on_a_small_stack() {
     }
 }
 
-/// 100,000 nested `<div>` did not finish within 60 seconds in a debug build;
-/// it was stopped before any stack or allocation failure was observed.
+/// 100,000 nested `<div>` did not finish within 60 seconds in a debug build.
+///
+/// The time went to the HTML tree builder, which walks its stack of open
+/// elements for every block-level start tag (5,000 / 10,000 / 20,000 levels
+/// took 1.1 s / 5.4 s / 24 s on their own). Input nested deeper than
+/// `MAX_NESTING_DEPTH` is now refused before it reaches the tree builder.
 #[test]
-#[ignore = "100,000 nested <div> runs for more than 60 s in a debug build; cause not established"]
 fn a_hundred_thousand_nested_divs_are_bounded_on_a_small_stack() {
     let document = smoke::nested(b"<div>", b"<p>leaf</p>", b"</div>", 100_000);
     smoke::run_on_small_stack(move || exercise(&document));
+}
+
+fn parse_text(html: &str) -> Result<WebDocument, WebParseError> {
+    parse_html(html, None, ParseOptions::default())
+}
+
+#[test]
+fn nesting_beyond_the_limit_is_an_error_not_truncation() {
+    // `html` and `body` are the first two levels.
+    let at_limit = "<div>".repeat(MAX_NESTING_DEPTH - 2) + "x";
+    let document = parse_text(&at_limit).expect("nesting at the limit parses");
+    assert_eq!(document.text, "x");
+    for html in [
+        "<div>".repeat(MAX_NESTING_DEPTH - 1) + "x",
+        "<div>".repeat(100_000) + "<p>leaf</p>",
+        "<blockquote>".repeat(100_000) + "x",
+        "<ul><li>".repeat(MAX_NESTING_DEPTH) + "x",
+        "<table><tr><td>".repeat(MAX_NESTING_DEPTH) + "x",
+    ] {
+        assert!(matches!(
+            parse_text(&html),
+            Err(WebParseError::NestingLimitExceeded)
+        ));
+    }
+}
+
+/// Long documents that are not deeply nested must not trip the nesting limit:
+/// implied end tags, void elements, self-closing SVG shapes, and markup that
+/// only appears inside a script, a comment or an attribute value.
+#[test]
+fn long_flat_documents_are_not_mistaken_for_deep_ones() {
+    let fake = "<div>".repeat(5_000);
+    let cases = [
+        ("<p>x".repeat(3_000), 3_000),
+        (format!("<ul>{}</ul>", "<li>x".repeat(3_000)), 3_000),
+        ("x<br>".repeat(3_000) + "<p>end", 1),
+        (
+            format!("<table>{}</table>", "<tr><td>a<td>b".repeat(5_000)),
+            10_000,
+        ),
+        (format!("<dl>{}</dl>", "<dt>t<dd>d".repeat(1_500)), 3_000),
+        ("<p><font size=2>x<p><b><i>y".repeat(2_000), 4_000),
+        (
+            format!("<svg>{}</svg><p>end", "<path d=\"M0 0\"/>".repeat(5_000)),
+            1,
+        ),
+        (format!("<script>{fake}</script><p>end"), 1),
+        (format!("<!-- {fake} --><p title=\"{fake}\">end"), 1),
+        (
+            format!("<select>{}</select><p>end", "<option>o".repeat(5_000)),
+            1,
+        ),
+    ];
+    for (html, blocks) in cases {
+        let document = parse_text(&html).unwrap_or_else(|error| {
+            panic!("{error}: {}", &html[..html.len().min(60)]);
+        });
+        assert_eq!(document.blocks.len(), blocks, "{}", &html[..40]);
+    }
 }
 
 #[test]
@@ -193,12 +257,12 @@ fn nested_tables_report_only_their_own_rows_and_cells() {
     }
 }
 
-/// 300 nested tables ran for more than 60 seconds in a debug build and were
-/// stopped. Table extraction selects every descendant row of every table and
-/// every descendant cell of every row, and each text block stores its full
-/// `dom_path`, so the cost grows much faster than the nesting depth.
+/// 300 nested tables ran for more than 60 seconds in a debug build because
+/// every table repeated the rows and cells of the tables inside it; 100,000
+/// nested block quotes were never run. Both now exceed `MAX_NESTING_DEPTH`
+/// and are refused; `nested_tables_report_only_their_own_rows_and_cells`
+/// covers the table shape inside the limit.
 #[test]
-#[ignore = "nested tables are superlinear: 300 levels ran over 60 s in a debug build; not fixed yet"]
 fn deeply_nested_tables_and_text_blocks_are_bounded() {
     let document = smoke::nested(b"<table><tr><td>", b"x", b"</td></tr></table>", 300);
     smoke::run_on_small_stack(move || exercise(&document));

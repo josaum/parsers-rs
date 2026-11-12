@@ -20,6 +20,7 @@ use url::Url;
 
 #[cfg(feature = "arrow")]
 pub mod arrow;
+mod nesting;
 
 /// Parser failures that are safe to expose without including source content.
 #[derive(Debug, Error)]
@@ -39,6 +40,9 @@ pub enum WebParseError {
     /// Extracted text exceeded the configured byte limit.
     #[error("HTML text exceeds the configured byte limit")]
     TextLimitExceeded,
+    /// Elements were nested deeper than [`MAX_NESTING_DEPTH`].
+    #[error("HTML element nesting exceeds the supported depth")]
+    NestingLimitExceeded,
     /// Reading a local source failed.
     #[error("failed to read HTML source: {0}")]
     Io(#[from] std::io::Error),
@@ -46,6 +50,18 @@ pub enum WebParseError {
     #[error("failed to encode HTML as Arrow IPC: {0}")]
     Arrow(String),
 }
+
+/// Deepest element nesting accepted in one document.
+///
+/// The HTML tree builder this crate depends on walks its stack of open
+/// elements for every block-level start tag, so its cost grows with the
+/// square of the nesting depth: 5,000, 10,000 and 20,000 nested `<div>` took
+/// 1.1 s, 5.4 s and 24 s in an unoptimized build. Every text block also
+/// stores a `dom_path` as long as its depth. A document nested deeper than
+/// this is rejected with [`WebParseError::NestingLimitExceeded`], never
+/// truncated. 512 is the depth at which browsers stop nesting elements, so
+/// a document a browser renders faithfully stays within it.
+pub const MAX_NESTING_DEPTH: usize = 512;
 
 /// Resource limits and decoding policy for one parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,7 +340,14 @@ fn parse_html_inner(
     supplied_base_url: Option<&str>,
     options: &ParseOptions,
 ) -> Result<WebDocument, WebParseError> {
+    // The tree builder is quadratic in nesting depth, so deep input is
+    // refused before it is handed over; the built tree is then checked
+    // exactly, because the lexical scan only estimates the depth.
+    if nesting::lexical_depth_exceeds(html.as_bytes(), MAX_NESTING_DEPTH) {
+        return Err(WebParseError::NestingLimitExceeded);
+    }
     let document = Html::parse_document(html);
+    check_tree_depth(&document)?;
     let mut budget = Budget::new(options.max_nodes, options.max_text_bytes);
 
     let supplied_base = supplied_base_url.and_then(|value| Url::parse(value).ok());
@@ -498,6 +521,20 @@ fn parse_html_inner(
         json_ld,
         diagnostics,
     })
+}
+
+/// Rejects a built tree whose elements nest deeper than [`MAX_NESTING_DEPTH`].
+fn check_tree_depth(document: &Html) -> Result<(), WebParseError> {
+    // Explicit stack of (node, element depth of its parent): no recursion.
+    let mut pending = vec![(document.tree.root(), 0usize)];
+    while let Some((node, parent_depth)) = pending.pop() {
+        let depth = parent_depth + usize::from(node.value().is_element());
+        if depth > MAX_NESTING_DEPTH {
+            return Err(WebParseError::NestingLimitExceeded);
+        }
+        pending.extend(node.children().map(|child| (child, depth)));
+    }
+    Ok(())
 }
 
 /// The caption and rows that belong to one table, in document order.
