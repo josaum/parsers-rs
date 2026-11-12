@@ -5,8 +5,10 @@
 //!   - ModelTiepointTag      (33922)
 //!   - ModelTransformationTag (34264 / 34264 — alias; actually 33920 for the full matrix)
 //!   - GeoKeyDirectoryTag    (34735), for the keys whose value is stored in the
-//!     directory itself; GeoDoubleParamsTag (34736) and GeoAsciiParamsTag
-//!     (34737) are not read
+//!     directory itself
+//!   - GeoDoubleParamsTag (34736) and GeoAsciiParamsTag (34737), for the keys
+//!     whose value is stored there: read only by
+//!     [`parse_geotiff_geokey_params`], and leniently
 //!
 //! Returns [`GeoTiffMetadata`] and, optionally, raster band data as `Vec<f32>`.
 
@@ -27,12 +29,20 @@ const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
 const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_MODEL_TRANSFORMATION: u16 = 34264;
 const TAG_GEO_KEY_DIRECTORY: u16 = 34735;
+const TAG_GEO_DOUBLE_PARAMS: u16 = 34736;
+const TAG_GEO_ASCII_PARAMS: u16 = 34737;
 
 // GeoKey IDs
 const GEOKEY_MODEL_TYPE: u16 = 1024;
 const GEOKEY_RASTER_TYPE: u16 = 1025;
 const GEOKEY_GEOGRAPHIC_TYPE: u16 = 2048;
 const GEOKEY_PROJECTED_CS_TYPE: u16 = 3072;
+const GEOKEY_CITATION: u16 = 1026;
+const GEOKEY_GEOGRAPHIC_CITATION: u16 = 2049;
+const GEOKEY_SEMI_MAJOR_AXIS: u16 = 2057;
+const GEOKEY_SEMI_MINOR_AXIS: u16 = 2058;
+const GEOKEY_INVERSE_FLATTENING: u16 = 2059;
+const GEOKEY_PROJECTED_CITATION: u16 = 3073;
 
 /// `GTModelTypeGeoKey` value for a geographic (latitude-longitude) CRS.
 ///
@@ -146,6 +156,153 @@ impl GeoTiffMetadata {
     }
 }
 
+/// Values of the GeoKeys that are stored outside the GeoKey directory.
+///
+/// A key whose value is a double or a string holds, in the directory, only
+/// the position of that value in `GeoDoubleParamsTag` (34736) or
+/// `GeoAsciiParamsTag` (34737); [`GeoTiffMetadata::geokeys`] records that
+/// position. This is the value itself, for each such key that could be
+/// resolved.
+///
+/// A key is left out, and nothing fails, when its parameter tag is missing
+/// or unreadable, when the key points outside the tag, or when its string is
+/// not UTF-8 (a citation in a legacy encoding).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GeoKeyParams {
+    /// Values of the keys stored in `GeoDoubleParamsTag`, by key ID.
+    pub doubles: HashMap<u16, Vec<f64>>,
+    /// Values of the keys stored in `GeoAsciiParamsTag`, by key ID, without
+    /// the `|` that ends each string in the tag.
+    pub strings: HashMap<u16, String>,
+}
+
+impl GeoKeyParams {
+    /// Returns the general citation of the raster (`GTCitationGeoKey`, 1026).
+    pub fn citation(&self) -> Option<&str> {
+        self.string(GEOKEY_CITATION)
+    }
+
+    /// Returns the citation of the geographic CRS (`GeogCitationGeoKey`, 2049).
+    pub fn geographic_citation(&self) -> Option<&str> {
+        self.string(GEOKEY_GEOGRAPHIC_CITATION)
+    }
+
+    /// Returns the citation of the projected CRS (`PCSCitationGeoKey`, 3073).
+    pub fn projected_citation(&self) -> Option<&str> {
+        self.string(GEOKEY_PROJECTED_CITATION)
+    }
+
+    /// Returns the ellipsoid's semi-major axis (`GeogSemiMajorAxisGeoKey`, 2057).
+    ///
+    /// In the CRS's linear unit, usually metres.
+    pub fn semi_major_axis(&self) -> Option<f64> {
+        self.double(GEOKEY_SEMI_MAJOR_AXIS)
+    }
+
+    /// Returns the ellipsoid's semi-minor axis (`GeogSemiMinorAxisGeoKey`, 2058).
+    ///
+    /// In the CRS's linear unit, usually metres.
+    pub fn semi_minor_axis(&self) -> Option<f64> {
+        self.double(GEOKEY_SEMI_MINOR_AXIS)
+    }
+
+    /// Returns the ellipsoid's inverse flattening (`GeogInvFlatteningGeoKey`, 2059).
+    pub fn inverse_flattening(&self) -> Option<f64> {
+        self.double(GEOKEY_INVERSE_FLATTENING)
+    }
+
+    /// Returns the string value of the key `key_id`, if it was resolved.
+    pub fn string(&self, key_id: u16) -> Option<&str> {
+        self.strings.get(&key_id).map(String::as_str)
+    }
+
+    /// Returns the first double value of the key `key_id`, if it was resolved.
+    pub fn double(&self, key_id: u16) -> Option<f64> {
+        self.doubles.get(&key_id)?.first().copied()
+    }
+}
+
+/// Reads the GeoKey values stored in the double and ASCII parameter tags.
+///
+/// See [`GeoKeyParams`] for what is resolved and what is left out.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Io`] when the file cannot be opened, and
+/// [`GeoError::Tiff`] or [`GeoError::InvalidFormat`] when it is not a
+/// readable TIFF or its GeoKey directory cannot be read. A problem with
+/// either parameter tag is not an error.
+pub fn parse_geotiff_geokey_params<P: AsRef<Path>>(path: P) -> Result<GeoKeyParams, GeoError> {
+    let file = std::fs::File::open(path.as_ref()).map_err(GeoError::Io)?;
+    parse_geotiff_geokey_params_reader(BufReader::new(file))
+}
+
+/// Reads the GeoKey values in the parameter tags from any `Read + Seek`.
+///
+/// # Errors
+///
+/// As [`parse_geotiff_geokey_params`], without the file to open.
+pub fn parse_geotiff_geokey_params_reader<R: Read + Seek>(
+    reader: R,
+) -> Result<GeoKeyParams, GeoError> {
+    let mut decoder = open_tag_decoder(reader)?;
+    let entries = read_geokey_entries(&mut decoder)?;
+
+    // Each tag is read only if a key points into it, and a tag that cannot
+    // be read is the same as one that is not there.
+    let points_into = |tag_id: u16| entries.iter().any(|entry| entry[1] == tag_id);
+    let doubles: Option<Vec<f64>> = points_into(TAG_GEO_DOUBLE_PARAMS)
+        .then(|| decoder.find_tag(tag(TAG_GEO_DOUBLE_PARAMS)).ok().flatten())
+        .flatten()
+        .and_then(|value| value.into_f64_vec().ok());
+    let ascii: Option<Vec<u8>> = points_into(TAG_GEO_ASCII_PARAMS)
+        .then(|| decoder.find_tag(tag(TAG_GEO_ASCII_PARAMS)).ok().flatten())
+        .flatten()
+        .and_then(tag_bytes);
+
+    let mut params = GeoKeyParams::default();
+    for [key_id, location, count, offset] in entries {
+        let range = usize::from(offset)..usize::from(offset) + usize::from(count);
+        match location {
+            TAG_GEO_DOUBLE_PARAMS => {
+                if let Some(values) = doubles.as_deref().and_then(|all| all.get(range)) {
+                    params.doubles.insert(key_id, values.to_vec());
+                }
+            }
+            TAG_GEO_ASCII_PARAMS => {
+                let text = ascii
+                    .as_deref()
+                    .and_then(|all| all.get(range))
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok());
+                if let Some(text) = text {
+                    // `|` ends a string in the tag, standing in for NUL.
+                    let text = text.trim_end_matches(['|', '\0']);
+                    params.strings.insert(key_id, text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(params)
+}
+
+/// The bytes of a tag holding text.
+///
+/// The text is ASCII by its field type, but some writers store it as BYTE
+/// values, which the decoder returns as a list of integers. `None` for any
+/// other kind of value.
+fn tag_bytes(value: Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Ascii(text) => Some(text.into_bytes()),
+        other => other
+            .into_u64_vec()
+            .ok()?
+            .into_iter()
+            .map(|byte| u8::try_from(byte).ok())
+            .collect(),
+    }
+}
+
 fn is_pixel_is_point(geokeys: &HashMap<u16, u32>) -> bool {
     geokeys.get(&GEOKEY_RASTER_TYPE) == Some(&RASTER_PIXEL_IS_POINT)
 }
@@ -208,6 +365,7 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
     // ASCII parameter tags hold the values of the other keys (citations,
     // ellipsoid axes), which nothing here reads; they are left alone so that
     // a citation in some legacy encoding cannot fail the parse.
+    // `parse_geotiff_geokey_params_reader` resolves those keys separately.
     let geokeys = read_geokey_directory(&mut decoder)?;
 
     let epsg_code = geokeys
@@ -693,17 +851,36 @@ fn read_doubles_tag<R: Read + Seek>(
 
 /// Reads the GeoKey directory into a key→value map.
 ///
+/// The value is the entry's `ValueOffset`: the value itself for a key stored
+/// in the directory, and the position of the value in its parameter tag for
+/// any other key.
+///
+/// # Errors
+///
+/// As [`read_geokey_entries`].
+fn read_geokey_directory<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+) -> Result<HashMap<u16, u32>, GeoError> {
+    Ok(read_geokey_entries(decoder)?
+        .into_iter()
+        .map(|[key_id, _tiff_tag_location, _count, value_offset]| (key_id, u32::from(value_offset)))
+        .collect())
+}
+
+/// Reads the `[KeyID, TIFFTagLocation, Count, ValueOffset]` entries of the
+/// GeoKey directory.
+///
 /// # Errors
 ///
 /// Returns [`GeoError::Tiff`] when the directory tag is present but
 /// unreadable, or is not an array of unsigned integers. A TIFF without the
-/// tag is not a GeoTIFF and yields an empty map.
-fn read_geokey_directory<R: Read + Seek>(
+/// tag is not a GeoTIFF and yields no entries.
+fn read_geokey_entries<R: Read + Seek>(
     decoder: &mut Decoder<R>,
-) -> Result<HashMap<u16, u32>, GeoError> {
+) -> Result<Vec<[u16; 4]>, GeoError> {
     // Tag absent: not a GeoTIFF, but still a valid TIFF.
     let Some(value) = find_geo_tag(decoder, TAG_GEO_KEY_DIRECTORY)? else {
-        return Ok(HashMap::new());
+        return Ok(Vec::new());
     };
     let raw: Vec<u16> = value
         .into_u16_vec()
@@ -712,19 +889,17 @@ fn read_geokey_directory<R: Read + Seek>(
     // Directory header: [KeyDirectoryVersion, KeyRevision, MinorRevision, NumberOfKeys]
     // followed by one [KeyID, TIFFTagLocation, Count, ValueOffset] entry per key.
     let Some((header, entries)) = raw.split_at_checked(4) else {
-        return Ok(HashMap::new());
+        return Ok(Vec::new());
     };
     // The directory cannot hold more keys than it has entries for.
     let n_keys = usize::from(header[3]).min(entries.len() / 4);
-    let mut keys = HashMap::with_capacity(n_keys);
-
-    for &[key_id, _tiff_tag_location, _count, value_offset] in
-        entries.as_chunks::<4>().0.iter().take(n_keys)
-    {
-        // For SHORT values (TIFFTagLocation == 0), ValueOffset IS the value
-        keys.insert(key_id, u32::from(value_offset));
-    }
-    Ok(keys)
+    Ok(entries
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .take(n_keys)
+        .copied()
+        .collect())
 }
 
 /// World coordinate of pixel (0, 0), from one tiepoint and the pixel scale.
@@ -1400,5 +1575,157 @@ mod tests {
             -47.005,
             -14.995,
         );
+    }
+
+    /// Encodes a 2×2 GeoTIFF with `geokeys` and, when given, the double and
+    /// ASCII parameter tags.
+    fn geotiff_with_params(
+        geokeys: &[u16],
+        doubles: Option<&[f64]>,
+        ascii: Option<&str>,
+    ) -> Vec<u8> {
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, geokeys)
+                .expect("geokeys");
+            if let Some(doubles) = doubles {
+                directory
+                    .write_tag(Tag::GeoDoubleParamsTag, doubles)
+                    .expect("double parameters");
+            }
+            if let Some(ascii) = ascii {
+                directory
+                    .write_tag(Tag::GeoAsciiParamsTag, ascii)
+                    .expect("ASCII parameters");
+            }
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        file.into_inner()
+    }
+
+    /// A geographic raster with a user-defined ellipsoid: two citations in
+    /// the ASCII parameters, and the axes in the double parameters.
+    const PARAM_KEYS: [u16; 28] = [
+        1, 1, 0, 6, //
+        1024, 0, 1, 2, // model type, in the directory
+        1026, 34737, 12, 0, // "My citation|"
+        2049, 34737, 7, 12, // "WGS 84|"
+        2057, 34736, 1, 0, // semi-major axis
+        2058, 34736, 1, 2, // semi-minor axis
+        2059, 34736, 1, 1, // inverse flattening
+    ];
+    const PARAM_DOUBLES: [f64; 3] = [6_378_137.0, 298.257_223_563, 6_356_752.314_245];
+    const PARAM_ASCII: &str = "My citation|WGS 84|";
+
+    /// A key whose value lives in a parameter tag was only ever recorded as
+    /// its position there: semi-major axis "0", inverse flattening "1".
+    #[test]
+    fn geokeys_in_the_parameter_tags_are_resolved() {
+        let bytes = geotiff_with_params(&PARAM_KEYS, Some(&PARAM_DOUBLES), Some(PARAM_ASCII));
+        let params =
+            parse_geotiff_geokey_params_reader(Cursor::new(bytes.clone())).expect("params");
+        assert_eq!(params.citation(), Some("My citation"));
+        assert_eq!(params.geographic_citation(), Some("WGS 84"));
+        assert_eq!(params.projected_citation(), None);
+        assert_eq!(params.semi_major_axis(), Some(6_378_137.0));
+        assert_eq!(params.semi_minor_axis(), Some(6_356_752.314_245));
+        assert_eq!(params.inverse_flattening(), Some(298.257_223_563));
+        assert_eq!(params.strings.len(), 2);
+        assert_eq!(params.doubles.len(), 3);
+
+        // The metadata's own map is what it was: positions for these keys.
+        let parsed = metadata(bytes);
+        assert_eq!(parsed.geokeys.len(), 6);
+        assert_eq!(parsed.geokeys[&1024], 2);
+        assert_eq!(parsed.geokeys[&2049], 12);
+        assert_eq!(parsed.geokeys[&2057], 0);
+        assert_eq!(parsed.geokeys[&2059], 1);
+    }
+
+    /// Nothing about a parameter tag fails the file; the keys that cannot be
+    /// resolved are left out.
+    #[test]
+    fn unusable_parameter_tags_leave_their_keys_unresolved() {
+        let params = |bytes: Vec<u8>| {
+            parse_geotiff_geokey_params_reader(Cursor::new(bytes)).expect("lenient read")
+        };
+
+        // Neither tag is in the file.
+        assert_eq!(
+            params(geotiff_with_params(&PARAM_KEYS, None, None)),
+            GeoKeyParams::default()
+        );
+        // No GeoKey directory at all.
+        assert_eq!(
+            params(geotiff(2, 2, &GeoTags::default())),
+            GeoKeyParams::default()
+        );
+
+        // The double parameters are text and the ASCII parameters doubles.
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, &PARAM_KEYS[..])
+                .expect("geokeys");
+            directory
+                .write_tag(Tag::GeoDoubleParamsTag, "6378137 298.257223563")
+                .expect("mistyped doubles");
+            directory
+                .write_tag(Tag::GeoAsciiParamsTag, &PARAM_DOUBLES[..])
+                .expect("mistyped text");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        assert_eq!(params(file.into_inner()), GeoKeyParams::default());
+
+        // Keys that point past the end of their tag: the citation is cut to
+        // "My cit", so the second string and the third double are outside.
+        let short = params(geotiff_with_params(
+            &PARAM_KEYS,
+            Some(&PARAM_DOUBLES[..2]),
+            Some("My cit"),
+        ));
+        assert_eq!(short.citation(), None);
+        assert_eq!(short.geographic_citation(), None);
+        assert_eq!(short.semi_major_axis(), Some(6_378_137.0));
+        assert_eq!(short.semi_minor_axis(), None);
+        assert_eq!(short.inverse_flattening(), Some(298.257_223_563));
+    }
+
+    /// A citation in Latin-1 is not UTF-8: it stays unresolved, the keys
+    /// beside it are read, and the metadata parse is untouched by it.
+    #[test]
+    fn citation_in_a_legacy_encoding_is_left_unresolved() {
+        let keys: [u16; 16] = [
+            1, 1, 0, 3, //
+            1024, 0, 1, 2, //
+            1026, 34737, 15, 0, // "C\u{f3}rrego Alegre|" in Latin-1
+            2049, 34737, 7, 15, // "WGS 84|"
+        ];
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, &keys[..])
+                .expect("geokeys");
+            directory
+                .write_tag(Tag::GeoAsciiParamsTag, &b"C\xF3rrego Alegre|WGS 84|"[..])
+                .expect("citation");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let bytes = file.into_inner();
+        let params =
+            parse_geotiff_geokey_params_reader(Cursor::new(bytes.clone())).expect("params");
+        assert_eq!(params.citation(), None);
+        assert_eq!(params.geographic_citation(), Some("WGS 84"));
+        assert!(metadata(bytes).is_geographic);
     }
 }
