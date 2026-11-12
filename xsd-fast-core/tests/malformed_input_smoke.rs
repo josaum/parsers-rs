@@ -336,12 +336,17 @@ fn schema_locations_cannot_leave_the_schema_directory() {
         "..".to_string(),
         "\u{0}".to_string(),
     ];
+    // A symbolic link out of the schema directory, where the platform lets an
+    // unprivileged process create one.
     #[cfg(unix)]
-    {
+    let symlinked = {
         std::os::unix::fs::symlink(outer.path().join("secret.xsd"), root_dir.join("link.xsd"))
             .expect("symlink");
-        locations.push("link.xsd".to_string());
-    }
+        Some("link.xsd".to_string())
+    };
+    #[cfg(not(unix))]
+    let symlinked: Option<String> = None;
+    locations.extend(symlinked);
 
     for location in locations {
         let escaped = location.replace('\u{0}', "&#0;");
