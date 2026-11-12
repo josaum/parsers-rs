@@ -54,9 +54,10 @@ use ooxml_archive::SharedInflateBudget;
 use ooxml_archive::{
     parse_relationships, part_dir, rels_path_for_part, resolve_part, OoxmlArchive, PartReader,
 };
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::Reader;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, Cursor};
@@ -70,6 +71,110 @@ fn local_name(name: &[u8]) -> &[u8] {
         name
     }
 }
+
+/// Decodes a text event leniently.
+///
+/// A stray non-UTF-8 byte becomes U+FFFD and an unknown entity is kept as
+/// written, so one bad character costs that character rather than the whole
+/// workbook.
+fn text_event_str<'a>(event: &'a BytesText<'_>) -> Cow<'a, str> {
+    let raw = String::from_utf8_lossy(event);
+    let unescaped = match quick_xml::escape::unescape(&raw) {
+        Ok(Cow::Owned(text)) => Some(text),
+        // Nothing to unescape, or an entity this parser does not know.
+        Ok(Cow::Borrowed(_)) | Err(_) => None,
+    };
+    unescaped.map_or(raw, Cow::Owned)
+}
+
+/// Returns the character data of a text or CDATA event, `None` for any other.
+///
+/// CDATA is literal character data: it is decoded, never entity-unescaped.
+fn character_data<'a>(event: &'a Event<'_>) -> Option<Cow<'a, str>> {
+    match event {
+        Event::Text(text) => Some(text_event_str(text)),
+        Event::CData(data) => Some(String::from_utf8_lossy(data)),
+        _ => None,
+    }
+}
+
+/// Byte length of one `ST_Xstring` escape, `_xHHHH_`.
+const XSTRING_ESCAPE_LEN: usize = 7;
+
+/// Returns the UTF-16 code unit of the `_xHHHH_` escape `bytes` starts with.
+fn xstring_code_unit(bytes: &[u8]) -> Option<u16> {
+    let escape = bytes.get(..XSTRING_ESCAPE_LEN)?;
+    if escape[0] != b'_' || escape[1] != b'x' || escape[6] != b'_' {
+        return None;
+    }
+    let mut unit = 0u16;
+    for &digit in &escape[2..6] {
+        unit = (unit << 4) | u16::try_from(char::from(digit).to_digit(16)?).ok()?;
+    }
+    Some(unit)
+}
+
+/// Decodes the `_xHHHH_` escapes of an ECMA-376 `ST_Xstring`.
+///
+/// Excel writes characters XML cannot carry, such as a carriage return, as
+/// `_x000D_`: the UTF-16 code unit in hexadecimal. A literal underscore that
+/// would otherwise start an escape is itself written `_x005F_`, so decoding
+/// runs left to right and never rescans its own output. Two escapes that form
+/// a surrogate pair decode to one character; an unpaired surrogate becomes
+/// U+FFFD.
+fn decode_xstring(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut decoded = String::new();
+    let mut copied = 0;
+    let mut cursor = 0;
+    while let Some(found) = text[cursor..].find("_x") {
+        let start = cursor + found;
+        let Some(unit) = xstring_code_unit(&bytes[start..]) else {
+            cursor = start + 2;
+            continue;
+        };
+        let mut end = start + XSTRING_ESCAPE_LEN;
+        let mut units = [unit, 0];
+        let mut unit_count = 1;
+        if (0xD800..0xDC00).contains(&unit) {
+            if let Some(low) =
+                xstring_code_unit(&bytes[end..]).filter(|low| (0xDC00..0xE000).contains(low))
+            {
+                units[1] = low;
+                unit_count = 2;
+                end += XSTRING_ESCAPE_LEN;
+            }
+        }
+        decoded.push_str(&text[copied..start]);
+        decoded.extend(
+            char::decode_utf16(units[..unit_count].iter().copied())
+                .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER)),
+        );
+        copied = end;
+        cursor = end;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    decoded.push_str(&text[copied..]);
+    Cow::Owned(decoded)
+}
+
+/// Decodes the `ST_Xstring` escapes in `text[from..]` in place.
+///
+/// `from` is where the current `<t>` element's text starts, so an escape is
+/// never assembled from two adjacent elements.
+fn decode_xstring_tail(text: &mut String, from: usize) {
+    let decoded = match decode_xstring(&text[from..]) {
+        Cow::Owned(decoded) => Some(decoded),
+        Cow::Borrowed(_) => None,
+    };
+    if let Some(decoded) = decoded {
+        text.truncate(from);
+        text.push_str(&decoded);
+    }
+}
+
 /// Arrow RecordBatch streaming output (optional feature).
 ///
 /// Exports spreadsheet data as Arrow Record Batch files, suitable for
@@ -417,6 +522,9 @@ struct CellPartsRef<'a> {
     col: u32,
     formula: Option<&'a str>,
     value: CellValueRef<'a>,
+    /// Index into the shared-string table when `value` is that entry, so a
+    /// caller that keeps cells can share one allocation per entry.
+    shared_string: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -463,6 +571,10 @@ impl StringTable {
     fn get(&self, idx: usize) -> Option<&str> {
         let (start, len) = *self.index.get(idx)?;
         std::str::from_utf8(&self.data[start..start + len]).ok()
+    }
+
+    fn len(&self) -> usize {
+        self.index.len()
     }
 }
 
@@ -595,6 +707,11 @@ fn parse_xlsx_from_archive(archive: XlsxArchive, options: ParseOptions) -> Resul
     };
 
     let mut sheets = Vec::with_capacity(workbook_info.sheets.len());
+    // One allocation per shared string that is actually used, however many
+    // cells refer to it. Copying the text into every cell instead lets a
+    // small file with one long string and many references to it allocate
+    // their product.
+    let mut shared_values: Vec<Option<Arc<str>>> = vec![None; shared_strings.len()];
 
     for sheet in workbook_info.sheets {
         let target = workbook_rels
@@ -614,11 +731,20 @@ fn parse_xlsx_from_archive(archive: XlsxArchive, options: ParseOptions) -> Resul
             &options,
             None,
             |parts| {
+                let shared_slot = parts
+                    .shared_string
+                    .and_then(|index| shared_values.get_mut(index));
+                let value = match (shared_slot, parts.value) {
+                    (Some(slot), CellValueRef::String { v }) => CellValue::String {
+                        v: Arc::clone(slot.get_or_insert_with(|| Arc::from(v))),
+                    },
+                    (_, value) => cell_value_ref_to_owned(value),
+                };
                 cells.push(Cell {
                     row: parts.row,
                     col: parts.col,
                     formula: parts.formula.map(str::to_string),
-                    value: cell_value_ref_to_owned(parts.value),
+                    value,
                 });
                 Ok(())
             },
@@ -816,6 +942,9 @@ fn parse_shared_strings_reader<R: BufRead>(reader: R) -> Result<StringTable> {
 
     let mut in_si = false;
     let mut in_t = false;
+    // Phonetic runs (`rPh`) hold a reading aid, not cell text.
+    let mut phonetic_depth = 0u32;
+    let mut text_start = 0;
     let mut current = String::new();
 
     loop {
@@ -826,15 +955,27 @@ fn parse_shared_strings_reader<R: BufRead>(reader: R) -> Result<StringTable> {
 
                 if name == b"si" {
                     in_si = true;
+                    in_t = false;
+                    phonetic_depth = 0;
                     current.clear();
-                } else if in_si && name == b"t" {
+                } else if in_si && name == b"rPh" {
+                    phonetic_depth = phonetic_depth.saturating_add(1);
+                } else if in_si && name == b"t" && phonetic_depth == 0 {
                     in_t = true;
+                    text_start = current.len();
                 }
             }
-            Ok(Event::Text(e)) => {
-                if in_si && in_t {
-                    let text = e.unescape()?;
-                    current.push_str(text.as_ref());
+            Ok(Event::Empty(e)) => {
+                // `<si/>` is an empty string that still occupies an index.
+                if !in_si && local_name(e.name().as_ref()) == b"si" {
+                    strings.push("");
+                }
+            }
+            Ok(event @ (Event::Text(_) | Event::CData(_))) => {
+                if in_t {
+                    if let Some(text) = character_data(&event) {
+                        current.push_str(&text);
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -842,9 +983,15 @@ fn parse_shared_strings_reader<R: BufRead>(reader: R) -> Result<StringTable> {
                 let name = local_name(qname.as_ref());
 
                 if name == b"t" {
-                    in_t = false;
+                    if in_t {
+                        in_t = false;
+                        decode_xstring_tail(&mut current, text_start);
+                    }
+                } else if name == b"rPh" {
+                    phonetic_depth = phonetic_depth.saturating_sub(1);
                 } else if name == b"si" {
                     in_si = false;
+                    in_t = false;
                     strings.push(current.as_str());
                     current.clear();
                 }
@@ -1025,9 +1172,14 @@ where
     let mut in_formula = false;
     let mut in_inline_str = false;
     let mut in_inline_t = false;
+    // Phonetic runs (`rPh`) inside an inline string are not cell text.
+    let mut inline_phonetic_depth = 0u32;
+    let mut inline_text_start = 0;
     let mut inline_buf = String::new();
     let mut skip_cell = false;
     let mut skip_row_depth: u32 = 0;
+    // Last valid row seen: a `<row>` without `r` is the one after it.
+    let mut last_row: u32 = 0;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1045,21 +1197,16 @@ where
                 match name {
                     b"sheetData" => in_sheet_data = true,
                     b"row" if in_sheet_data => {
-                        current_row = 0;
+                        current_row = row_index(&e, reader.decoder(), last_row)?;
                         col_cursor = 0;
-                        for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"r" {
-                                let value = attr.decode_and_unescape_value(reader.decoder())?;
-                                current_row =
-                                    lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0);
-                            }
-                        }
-                        if !(1..=1_048_576).contains(&current_row) {
+                        if !EXCEL_ROWS.contains(&current_row) {
                             row_outside = true;
                             skip_row_depth = 1;
                         } else if has_ranges {
+                            last_row = current_row;
                             row_outside = current_row < row_min || current_row > row_max;
                         } else {
+                            last_row = current_row;
                             row_outside = false;
                         }
                         if row_outside {
@@ -1077,6 +1224,7 @@ where
                         has_formula = false;
                         in_inline_str = false;
                         in_inline_t = false;
+                        inline_phonetic_depth = 0;
                         inline_buf.clear();
                         let mut cell_ref_row: u32 = 0;
                         let mut cell_ref_col: u32 = 0;
@@ -1122,11 +1270,11 @@ where
                             cell_col = if cell_ref_col > 0 {
                                 cell_ref_col
                             } else {
-                                col_cursor + 1
+                                col_cursor.saturating_add(1)
                             };
                         } else {
                             cell_row = current_row;
-                            cell_col = col_cursor + 1;
+                            cell_col = col_cursor.saturating_add(1);
                         }
                         col_cursor = cell_col;
                         if has_ranges {
@@ -1159,35 +1307,70 @@ where
                     }
                     b"is" if in_cell => {
                         in_inline_str = true;
+                        inline_phonetic_depth = 0;
                     }
-                    b"t" if in_inline_str => {
+                    b"rPh" if in_inline_str => {
+                        inline_phonetic_depth = inline_phonetic_depth.saturating_add(1);
+                    }
+                    b"t" if in_inline_str && inline_phonetic_depth == 0 => {
                         in_inline_t = true;
+                        inline_text_start = inline_buf.len();
                     }
                     _ => {}
                 }
             }
-            Ok(Event::Empty(_)) => {
+            Ok(Event::Empty(e)) => {
                 if skip_row_depth > 0 {
                     buf.clear();
                     continue;
                 }
+                if in_sheet_data {
+                    let qname = e.name();
+                    match local_name(qname.as_ref()) {
+                        // An empty row still takes its number, so a following
+                        // `<row>` without `r` is counted from it.
+                        b"row" => {
+                            let row = row_index(&e, reader.decoder(), last_row)?;
+                            if EXCEL_ROWS.contains(&row) {
+                                last_row = row;
+                            }
+                        }
+                        // A valueless cell emits nothing but still occupies
+                        // its column, so a following cell without `r` lands
+                        // in the right place.
+                        b"c" if !in_cell => {
+                            col_cursor = empty_cell_column(&e, reader.decoder(), col_cursor)?;
+                        }
+                        _ => {}
+                    }
+                }
             }
-            Ok(Event::Text(e)) => {
+            Ok(event @ (Event::Text(_) | Event::CData(_))) => {
                 if skip_row_depth > 0 || skip_cell {
                     buf.clear();
                     continue;
                 }
-                let text = e.unescape()?;
-                if in_value {
-                    cell_value.push_str(text.as_ref());
+                // Only text that lands in a cell is decoded; the whitespace
+                // between elements is most of a sheet's text events.
+                let target = if in_value {
                     has_value = true;
+                    Some(&mut cell_value)
                 } else if in_formula {
                     if options.include_formulas {
-                        cell_formula.push_str(text.as_ref());
                         has_formula = true;
+                        Some(&mut cell_formula)
+                    } else {
+                        None
                     }
                 } else if in_inline_t {
-                    inline_buf.push_str(text.as_ref());
+                    Some(&mut inline_buf)
+                } else {
+                    None
+                };
+                if let Some(target) = target {
+                    if let Some(text) = character_data(&event) {
+                        target.push_str(&text);
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -1206,8 +1389,19 @@ where
                     b"sheetData" => in_sheet_data = false,
                     b"v" => in_value = false,
                     b"f" => in_formula = false,
-                    b"t" => in_inline_t = false,
-                    b"is" => in_inline_str = false,
+                    b"t" => {
+                        if in_inline_t {
+                            in_inline_t = false;
+                            decode_xstring_tail(&mut inline_buf, inline_text_start);
+                        }
+                    }
+                    b"rPh" => {
+                        inline_phonetic_depth = inline_phonetic_depth.saturating_sub(1);
+                    }
+                    b"is" => {
+                        in_inline_str = false;
+                        in_inline_t = false;
+                    }
                     b"c" if in_cell => {
                         if skip_cell {
                             in_cell = false;
@@ -1216,6 +1410,11 @@ where
                         }
                         let raw = if has_value {
                             Some(cell_value.as_str())
+                        } else {
+                            None
+                        };
+                        let shared_string = if inline_buf.is_empty() {
+                            shared_string_index(cell_type, raw)
                         } else {
                             None
                         };
@@ -1258,6 +1457,7 @@ where
                             col: cell_col,
                             formula,
                             value,
+                            shared_string,
                         })?;
                         in_cell = false;
                     }
@@ -1272,6 +1472,51 @@ where
     }
 
     Ok(())
+}
+
+/// Rows a worksheet can address (1-based), per the Excel limits.
+const EXCEL_ROWS: std::ops::RangeInclusive<u32> = 1..=1_048_576;
+
+/// Returns the 1-based row a `<row>` element addresses.
+///
+/// `r` is optional: without it the row is the one after `previous`. A present
+/// but unreadable `r` yields 0, which no worksheet row has.
+fn row_index(element: &BytesStart<'_>, decoder: quick_xml::Decoder, previous: u32) -> Result<u32> {
+    for attr in element.attributes().flatten() {
+        if attr.key.as_ref() == b"r" {
+            let value = attr.decode_and_unescape_value(decoder)?;
+            return Ok(lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0));
+        }
+    }
+    Ok(previous.saturating_add(1))
+}
+
+/// Returns the column cursor after a self-closing `<c/>` element.
+///
+/// Mirrors how a cell with content moves the cursor: to its `r` column, to 0
+/// when `r` is unreadable, and one to the right when `r` is absent.
+fn empty_cell_column(
+    element: &BytesStart<'_>,
+    decoder: quick_xml::Decoder,
+    col_cursor: u32,
+) -> Result<u32> {
+    for attr in element.attributes().flatten() {
+        if local_name(attr.key.as_ref()) == b"r" {
+            let value = attr.decode_and_unescape_value(decoder)?;
+            return Ok(parse_cell_ref(value.as_ref()).map_or(0, |(_, col)| col));
+        }
+    }
+    Ok(col_cursor.saturating_add(1))
+}
+
+/// Returns the shared-string index a `t="s"` cell's `<v>` holds.
+fn shared_string_index(cell_type: CellType, raw_value: Option<&str>) -> Option<usize> {
+    match cell_type {
+        CellType::SharedString => {
+            raw_value.and_then(|v| lexical_core::parse::<usize>(v.as_bytes()).ok())
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1295,8 +1540,7 @@ fn decode_cell_value_ref<'a>(
 
     match cell_type {
         CellType::SharedString => {
-            if let Some(v) = raw_value.and_then(|v| lexical_core::parse::<usize>(v.as_bytes()).ok())
-            {
+            if let Some(v) = shared_string_index(cell_type, raw_value) {
                 if let Some(s) = context.shared_strings.get(v) {
                     return CellValueRef::String { v: s };
                 }
@@ -1344,8 +1588,7 @@ fn decode_cell_value_raw<'a>(
 
     match cell_type {
         CellType::SharedString => {
-            if let Some(v) = raw_value.and_then(|v| lexical_core::parse::<usize>(v.as_bytes()).ok())
-            {
+            if let Some(v) = shared_string_index(cell_type, raw_value) {
                 if let Some(s) = shared_strings.get(v) {
                     return CellValueRef::String { v: s };
                 }
@@ -1388,6 +1631,12 @@ fn excel_serial_to_iso(serial: f64, date_1904: bool) -> Option<String> {
     }
     let mut days = serial.floor() as i64;
     let fraction = serial - serial.floor();
+    let mut seconds = (fraction * 86_400.0).round() as i64;
+    // A time within half a second of midnight rounds up into the next day.
+    if seconds >= 86_400 {
+        seconds -= 86_400;
+        days = days.checked_add(1)?;
+    }
 
     let base_date = if date_1904 {
         NaiveDate::from_ymd_opt(1904, 1, 1)?
@@ -1400,10 +1649,10 @@ fn excel_serial_to_iso(serial: f64, date_1904: bool) -> Option<String> {
         days -= 1; // fix Excel's fake 1900-02-29
     }
 
-    let date = base_date.checked_add_signed(chrono::Duration::days(days))?;
-    let seconds = (fraction * 86_400.0).round() as i64;
-    let time =
-        NaiveTime::from_num_seconds_from_midnight_opt((seconds.rem_euclid(86_400)) as u32, 0)?;
+    // `try_days`: a serial far outside the calendar is not a date, and the
+    // infallible constructor panics on it.
+    let date = base_date.checked_add_signed(chrono::Duration::try_days(days)?)?;
+    let time = NaiveTime::from_num_seconds_from_midnight_opt(u32::try_from(seconds).ok()?, 0)?;
     let dt = NaiveDateTime::new(date, time);
     Some(dt.format("%Y-%m-%dT%H:%M:%S").to_string())
 }
