@@ -872,7 +872,18 @@ fn parse_content_extension(
                 }
                 other => skip_element(reader, other)?,
             },
-            Tag::Empty { .. } => {}
+            // `<xs:extension base="..."/>` adds nothing to its base, and is
+            // read as the open-and-close form with no children is.
+            Tag::Empty { local, attrs } => {
+                if local == "extension" {
+                    if let Some(content) = simple_extension_content(&attrs, ns_map) {
+                        complex_type.content = content;
+                    } else {
+                        complex_type.content = ContentModel::Sequence(Vec::new());
+                        complex_type.base = Some(extension_base(&attrs));
+                    }
+                }
+            }
             Tag::End { local } => {
                 if local == outer_tag {
                     break;
