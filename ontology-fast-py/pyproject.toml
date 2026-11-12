@@ -7,7 +7,7 @@ name = "ontology-fast"
 version = "0.1.1"
 description = "Canonical Turtle reading and indexed triple access powered by Rust"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.9"
 authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 keywords = ["turtle", "rdf", "ontology", "parser", "rust"]
@@ -15,6 +15,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",

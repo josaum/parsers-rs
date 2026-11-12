@@ -185,6 +185,10 @@ jobs:
             cargo cyclonedx --manifest-path "$core/Cargo.toml" -f json --describe crate
           done
           python3 scripts/inject_sbom.py --dist dist
+      - name: Refuse an artifact without both license texts
+        # MIT and Apache-2.0 both require their text to travel with every copy.
+        # Runs after the SBOM injector rewrites the wheels, before hashes are stamped.
+        run: python3 scripts/check_license_files.py --dist dist
       - name: Stamp the release manifest
         # Refuses a dirty tree, a wheel whose version disagrees with its crate,
         # and a wheel attributed to a consumer. The tag is the commit it names.
@@ -202,6 +206,8 @@ jobs:
             dist/*.tgz
             dist/release-manifest.json
             dist/SHA256SUMS
+            LICENSE
+            LICENSE-APACHE
           fail_on_unmatched_files: true
           generate_release_notes: true
       - uses: actions/upload-artifact@v7
@@ -212,3 +218,5 @@ jobs:
             dist/*.tgz
             dist/release-manifest.json
             dist/SHA256SUMS
+            LICENSE
+            LICENSE-APACHE

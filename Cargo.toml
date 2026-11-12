@@ -75,7 +75,7 @@ tonic = { version = "0.14.2", features = ["transport"] }
 [workspace.package]
 authors = ["Dionisio Chiuratto Agourakis"]
 edition = "2021"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 # Every published artifact inherits this remote, so it must never point at a
 # consumer of this repository.
 repository = "https://github.com/fast-parser-inc/parsers-rs"

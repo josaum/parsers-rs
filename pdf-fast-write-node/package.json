@@ -4,7 +4,7 @@
   "description": "Sovereign PDF page subsetter with native Rust core (no external deps)",
   "main": "index.js",
   "types": "index.d.ts",
-  "license": "MIT",
+  "license": "(MIT OR Apache-2.0)",
   "author": "Dionisio Chiuratto Agourakis",
   "repository": {
     "type": "git",
@@ -20,7 +20,8 @@
     "index.d.ts",
     "*.node",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "LICENSE-APACHE"
   ],
   "engines": {
     "node": ">=16"

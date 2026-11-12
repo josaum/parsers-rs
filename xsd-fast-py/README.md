@@ -25,4 +25,4 @@ validation findings are surfaced to the caller rather than silently accepted.
 cargo test -p xsd-fast-py
 ```
 
-Licensed under MIT.
+Licensed under either of MIT ([LICENSE](LICENSE)) or Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your option.

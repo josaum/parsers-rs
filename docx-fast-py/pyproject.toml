@@ -7,7 +7,7 @@ name = "docx-fast"
 version = "0.2.6"
 description = "High-performance Word (.docx) parser powered by Rust"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.9"
 authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 keywords = [
@@ -25,6 +25,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",

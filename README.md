@@ -145,3 +145,14 @@ Verify consumer pin integrity in CI with:
 python3 vendor/parsers-rs/src/scripts/verify_consumer_pin.py --vendor vendor/parsers-rs
 python3 vendor/parsers-rs/src/scripts/consumer_surface_check.py --dist dist --consumer .
 ```
+
+## License
+
+Licensed under either of
+
+- MIT license ([LICENSE](LICENSE))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+
+at your option. Every wheel and Node tarball carries both texts: wheels under `*.dist-info/licenses/`, tarballs at the package root. The release workflow refuses to publish an artifact that is missing either one.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this repository shall be dual licensed as above, without any additional terms or conditions.

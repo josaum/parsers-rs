@@ -50,4 +50,4 @@ email-fast-flight --root ~/Emails --max-attachment-size 500
 
 ## License
 
-MIT
+Licensed under either of MIT ([LICENSE](../LICENSE)) or Apache License, Version 2.0 ([LICENSE-APACHE](../LICENSE-APACHE)) at your option.

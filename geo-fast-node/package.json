@@ -4,7 +4,7 @@
   "description": "High-performance GIS N-API bindings, full parity with geo-fast-py",
   "main": "index.js",
   "types": "index.d.ts",
-  "license": "MIT",
+  "license": "(MIT OR Apache-2.0)",
   "author": "Dionisio Chiuratto Agourakis",
   "repository": {
     "type": "git",
@@ -15,7 +15,7 @@
   "bugs": {
     "url": "https://github.com/fast-parser-inc/parsers-rs/issues"
   },
-  "files": ["index.js", "index.d.ts", "*.node", "README.md", "LICENSE"],
+  "files": ["index.js", "index.d.ts", "*.node", "README.md", "LICENSE", "LICENSE-APACHE"],
   "engines": { "node": ">=16" },
   "napi": { "name": "geo_fast_node" },
   "os": ["darwin", "linux", "win32"],
