@@ -389,6 +389,14 @@ pub fn parse_eml(path: impl AsRef<Path>, options: ParseOptions) -> Result<Email>
 
 /// Parse EML from bytes
 pub fn parse_eml_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
+    // `mailparse` decodes some header lines in more than linear time, and it
+    // decodes `Content-*` headers on its own while it splits the message, so
+    // the cost is bounded before it sees a single header.
+    if header_decode_cost(bytes, MAX_HEADER_DECODE_COST).is_none() {
+        return Err(anyhow!(
+            "Failed to parse email: header encoded-words too costly to decode"
+        ));
+    }
     // `mailparse` recurses once per nested multipart, so the depth is checked
     // before it sees the message.
     if mime_nesting_exceeds(bytes, MAX_MIME_DEPTH) {
@@ -923,6 +931,103 @@ fn mime_nesting_depth(raw: &[u8], limit: usize) -> Option<usize> {
         }
     }
     Some(deepest)
+}
+
+/// Most work [`header_decode_cost`] lets the header lines of one message ask
+/// of `mailparse`, in characters walked.
+///
+/// Measured on `mailparse` 0.15, decoding one header at this bound takes
+/// about 10 ms in an optimized build and about 2 s in an unoptimized one,
+/// and this crate has a header decoded up to four times. The bound is far
+/// above what mail holds: a line of two encoded-words costs a few hundred,
+/// and a single unfolded line of 900 properly ended encoded-word names of
+/// 40 characters each stays under it. What it refuses is a line built to be
+/// slow (350 encoded-words run together on one line), or one far outside
+/// the 998 characters RFC 5322 allows a line.
+const MAX_HEADER_DECODE_COST: u64 = 100_000_000;
+
+/// Returns an upper bound on the work `mailparse` 0.15 does to decode the
+/// header lines of `raw`, or `None` once it passes `limit`.
+///
+/// `mailparse` looks for encoded-words (`=?charset?B?text?=`) one physical
+/// line at a time. For every `=?`, and for every `?=` it tries as that
+/// word's end, it checks the neighboring character by walking the line from
+/// its first character. A word whose `?=` is not followed by a delimiter is
+/// not ended there, so the search goes on to the next `?=`; when no `?=`
+/// ends the word, the next `=?` starts the same search again. A line of `n`
+/// such words therefore costs `n * n` checks of up to the line's length
+/// each, where a line of `n` proper words costs `2 * n` of them.
+///
+/// The bound for one line is its length times the checks it can cause, which
+/// [`header_line_decode_cost`] counts. The lines counted are those from the start
+/// of `raw`, and from every line that begins with `--`, up to the next empty
+/// line: `mailparse` reads headers at the start of the message and after a
+/// multipart delimiter line, which begins with `--`, so every header line it
+/// decodes is counted, along with some body lines that only look the part.
+/// The scan is a single pass over `raw`.
+fn header_decode_cost(raw: &[u8], limit: u64) -> Option<u64> {
+    let mut cost = 0u64;
+    let mut in_headers = true;
+    for line in raw.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if !in_headers {
+            in_headers = line.starts_with(b"--");
+        } else if line.is_empty() {
+            in_headers = false;
+        } else {
+            cost = cost.saturating_add(header_line_decode_cost(line));
+            if cost > limit {
+                return None;
+            }
+        }
+    }
+    Some(cost)
+}
+
+/// Returns an upper bound on the characters `mailparse` walks to find the
+/// encoded-words of one header line.
+///
+/// Each `=?` costs one check of the character before it. One that follows a
+/// delimiter opens a word, which costs one more check after each `?=` up to
+/// the first that ends the word, and a failed search to the end of the line
+/// when none does. A `?=` ends a word when the character after it is a
+/// delimiter or the line's end. `mailparse` finds these characters by
+/// counting characters with a byte offset, which lands somewhere else on a
+/// line with multi-byte characters, so on a line that is not ASCII every
+/// `=?` is assumed to open a word and no `?=` to end one.
+fn header_line_decode_cost(line: &[u8]) -> u64 {
+    /// Checks and scans per opened word besides the `?=` that do not end
+    /// it: the `?=` that does, and a failed search.
+    const STEPS_PER_OPENED_WORD: u64 = 2;
+
+    /// The delimiters `mailparse` accepts around an encoded-word.
+    fn is_delimiter(byte: u8) -> bool {
+        byte.is_ascii_whitespace() || matches!(byte, 0x0B | b'"' | b'(' | b')' | b'<' | b'>' | b',')
+    }
+
+    let ascii = line.is_ascii();
+    let (mut starts, mut opened, mut open_ends) = (0u64, 0u64, 0u64);
+    for (at, pair) in line.windows(2).enumerate() {
+        if pair == b"=?" {
+            starts += 1;
+            // A word at the start of a header's value has nothing before it
+            // and counts as following a delimiter; the value starts after
+            // the name's colon.
+            let before = at.checked_sub(1).and_then(|before| line.get(before));
+            if !ascii || before.is_none_or(|byte| *byte == b':' || is_delimiter(*byte)) {
+                opened += 1;
+            }
+        } else if pair == b"?=" {
+            let after = line.get(at + 2);
+            if !ascii || after.is_some_and(|byte| !is_delimiter(*byte)) {
+                open_ends += 1;
+            }
+        }
+    }
+    opened
+        .saturating_mul(open_ends.saturating_add(STEPS_PER_OPENED_WORD))
+        .saturating_add(starts)
+        .saturating_mul(line.len() as u64)
 }
 
 /// Finds `key` in `data` at or after `start`, as `mailparse` does.
@@ -2222,6 +2327,60 @@ mod malformed_input_unit_tests {
         assert_eq!(
             html_to_text("<P>one<br>two<br/>three</p>"),
             "one\ntwo\nthree\n"
+        );
+    }
+
+    #[test]
+    fn header_decode_cost_is_the_checks_a_line_causes_times_its_length() {
+        // No encoded-word, no cost.
+        assert_eq!(header_line_decode_cost(b"Subject: plain ?= text"), 0);
+        // Two proper words: one check before each, one after each.
+        let proper = b"Subject: =?UTF-8?Q?a?= =?UTF-8?Q?b?=";
+        assert_eq!(header_line_decode_cost(proper), 6 * proper.len() as u64);
+        // A word at the very start of the value opens a word too.
+        let unspaced = b"Subject:=?UTF-8?Q?a?=";
+        assert_eq!(header_line_decode_cost(unspaced), 3 * unspaced.len() as u64);
+        // Two words run together: the first `?=` ends neither, and the
+        // second `=?` follows no delimiter, so it opens nothing.
+        let glued = b"Subject: =?UTF-8?Q?a?==?UTF-8?Q?b?=";
+        assert_eq!(header_line_decode_cost(glued), 5 * glued.len() as u64);
+        // Words that never end are searched for once per `=?`.
+        let open = b"Subject: =?a?=x =?a?=x =?a?=x";
+        assert_eq!(header_line_decode_cost(open), 18 * open.len() as u64);
+        // A line with a multi-byte character is counted at its worst.
+        let wide = "Subject: \u{e9} =?UTF-8?Q?a?= =?UTF-8?Q?b?=".as_bytes();
+        assert_eq!(header_line_decode_cost(wide), 10 * wide.len() as u64);
+    }
+
+    #[test]
+    fn header_decode_cost_counts_header_lines_only() {
+        let costly = " =?a?=x".repeat(50);
+        let line_cost = header_line_decode_cost(format!("Subject:{costly}").as_bytes());
+        assert!(line_cost > 0);
+        let cost = |message: String| header_decode_cost(message.as_bytes(), u64::MAX);
+
+        // A body line is not decoded, so it is not counted.
+        assert_eq!(
+            cost(format!("Subject: x\r\n\r\nSubject:{costly}\r\n")),
+            Some(0)
+        );
+        // The headers of the message and of each part are.
+        assert_eq!(
+            cost(format!("Subject:{costly}\r\n\r\nbody\r\n")),
+            Some(line_cost)
+        );
+        assert_eq!(
+            cost(format!(
+                "Subject: x\n\npreamble\n--b\nSubject:{costly}\n\ntext\n--b--\n"
+            )),
+            Some(line_cost)
+        );
+        assert_eq!(
+            header_decode_cost(
+                format!("Subject:{costly}\r\n\r\n").as_bytes(),
+                line_cost - 1
+            ),
+            None
         );
     }
 

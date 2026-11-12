@@ -469,12 +469,12 @@ fn deep_nesting_inside_headers_and_html_is_bounded_on_a_small_stack() {
             b"\r\n\r\nbody\r\n".to_vec(),
         ]
         .concat(),
-        // Nested encoded-words. Kept short: `mailparse` decodes a header
-        // line in time quadratic in its encoded-word count, so a long one
-        // would turn this stack test into a timing test.
+        // Nested encoded-words. `mailparse` decodes such a line in time
+        // quadratic in its encoded-word count; the parser refuses the line
+        // before `mailparse` sees it.
         [
             b"Subject: ".to_vec(),
-            smoke::nested(b"=?UTF-8?Q?", b"x", b"?=", 300),
+            smoke::nested(b"=?UTF-8?Q?", b"x", b"?=", 100_000),
             b"\r\n\r\nbody\r\n".to_vec(),
         ]
         .concat(),
@@ -511,6 +511,58 @@ fn deep_nesting_inside_headers_and_html_is_bounded_on_a_small_stack() {
     for message in cases {
         smoke::run_on_small_stack(move || parse_eml_both_ways(&message));
     }
+}
+
+/// A header line of `count` encoded-words that are opened and never ended:
+/// each `?=` is followed by a letter, not by a delimiter.
+fn unended_encoded_words(count: usize) -> String {
+    " =?a?=x".repeat(count)
+}
+
+/// `mailparse` searches such a line once per word, and each step of each
+/// search walks the line from its start: 600 words took half a minute in an
+/// unoptimized build, and 4,000 would take hours. The line is refused
+/// wherever `mailparse` would decode it: in a header this crate asks for, in
+/// the `Content-Type` it reads while splitting the message, and in the
+/// headers of a part.
+#[test]
+fn header_lines_that_are_costly_to_decode_are_refused() {
+    let words = unended_encoded_words(4_000);
+    let cases = [
+        format!("Subject:{words}\r\n\r\nbody\r\n"),
+        format!("Content-Type: text/plain;{words}\r\n\r\nbody\r\n"),
+        format!(
+            "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\
+             Content-Disposition: inline;{words}\r\n\r\ntext\r\n--b--\r\n"
+        ),
+    ];
+    for message in cases {
+        let started = std::time::Instant::now();
+        let err = parse_eml_bytes(message.as_bytes(), ParseOptions::default())
+            .expect_err("a costly header line must be refused");
+        assert!(err.to_string().contains("too costly"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "refusing took {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// The bound is on cost, not on the number of encoded-words: properly ended
+/// words still decode, on one long unfolded line or folded one per line.
+#[test]
+fn many_proper_encoded_words_in_a_header_still_decode() {
+    let unfolded = format!("Subject:{}\r\n\r\nbody\r\n", " =?UTF-8?Q?x?=".repeat(500));
+    let email = parse_eml_bytes(unfolded.as_bytes(), ParseOptions::default()).expect("parses");
+    assert_eq!(email.subject, Some("x".repeat(500)));
+
+    let folded = format!(
+        "Subject:{} end\r\n\r\nbody\r\n",
+        " =?UTF-8?Q?x?=\r\n".repeat(5_000)
+    );
+    let email = parse_eml_bytes(folded.as_bytes(), ParseOptions::default()).expect("parses");
+    assert_eq!(email.subject, Some(format!("{} end", "x".repeat(5_000))));
 }
 
 // ------------------------------------------------------ MSG regressions ----
