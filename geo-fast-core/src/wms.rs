@@ -173,7 +173,7 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                                 let mut min_y: Option<f64> = None;
                                 let mut max_x: Option<f64> = None;
                                 let mut max_y: Option<f64> = None;
-                                for attr in e.attributes().flatten() {
+                                for attr in e.attributes().with_checks(false).flatten() {
                                     let key = attr.key.local_name();
                                     let val = attr.unescape_value().unwrap_or_default();
                                     let f = val.parse::<f64>().ok();
