@@ -14,20 +14,20 @@ A crate belongs in `parsers-rs` when it provides a deterministic, side-effect-fr
 
 | Domain | Rust Core / Writer | Python Binding (`abi3`) | Node-API Binding (`napi-2`) | Arrow Flight Service | Capabilities |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **JSON** | `json-fast-core` (`0.1.7`) | `json-fast-py` (`json_fast`) | `json-fast-node` | `json-fast-flight` (`0.1.1`) | SIMD JSON/JSONL parsing, JSON Schema validation, JSON-RPC 2.0, JSON:API, JWT/JWK split, JSON-LD context peek, Arrow batches |
-| **XSD / XML** | `xsd-fast-core` (`0.2.5`) | `xsd-fast-py` (`xsd_fast`) | `xsd-fast-node` | `xsd-fast-flight` (`0.2.1`) | XSD schema parsing, element/type introspection, XML validation, and Arrow schema derivation |
-| **DOCX** | `docx-fast-core` (`0.2.6`) | `docx-fast-py` (`docx_fast`) | `docx-fast-node` | `docx-fast-flight` (`0.2.2`) | Read-only DOCX structure extraction, tables, paragraphs, metadata, NDJSON & Arrow IPC streaming |
-| **XLSX (Read)** | `xlsx-fast-core` (`0.2.6`) | `xlsx-fast-py` (`xlsx_fast`) | `xlsx-fast-node` | `xlsx-fast-flight` (`0.2.2`) | Read-only XLSX workbook extraction, typed cells, formulas, merged ranges, NDJSON & Arrow IPC streaming |
-| **XLSX (Write)** | `xlsx-fast-write` (`0.2.0`) | `xlsx-fast-write-py` (`xlsx_fast_write`) | `xlsx-fast-write-node` | — | Streaming XLSX writer with zero-copy XML sheet writing, shared-strings deduplication, wrap/zebra/freeze-rows styling |
-| **PPTX** | `pptx-fast-core` (`0.2.6`) | `pptx-fast-py` (`pptx_fast`) | `pptx-fast-node` | `pptx-fast-flight` (`0.2.2`) | Read-only PPTX slide, shape, table, notes, and embedded media extraction, NDJSON & Arrow datasets |
-| **PDF (Read)** | `pdf-fast-core` (`0.2.5`) | `pdf-fast-py` (`pdf_fast`) | `pdf-fast-node` | — | Read-only PDF text, glyph catalog, vector/raster images, CCITT/LZW, tables, page rendering, and Arrow batches |
-| **PDF (Write)** | `pdf-fast-write` (`0.2.0`) | `pdf-fast-write-py` (`pdf_fast_write`) | `pdf-fast-write-node` | — | Direct PDF 1.7 writer for vector primitives, TrueType font subsetting, raster images, and structured tables |
-| **Email** | `email-fast-core` (`0.2.7`) | `email-fast-py` (`email_fast`) | `email-fast-node` | `email-fast-flight` (`0.2.1`) | Read-only EML (RFC 5322), OLE/CFB `.msg`, and `mbox` extraction with bounded attachment budgets and Arrow IPC |
-| **Geospatial** | `geo-fast-core` (`0.2.1`) | `geo-fast-py` (`geo_fast`) | `geo-fast-node` | — | GeoParquet, Shapefile, FlatGeobuf, GeoJSON, GeoTIFF, SAR, thermal, hyperspectral, WMS/WFS, and GeoArrow IPC |
-| **Ontology** | `ontology-fast-core` (`0.1.1`) | `ontology-fast-py` (`ontology_fast`) | — | — | Canonical Turtle/RDF reading and indexed triple store with strict memory and triple-count budgets |
-| **Web / HTML** | `web-fast-core` (`0.1.1`) | — | — | — | Deterministic, side-effect-free HTML5 DOM & table extraction with Apache Arrow record batches |
-| **OOXML ZIP** | `ooxml-archive` (`0.1.4`) | — | — | — | Shared OOXML ZIP reader, aggregate `max_inflate` decompression bomb guard, and relationship resolution |
-| **Flight Config** | `flight-ipc-config` (`0.1.0`) | — | — | — | Shared Arrow Flight IPC compression (`LZ4`/`ZSTD`), JWT bearer authentication, and transport configuration |
+| **JSON** | `json-fast-core` (`0.1.8`) | `json-fast-py` (`json_fast`) | `json-fast-node` | `json-fast-flight` (`0.1.2`) | SIMD JSON/JSONL parsing, JSON Schema validation, JSON-RPC 2.0, JSON:API, JWT/JWK split, JSON-LD context peek, Arrow batches |
+| **XSD / XML** | `xsd-fast-core` (`0.2.6`) | `xsd-fast-py` (`xsd_fast`) | `xsd-fast-node` | `xsd-fast-flight` (`0.2.2`) | XSD schema parsing, element/type introspection, XML validation, and Arrow schema derivation |
+| **DOCX** | `docx-fast-core` (`0.2.7`) | `docx-fast-py` (`docx_fast`) | `docx-fast-node` | `docx-fast-flight` (`0.2.3`) | Read-only DOCX structure extraction, tables, paragraphs, metadata, NDJSON & Arrow IPC streaming |
+| **XLSX (Read)** | `xlsx-fast-core` (`0.2.7`) | `xlsx-fast-py` (`xlsx_fast`) | `xlsx-fast-node` | `xlsx-fast-flight` (`0.2.3`) | Read-only XLSX workbook extraction, typed cells, formulas, merged ranges, NDJSON & Arrow IPC streaming |
+| **XLSX (Write)** | `xlsx-fast-write` (`0.2.1`) | `xlsx-fast-write-py` (`xlsx_fast_write`) | `xlsx-fast-write-node` | — | Streaming XLSX writer with zero-copy XML sheet writing, shared-strings deduplication, wrap/zebra/freeze-rows styling |
+| **PPTX** | `pptx-fast-core` (`0.2.7`) | `pptx-fast-py` (`pptx_fast`) | `pptx-fast-node` | `pptx-fast-flight` (`0.2.3`) | Read-only PPTX slide, shape, table, notes, and embedded media extraction, NDJSON & Arrow datasets |
+| **PDF (Read)** | `pdf-fast-core` (`0.2.6`) | `pdf-fast-py` (`pdf_fast`) | `pdf-fast-node` | — | Read-only PDF text, glyph catalog, vector/raster images, CCITT/LZW, tables, page rendering, and Arrow batches |
+| **PDF (Write)** | `pdf-fast-write` (`0.2.1`) | `pdf-fast-write-py` (`pdf_fast_write`) | `pdf-fast-write-node` | — | Direct PDF 1.7 writer for vector primitives, TrueType font subsetting, raster images, and structured tables |
+| **Email** | `email-fast-core` (`0.2.8`) | `email-fast-py` (`email_fast`) | `email-fast-node` | `email-fast-flight` (`0.2.2`) | Read-only EML (RFC 5322), OLE/CFB `.msg`, and `mbox` extraction with bounded attachment budgets and Arrow IPC |
+| **Geospatial** | `geo-fast-core` (`0.2.2`) | `geo-fast-py` (`geo_fast`) | `geo-fast-node` | — | GeoParquet, Shapefile, FlatGeobuf, GeoJSON, GeoTIFF, SAR, thermal, hyperspectral, WMS/WFS, and GeoArrow IPC |
+| **Ontology** | `ontology-fast-core` (`0.1.2`) | `ontology-fast-py` (`ontology_fast`) | — | — | Canonical Turtle/RDF reading and indexed triple store with strict memory and triple-count budgets |
+| **Web / HTML** | `web-fast-core` (`0.1.2`) | — | — | — | Deterministic, side-effect-free HTML5 DOM & table extraction with Apache Arrow record batches |
+| **OOXML ZIP** | `ooxml-archive` (`0.1.5`) | — | — | — | Shared OOXML ZIP reader, aggregate `max_inflate` decompression bomb guard, and relationship resolution |
+| **Flight Config** | `flight-ipc-config` (`0.1.1`) | — | — | — | Shared Arrow Flight IPC compression (`LZ4`/`ZSTD`), JWT bearer authentication, and transport configuration |
 
 ---
 

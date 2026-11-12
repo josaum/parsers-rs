@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "docx-fast-core"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "docx-fast-flight"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "docx-fast-node"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "docx-fast-core",
  "napi",
@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "docx-fast-py"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "docx-fast-core",
  "pyo3",
@@ -1039,7 +1039,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "email-fast-core"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "email-fast-flight"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "email-fast-node"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "email-fast-core",
  "napi",
@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "email-fast-py"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "email-fast-core",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "flight-ipc-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow-flight",
  "arrow-ipc",
@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "geo-fast-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "byteorder",
  "quick-xml 0.36.2",
@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "geo-fast-node"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "geo-fast-core",
  "napi",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "geo-fast-py"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "geo-fast-core",
  "pyo3",
@@ -1989,7 +1989,7 @@ checksum = "574b0cd5e90ee2ba03a66d0611fc9a09c9a0c28b2ecc2dc8a181dd31a53ca5d7"
 
 [[package]]
 name = "json-fast-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -2005,7 +2005,7 @@ dependencies = [
 
 [[package]]
 name = "json-fast-flight"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "json-fast-node"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "json-fast-core",
  "napi",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "json-fast-py"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "json-fast-core",
  "pyo3",
@@ -2581,7 +2581,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "ontology-fast-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "oxrdf",
  "oxrdfio",
@@ -2590,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "ontology-fast-py"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ontology-fast-core",
  "pyo3",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "ooxml-archive"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "flate2",
@@ -2781,7 +2781,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-fast-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2803,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-fast-node"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2816,7 +2816,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-fast-py"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2829,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-fast-write"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -2840,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-fast-write-node"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "napi",
  "napi-build",
@@ -2850,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-fast-write-py"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pdf-fast-write",
  "pyo3",
@@ -3020,7 +3020,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "pptx-fast-core"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -3037,7 +3037,7 @@ dependencies = [
 
 [[package]]
 name = "pptx-fast-flight"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -3057,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "pptx-fast-node"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "napi",
  "napi-build",
@@ -3068,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "pptx-fast-py"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "pptx-fast-core",
  "pyo3",
@@ -4644,7 +4644,7 @@ dependencies = [
 
 [[package]]
 name = "web-fast-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -4853,7 +4853,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xlsx-fast-core"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4872,7 +4872,7 @@ dependencies = [
 
 [[package]]
 name = "xlsx-fast-flight"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4892,7 +4892,7 @@ dependencies = [
 
 [[package]]
 name = "xlsx-fast-node"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "napi",
  "napi-build",
@@ -4903,7 +4903,7 @@ dependencies = [
 
 [[package]]
 name = "xlsx-fast-py"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
@@ -4913,7 +4913,7 @@ dependencies = [
 
 [[package]]
 name = "xlsx-fast-write"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "quick-xml 0.36.2",
  "serde",
@@ -4925,7 +4925,7 @@ dependencies = [
 
 [[package]]
 name = "xlsx-fast-write-node"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "napi",
  "napi-build",
@@ -4935,7 +4935,7 @@ dependencies = [
 
 [[package]]
 name = "xlsx-fast-write-py"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
@@ -4944,7 +4944,7 @@ dependencies = [
 
 [[package]]
 name = "xsd-fast-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4960,7 +4960,7 @@ dependencies = [
 
 [[package]]
 name = "xsd-fast-flight"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4980,7 +4980,7 @@ dependencies = [
 
 [[package]]
 name = "xsd-fast-node"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4993,7 +4993,7 @@ dependencies = [
 
 [[package]]
 name = "xsd-fast-py"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "pyo3",

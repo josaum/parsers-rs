@@ -1,6 +1,6 @@
 [package]
 name = "xlsx-fast-py"
-version = "0.2.6"
+version = "0.2.7"
 edition.workspace = true
 authors.workspace = true
 description = "Python bindings for xlsx-fast-core"

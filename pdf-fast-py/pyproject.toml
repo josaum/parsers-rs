@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pdf-fast"
-version = "0.2.5"
+version = "0.2.6"
 description = "High-performance PDF parser powered by Rust"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }

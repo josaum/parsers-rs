@@ -1,6 +1,6 @@
 [package]
 name = "docx-fast-core"
-version = "0.2.6"
+version = "0.2.7"
 edition.workspace = true
 authors.workspace = true
 description = "High-performance Word (.docx) parser with full OOXML support"
