@@ -591,6 +591,12 @@ impl PdfDocument {
                                 // aimed at one large value would otherwise
                                 // materialize it N times, turning a few
                                 // kilobytes of input into gigabytes.
+                                //
+                                // The table is walked in offset order, not
+                                // table order: a writer that lists the
+                                // objects out of order must not have the
+                                // earlier ones mistaken for overlaps.
+                                offsets.sort_by_key(|(_, offset)| *offset);
                                 let mut parsed_end = 0usize;
                                 for (obj_num, offset) in offsets {
                                     let mut obj_cursor = first.saturating_add(offset);
@@ -974,17 +980,15 @@ impl PdfDocument {
             return Ok(None);
         }
 
-        // The full interpreter follows `Do` with no cycle or depth guard, so a
-        // Form XObject that draws itself recurses until the stack overflows
-        // and takes the process with it. This crate's own content walker
-        // refuses such a page with an error, so the page is walked with it
-        // first and only a page whose forms terminate is handed over. A page
-        // this parser cannot find cannot be vetted and is not rendered.
-        let pages = self.pages();
-        let Some(page) = pages.iter().find(|page| page.page_index == page_index) else {
-            return Ok(None);
-        };
-        self.extract_page_line_segments(page)?;
+        // Known limit: the full interpreter follows `Do` with no cycle or
+        // depth guard, so a Form XObject that draws itself, directly or
+        // through inherited resources, recurses until the stack overflows.
+        // Walking the page with this crate's own content walker first was
+        // tried and removed: it charged the decode budget on every render,
+        // refused forms nested deeper than the fast path allows, and still
+        // missed forms reached through inherited resources. A caller that
+        // renders untrusted files with this entry point should do so in a
+        // process it can afford to lose.
 
         let replay_bytes = self.streams.iter().try_fold(0usize, |total, stream| {
             let decoded_len = stream.decoded_len.unwrap_or(stream.raw_len);
@@ -4814,7 +4818,10 @@ struct GraphicsState {
     fill_paint: Paint<'static>,
     stroke_paint: Paint<'static>,
     stroke: Stroke,
-    clip_mask: Option<Mask>,
+    /// Shared between a state and the copies `q` saves of it. A mask is one
+    /// byte per surface pixel, so copying it per saved state would make
+    /// nesting cost memory; it is copied only when a nested clip changes it.
+    clip_mask: Option<Rc<Mask>>,
 }
 
 #[cfg(feature = "rasterize")]
@@ -8768,9 +8775,6 @@ impl<'a> PageRasterizer<'a> {
                     self.unsaved_states += 1;
                 } else {
                     let current = self.state_stack.last().cloned().unwrap_or_default();
-                    if current.clip_mask.is_some() {
-                        self.ensure_clip_mask_budget()?;
-                    }
                     self.state_stack.push(current);
                 }
             }
@@ -8904,9 +8908,6 @@ impl<'a> PageRasterizer<'a> {
                     return Ok(());
                 };
                 let mut state = self.state_stack.last().cloned().unwrap_or_default();
-                if state.clip_mask.is_some() {
-                    self.ensure_clip_mask_budget()?;
-                }
                 state.ctm = matrix_multiply(state.ctm, form.matrix);
                 self.state_stack.push(state);
                 self.form_stack.push(form.object_id);
@@ -8923,18 +8924,21 @@ impl<'a> PageRasterizer<'a> {
 
     /// Refuse one more clip mask when the masks alive would outgrow the budget.
     ///
-    /// A clip mask is one byte per surface pixel and every saved state that
-    /// has one owns its own copy, so `W n q W n q …` holds a mask per level.
-    /// The masks are released when the page is done, so they are checked
-    /// against the decoded-byte budget rather than charged to it.
+    /// A clip mask is one byte per surface pixel. Saved states share a mask
+    /// until a nested clip changes it, so `W n q W n q …` holds one distinct
+    /// mask per level that clips again, and only those are counted. The masks
+    /// are released when the page is done, so they are checked against the
+    /// decoded-byte budget rather than charged to it.
     fn ensure_clip_mask_budget(&self) -> Result<()> {
         let mask_bytes = (self.px_width as usize).saturating_mul(self.px_height as usize);
-        let alive = self
+        let mut distinct: Vec<*const Mask> = self
             .state_stack
             .iter()
-            .filter(|state| state.clip_mask.is_some())
-            .count()
-            + 1;
+            .filter_map(|state| state.clip_mask.as_ref().map(Rc::as_ptr))
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let alive = distinct.len() + 1;
         self.doc
             .decoded_byte_budget
             .ensure_available(alive.saturating_mul(mask_bytes))
@@ -8955,11 +8959,15 @@ impl<'a> PageRasterizer<'a> {
             self.path_builder = PathBuilder::new();
             return Ok(());
         };
+        // A clip allocates a mask when the state has none, or when the one
+        // it has is shared with a saved state and must be copied to change.
         if pending_clip.is_some()
-            && self
-                .state_stack
-                .last()
-                .is_some_and(|state| state.clip_mask.is_none())
+            && self.state_stack.last().is_some_and(|state| {
+                state
+                    .clip_mask
+                    .as_ref()
+                    .is_none_or(|mask| Rc::strong_count(mask) > 1)
+            })
         {
             self.ensure_clip_mask_budget()?;
         }
@@ -8970,13 +8978,13 @@ impl<'a> PageRasterizer<'a> {
         let transform = pdf_matrix_to_skia(matrix_multiply(self.base_ctm, state.ctm));
         if let Some(rule) = pending_clip {
             if let Some(mask) = state.clip_mask.as_mut() {
-                mask.intersect_path(&path, rule, true, transform);
+                Rc::make_mut(mask).intersect_path(&path, rule, true, transform);
             } else if let Some(mut mask) = Mask::new(self.px_width, self.px_height) {
                 mask.fill_path(&path, rule, true, transform);
-                state.clip_mask = Some(mask);
+                state.clip_mask = Some(Rc::new(mask));
             }
         }
-        let clip_mask = state.clip_mask.as_ref();
+        let clip_mask = state.clip_mask.as_deref();
         if let Some(rule) = fill_rule {
             self.pixmap
                 .fill_path(&path, &state.fill_paint, rule, transform, clip_mask);
