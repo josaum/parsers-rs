@@ -454,7 +454,9 @@ fn parse_dbf(data: &[u8]) -> Result<(Vec<FieldDef>, Vec<Vec<String>>), GeoError>
     let mut schema: Vec<FieldDef> = Vec::with_capacity(n_fields);
     let mut row_width = 1usize; // the deletion flag
 
-    for descriptor in data[DBF_HEADER_SIZE..header_size].chunks_exact(DBF_FIELD_DESCRIPTOR_SIZE) {
+    let (descriptors, _) =
+        data[DBF_HEADER_SIZE..header_size].as_chunks::<DBF_FIELD_DESCRIPTOR_SIZE>();
+    for descriptor in descriptors {
         // A terminator where a descriptor would start ends the field list.
         if descriptor[0] == DBF_TERMINATOR {
             break;

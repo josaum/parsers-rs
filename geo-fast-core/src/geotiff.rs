@@ -495,10 +495,10 @@ fn read_geokey_directory<R: Read + Seek>(
     let n_keys = usize::from(header[3]).min(entries.len() / 4);
     let mut keys = HashMap::with_capacity(n_keys);
 
-    for entry in entries.chunks_exact(4).take(n_keys) {
-        let key_id = entry[0];
+    for &[key_id, _tiff_tag_location, _count, value_offset] in
+        entries.as_chunks::<4>().0.iter().take(n_keys)
+    {
         // For SHORT values (TIFFTagLocation == 0), ValueOffset IS the value
-        let value_offset = entry[3];
         keys.insert(key_id, u32::from(value_offset));
     }
     Ok(keys)

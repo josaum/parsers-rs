@@ -1705,17 +1705,18 @@ fn deeply_nested_geojson_is_bounded_on_a_small_stack() {
             });
         }
 
-        // Past the limit, at every depth up to far beyond what any stack
-        // holds, in every position a document can nest: rejected, not parsed.
+        // Past the limit, in every position a document can nest: rejected,
+        // not parsed. Deepest first, on the plain small stack, so that a reader
+        // which does recurse into these fails by overflowing it.
         for levels in [
-            GEOJSON_NESTING_LIMIT,
-            GEOJSON_NESTING_LIMIT + 1,
-            127,
-            128,
-            129,
-            200,
-            1_000,
             100_000,
+            1_000,
+            200,
+            129,
+            128,
+            127,
+            GEOJSON_NESTING_LIMIT + 1,
+            GEOJSON_NESTING_LIMIT,
         ] {
             let mut documents = Vec::new();
             for value in nested_values(levels + levels % 2) {
@@ -1744,7 +1745,7 @@ fn deeply_nested_geojson_is_bounded_on_a_small_stack() {
                 .expect("ASCII document"),
             );
             for document in documents {
-                run_on_half_the_small_stack(move || {
+                smoke::run_on_small_stack(move || {
                     assert!(parse_geojson_str(&document).is_err(), "{levels} levels");
                 });
             }
@@ -1997,11 +1998,15 @@ fn mutated_boxes_never_panic() {
             .unwrap_or_else(|_| BBox::new(-180.0, -90.0, 180.0, 90.0));
         let _ = geo_fast_core::bbox_area_km2(&query);
         let values: Vec<f64> = bytes
-            .chunks_exact(8)
-            .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("eight bytes")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| f64::from_le_bytes(*chunk))
             .collect();
         let boxes: Vec<(BBox, usize)> = values
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|quad| BBox::new(quad[0], quad[1], quad[2], quad[3]))
             .zip(0..)
             .collect();
