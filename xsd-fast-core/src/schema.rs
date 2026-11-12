@@ -409,16 +409,101 @@ impl SchemaModel {
     /// once, immediately after a schema set finishes loading. Cycles and
     /// self-references are bounded by a visited set and a depth cap, so a
     /// malformed schema can never cause unbounded recursion.
+    ///
+    /// Folding copies each base into every type derived from it, so the model
+    /// can grow far beyond the schema text. The copies are capped: once the
+    /// cap is reached this method stops and leaves the remaining types
+    /// unfolded. [`SchemaSet`](crate::SchemaSet) loading reports that case as
+    /// an error instead.
     pub fn resolve_inheritance(&mut self) {
+        // The only failure is the copy budget, which this signature cannot
+        // report; the types folded so far are complete and stay folded.
+        let _ = self.try_resolve_inheritance();
+    }
+
+    /// Folds base types into derived types, failing when the copies exceed
+    /// [`MAX_INHERITED_NODES`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a `resource_limit` error when inheritance would copy more
+    /// particles and attributes than the budget allows. The model is then
+    /// partially folded and should be discarded.
+    pub(crate) fn try_resolve_inheritance(&mut self) -> anyhow::Result<()> {
         // Snapshot of the *local* (pre-resolution) named types. All base
         // chasing reads from this immutable view, which makes the pass
         // order-independent and prevents double-folding when a base type is
         // itself resolved later in the same pass.
         let originals = self.complex_types.clone();
+        let mut budget = InheritanceBudget {
+            remaining: MAX_INHERITED_NODES,
+        };
 
         for (name, ct) in self.complex_types.iter_mut() {
-            resolve_complex_type(ct, Some(name.as_str()), &originals, 0);
+            resolve_complex_type(ct, Some(name.as_str()), &originals, 0, &mut budget)?;
         }
+        Ok(())
+    }
+}
+
+/// Most particles and attributes inheritance folding may copy in one schema set.
+///
+/// Folding is eager: every derived type receives its own copy of each
+/// ancestor's content, and an inline type that extends a named type receives
+/// a copy that can itself hold inline extensions. A schema of a few kilobytes
+/// can therefore ask for billions of copies (six inline extensions of the
+/// enclosing type, folded sixteen levels deep, is 6^16). The largest public
+/// schema sets (NIEM, FpML, HL7 CDA) fold in the tens of thousands of copies;
+/// this cap is several times that, and holds the folded model to roughly
+/// 150 MiB in the worst case.
+const MAX_INHERITED_NODES: usize = 1 << 18;
+
+/// Copies still allowed during one [`SchemaModel::try_resolve_inheritance`] pass.
+struct InheritanceBudget {
+    remaining: usize,
+}
+
+impl InheritanceBudget {
+    fn charge(&mut self, nodes: usize) -> anyhow::Result<()> {
+        match self.remaining.checked_sub(nodes) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!(
+                "resource_limit: inherited_nodes: complexContent extensions copy more than \
+                 {MAX_INHERITED_NODES} particles and attributes"
+            )),
+        }
+    }
+}
+
+/// Particles and attributes held by `particles`, nested inline types included.
+///
+/// This is what one copy of the slice costs. The recursion follows the nesting
+/// of the model, which the parser bounds.
+fn node_count(particles: &[Particle]) -> usize {
+    particles
+        .iter()
+        .map(|particle| {
+            1 + match &particle.element {
+                ElementRef::Inline(decl) => match &decl.type_def {
+                    XsdType::Complex(inner) => {
+                        inner.attributes.len() + content_node_count(&inner.content)
+                    }
+                    XsdType::Simple(_) | XsdType::Ref(_) => 0,
+                },
+                ElementRef::Group(group) => content_node_count(group),
+                ElementRef::Ref(_) => 0,
+            }
+        })
+        .sum()
+}
+
+fn content_node_count(content: &ContentModel) -> usize {
+    match content {
+        ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => node_count(p),
+        ContentModel::SimpleContent(_) | ContentModel::Empty => 0,
     }
 }
 
@@ -439,21 +524,26 @@ fn resolve_complex_type(
     owner: Option<&str>,
     originals: &IndexMap<String, ComplexType>,
     depth: usize,
-) {
+    budget: &mut InheritanceBudget,
+) -> anyhow::Result<()> {
     // Fold the base chain into this type's content + attributes. A fresh
     // visited stack (seeded with the owner) bounds cycles for this chain only.
     if let Some(base) = ct.base.clone() {
         let mut visited: Vec<String> = owner.map(|s| vec![s.to_string()]).unwrap_or_default();
         if let Some((mut base_particles, mut base_attrs)) =
-            collect_base(&base.local, originals, &mut visited, depth)
+            collect_base(&base.local, originals, &mut visited, depth, budget)?
         {
-            if let ContentModel::Sequence(own) = &ct.content {
-                base_particles.extend(own.iter().cloned());
-                ct.content = ContentModel::Sequence(base_particles);
-            } else if matches!(ct.content, ContentModel::Empty) {
+            match &mut ct.content {
+                // The type's own particles move behind the inherited ones.
+                ContentModel::Sequence(own) => {
+                    base_particles.append(own);
+                    *own = base_particles;
+                }
                 // Pure extension that only adds attributes: keep the base's
                 // particles verbatim.
-                ct.content = ContentModel::Sequence(base_particles);
+                ContentModel::Empty => ct.content = ContentModel::Sequence(base_particles),
+                ContentModel::All(_) | ContentModel::Choice(_) | ContentModel::SimpleContent(_) => {
+                }
             }
             // Inherited attributes come first, then locally declared ones.
             base_attrs.append(&mut ct.attributes);
@@ -465,10 +555,11 @@ fn resolve_complex_type(
     if depth < MAX_INHERITANCE_DEPTH {
         if let Some(particles) = content_particles_mut(&mut ct.content) {
             for particle in particles {
-                resolve_element_ref(&mut particle.element, originals, depth + 1);
+                resolve_element_ref(&mut particle.element, originals, depth + 1, budget)?;
             }
         }
     }
+    Ok(())
 }
 
 /// Resolve any inline complex type reachable through one particle's element.
@@ -476,59 +567,72 @@ fn resolve_element_ref(
     element: &mut ElementRef,
     originals: &IndexMap<String, ComplexType>,
     depth: usize,
-) {
+    budget: &mut InheritanceBudget,
+) -> anyhow::Result<()> {
     if depth >= MAX_INHERITANCE_DEPTH {
-        return;
+        return Ok(());
     }
     match element {
         ElementRef::Inline(decl) => {
             if let XsdType::Complex(inner) = &mut decl.type_def {
                 // Inline types are anonymous; they have no name to self-reference.
-                resolve_complex_type(inner, None, originals, depth);
+                resolve_complex_type(inner, None, originals, depth, budget)?;
             }
         }
         ElementRef::Group(group) => {
             if let Some(particles) = content_particles_mut(group) {
                 for particle in particles {
-                    resolve_element_ref(&mut particle.element, originals, depth + 1);
+                    resolve_element_ref(&mut particle.element, originals, depth + 1, budget)?;
                 }
             }
         }
         ElementRef::Ref(_) => {}
     }
+    Ok(())
 }
+
+/// One base's effective particles and attributes, ancestors first.
+type Inherited = (Vec<Particle>, Vec<AttributeDecl>);
 
 /// Collect a base type's effective particles and attributes, base-first,
 /// chasing the base chain transitively. Returns `None` if the base is unknown
 /// or already on the current chain (cycle).
+///
+/// Every particle and attribute copied here is charged to `budget` before the
+/// copy is made.
 fn collect_base(
     base_local: &str,
     originals: &IndexMap<String, ComplexType>,
     visited: &mut Vec<String>,
     depth: usize,
-) -> Option<(Vec<Particle>, Vec<AttributeDecl>)> {
+    budget: &mut InheritanceBudget,
+) -> anyhow::Result<Option<Inherited>> {
     if depth >= MAX_INHERITANCE_DEPTH || visited.iter().any(|v| v == base_local) {
-        return None;
+        return Ok(None);
     }
-    let base = originals.get(base_local)?;
+    let Some(base) = originals.get(base_local) else {
+        return Ok(None);
+    };
     visited.push(base_local.to_string());
 
     // Recurse first so deeper ancestors land before this base's own members.
     let mut particles: Vec<Particle> = Vec::new();
     let mut attrs: Vec<AttributeDecl> = Vec::new();
     if let Some(grand) = base.base.as_ref() {
-        if let Some((gp, ga)) = collect_base(&grand.local, originals, visited, depth + 1) {
+        if let Some((gp, ga)) = collect_base(&grand.local, originals, visited, depth + 1, budget)? {
             particles.extend(gp);
             attrs.extend(ga);
         }
     }
     if let ContentModel::Sequence(p) = &base.content {
+        budget.charge(node_count(p))?;
         particles.extend(p.iter().cloned());
     }
+    budget.charge(base.attributes.len())?;
     attrs.extend(base.attributes.iter().cloned());
 
     visited.pop();
-    Some((particles, attrs))
+    Ok(Some((particles, attrs)))
 }
 
 /// Mutable access to a content model's particles, for the variants that carry them.
