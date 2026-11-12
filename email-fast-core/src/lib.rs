@@ -483,29 +483,31 @@ pub fn parse_mbox(
     let mut reader = BufReader::new(file);
 
     let mut count = 0;
-    let mut current_message = Vec::new();
+    let mut current_message: Vec<u8> = Vec::new();
     let mut in_message = false;
 
-    // Lossy line reads: real-world mbox corpora (e.g. 1990s corporate
-    // mail) contain non-UTF-8 bytes; BufRead::lines would abort the whole
-    // mailbox on the first one. One bad byte replaces with U+FFFD and the
-    // mailbox survives — consistent with this crate's lenient-by-design
-    // parsing posture.
+    // Byte-wise line reads: real-world mbox corpora (e.g. 1990s corporate
+    // mail) contain non-UTF-8 bytes, so `BufRead::lines` would abort the whole
+    // mailbox on the first one. The bytes are kept exactly as stored rather
+    // than converted lossily, because an 8-bit body is only decodable through
+    // the charset its own headers declare; replacing its bytes here would
+    // leave U+FFFD for the MIME decoder to misread as that charset.
     let mut raw: Vec<u8> = Vec::new();
     loop {
         raw.clear();
         if reader.read_until(b'\n', &mut raw)? == 0 {
             break;
         }
-        let line = String::from_utf8_lossy(&raw)
-            .trim_end_matches(['\r', '\n'])
-            .to_string();
+        let mut line = raw.as_slice();
+        while let [rest @ .., b'\r' | b'\n'] = line {
+            line = rest;
+        }
 
         // Mbox messages start with "From " at beginning of line
-        if line.starts_with("From ") {
+        if line.starts_with(b"From ") {
             if !current_message.is_empty() {
                 // Parse previous message
-                if let Ok(email) = parse_eml_bytes(current_message.join("\n").as_bytes(), options) {
+                if let Ok(email) = parse_eml_bytes(&current_message, options) {
                     callback(email)?;
                     count += 1;
                 }
@@ -516,13 +518,16 @@ pub fn parse_mbox(
         }
 
         if in_message {
-            current_message.push(line);
+            if !current_message.is_empty() {
+                current_message.push(b'\n');
+            }
+            current_message.extend_from_slice(line);
         }
     }
 
     // Parse last message
     if !current_message.is_empty() {
-        if let Ok(email) = parse_eml_bytes(current_message.join("\n").as_bytes(), options) {
+        if let Ok(email) = parse_eml_bytes(&current_message, options) {
             callback(email)?;
             count += 1;
         }
@@ -602,20 +607,73 @@ fn parse_address_header(
     headers: &dyn mailparse::MailHeaderMap,
     name: &str,
 ) -> Option<EmailAddress> {
-    get_header_value(headers, name).and_then(|v| parse_email_address(&v).ok())
+    let header = headers.get_first_header(name)?;
+    if let Some(first) = structured_addresses(header).and_then(|list| list.into_iter().next()) {
+        return Some(first);
+    }
+    parse_email_address(&header.get_value()).ok()
 }
 
 fn parse_address_list_header(
     headers: &dyn mailparse::MailHeaderMap,
     name: &str,
 ) -> Vec<EmailAddress> {
-    get_header_value(headers, name)
-        .map(|v| {
-            v.split(',')
-                .filter_map(|addr| parse_email_address(addr.trim()).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(header) = headers.get_first_header(name) else {
+        return Vec::new();
+    };
+    if let Some(list) = structured_addresses(header) {
+        return list;
+    }
+    // Not RFC 5322 address syntax; keep whatever the sender wrote rather than
+    // dropping the recipients.
+    header
+        .get_value()
+        .split(',')
+        .filter_map(|addr| parse_email_address(addr.trim()).ok())
+        .collect()
+}
+
+/// Parses an address header with the RFC 5322 grammar.
+///
+/// A comma separates mailboxes only outside a quoted string and outside an
+/// encoded-word, so `"Doe, Jane" <j@example.com>` and a display name whose
+/// encoded form decodes to text containing a comma each stay one mailbox.
+/// Group members (`Team: a@x, b@y;`) are flattened into the list. Returns
+/// `None` when the header does not parse or names no mailbox, so the caller
+/// can fall back to lenient splitting.
+fn structured_addresses(header: &mailparse::MailHeader<'_>) -> Option<Vec<EmailAddress>> {
+    let parsed = mailparse::addrparse_header(header).ok()?;
+    let mut addresses = Vec::new();
+    for entry in parsed.iter() {
+        match entry {
+            mailparse::MailAddr::Single(single) => addresses.push(email_address_from(single)),
+            mailparse::MailAddr::Group(group) => {
+                addresses.extend(group.addrs.iter().map(email_address_from));
+            }
+        }
+    }
+    if addresses.is_empty() {
+        None
+    } else {
+        Some(addresses)
+    }
+}
+
+fn email_address_from(single: &mailparse::SingleInfo) -> EmailAddress {
+    EmailAddress {
+        name: single
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+        // `mailparse` leaves the separator on a mailbox that follows a group
+        // (`Team: a@x;, c@y` yields `, c@y`); no address starts with one.
+        address: single
+            .addr
+            .trim_start_matches(|ch: char| ch == ',' || ch.is_whitespace())
+            .to_string(),
+    }
 }
 
 fn get_header_value(headers: &dyn mailparse::MailHeaderMap, name: &str) -> Option<String> {
@@ -685,13 +743,43 @@ fn decode_header(value: &str) -> Result<String> {
 fn decode_bytes(bytes: &[u8], charset: &str) -> Option<String> {
     use encoding_rs::Encoding;
 
-    let encoding = Encoding::for_label(charset.as_bytes())?;
+    let Some(encoding) = Encoding::for_label(charset.as_bytes()) else {
+        return Some(decode_unlabeled_bytes(bytes));
+    };
     let (cow, _, had_errors) = encoding.decode(bytes);
     if had_errors {
         None
     } else {
         Some(cow.to_string())
     }
+}
+
+/// Decodes text whose charset label is missing or names no known encoding.
+///
+/// Valid UTF-8 is taken as UTF-8. Anything else is read as windows-1252, the
+/// encoding mail clients themselves assume for unlabeled 8-bit text: it maps
+/// every byte, so no character is lost to U+FFFD.
+pub(crate) fn decode_unlabeled_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => encoding_rs::WINDOWS_1252
+            .decode_without_bom_handling(bytes)
+            .0
+            .into_owned(),
+    }
+}
+
+/// Decodes a `text/*` part body through the charset its headers declare.
+///
+/// `mailparse` substitutes U+FFFD for every non-ASCII byte when the label is
+/// one it does not recognize (for example `x-unknown`), which loses the text.
+/// Those parts are decoded from their transfer-decoded bytes instead.
+fn decode_text_body(part: &mailparse::ParsedMail<'_>) -> Result<String> {
+    if encoding_rs::Encoding::for_label(part.ctype.charset.as_bytes()).is_some() {
+        return part.get_body().map_err(|e| anyhow!("{e}"));
+    }
+    let raw = part.get_body_raw().map_err(|e| anyhow!("{e}"))?;
+    Ok(decode_unlabeled_bytes(&raw))
 }
 
 fn decode_quoted_printable(encoded: &str, charset: &str) -> Option<String> {
@@ -856,14 +944,12 @@ fn parse_mime_part(
 
         attachments.push(attachment);
     } else if content_type == "text/plain" && body.text.is_none() {
-        let text = part
-            .get_body()
-            .map_err(|e| anyhow!("Failed to read text body: {}", e))?;
+        let text =
+            decode_text_body(part).map_err(|e| anyhow!("Failed to read text body: {}", e))?;
         body.text = Some(text);
     } else if content_type == "text/html" && body.html.is_none() {
-        let html = part
-            .get_body()
-            .map_err(|e| anyhow!("Failed to read HTML body: {}", e))?;
+        let html =
+            decode_text_body(part).map_err(|e| anyhow!("Failed to read HTML body: {}", e))?;
         body.html = Some(html);
     }
 
@@ -944,7 +1030,113 @@ fn html_to_text(html: &str) -> String {
 
     // Remove remaining HTML tags
     let re = regex::Regex::new(r"<[^>]+>").expect("static HTML tag regex must compile");
-    re.replace_all(&text, "").to_string()
+    // Character references are decoded only after the tags are gone, so an
+    // escaped `&lt;b&gt;` survives as the literal text `<b>` instead of being
+    // stripped as markup.
+    decode_html_entities(&re.replace_all(&text, ""))
+}
+
+/// Longest character reference name in the HTML standard, without the `&`.
+///
+/// `CounterClockwiseContourIntegral;` is 32 bytes; a name scan stops there so
+/// a stray `&` in long text costs a bounded lookup.
+const MAX_ENTITY_NAME_LEN: usize = 32;
+
+/// Replaces HTML character references with the characters they name.
+///
+/// Handles decimal (`&#233;`) and hexadecimal (`&#x20AC;`) references and
+/// every named reference in the HTML standard (`&eacute;`, `&nbsp;`). An `&`
+/// that does not start a reference is kept as written, so `AT&T` is unchanged.
+fn decode_html_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let candidate = &rest[pos + 1..];
+        match decode_entity(candidate) {
+            Some((decoded, consumed)) => {
+                out.push_str(&decoded);
+                rest = &candidate[consumed..];
+            }
+            None => {
+                out.push('&');
+                rest = candidate;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decodes the reference at the start of `candidate`, the text after an `&`.
+///
+/// Returns the replacement and how many bytes of `candidate` it consumed.
+fn decode_entity(candidate: &str) -> Option<(String, usize)> {
+    if let Some(numeric) = candidate.strip_prefix('#') {
+        let (digits, radix) = match numeric.strip_prefix(['x', 'X']) {
+            Some(hex) => (hex, 16),
+            None => (numeric, 10),
+        };
+        let len = digits
+            .bytes()
+            .take_while(|byte| char::from(*byte).is_digit(radix))
+            .count();
+        if len == 0 {
+            return None;
+        }
+        let code = u32::from_str_radix(&digits[..len], radix).unwrap_or(u32::MAX);
+        let mut consumed = candidate.len() - digits.len() + len;
+        if candidate[consumed..].starts_with(';') {
+            consumed += 1;
+        }
+        return Some((numeric_reference_char(code).to_string(), consumed));
+    }
+
+    // Named references: extend the name while the table still knows a longer
+    // one, and keep the longest complete match (`&notin;` over `&not`).
+    let mut best = None;
+    for (index, ch) in candidate.char_indices().take(MAX_ENTITY_NAME_LEN) {
+        if !ch.is_ascii_alphanumeric() && ch != ';' {
+            break;
+        }
+        let end = index + ch.len_utf8();
+        match web_atoms::NAMED_ENTITIES.get(&candidate[..end]) {
+            // The table maps every proper prefix of a name to (0, 0).
+            Some(&(0, _)) => {}
+            Some(&(first, second)) => {
+                let mut decoded = String::new();
+                decoded.extend(char::from_u32(first));
+                if second != 0 {
+                    decoded.extend(char::from_u32(second));
+                }
+                best = Some((decoded, end));
+            }
+            None => break,
+        }
+        if ch == ';' {
+            break;
+        }
+    }
+    best
+}
+
+/// Maps a numeric character reference to its character, per the HTML standard.
+///
+/// Code points 0x80..=0x9F are read as windows-1252 (`&#150;` is an en dash,
+/// as every browser renders it); zero, surrogates and out-of-range values
+/// become U+FFFD.
+fn numeric_reference_char(code: u32) -> char {
+    if let Ok(byte @ 0x80..=0x9F) = u8::try_from(code) {
+        let bytes = [byte];
+        let (decoded, _) = encoding_rs::WINDOWS_1252.decode_without_bom_handling(&bytes);
+        if let Some(ch) = decoded.chars().next() {
+            return ch;
+        }
+    }
+    match char::from_u32(code) {
+        Some('\0') | None => char::REPLACEMENT_CHARACTER,
+        Some(ch) => ch,
+    }
 }
 
 #[cfg(test)]
@@ -1281,5 +1473,174 @@ mod tests {
         assert_eq!(count, 2, "both messages must survive: {subjects:?}");
         assert!(subjects.contains(&"first".to_string()));
         assert!(subjects.contains(&"second".to_string()));
+    }
+
+    #[test]
+    fn mbox_8bit_body_decodes_through_its_declared_charset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("latin1.mbox");
+        fs::write(
+            &path,
+            b"From a@b Thu Jan  1 00:00:00 2024\r\n\
+              Subject: =?ISO-8859-1?Q?Ol=E1?=\r\n\
+              Content-Type: text/plain; charset=ISO-8859-1\r\n\
+              Content-Transfer-Encoding: 8bit\r\n\
+              \r\n\
+              Ol\xE1 mundo\r\n\
+              From c@d Thu Jan  1 00:00:01 2024\n\
+              Subject: second\n\
+              Content-Type: text/plain; charset=windows-1252\n\
+              \n\
+              \x93quoted\x94 \x80 5\n",
+        )
+        .unwrap();
+
+        let mut emails = Vec::new();
+        let count = parse_mbox(&path, ParseOptions::default(), |email| {
+            emails.push(email);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(emails[0].subject.as_deref(), Some("Olá"));
+        assert_eq!(
+            emails[0].body.text.as_deref().map(str::trim),
+            Some("Olá mundo")
+        );
+        assert_eq!(
+            emails[1].body.text.as_deref().map(str::trim),
+            Some("“quoted” € 5")
+        );
+    }
+
+    #[test]
+    fn address_lists_keep_display_names_that_contain_commas() {
+        let email = parse_eml_bytes(
+            concat!(
+                "From: =?ISO-8859-1?Q?Jos=E9_Mu=F1oz?= <jose@example.com>\r\n",
+                "To: =?UTF-8?B?U8O4cmVuLCBLaWVya2VnYWFyZA==?= <s@example.com>,\r\n",
+                " \"Doe, Jane\" <j@example.com>, plain@example.com\r\n",
+                "Cc: Team: a@example.com, Bob <b@example.com>;, c@example.com\r\n",
+                "Subject: x\r\n",
+                "\r\n",
+                "body\r\n",
+            )
+            .as_bytes(),
+            ParseOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(email.from.name.as_deref(), Some("José Muñoz"));
+        assert_eq!(email.from.address, "jose@example.com");
+
+        let to: Vec<_> = email
+            .to
+            .iter()
+            .map(|a| (a.name.as_deref(), a.address.as_str()))
+            .collect();
+        assert_eq!(
+            to,
+            [
+                (Some("Søren, Kierkegaard"), "s@example.com"),
+                (Some("Doe, Jane"), "j@example.com"),
+                (None, "plain@example.com"),
+            ]
+        );
+
+        let cc: Vec<_> = email
+            .cc
+            .iter()
+            .map(|a| (a.name.as_deref(), a.address.as_str()))
+            .collect();
+        assert_eq!(
+            cc,
+            [
+                (None, "a@example.com"),
+                (Some("Bob"), "b@example.com"),
+                (None, "c@example.com"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unparseable_address_headers_still_yield_what_was_written() {
+        let email = parse_eml_bytes(
+            b"From: not an address\r\nTo: also not one\r\nSubject: x\r\n\r\nbody\r\n",
+            ParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(email.from.address, "not an address");
+        assert_eq!(email.to.len(), 1);
+        assert_eq!(email.to[0].address, "also not one");
+    }
+
+    #[test]
+    fn unknown_charset_labels_do_not_degrade_to_replacement_characters() {
+        let email = parse_eml_bytes(
+            b"Subject: =?x-unknown?Q?Ol=E1?=\r\n\
+              Content-Type: text/plain; charset=x-unknown\r\n\
+              Content-Transfer-Encoding: 8bit\r\n\
+              \r\n\
+              Ol\xE1 mundo\r\n",
+            ParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(email.subject.as_deref(), Some("Olá"));
+        assert_eq!(email.body.text.as_deref().map(str::trim), Some("Olá mundo"));
+
+        // The same label over valid UTF-8 bytes is read as UTF-8.
+        let email = parse_eml_bytes(
+            "Subject: x\r\nContent-Type: text/plain; charset=x-unknown\r\n\r\nOlá € 日本\r\n"
+                .as_bytes(),
+            ParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            email.body.text.as_deref().map(str::trim),
+            Some("Olá € 日本")
+        );
+    }
+
+    #[test]
+    fn declared_charsets_still_decode_as_declared() {
+        let email = parse_eml_bytes(
+            b"Subject: =?ISO-2022-JP?B?GyRCRnxLXDhsGyhC?=\r\n\
+              Content-Type: text/plain; charset=Shift_JIS\r\n\
+              Content-Transfer-Encoding: base64\r\n\
+              \r\n\
+              k/qWe4zq\r\n",
+            ParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(email.subject.as_deref(), Some("日本語"));
+        assert_eq!(email.body.text.as_deref().map(str::trim), Some("日本語"));
+    }
+
+    #[test]
+    fn html_to_text_decodes_character_references_after_stripping_tags() {
+        assert_eq!(
+            html_to_text("<p>Caf&eacute;&nbsp;&amp; &#233; &#x20AC; &rsquo;</p>"),
+            "\nCafé\u{a0}& é € ’\n"
+        );
+        // An escaped tag is text, not markup, and must survive.
+        assert_eq!(html_to_text("<b>a &lt;b&gt; c</b>"), "a <b> c");
+        // `&` that starts no reference is kept as written.
+        assert_eq!(
+            html_to_text("AT&T & Sons &; &#; &#x; &unknown;"),
+            "AT&T & Sons &; &#; &#x; &unknown;"
+        );
+        // Longest name wins, legacy names need no semicolon, and 0x80..=0x9F
+        // numeric references follow windows-1252.
+        assert_eq!(
+            html_to_text("&notin; &not; &copy 2024 &#150; &#x99;"),
+            "∉ ¬ © 2024 – ™"
+        );
+        // Two-code-point references and invalid numbers.
+        assert_eq!(
+            html_to_text("&NotEqualTilde; &#0; &#xD800; &#x110000;"),
+            "≂̸ \u{fffd} \u{fffd} \u{fffd}"
+        );
+        assert_eq!(html_to_text("ol&aacute;"), "olá");
     }
 }

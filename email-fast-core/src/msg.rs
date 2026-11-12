@@ -11,6 +11,7 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use base64::Engine;
+use encoding_rs::Encoding;
 
 const OLE_SIGNATURE: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 const FREESECT: u32 = 0xFFFF_FFFF;
@@ -42,17 +43,50 @@ const TAG_ATTACH_LONG_FILENAME: &str = "3707";
 const TAG_ATTACH_MIME_TAG: &str = "370E";
 const TAG_ATTACH_CONTENT_ID: &str = "3712";
 
+/// Name of the stream holding an object's fixed-length properties (MS-OXMSG 2.4).
+const PROPERTY_STREAM_NAME: &str = "__properties_version1.0";
+/// Pseudo-tag under which the root property stream is carried with the
+/// `__substg1.0_*` streams. It is not a valid four-hex-digit property ID, so
+/// it cannot collide with a real one.
+const TAG_PROPERTY_STREAM: &str = "__properties";
+/// Size of the property stream header of a top-level message: 8 reserved
+/// bytes, four 4-byte counters, 8 reserved bytes (MS-OXMSG 2.4.1.1).
+const TOP_LEVEL_PROPERTY_HEADER_LEN: usize = 32;
+/// Size of one property stream entry: tag, flags, 8-byte value (MS-OXMSG 2.4.2).
+const PROPERTY_ENTRY_LEN: usize = 16;
+/// `PidTagMessageCodepage` as PtypInteger32: the code page of the message's
+/// non-Unicode (PtypString8) string properties.
+const PROP_MESSAGE_CODEPAGE: u32 = 0x3FFD_0003;
+/// `PidTagInternetCodepage` as PtypInteger32: the code page of the body
+/// streams, including the binary HTML body.
+const PROP_INTERNET_CODEPAGE: u32 = 0x3FDE_0003;
+
 pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
     if bytes.len() < HEADER_SIZE || bytes[..8] != OLE_SIGNATURE {
         return Err(anyhow!("Not a valid MSG file"));
     }
     let file = CfbFile::parse(bytes)?;
     let (streams, attach_storages) = file.root_streams_and_attachments()?;
-    if streams.is_empty() {
+    if streams.iter().all(|s| s.tag == TAG_PROPERTY_STREAM) {
         return Err(anyhow!(
             "MSG file has no root __substg1.0_ property streams (not a message object)"
         ));
     }
+
+    let property_stream = first_binary(&streams, TAG_PROPERTY_STREAM);
+    let message_codepage = property_stream
+        .and_then(|props| fixed_u32_property(props, PROP_MESSAGE_CODEPAGE))
+        .and_then(encoding_for_codepage);
+    let internet_codepage = property_stream
+        .and_then(|props| fixed_u32_property(props, PROP_INTERNET_CODEPAGE))
+        .and_then(encoding_for_codepage);
+    // Strings follow the message code page and body streams the internet
+    // one; each stands in for the other when only one was written.
+    let string_encoding = message_codepage.or(internet_codepage);
+    let body_encoding = internet_codepage.or(message_codepage);
+    let first_string = |streams: &[PropStream], tag: &str| -> Option<String> {
+        first_string_with(streams, tag, string_encoding)
+    };
 
     let subject = first_string(&streams, TAG_SUBJECT);
     let from_addr = first_string(&streams, TAG_SENDER_EMAIL)
@@ -60,11 +94,11 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Ema
     let from_name = first_string(&streams, TAG_SENDER_NAME);
     let to_raw = first_string(&streams, TAG_DISPLAY_TO);
     let cc_raw = first_string(&streams, TAG_DISPLAY_CC);
-    let mut body_text = first_string(&streams, TAG_BODY);
-    let body_html = first_string(&streams, TAG_BODY_HTML).or_else(|| {
+    let mut body_text = first_string_with(&streams, TAG_BODY, body_encoding);
+    let body_html = first_string_with(&streams, TAG_BODY_HTML, body_encoding).or_else(|| {
         first_binary(&streams, TAG_BODY_HTML)
             .map(|b| {
-                String::from_utf8_lossy(b)
+                decode_ansi(b, body_encoding)
                     .trim_matches('\0')
                     .trim()
                     .to_string()
@@ -337,6 +371,12 @@ impl<'a> CfbFile<'a> {
             if let Some((tag, kind)) = parse_substg_name(&entry.name) {
                 let bytes = self.read_stream(entry)?;
                 out.push(PropStream { tag, kind, bytes });
+            } else if entry.name == PROPERTY_STREAM_NAME {
+                out.push(PropStream {
+                    tag: TAG_PROPERTY_STREAM.to_string(),
+                    kind: PropKind::Binary,
+                    bytes: self.read_stream(entry)?,
+                });
             }
         }
         self.walk_dir(entry.right, take_streams, out, attachments, visited)?;
@@ -604,20 +644,109 @@ fn first_binary<'a>(streams: &'a [PropStream], tag: &str) -> Option<&'a [u8]> {
         .map(|s| s.bytes.as_slice())
 }
 
-fn first_string(streams: &[PropStream], tag: &str) -> Option<String> {
+/// Reads a string property, preferring its Unicode stream over the ANSI one.
+///
+/// `ansi_encoding` is the code page the message declares for its non-Unicode
+/// strings, if any; see [`decode_ansi`].
+fn first_string_with(
+    streams: &[PropStream],
+    tag: &str,
+    ansi_encoding: Option<&'static Encoding>,
+) -> Option<String> {
     let unicode = streams
         .iter()
         .find(|s| s.tag.eq_ignore_ascii_case(tag) && matches!(s.kind, PropKind::Unicode));
     if let Some(stream) = unicode {
-        return decode_prop(&stream.bytes, &stream.kind);
+        return decode_prop(&stream.bytes, &stream.kind, ansi_encoding);
     }
     streams
         .iter()
         .find(|s| s.tag.eq_ignore_ascii_case(tag) && matches!(s.kind, PropKind::Ansi))
-        .and_then(|stream| decode_prop(&stream.bytes, &stream.kind))
+        .and_then(|stream| decode_prop(&stream.bytes, &stream.kind, ansi_encoding))
 }
 
-fn decode_prop(bytes: &[u8], kind: &PropKind) -> Option<String> {
+/// Finds a 4-byte fixed-length property in a top-level property stream.
+///
+/// `tag` is the full property tag (property ID in the high word, property
+/// type in the low word), stored little-endian at the start of each entry
+/// with the value in the entry's last eight bytes.
+fn fixed_u32_property(property_stream: &[u8], tag: u32) -> Option<u32> {
+    property_stream
+        .get(TOP_LEVEL_PROPERTY_HEADER_LEN..)?
+        .as_chunks::<PROPERTY_ENTRY_LEN>()
+        .0
+        .iter()
+        .find(|entry| u32_le(entry.as_slice(), 0).ok() == Some(tag))
+        .and_then(|entry| u32_le(entry.as_slice(), 8).ok())
+}
+
+/// Maps a Windows code page identifier to its decoder.
+///
+/// Covers the code pages Outlook writes for `PidTagMessageCodepage` and
+/// `PidTagInternetCodepage`. `encoding_rs` looks encodings up by WHATWG label,
+/// not by number, hence the explicit table. US-ASCII (20127) and Latin-1
+/// (28591) map to windows-1252, their superset, as the WHATWG standard does.
+fn encoding_for_codepage(codepage: u32) -> Option<&'static Encoding> {
+    use encoding_rs as enc;
+    Some(match codepage {
+        65001 => enc::UTF_8,
+        1250 => enc::WINDOWS_1250,
+        1251 => enc::WINDOWS_1251,
+        1252 | 20127 | 28591 => enc::WINDOWS_1252,
+        1253 => enc::WINDOWS_1253,
+        1254 | 28599 => enc::WINDOWS_1254,
+        1255 => enc::WINDOWS_1255,
+        1256 => enc::WINDOWS_1256,
+        1257 => enc::WINDOWS_1257,
+        1258 => enc::WINDOWS_1258,
+        874 => enc::WINDOWS_874,
+        866 => enc::IBM866,
+        932 => enc::SHIFT_JIS,
+        936 => enc::GBK,
+        949 | 51949 => enc::EUC_KR,
+        950 => enc::BIG5,
+        10000 => enc::MACINTOSH,
+        20866 => enc::KOI8_R,
+        21866 => enc::KOI8_U,
+        28592 => enc::ISO_8859_2,
+        28593 => enc::ISO_8859_3,
+        28594 => enc::ISO_8859_4,
+        28595 => enc::ISO_8859_5,
+        28596 => enc::ISO_8859_6,
+        28597 => enc::ISO_8859_7,
+        28598 | 38598 => enc::ISO_8859_8,
+        28603 => enc::ISO_8859_13,
+        28605 => enc::ISO_8859_15,
+        50220..=50222 => enc::ISO_2022_JP,
+        51932 => enc::EUC_JP,
+        54936 => enc::GB18030,
+        _ => return None,
+    })
+}
+
+/// Decodes a non-Unicode (PtypString8 or binary body) value.
+///
+/// Valid UTF-8 is taken as UTF-8, since writers that ignore the declared code
+/// page almost always emit UTF-8. Otherwise the declared code page decides,
+/// and windows-1252 is the last resort: it maps every byte, so nothing
+/// degrades to U+FFFD the way a UTF-8 lossy read does.
+fn decode_ansi(bytes: &[u8], declared: Option<&'static Encoding>) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    match declared {
+        Some(encoding) if encoding != encoding_rs::UTF_8 => {
+            encoding.decode_without_bom_handling(bytes).0.into_owned()
+        }
+        _ => crate::decode_unlabeled_bytes(bytes),
+    }
+}
+
+fn decode_prop(
+    bytes: &[u8],
+    kind: &PropKind,
+    ansi_encoding: Option<&'static Encoding>,
+) -> Option<String> {
     let text = match kind {
         PropKind::Unicode => {
             if bytes.len() < 2 {
@@ -631,7 +760,7 @@ fn decode_prop(bytes: &[u8], kind: &PropKind) -> Option<String> {
                 .collect();
             String::from_utf16_lossy(&units)
         }
-        PropKind::Ansi => String::from_utf8_lossy(bytes).into_owned(),
+        PropKind::Ansi => decode_ansi(bytes, ansi_encoding),
         PropKind::Binary => return None,
     };
     let trimmed = text.trim_matches('\0').trim();
@@ -949,5 +1078,99 @@ mod cfb_hardening_tests {
             .map(|_| ())
             .expect_err("out-of-range must error");
         assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    /// Builds a top-level property stream holding the given 4-byte properties.
+    fn property_stream(properties: &[(u32, u32)]) -> Vec<u8> {
+        let mut stream = vec![0u8; TOP_LEVEL_PROPERTY_HEADER_LEN];
+        for (tag, value) in properties {
+            stream.extend_from_slice(&tag.to_le_bytes());
+            stream.extend_from_slice(&0x0000_0006u32.to_le_bytes()); // readable | writable
+            stream.extend_from_slice(&value.to_le_bytes());
+            stream.extend_from_slice(&[0u8; 4]);
+        }
+        stream
+    }
+
+    fn parse_fixture(streams: &[(&str, Vec<u8>)]) -> Email {
+        parse_msg_bytes(&write_ministream_cfb(streams), ParseOptions::default())
+            .expect("fixture parses")
+    }
+
+    #[test]
+    fn ansi_strings_decode_through_the_declared_message_code_page() {
+        // "Привет" in windows-1251; not valid UTF-8.
+        let email = parse_fixture(&[
+            (
+                "__properties_version1.0",
+                property_stream(&[(PROP_MESSAGE_CODEPAGE, 1251)]),
+            ),
+            (
+                "__substg1.0_0037001E",
+                vec![0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, 0x00],
+            ),
+            ("__substg1.0_1000001E", b"\xD2\xE5\xEA\xF1\xF2\0".to_vec()),
+        ]);
+        assert_eq!(email.subject.as_deref(), Some("Привет"));
+        assert_eq!(email.body.text.as_deref(), Some("Текст"));
+    }
+
+    #[test]
+    fn ansi_strings_without_a_code_page_fall_back_to_windows_1252() {
+        let email = parse_fixture(&[("__substg1.0_0037001E", b"Caf\xE9 \x80 ok\0".to_vec())]);
+        let subject = email.subject.expect("subject");
+        assert_eq!(subject, "Café € ok");
+        assert!(!subject.contains(char::REPLACEMENT_CHARACTER));
+    }
+
+    #[test]
+    fn ansi_strings_that_are_valid_utf8_stay_utf8_despite_the_code_page() {
+        let email = parse_fixture(&[
+            (
+                "__properties_version1.0",
+                property_stream(&[(PROP_MESSAGE_CODEPAGE, 1252)]),
+            ),
+            ("__substg1.0_0037001E", "Olá € 日本".as_bytes().to_vec()),
+        ]);
+        assert_eq!(email.subject.as_deref(), Some("Olá € 日本"));
+    }
+
+    #[test]
+    fn binary_html_body_decodes_through_the_internet_code_page() {
+        // `PidTagHtml` (0x1013) is PtypBinary; its bytes follow
+        // `PidTagInternetCodepage`, here ISO-8859-2: "Łódź".
+        let mut html = b"<p>".to_vec();
+        html.extend_from_slice(&[0xA3, 0xF3, 0x64, 0xBC]);
+        html.extend_from_slice(b"</p>");
+        let email = parse_fixture(&[
+            (
+                "__properties_version1.0",
+                property_stream(&[
+                    (PROP_MESSAGE_CODEPAGE, 1252),
+                    (PROP_INTERNET_CODEPAGE, 28592),
+                ]),
+            ),
+            ("__substg1.0_0037001F", utf16_le("s")),
+            ("__substg1.0_10130102", html),
+        ]);
+        assert_eq!(email.body.html.as_deref(), Some("<p>Łódź</p>"));
+    }
+
+    #[test]
+    fn a_property_stream_alone_is_not_a_message() {
+        let bytes = write_ministream_cfb(&[("__properties_version1.0", property_stream(&[]))]);
+        assert!(parse_msg_bytes(&bytes, ParseOptions::default()).is_err());
+    }
+
+    #[test]
+    fn unicode_streams_are_unaffected_by_the_code_page() {
+        let email = parse_fixture(&[
+            (
+                "__properties_version1.0",
+                property_stream(&[(PROP_MESSAGE_CODEPAGE, 1251)]),
+            ),
+            ("__substg1.0_0037001F", utf16_le("Olá € 日本語 😀")),
+        ]);
+        assert_eq!(email.subject.as_deref(), Some("Olá € 日本語 😀"));
     }
 }
