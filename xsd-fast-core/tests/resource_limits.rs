@@ -108,4 +108,38 @@ mod arrow {
             resource_limit_message(schema.to_arrow_schema("big", ArrowOptions::default()));
         assert!(message.contains("arrow_derivation_steps"), "{message}");
     }
+
+    #[test]
+    fn all_arrow_schemas_omits_what_try_all_arrow_schemas_reports() {
+        // `big` cannot be derived and `small` can.
+        let schema = load(&self_recursive_type(12)).expect("a recursive type is legal XSD");
+        assert_eq!(schema.model().global_elements.len(), 2);
+
+        let derived = schema.all_arrow_schemas(ArrowOptions::default());
+        let names: Vec<&str> = derived.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["small"], "the element over the limit is omitted");
+
+        // Callers match on the plain message, so the limit must lead it.
+        let error = schema
+            .try_all_arrow_schemas(ArrowOptions::default())
+            .expect_err("an element over the limit must fail the strict form");
+        let message = error.to_string();
+        assert!(
+            message.starts_with("resource_limit: arrow_derivation_steps"),
+            "{message}"
+        );
+        assert!(message.ends_with("(element 'big')"), "{message}");
+    }
+
+    #[test]
+    fn try_all_arrow_schemas_returns_every_element() {
+        let schema = load(&named_type_tree(3, 3)).expect("a tree of named types is legal XSD");
+        let lenient = schema.all_arrow_schemas(ArrowOptions::default());
+        let strict = schema
+            .try_all_arrow_schemas(ArrowOptions::default())
+            .expect("every element of a small schema derives");
+        let names: Vec<&str> = strict.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["big", "small"]);
+        assert_eq!(strict, lenient);
+    }
 }

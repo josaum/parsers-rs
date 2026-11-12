@@ -191,7 +191,13 @@ impl SchemaSet {
         Ok(())
     }
 
-    /// Derive Arrow schemas for **all** global elements. Returns `(element_name, schema)` pairs.
+    /// Derive Arrow schemas for the global elements that can be derived.
+    ///
+    /// Returns `(element_name, schema)` pairs in declaration order. An element
+    /// whose derivation fails, which happens when it exceeds a resource limit
+    /// (see [`SchemaSet::to_arrow_schema`]), is left out without a report, so
+    /// the result can hold fewer entries than the schema has global elements.
+    /// Use [`SchemaSet::try_all_arrow_schemas`] to learn of the failure.
     pub fn all_arrow_schemas(&self, opts: ArrowOptions) -> Vec<(String, SchemaRef)> {
         self.model
             .global_elements
@@ -200,6 +206,30 @@ impl SchemaSet {
                 self.to_arrow_schema(name, opts.clone())
                     .ok()
                     .map(|s| (name.clone(), s))
+            })
+            .collect()
+    }
+
+    /// Derive Arrow schemas for **all** global elements, or fail.
+    ///
+    /// Returns `(element_name, schema)` pairs in declaration order, one for
+    /// every global element.
+    ///
+    /// # Errors
+    ///
+    /// Fails on the first element whose derivation fails. The message is the
+    /// one [`SchemaSet::to_arrow_schema`] gives, so it still starts with
+    /// `resource_limit` for a resource limit, followed by the name of the
+    /// element. No partial result is returned.
+    pub fn try_all_arrow_schemas(&self, opts: ArrowOptions) -> Result<Vec<(String, SchemaRef)>> {
+        self.model
+            .global_elements
+            .keys()
+            .map(|name| {
+                let schema = self
+                    .to_arrow_schema(name, opts.clone())
+                    .map_err(|error| anyhow::anyhow!("{error:#} (element '{name}')"))?;
+                Ok((name.clone(), schema))
             })
             .collect()
     }
