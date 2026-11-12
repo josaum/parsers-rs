@@ -49,13 +49,14 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
 #[cfg(feature = "rasterize")]
 use std::io::Write as IoWrite;
 use std::path::Path;
+use std::rc::Rc;
 #[cfg(feature = "arrow")]
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -169,7 +170,28 @@ impl std::error::Error for DecodeBudgetExceeded {}
 
 const MAX_FORM_XOBJECT_DEPTH: usize = 8;
 
+/// Deepest `q` nesting the content interpreters keep saved state for.
+///
+/// Every `q` copies the current state, and in the rasterizer a state can own
+/// a clip mask the size of the page surface, so an unbounded run of `q`
+/// turns a few kilobytes of compressed content into gigabytes. PDF 32000-1
+/// Annex C names 28 as the nesting a reader must support; this allows about
+/// ten times that. Saves past the limit are counted rather than stored, so
+/// the `Q` operators that close them still pair up correctly.
+const MAX_GRAPHICS_STATE_DEPTH: usize = 256;
+
+/// Most components one color operator can set.
+///
+/// A DeviceN color space has at most 32 colorants (PDF 32000-1 §8.6.6.5), and
+/// no other space has more. Operands beyond that are not a color; keeping them
+/// would let one operator hold an arbitrary amount of memory that every
+/// following `q` then copies.
+const MAX_COLOR_COMPONENTS: usize = 32;
+
 type PageImagePayload = (Option<Vec<u8>>, Option<String>);
+
+/// A page-tree node still to visit, with the `/Resources` it inherits.
+type PendingPageNode = ((u32, u16), Option<Rc<PdfDictionary>>);
 
 #[derive(Debug)]
 struct FormXObjectTraversalExceeded {
@@ -252,6 +274,22 @@ impl DecodedByteBudget {
             Err(error) if is_decode_length_limit(&error) => Err(self.stream_limit_error()),
             Err(error) => Err(error),
         }
+    }
+
+    /// Fail when `bytes` would not fit in what is left of the budget.
+    ///
+    /// Unlike [`Self::charge_resource_bytes`] nothing is deducted: this is for
+    /// transient memory that is released again before the call returns.
+    #[cfg(feature = "rasterize")]
+    fn ensure_available(&self, bytes: usize) -> Result<()> {
+        let remaining = self
+            .remaining
+            .lock()
+            .map_err(|_| anyhow!("PDF decoded-byte budget lock poisoned"))?;
+        if bytes > *remaining {
+            return Err(self.total_limit_error());
+        }
+        Ok(())
     }
 
     fn charge_resource_bytes(&self, bytes: usize) -> Result<()> {
@@ -547,14 +585,23 @@ impl PdfDocument {
                                     }
                                 }
 
+                                // Objects in an object stream are stored one
+                                // after another. An offset that lands inside
+                                // an object already read is refused: N offsets
+                                // aimed at one large value would otherwise
+                                // materialize it N times, turning a few
+                                // kilobytes of input into gigabytes.
+                                let mut parsed_end = 0usize;
                                 for (obj_num, offset) in offsets {
                                     let mut obj_cursor = first.saturating_add(offset);
-                                    if obj_cursor >= decoded.len() {
+                                    if obj_cursor >= decoded.len() || obj_cursor < parsed_end {
                                         continue;
                                     }
                                     skip_whitespace_and_comments(decoded, &mut obj_cursor);
                                     let mut parser = ValueParser::new(decoded, obj_cursor);
-                                    if let Ok(value) = parser.parse_value() {
+                                    let parsed = parser.parse_value();
+                                    parsed_end = parsed_end.max(parser.pos);
+                                    if let Ok(value) = parsed {
                                         let (dictionary, array) = match value {
                                             PdfValue::Dictionary(d) => (Some(d), None),
                                             PdfValue::Array(a) => (None, Some(a)),
@@ -926,6 +973,18 @@ impl PdfDocument {
         if !dpi.is_finite() || !(1.0..=600.0).contains(&dpi) {
             return Ok(None);
         }
+
+        // The full interpreter follows `Do` with no cycle or depth guard, so a
+        // Form XObject that draws itself recurses until the stack overflows
+        // and takes the process with it. This crate's own content walker
+        // refuses such a page with an error, so the page is walked with it
+        // first and only a page whose forms terminate is handed over. A page
+        // this parser cannot find cannot be vetted and is not rendered.
+        let pages = self.pages();
+        let Some(page) = pages.iter().find(|page| page.page_index == page_index) else {
+            return Ok(None);
+        };
+        self.extract_page_line_segments(page)?;
 
         let replay_bytes = self.streams.iter().try_fold(0usize, |total, stream| {
             let decoded_len = stream.decoded_len.unwrap_or(stream.raw_len);
@@ -2565,7 +2624,7 @@ impl PdfDocument {
             _ => return None,
         };
         let mut pages = Vec::new();
-        self.collect_pages_from_node(pages_ref, None, &mut pages);
+        self.collect_pages_from_node(pages_ref, &mut pages);
         if pages.is_empty() {
             None
         } else {
@@ -2573,48 +2632,60 @@ impl PdfDocument {
         }
     }
 
-    fn collect_pages_from_node(
-        &self,
-        node_ref: (u32, u16),
-        inherited_resources: Option<PdfDictionary>,
-        pages: &mut Vec<PdfPage>,
-    ) {
-        let Some(object) = self.object_by_id(node_ref.0, node_ref.1) else {
-            return;
-        };
-        let Some(dictionary) = object.dictionary.as_ref() else {
-            return;
-        };
-
-        let resources = dictionary
-            .get("Resources")
-            .and_then(|value| self.resolve_dictionary(value))
-            .cloned()
-            .or(inherited_resources);
-
-        match dictionary.get_name("Type") {
-            Some("Page") => {
-                let page_index = pages.len();
-                pages.push(self.page_from_object(object, page_index, resources));
+    /// Collect the leaf pages under `root`, in document order.
+    ///
+    /// The walk keeps its own stack and visits each node once. A page tree is
+    /// a tree, but a malformed or hostile file can make `/Kids` point back at
+    /// an ancestor, chain nodes thousands deep, or share one subtree between
+    /// many parents; following those by recursion overflows the stack, and
+    /// following shared subtrees repeatedly multiplies a kilobyte of input
+    /// into billions of pages. Visiting each node once bounds the work by the
+    /// number of objects in the file.
+    fn collect_pages_from_node(&self, root: (u32, u16), pages: &mut Vec<PdfPage>) {
+        let mut visited: HashSet<(u32, u16)> = HashSet::new();
+        let mut pending: Vec<PendingPageNode> = vec![(root, None)];
+        while let Some((node_ref, inherited_resources)) = pending.pop() {
+            if !visited.insert(node_ref) {
+                continue;
             }
-            Some("Pages") | None => {
-                if let Some(PdfValue::Array(kids)) = dictionary.get("Kids") {
-                    for kid in kids {
-                        if let PdfValue::Reference {
-                            object_number,
-                            generation,
-                        } = kid
-                        {
-                            self.collect_pages_from_node(
-                                (*object_number, *generation),
-                                resources.clone(),
-                                pages,
-                            );
+            let Some(object) = self.object_by_id(node_ref.0, node_ref.1) else {
+                continue;
+            };
+            let Some(dictionary) = object.dictionary.as_ref() else {
+                continue;
+            };
+
+            let resources = dictionary
+                .get("Resources")
+                .and_then(|value| self.resolve_dictionary(value))
+                .map(|resources| Rc::new(resources.clone()))
+                .or(inherited_resources);
+
+            match dictionary.get_name("Type") {
+                Some("Page") => {
+                    let page_index = pages.len();
+                    let resources = resources.map(|resources| {
+                        Rc::try_unwrap(resources).unwrap_or_else(|shared| (*shared).clone())
+                    });
+                    pages.push(self.page_from_object(object, page_index, resources));
+                }
+                Some("Pages") | None => {
+                    if let Some(PdfValue::Array(kids)) = dictionary.get("Kids") {
+                        // Reversed so the first kid is popped, and so visited,
+                        // first: pages come out in document order.
+                        for kid in kids.iter().rev() {
+                            if let PdfValue::Reference {
+                                object_number,
+                                generation,
+                            } = kid
+                            {
+                                pending.push(((*object_number, *generation), resources.clone()));
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -4450,6 +4521,8 @@ struct ContentState {
     ctm: ContentMatrix,
     graphics_stack: Vec<ContentMatrix>,
     color_stack: Vec<(PdfColor, PdfColor)>, // (fill_color, stroke_color)
+    /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
+    unsaved_states: usize,
     text_matrix: ContentMatrix,
     line_matrix: ContentMatrix,
     leading: f32,
@@ -4470,6 +4543,7 @@ impl Default for ContentState {
             ctm: IDENTITY_MATRIX,
             graphics_stack: Vec::new(),
             color_stack: Vec::new(),
+            unsaved_states: 0,
             text_matrix: IDENTITY_MATRIX,
             line_matrix: IDENTITY_MATRIX,
             leading: 0.0,
@@ -4768,6 +4842,8 @@ struct PageRasterizer<'a> {
     px_width: u32,
     px_height: u32,
     state_stack: Vec<GraphicsState>,
+    /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
+    unsaved_states: usize,
     path_builder: PathBuilder,
     pending_clip: Option<FillRule>,
     form_stack: Vec<(u32, u16)>,
@@ -4890,6 +4966,11 @@ impl UnicodeMap {
             }
         }
 
+        // An empty source code (`<>`) names no bytes. Kept as a code length it
+        // would match at every position without consuming input, so decoding
+        // would never advance.
+        map.code_lengths.retain(|len| *len > 0);
+        map.chars.remove(&[][..]);
         map.code_lengths.sort_unstable();
         map.code_lengths.dedup();
         if map.code_lengths.is_empty() {
@@ -4957,7 +5038,9 @@ impl UnicodeMap {
         let value = bytes_to_u32(code);
         for range in &self.ranges {
             if range.byte_len == code.len() && value >= range.start && value <= range.end {
-                let scalar = range.dst_start + (value - range.start);
+                // The destination start comes from the file; a range that runs
+                // past `u32::MAX` names no scalar value.
+                let scalar = range.dst_start.checked_add(value - range.start)?;
                 return char::from_u32(scalar).map(|ch| ch.to_string());
             }
         }
@@ -6964,7 +7047,16 @@ fn collect_indirect_integers(
     headers
         .iter()
         .filter_map(|header| {
-            let mut parser = ValueParser::new(bytes, header.header_end);
+            // Only an integer object is wanted, so anything that does not
+            // start like a number is skipped without parsing it. Parsing a
+            // whole array or dictionary here, once per object header, made
+            // the scan quadratic in the document size.
+            let mut cursor = header.header_end;
+            skip_whitespace_and_comments(bytes, &mut cursor);
+            if !matches!(bytes.get(cursor), Some(b'+' | b'-' | b'.' | b'0'..=b'9')) {
+                return None;
+            }
+            let mut parser = ValueParser::new(bytes, cursor);
             match parser.parse_value().ok()? {
                 PdfValue::Integer(value) => {
                     Some(((header.object_number, header.generation), value))
@@ -7399,14 +7491,40 @@ fn is_delimiter(byte: u8) -> bool {
     )
 }
 
+/// Deepest array or dictionary nesting the object parser follows.
+///
+/// Real documents nest a handful of levels; an input that nests deeper is
+/// malformed or hostile, and each level costs two recursive calls. The bound
+/// matches the 128-hop limit the `/Parent` walks use, and is small enough that
+/// the recursion fits a 256 KiB worker-thread stack in an unoptimized build.
+/// Raising it trades that stack headroom away.
+const MAX_VALUE_NESTING: usize = 128;
+
 struct ValueParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Containers currently open, bounded by [`MAX_VALUE_NESTING`].
+    depth: usize,
 }
 
 impl<'a> ValueParser<'a> {
     fn new(bytes: &'a [u8], pos: usize) -> Self {
-        Self { bytes, pos }
+        Self {
+            bytes,
+            pos,
+            depth: 0,
+        }
+    }
+
+    /// Record one more open container, refusing nesting past the limit.
+    fn enter_container(&mut self) -> Result<()> {
+        if self.depth >= MAX_VALUE_NESTING {
+            return Err(anyhow!(
+                "PDF value nesting exceeds {MAX_VALUE_NESTING} levels"
+            ));
+        }
+        self.depth += 1;
+        Ok(())
     }
 
     fn parse_value(&mut self) -> Result<PdfValue> {
@@ -7442,6 +7560,7 @@ impl<'a> ValueParser<'a> {
     }
 
     fn parse_dictionary(&mut self) -> Result<PdfValue> {
+        self.enter_container()?;
         self.pos += 2;
         let mut entries = Vec::new();
         loop {
@@ -7450,14 +7569,18 @@ impl<'a> ValueParser<'a> {
                 self.pos += 2;
                 break;
             }
+            // `parse_name` consumes at least the solidus, so every pass makes
+            // progress even when the value that follows is empty.
             let key = self.parse_name()?;
             let value = self.parse_value()?;
             entries.push(PdfDictionaryEntry { key, value });
         }
+        self.depth -= 1;
         Ok(PdfValue::Dictionary(PdfDictionary { entries }))
     }
 
     fn parse_array(&mut self) -> Result<PdfValue> {
+        self.enter_container()?;
         self.pos += 1;
         let mut values = Vec::new();
         loop {
@@ -7466,8 +7589,17 @@ impl<'a> ValueParser<'a> {
                 self.pos += 1;
                 break;
             }
-            values.push(self.parse_value()?);
+            let before = self.pos;
+            let value = self.parse_value()?;
+            if self.pos == before {
+                // A stray delimiter (`)`, `>`, `{`, `}`) parses as an empty
+                // bareword without consuming it. Pushing that value and
+                // looping would never advance, so the array is refused.
+                return Err(anyhow!("unexpected delimiter in PDF array"));
+            }
+            values.push(value);
         }
+        self.depth -= 1;
         Ok(PdfValue::Array(values))
     }
 
@@ -7642,8 +7774,8 @@ fn decode_filters(
                 crate::lzw::decode_lzw_limited(&current, early_change, max_len)?
             }
             "ASCIIHexDecode" | "AHx" => decode_ascii_hex(&current)?,
-            "ASCII85Decode" | "A85" => decode_ascii85(&current)?,
-            "RunLengthDecode" | "RL" => decode_run_length(&current)?,
+            "ASCII85Decode" | "A85" => decode_ascii85(&current, max_len)?,
+            "RunLengthDecode" | "RL" => decode_run_length(&current, max_len)?,
             other => return Err(anyhow!("unsupported PDF filter: {}", other)),
         };
         if matches!(filter.as_str(), "FlateDecode" | "Fl" | "LZWDecode" | "LZW") {
@@ -7808,12 +7940,37 @@ fn decode_ascii_hex(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decode_ascii85(raw: &[u8]) -> Result<Vec<u8>> {
+/// The error for a filter stage whose output passes the stream limit.
+///
+/// The wording carries `max_decoded_stream_len` because that is what
+/// [`is_decode_length_limit`] recognizes as a budget failure.
+fn decoded_len_limit_error(filter: &str, max_len: usize) -> anyhow::Error {
+    anyhow!("{filter} decoded stream exceeds max_decoded_stream_len {max_len}")
+}
+
+/// One ASCII85 group of five base-85 digits as its four-byte value.
+///
+/// Five digits can spell a number above `u32::MAX` (`s8W-!` is the largest
+/// valid group); such a group is malformed, and computing it in 32 bits would
+/// overflow.
+fn ascii85_group_value(group: &[u32; 5]) -> Result<u32> {
+    let value = group
+        .iter()
+        .fold(0u64, |value, digit| value * 85 + u64::from(*digit));
+    u32::try_from(value).map_err(|_| anyhow!("ASCII85 group out of range"))
+}
+
+fn decode_ascii85(raw: &[u8], max_len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut group = [0u32; 5];
     let mut len = 0usize;
     let mut i = 0usize;
     while i < raw.len() {
+        // `z` expands one byte to four, so the limit is enforced as the output
+        // grows rather than after the whole stage has been materialized.
+        if out.len() > max_len {
+            return Err(decoded_len_limit_error("ASCII85", max_len));
+        }
         match raw[i] {
             b'~' if raw.get(i + 1) == Some(&b'>') => break,
             b'z' if len == 0 => {
@@ -7833,8 +7990,7 @@ fn decode_ascii85(raw: &[u8]) -> Result<Vec<u8>> {
         }
         i += 1;
         if len == 5 {
-            let value =
-                (((group[0] * 85 + group[1]) * 85 + group[2]) * 85 + group[3]) * 85 + group[4];
+            let value = ascii85_group_value(&group)?;
             out.extend_from_slice(&value.to_be_bytes());
             len = 0;
         }
@@ -7843,17 +7999,26 @@ fn decode_ascii85(raw: &[u8]) -> Result<Vec<u8>> {
         for item in group.iter_mut().skip(len) {
             *item = 84;
         }
-        let value = (((group[0] * 85 + group[1]) * 85 + group[2]) * 85 + group[3]) * 85 + group[4];
+        let value = ascii85_group_value(&group)?;
         let bytes = value.to_be_bytes();
         out.extend_from_slice(&bytes[..len - 1]);
+    }
+    if out.len() > max_len {
+        return Err(decoded_len_limit_error("ASCII85", max_len));
     }
     Ok(out)
 }
 
-fn decode_run_length(raw: &[u8]) -> Result<Vec<u8>> {
+fn decode_run_length(raw: &[u8], max_len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     while cursor < raw.len() {
+        // A repeat run expands two bytes to 128, and chained RunLength
+        // filters compound that, so the limit is enforced as the output grows
+        // rather than after the whole stage has been materialized.
+        if out.len() > max_len {
+            return Err(decoded_len_limit_error("RunLength", max_len));
+        }
         let length = raw[cursor];
         cursor += 1;
         match length {
@@ -7878,6 +8043,9 @@ fn decode_run_length(raw: &[u8]) -> Result<Vec<u8>> {
                 out.extend(std::iter::repeat_n(byte, count));
             }
         }
+    }
+    if out.len() > max_len {
+        return Err(decoded_len_limit_error("RunLength", max_len));
     }
     Ok(out)
 }
@@ -8015,18 +8183,26 @@ fn extract_semantic_text_runs(
                         operands.clear();
                     }
                     "q" => {
-                        state.graphics_stack.push(state.ctm);
-                        state
-                            .color_stack
-                            .push((state.fill_color.clone(), state.stroke_color.clone()));
+                        if state.graphics_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
+                            state.unsaved_states += 1;
+                        } else {
+                            state.graphics_stack.push(state.ctm);
+                            state
+                                .color_stack
+                                .push((state.fill_color.clone(), state.stroke_color.clone()));
+                        }
                     }
                     "Q" => {
-                        if let Some(matrix) = state.graphics_stack.pop() {
-                            state.ctm = matrix;
-                        }
-                        if let Some((fill, stroke)) = state.color_stack.pop() {
-                            state.fill_color = fill;
-                            state.stroke_color = stroke;
+                        if state.unsaved_states > 0 {
+                            state.unsaved_states -= 1;
+                        } else {
+                            if let Some(matrix) = state.graphics_stack.pop() {
+                                state.ctm = matrix;
+                            }
+                            if let Some((fill, stroke)) = state.color_stack.pop() {
+                                state.fill_color = fill;
+                                state.stroke_color = stroke;
+                            }
                         }
                     }
                     "cm" => {
@@ -8325,7 +8501,27 @@ fn is_content_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0')
 }
 
+/// Deepest array nesting the content-stream tokenizer follows.
+///
+/// A content stream only nests arrays one level (`TJ`, dash patterns), so
+/// anything deeper is malformed. Each level is one recursive call; the bound
+/// keeps that recursion inside a 256 KiB worker-thread stack.
+const MAX_CONTENT_ARRAY_NESTING: usize = 128;
+
 fn next_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> {
+    next_content_token_nested(bytes, cursor, 0)
+}
+
+/// [`next_content_token`] with the number of arrays already open.
+///
+/// Returns `None` — the same answer as the end of the stream — when arrays
+/// nest past [`MAX_CONTENT_ARRAY_NESTING`], so a caller stops reading a stream
+/// it cannot make sense of instead of recursing without bound.
+fn next_content_token_nested(
+    bytes: &[u8],
+    cursor: &mut usize,
+    depth: usize,
+) -> Option<ContentToken> {
     skip_whitespace_and_comments(bytes, cursor);
     let byte = *bytes.get(*cursor)?;
     match byte {
@@ -8350,6 +8546,9 @@ fn next_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> 
             Some(ContentToken::Value(ContentValue::HexString(value)))
         }
         b'[' => {
+            if depth >= MAX_CONTENT_ARRAY_NESTING {
+                return None;
+            }
             *cursor += 1;
             let mut items = Vec::new();
             loop {
@@ -8358,7 +8557,7 @@ fn next_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> 
                     *cursor += 1;
                     break;
                 }
-                match next_content_token(bytes, cursor)? {
+                match next_content_token_nested(bytes, cursor, depth + 1)? {
                     ContentToken::Value(value) => items.push(value),
                     ContentToken::Operator(_) => items.push(ContentValue::Other),
                 }
@@ -8429,11 +8628,17 @@ fn operands_as_pair(values: &[ContentValue]) -> Option<(f32, f32)> {
     Some((first, second))
 }
 
+/// The numeric operands of a color operator, as its components.
+///
+/// At most the last [`MAX_COLOR_COMPONENTS`] are kept.
 fn operands_as_numbers(values: &[ContentValue]) -> Option<Vec<f64>> {
-    let numbers: Vec<f64> = values
+    let mut numbers: Vec<f64> = values
         .iter()
+        .rev()
         .filter_map(|v| content_number(v).map(|n| n as f64))
+        .take(MAX_COLOR_COMPONENTS)
         .collect();
+    numbers.reverse();
     if numbers.is_empty() {
         None
     } else {
@@ -8502,6 +8707,7 @@ impl<'a> PageRasterizer<'a> {
             px_width,
             px_height,
             state_stack: vec![GraphicsState::default()],
+            unsaved_states: 0,
             path_builder: PathBuilder::new(),
             pending_clip: None,
             form_stack: Vec::new(),
@@ -8558,11 +8764,20 @@ impl<'a> PageRasterizer<'a> {
     ) -> Result<()> {
         match operator {
             "q" => {
-                let current = self.state_stack.last().cloned().unwrap_or_default();
-                self.state_stack.push(current);
+                if self.state_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
+                    self.unsaved_states += 1;
+                } else {
+                    let current = self.state_stack.last().cloned().unwrap_or_default();
+                    if current.clip_mask.is_some() {
+                        self.ensure_clip_mask_budget()?;
+                    }
+                    self.state_stack.push(current);
+                }
             }
             "Q" => {
-                if self.state_stack.len() > 1 {
+                if self.unsaved_states > 0 {
+                    self.unsaved_states -= 1;
+                } else if self.state_stack.len() > 1 {
                     self.state_stack.pop();
                 }
             }
@@ -8602,16 +8817,16 @@ impl<'a> PageRasterizer<'a> {
                     self.path_builder.close();
                 }
             }
-            "f" | "F" => self.execute_paint(Some(FillRule::Winding), false, false),
-            "f*" => self.execute_paint(Some(FillRule::EvenOdd), false, false),
-            "S" => self.execute_paint(None, true, false),
-            "s" => self.execute_paint(None, true, true),
-            "B" => self.execute_paint(Some(FillRule::Winding), true, false),
-            "B*" => self.execute_paint(Some(FillRule::EvenOdd), true, false),
-            "b" => self.execute_paint(Some(FillRule::Winding), true, true),
-            "b*" => self.execute_paint(Some(FillRule::EvenOdd), true, true),
+            "f" | "F" => self.execute_paint(Some(FillRule::Winding), false, false)?,
+            "f*" => self.execute_paint(Some(FillRule::EvenOdd), false, false)?,
+            "S" => self.execute_paint(None, true, false)?,
+            "s" => self.execute_paint(None, true, true)?,
+            "B" => self.execute_paint(Some(FillRule::Winding), true, false)?,
+            "B*" => self.execute_paint(Some(FillRule::EvenOdd), true, false)?,
+            "b" => self.execute_paint(Some(FillRule::Winding), true, true)?,
+            "b*" => self.execute_paint(Some(FillRule::EvenOdd), true, true)?,
             "n" => {
-                self.execute_paint(None, false, false);
+                self.execute_paint(None, false, false)?;
             }
             "w" => {
                 if let Some(width) = operands.iter().rev().find_map(content_number) {
@@ -8689,6 +8904,9 @@ impl<'a> PageRasterizer<'a> {
                     return Ok(());
                 };
                 let mut state = self.state_stack.last().cloned().unwrap_or_default();
+                if state.clip_mask.is_some() {
+                    self.ensure_clip_mask_budget()?;
+                }
                 state.ctm = matrix_multiply(state.ctm, form.matrix);
                 self.state_stack.push(state);
                 self.form_stack.push(form.object_id);
@@ -8703,7 +8921,31 @@ impl<'a> PageRasterizer<'a> {
         Ok(())
     }
 
-    fn execute_paint(&mut self, fill_rule: Option<FillRule>, stroke: bool, close: bool) {
+    /// Refuse one more clip mask when the masks alive would outgrow the budget.
+    ///
+    /// A clip mask is one byte per surface pixel and every saved state that
+    /// has one owns its own copy, so `W n q W n q …` holds a mask per level.
+    /// The masks are released when the page is done, so they are checked
+    /// against the decoded-byte budget rather than charged to it.
+    fn ensure_clip_mask_budget(&self) -> Result<()> {
+        let mask_bytes = (self.px_width as usize).saturating_mul(self.px_height as usize);
+        let alive = self
+            .state_stack
+            .iter()
+            .filter(|state| state.clip_mask.is_some())
+            .count()
+            + 1;
+        self.doc
+            .decoded_byte_budget
+            .ensure_available(alive.saturating_mul(mask_bytes))
+    }
+
+    fn execute_paint(
+        &mut self,
+        fill_rule: Option<FillRule>,
+        stroke: bool,
+        close: bool,
+    ) -> Result<()> {
         if close {
             self.path_builder.close();
         }
@@ -8711,11 +8953,19 @@ impl<'a> PageRasterizer<'a> {
         let builder = std::mem::replace(&mut self.path_builder, PathBuilder::new());
         let Some(path) = builder.finish() else {
             self.path_builder = PathBuilder::new();
-            return;
+            return Ok(());
         };
+        if pending_clip.is_some()
+            && self
+                .state_stack
+                .last()
+                .is_some_and(|state| state.clip_mask.is_none())
+        {
+            self.ensure_clip_mask_budget()?;
+        }
         let Some(state) = self.state_stack.last_mut() else {
             self.path_builder = PathBuilder::new();
-            return;
+            return Ok(());
         };
         let transform = pdf_matrix_to_skia(matrix_multiply(self.base_ctm, state.ctm));
         if let Some(rule) = pending_clip {
@@ -8743,6 +8993,7 @@ impl<'a> PageRasterizer<'a> {
             self.painted = true;
         }
         self.path_builder = PathBuilder::new();
+        Ok(())
     }
 }
 
