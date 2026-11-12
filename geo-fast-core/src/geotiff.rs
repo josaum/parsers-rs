@@ -4,7 +4,9 @@
 //!   - ModelPixelScaleTag    (34264)
 //!   - ModelTiepointTag      (33922)
 //!   - ModelTransformationTag (34264 / 34264 — alias; actually 33920 for the full matrix)
-//!   - GeoKeyDirectoryTag    (34735) + GeoDoubleParamsTag (34736) + GeoAsciiParamsTag (34737)
+//!   - GeoKeyDirectoryTag    (34735), for the keys whose value is stored in the
+//!     directory itself; GeoDoubleParamsTag (34736) and GeoAsciiParamsTag
+//!     (34737) are not read
 //!
 //! Returns [`GeoTiffMetadata`] and, optionally, raster band data as `Vec<f32>`.
 
@@ -12,9 +14,10 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use tiff::decoder::ifd::Value;
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
-use tiff::ColorType;
+use tiff::{ColorType, TiffError};
 
 use crate::error::GeoError;
 use crate::types::BBox;
@@ -24,8 +27,6 @@ const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
 const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_MODEL_TRANSFORMATION: u16 = 34264;
 const TAG_GEO_KEY_DIRECTORY: u16 = 34735;
-const TAG_GEO_DOUBLE_PARAMS: u16 = 34736;
-const TAG_GEO_ASCII_PARAMS: u16 = 34737;
 
 // GeoKey IDs
 const GEOKEY_MODEL_TYPE: u16 = 1024;
@@ -70,7 +71,14 @@ pub struct GeoTiffMetadata {
     pub height: u32,
     /// Number of bands (samples per pixel).
     pub band_count: u16,
-    /// Geographic bounding box (EPSG:4326 when projection is known).
+    /// Bounding box in degrees of longitude and latitude.
+    ///
+    /// Set only when the raster's CRS is geographic ([`Self::is_geographic`])
+    /// and its tags locate it. The corners of a projected raster are in the
+    /// units of its projection, usually metres; a [`BBox`] holds degrees and
+    /// nothing here reprojects, so for a projected raster this is `None`.
+    /// [`Self::upper_left`] and [`Self::lower_right`] give the corners in the
+    /// raster's own CRS either way.
     pub bbox: Option<BBox>,
     /// Pixel size in projection units (x, y).
     pub pixel_scale: Option<(f64, f64)>,
@@ -87,14 +95,22 @@ pub struct GeoTiffMetadata {
 }
 
 impl GeoTiffMetadata {
-    /// Computes the upper-left world coordinate from tiepoints + pixel scale.
+    /// Returns the world coordinate of the raster's upper-left corner.
+    ///
+    /// The coordinate is in the raster's own CRS and comes from the first
+    /// tiepoint. A tiepoint ties a pixel to a world coordinate, and that
+    /// pixel need not be the corner, so the pixel scale carries the
+    /// coordinate back to pixel (0, 0). Returns `None` when there is no
+    /// tiepoint, or when the tiepoint is not at the corner and there is no
+    /// pixel scale to carry it there.
     pub fn upper_left(&self) -> Option<(f64, f64)> {
-        let tp = self.tiepoints.first()?;
-        // tp = [pixel_x, pixel_y, pixel_z, world_x, world_y, world_z]
-        Some((tp[3], tp[4]))
+        tiepoint_origin(self.tiepoints.first()?, self.pixel_scale)
     }
 
-    /// Computes the lower-right world coordinate.
+    /// Returns the world coordinate of the raster's lower-right corner.
+    ///
+    /// One pixel scale per pixel away from [`Self::upper_left`], in the
+    /// raster's own CRS. Returns `None` without a tiepoint and a pixel scale.
     pub fn lower_right(&self) -> Option<(f64, f64)> {
         let (world_x, world_y) = self.upper_left()?;
         let (sx, sy) = self.pixel_scale?;
@@ -115,7 +131,7 @@ pub fn parse_geotiff_metadata<P: AsRef<Path>>(path: P) -> Result<GeoTiffMetadata
 pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
     reader: R,
 ) -> Result<GeoTiffMetadata, GeoError> {
-    let mut decoder = open_decoder(reader)?;
+    let mut decoder = open_tag_decoder(reader)?;
 
     let (width, height) = decoder
         .dimensions()
@@ -158,11 +174,11 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
         });
 
     // ── GeoKey directory ────────────────────────────────────────────────────
-    let geo_double_params =
-        read_doubles_tag(&mut decoder, TAG_GEO_DOUBLE_PARAMS)?.unwrap_or_default();
-    let geo_ascii_params = read_ascii_tag(&mut decoder, TAG_GEO_ASCII_PARAMS)?.unwrap_or_default();
-
-    let geokeys = read_geokey_directory(&mut decoder, &geo_double_params, &geo_ascii_params)?;
+    // Only keys stored in the directory itself are used. The double and
+    // ASCII parameter tags hold the values of the other keys (citations,
+    // ellipsoid axes), which nothing here reads; they are left alone so that
+    // a citation in some legacy encoding cannot fail the parse.
+    let geokeys = read_geokey_directory(&mut decoder)?;
 
     let epsg_code = geokeys
         .get(&GEOKEY_PROJECTED_CS_TYPE)
@@ -177,13 +193,20 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
         .unwrap_or(false);
 
     // ── Derive bounding box ─────────────────────────────────────────────────
-    let bbox = derive_bbox(
-        &tiepoints,
-        pixel_scale,
-        width,
-        height,
-        &transformation_matrix,
-    );
+    // A `BBox` is in degrees. Only a geographic raster has corners in
+    // degrees; a projected one would put metres in the longitude and
+    // latitude fields.
+    let bbox = if is_geographic {
+        derive_bbox(
+            &tiepoints,
+            pixel_scale,
+            width,
+            height,
+            &transformation_matrix,
+        )
+    } else {
+        None
+    };
 
     Ok(GeoTiffMetadata {
         width,
@@ -238,15 +261,12 @@ pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, Geo
 /// raster), so a file of a few hundred bytes could have the whole buffer
 /// allocated from its header alone. Here the limits are also capped by what
 /// `reader` can hold: see [`COMPRESSED_EXPANSION`].
-pub(crate) fn open_decoder<R: Read + Seek>(mut reader: R) -> Result<Decoder<R>, GeoError> {
-    let start = reader.stream_position().map_err(GeoError::Io)?;
-    let input_len = reader.seek(SeekFrom::End(0)).map_err(GeoError::Io)?;
-    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
-    check_directory_fits(&mut reader, input_len)?;
-    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
-    let input_len = usize::try_from(input_len).unwrap_or(usize::MAX);
-
-    let mut decoder = Decoder::new(reader).map_err(|e| GeoError::Tiff(e.to_string()))?;
+///
+/// These limits are sized for decoding the raster. The decoder applies the
+/// same field to the arrays it builds for tag values, where it is too tight:
+/// a caller that reads tags and no pixels uses [`open_tag_decoder`].
+pub(crate) fn open_decoder<R: Read + Seek>(reader: R) -> Result<Decoder<R>, GeoError> {
+    let (mut decoder, input_len) = open_checked(reader)?;
 
     // Absent means uncompressed; a tag that cannot be read gets the looser bound.
     let uncompressed = matches!(
@@ -266,6 +286,46 @@ pub(crate) fn open_decoder<R: Read + Seek>(mut reader: R) -> Result<Decoder<R>, 
     // Tag values are stored as they are, so none is larger than the input.
     limits.ifd_value_size = limits.ifd_value_size.min(input_len);
     Ok(decoder.with_limits(limits))
+}
+
+/// Opens a TIFF decoder for reading tag values, not pixels.
+///
+/// The decoder turns a tag's array into one [`Value`] per element and
+/// refuses an array of more than `decoding_buffer_size / size_of::<Value>()`
+/// elements. An element takes at least one byte of the file, so a tag that
+/// fits in the file has at most `input_len` elements: allowing
+/// `size_of::<Value>()` bytes per input byte admits every such tag, and still
+/// ties the allocation to the size of the input. The raster limits of
+/// [`open_decoder`] allow 8 bytes per input byte of an uncompressed file,
+/// which is a quarter of that: under them a GeoKey directory that took up
+/// more than a quarter of a small file's bytes could not be read.
+fn open_tag_decoder<R: Read + Seek>(reader: R) -> Result<Decoder<R>, GeoError> {
+    let (decoder, input_len) = open_checked(reader)?;
+
+    let mut limits = Limits::default();
+    limits.decoding_buffer_size = limits
+        .decoding_buffer_size
+        .min(input_len.saturating_mul(std::mem::size_of::<Value>()));
+    // No strip or tile is decoded through this decoder.
+    limits.intermediate_buffer_size = limits.intermediate_buffer_size.min(input_len);
+    limits.ifd_value_size = limits.ifd_value_size.min(input_len);
+    Ok(decoder.with_limits(limits))
+}
+
+/// Opens a TIFF decoder after checking its first directory against the file.
+///
+/// Returns the decoder, still under the `tiff` crate's default limits, and
+/// the length of the input in bytes.
+fn open_checked<R: Read + Seek>(mut reader: R) -> Result<(Decoder<R>, usize), GeoError> {
+    let start = reader.stream_position().map_err(GeoError::Io)?;
+    let input_len = reader.seek(SeekFrom::End(0)).map_err(GeoError::Io)?;
+    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
+    check_directory_fits(&mut reader, input_len)?;
+    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
+    let input_len = usize::try_from(input_len).unwrap_or(usize::MAX);
+
+    let decoder = Decoder::new(reader).map_err(|e| GeoError::Tiff(e.to_string()))?;
+    Ok((decoder, input_len))
 }
 
 /// Reads the fixed-width integers of a TIFF header and directory.
@@ -454,37 +514,57 @@ fn tag(tag_id: u16) -> Tag {
     Tag::from_u16_exhaustive(tag_id)
 }
 
+/// Reads the value of an optional GeoTIFF tag.
+///
+/// Returns `Ok(None)` only when the image has no such tag. A tag that is
+/// present but cannot be read (its data lies outside the file, or exceeds
+/// the decoder's limits) is an error: reporting it as absent would hand back
+/// a raster that silently lost its georeferencing.
+fn find_geo_tag<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    tag_id: u16,
+) -> Result<Option<Value>, GeoError> {
+    decoder
+        .find_tag(tag(tag_id))
+        .map_err(|e| unreadable_tag(tag_id, &e))
+}
+
+fn unreadable_tag(tag_id: u16, error: &TiffError) -> GeoError {
+    GeoError::Tiff(format!("GeoTIFF tag {tag_id} cannot be read: {error}"))
+}
+
+/// Reads an optional GeoTIFF tag whose values are doubles.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Tiff`] when the tag is present but unreadable, or
+/// holds values of another type. A missing tag is `Ok(None)`.
 fn read_doubles_tag<R: Read + Seek>(
     decoder: &mut Decoder<R>,
     tag_id: u16,
 ) -> Result<Option<Vec<f64>>, GeoError> {
-    match decoder.get_tag_f64_vec(tag(tag_id)) {
-        Ok(v) => Ok(Some(v)),
-        // Tag not present in this image — not an error
-        Err(_) => Ok(None),
-    }
+    find_geo_tag(decoder, tag_id)?
+        .map(|value| value.into_f64_vec().map_err(|e| unreadable_tag(tag_id, &e)))
+        .transpose()
 }
 
-fn read_ascii_tag<R: Read + Seek>(
-    decoder: &mut Decoder<R>,
-    tag_id: u16,
-) -> Result<Option<String>, GeoError> {
-    match decoder.get_tag_ascii_string(tag(tag_id)) {
-        Ok(s) => Ok(Some(s)),
-        Err(_) => Ok(None),
-    }
-}
-
+/// Reads the GeoKey directory into a key→value map.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Tiff`] when the directory tag is present but
+/// unreadable, or is not an array of unsigned integers. A TIFF without the
+/// tag is not a GeoTIFF and yields an empty map.
 fn read_geokey_directory<R: Read + Seek>(
     decoder: &mut Decoder<R>,
-    _double_params: &[f64],
-    _ascii_params: &str,
 ) -> Result<HashMap<u16, u32>, GeoError> {
-    let raw: Vec<u16> = match decoder.get_tag_u16_vec(tag(TAG_GEO_KEY_DIRECTORY)) {
-        Ok(v) => v,
-        // Tag absent — not a GeoTIFF, but still a valid TIFF
-        Err(_) => return Ok(HashMap::new()),
+    // Tag absent: not a GeoTIFF, but still a valid TIFF.
+    let Some(value) = find_geo_tag(decoder, TAG_GEO_KEY_DIRECTORY)? else {
+        return Ok(HashMap::new());
     };
+    let raw: Vec<u16> = value
+        .into_u16_vec()
+        .map_err(|e| unreadable_tag(TAG_GEO_KEY_DIRECTORY, &e))?;
 
     // Directory header: [KeyDirectoryVersion, KeyRevision, MinorRevision, NumberOfKeys]
     // followed by one [KeyID, TIFFTagLocation, Count, ValueOffset] entry per key.
@@ -504,6 +584,21 @@ fn read_geokey_directory<R: Read + Seek>(
     Ok(keys)
 }
 
+/// World coordinate of pixel (0, 0), from one tiepoint and the pixel scale.
+///
+/// `tiepoint` is `[I, J, K, X, Y, Z]`: raster position (`I`, `J`) lies at
+/// world position (`X`, `Y`). World Y decreases as `J` grows. A tiepoint at
+/// the corner itself needs no scale; any other one cannot be carried to the
+/// corner without it.
+fn tiepoint_origin(tiepoint: &[f64; 6], pixel_scale: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let [i, j, _, x, y, _] = *tiepoint;
+    if i == 0.0 && j == 0.0 {
+        return Some((x, y));
+    }
+    let (sx, sy) = pixel_scale?;
+    Some((x - i * sx, y + j * sy))
+}
+
 fn derive_bbox(
     tiepoints: &[[f64; 6]],
     pixel_scale: Option<(f64, f64)>,
@@ -515,23 +610,25 @@ fn derive_bbox(
     if let Some(m) = transform {
         // Row-major 4×4 affine: world_x = m[0]*px + m[1]*py + m[3]
         //                        world_y = m[4]*px + m[5]*py + m[7]
-        let ul_x = m[3];
-        let ul_y = m[7];
-        let lr_x = m[0] * width as f64 + m[1] * height as f64 + m[3];
-        let lr_y = m[4] * width as f64 + m[5] * height as f64 + m[7];
-        return Some(BBox::new(
-            ul_x.min(lr_x),
-            lr_y.min(ul_y),
-            ul_x.max(lr_x),
-            lr_y.max(ul_y),
-        ));
+        // The matrix may rotate or shear the raster, and then the extremes
+        // are not at the upper-left and lower-right corners: take all four.
+        let (w, h) = (f64::from(width), f64::from(height));
+        let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)]
+            .map(|(px, py)| (m[0] * px + m[1] * py + m[3], m[4] * px + m[5] * py + m[7]));
+        let (first_x, first_y) = corners[0];
+        let mut bbox = BBox::new(first_x, first_y, first_x, first_y);
+        for (x, y) in corners {
+            bbox.min_lon = bbox.min_lon.min(x);
+            bbox.max_lon = bbox.max_lon.max(x);
+            bbox.min_lat = bbox.min_lat.min(y);
+            bbox.max_lat = bbox.max_lat.max(y);
+        }
+        return Some(bbox);
     }
 
     // Fall back to tiepoint + pixel scale
-    let tp = tiepoints.first()?;
     let (sx, sy) = pixel_scale?;
-    let ul_x = tp[3] - tp[0] * sx;
-    let ul_y = tp[4] + tp[1] * sy;
+    let (ul_x, ul_y) = tiepoint_origin(tiepoints.first()?, pixel_scale)?;
     let lr_x = ul_x + sx * width as f64;
     let lr_y = ul_y - sy * height as f64;
 
@@ -545,7 +642,351 @@ fn derive_bbox(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use tiff::encoder::{colortype, TiffEncoder};
+
     use super::*;
+
+    /// GeoKey directory of a raster in UTM zone 33N (EPSG:32633), projected.
+    const UTM_33N_KEYS: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32633];
+    /// GeoKey directory of a raster in WGS 84 (EPSG:4326), geographic.
+    const WGS84_KEYS: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326];
+
+    /// The georeferencing tags of a test GeoTIFF; `None` leaves a tag out.
+    #[derive(Default)]
+    struct GeoTags<'a> {
+        pixel_scale: Option<[f64; 3]>,
+        tiepoint: Option<[f64; 6]>,
+        transformation: Option<[f64; 16]>,
+        geokeys: Option<&'a [u16]>,
+    }
+
+    /// Encodes a `width`×`height` 8-bit gray GeoTIFF carrying `tags`.
+    fn geotiff(width: u32, height: u32, tags: &GeoTags<'_>) -> Vec<u8> {
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder
+                .new_image::<colortype::Gray8>(width, height)
+                .expect("image");
+            let directory = image.encoder();
+            if let Some(scale) = &tags.pixel_scale {
+                directory
+                    .write_tag(Tag::ModelPixelScaleTag, &scale[..])
+                    .expect("pixel scale");
+            }
+            if let Some(tiepoint) = &tags.tiepoint {
+                directory
+                    .write_tag(Tag::ModelTiepointTag, &tiepoint[..])
+                    .expect("tiepoint");
+            }
+            if let Some(matrix) = &tags.transformation {
+                directory
+                    .write_tag(Tag::ModelTransformationTag, &matrix[..])
+                    .expect("transformation");
+            }
+            if let Some(geokeys) = tags.geokeys {
+                directory
+                    .write_tag(Tag::GeoKeyDirectoryTag, geokeys)
+                    .expect("geokeys");
+            }
+            let pixels = vec![0u8; pixel_count(width, height).expect("pixel count")];
+            image.write_data(&pixels).expect("pixels");
+        }
+        file.into_inner()
+    }
+
+    fn metadata(bytes: Vec<u8>) -> GeoTiffMetadata {
+        parse_geotiff_metadata_reader(Cursor::new(bytes)).expect("GeoTIFF metadata")
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn assert_bbox(bbox: &BBox, min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) {
+        assert_close(bbox.min_lon, min_lon);
+        assert_close(bbox.min_lat, min_lat);
+        assert_close(bbox.max_lon, max_lon);
+        assert_close(bbox.max_lat, max_lat);
+    }
+
+    /// A UTM raster used to report `min_lon: 500000.0, min_lat: 4648276.0`:
+    /// metres in fields that hold degrees.
+    #[test]
+    fn projected_raster_has_no_degree_bbox() {
+        let projected = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([30.0, 30.0, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, 500_000.0, 4_649_776.0, 0.0]),
+                geokeys: Some(&UTM_33N_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        assert_eq!(projected.epsg_code, Some(32633));
+        assert!(!projected.is_geographic);
+        assert_eq!(projected.bbox, None);
+        // The corners are still available, in the projection's own units.
+        assert_eq!(projected.upper_left(), Some((500_000.0, 4_649_776.0)));
+        assert_eq!(projected.lower_right(), Some((503_000.0, 4_648_276.0)));
+    }
+
+    #[test]
+    fn geographic_raster_keeps_its_degree_bbox() {
+        let geographic = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                geokeys: Some(&WGS84_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        assert_eq!(geographic.epsg_code, Some(4326));
+        assert!(geographic.is_geographic);
+        let bbox = geographic.bbox.expect("bbox of a geographic raster");
+        assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
+    }
+
+    /// `upper_left` returned the tiepoint's world coordinate as it stood, so
+    /// a raster tied at its centre reported its centre as its corner, and
+    /// disagreed with `bbox`, which did account for the tiepoint's pixel.
+    #[test]
+    fn corners_account_for_a_tiepoint_away_from_the_origin() {
+        let centred = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([50.0, 25.0, 0.0, -47.5, -15.25, 0.0]),
+                geokeys: Some(&WGS84_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        let (ul_x, ul_y) = centred.upper_left().expect("upper left");
+        let (lr_x, lr_y) = centred.lower_right().expect("lower right");
+        assert_close(ul_x, -48.0);
+        assert_close(ul_y, -15.0);
+        assert_close(lr_x, -47.0);
+        assert_close(lr_y, -15.5);
+        // The corners and the bbox describe the same rectangle.
+        let bbox = centred.bbox.expect("bbox of a geographic raster");
+        assert_bbox(&bbox, ul_x, lr_y, lr_x, ul_y);
+    }
+
+    #[test]
+    fn corner_of_an_off_origin_tiepoint_needs_the_pixel_scale() {
+        let at_origin = [0.0, 0.0, 0.0, -48.0, -15.0, 0.0];
+        assert_eq!(tiepoint_origin(&at_origin, None), Some((-48.0, -15.0)));
+        let off_origin = [50.0, 25.0, 0.0, -47.5, -15.25, 0.0];
+        assert_eq!(tiepoint_origin(&off_origin, None), None);
+    }
+
+    /// A 4×4 `ModelTransformation` that scales by `scale` and rotates by
+    /// `degrees`, with pixel (0, 0) at (`x`, `y`).
+    fn rotation(degrees: f64, scale: f64, x: f64, y: f64) -> [f64; 16] {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let (c, s) = (cos * scale, sin * scale);
+        [
+            c, s, 0.0, x, s, -c, 0.0, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]
+    }
+
+    /// Only the upper-left and lower-right corners were used. On a raster
+    /// rotated by 30° the other two are the northernmost and southernmost
+    /// points, so the box was too short: 4649776..4649843 for a raster that
+    /// spans 4649343..4650276.
+    #[test]
+    fn rotated_transformation_bbox_covers_all_four_corners() {
+        let matrix = rotation(30.0, 10.0, 500_000.0, 4_649_776.0);
+        let (c, s) = (matrix[0], matrix[1]);
+        let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix)).expect("bbox");
+        // Corners: UL (0, 0), UR (100, 0), LL (0, 50), LR (100, 50).
+        assert_bbox(
+            &bbox,
+            500_000.0,
+            4_649_776.0 - 50.0 * c,
+            500_000.0 + 100.0 * c + 50.0 * s,
+            4_649_776.0 + 100.0 * s,
+        );
+        assert_close(bbox.min_lat, 4_649_342.987_298_108);
+        assert_close(bbox.max_lat, 4_650_276.0);
+    }
+
+    #[test]
+    fn rotated_geographic_raster_reports_its_full_extent() {
+        let rotated = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                transformation: Some(rotation(30.0, 0.01, -48.0, -15.0)),
+                geokeys: Some(&WGS84_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        let bbox = rotated.bbox.expect("bbox of a geographic raster");
+        let (c, s) = (30f64.to_radians().cos() * 0.01, 0.005);
+        assert_bbox(
+            &bbox,
+            -48.0,
+            -15.0 - 50.0 * c,
+            -48.0 + 100.0 * c + 50.0 * s,
+            -15.0 + 100.0 * s,
+        );
+    }
+
+    /// An axis-aligned matrix is the common case and is unchanged.
+    #[test]
+    fn unrotated_transformation_bbox_is_unchanged() {
+        let matrix = rotation(0.0, 0.01, -48.0, -15.0);
+        let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix)).expect("bbox");
+        assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
+    }
+
+    /// A GeoKey directory of `extra` keys beyond the model type and the
+    /// geographic CRS, for a file whose directory outweighs its pixels.
+    ///
+    /// The extra keys take IDs from the private range (32768 and up), which
+    /// no key this parser interprets falls in.
+    fn long_geokey_directory(extra: u16) -> Vec<u16> {
+        let mut keys = vec![1, 1, 0, extra + 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        for index in 0..extra {
+            keys.extend_from_slice(&[32768 + index, 0, 1, 1]);
+        }
+        keys
+    }
+
+    /// Tag arrays were read under the raster's limit of 8 bytes per input
+    /// byte, which the decoder divides by its 32-byte value type: a
+    /// directory of more than a quarter of the file's bytes was refused, and
+    /// the refusal was then taken for a missing tag. A 642-byte file with 42
+    /// keys came back with no keys, no EPSG code and `is_geographic: false`.
+    #[test]
+    fn geokey_directory_larger_than_the_pixels_is_read_in_full() {
+        // Measured before the fix on 2×2 files: 30 extra keys (132 values,
+        // 562 bytes) were read and 40 extra keys (172 values, 642 bytes)
+        // were lost. 4000 keys make the directory nearly the whole file.
+        for extra in [8u16, 30, 40, 60, 500, 4000] {
+            let keys = long_geokey_directory(extra);
+            let parsed = metadata(geotiff(
+                2,
+                2,
+                &GeoTags {
+                    pixel_scale: Some([0.01, 0.01, 0.0]),
+                    tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                    geokeys: Some(&keys),
+                    ..GeoTags::default()
+                },
+            ));
+            assert_eq!(parsed.geokeys.len(), usize::from(extra) + 2, "{extra}");
+            assert_eq!(parsed.epsg_code, Some(4326), "{extra}");
+            assert!(parsed.is_geographic, "{extra}");
+            assert!(parsed.bbox.is_some(), "{extra}");
+        }
+    }
+
+    /// Any error from reading a georeferencing tag used to mean "no such
+    /// tag", so a damaged tag produced a raster without georeferencing and
+    /// no error. Only a tag that is not there may do that.
+    #[test]
+    fn unreadable_georeferencing_tag_is_an_error_not_a_missing_tag() {
+        // A pixel scale written as text, not as doubles.
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::ModelPixelScaleTag, "0.01 0.01 0")
+                .expect("pixel scale");
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, &WGS84_KEYS[..])
+                .expect("geokeys");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let error = parse_geotiff_metadata_reader(Cursor::new(file.into_inner()))
+            .expect_err("a mistyped pixel scale is an error");
+        assert!(
+            matches!(&error, GeoError::Tiff(message) if message.contains("33550")),
+            "{error}"
+        );
+
+        // A GeoKey directory of doubles, not of unsigned integers.
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            image
+                .encoder()
+                .write_tag(Tag::GeoKeyDirectoryTag, &[1.0f64, 1.0, 0.0, 0.0][..])
+                .expect("geokeys");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let error = parse_geotiff_metadata_reader(Cursor::new(file.into_inner()))
+            .expect_err("a mistyped GeoKey directory is an error");
+        assert!(
+            matches!(&error, GeoError::Tiff(message) if message.contains("34735")),
+            "{error}"
+        );
+    }
+
+    /// A TIFF with no georeferencing tags at all is still a valid TIFF.
+    #[test]
+    fn missing_georeferencing_tags_are_not_an_error() {
+        let plain = metadata(geotiff(2, 2, &GeoTags::default()));
+        assert_eq!(plain.pixel_scale, None);
+        assert!(plain.tiepoints.is_empty());
+        assert_eq!(plain.transformation_matrix, None);
+        assert!(plain.geokeys.is_empty());
+        assert_eq!(plain.epsg_code, None);
+        assert_eq!(plain.bbox, None);
+    }
+
+    /// A citation that is not UTF-8 lives in a tag this parser does not
+    /// read, so it cannot fail the parse.
+    #[test]
+    fn non_utf8_citation_does_not_fail_the_parse() {
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, &WGS84_KEYS[..])
+                .expect("geokeys");
+            // "Córrego Alegre|" in Latin-1, as BYTE values under the ASCII
+            // parameters tag's number.
+            directory
+                .write_tag(Tag::GeoAsciiParamsTag, &b"C\xF3rrego Alegre|"[..])
+                .expect("citation");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let parsed = metadata(file.into_inner());
+        assert_eq!(parsed.epsg_code, Some(4326));
+    }
+
+    /// Without a GeoKey directory nothing says the coordinates are degrees.
+    #[test]
+    fn raster_without_a_model_type_has_no_degree_bbox() {
+        let untyped = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                ..GeoTags::default()
+            },
+        ));
+        assert!(!untyped.is_geographic);
+        assert_eq!(untyped.bbox, None);
+    }
 
     #[test]
     fn test_bbox_derives_from_tiepoint_scale() {
