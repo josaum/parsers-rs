@@ -710,9 +710,74 @@ mod tests {
         );
     }
 
+    /// WHY: the bytes this writer emits for markup characters are a contract
+    /// with every reader. They must not move when a dependency does, and what
+    /// is written must come back unchanged through our own reader, which sees
+    /// each `&amp;` as a reference event separate from the text around it.
+    #[test]
+    fn markup_characters_are_escaped_the_same_way_and_read_back() {
+        let name = "A&B <c> 'q' \u{e9}";
+        let texts = [
+            "a & b",
+            "<tag> x > y",
+            "\"double\" 'single'",
+            "&amp; &#233; &foo;",
+            " lead & trail ",
+            "tab\there",
+            "caf\u{e9} \u{1F600}",
+        ];
+        let mut wb = Workbook::new();
+        let sheet = wb.add_sheet(name);
+        for (row, text) in (0u32..).zip(texts) {
+            sheet.write(row, 0, text);
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+
+        let workbook_xml = part_xml(&bytes, "xl/workbook.xml");
+        assert!(
+            workbook_xml.contains("<sheet name=\"A&amp;B &lt;c&gt; 'q' \u{e9}\" sheetId=\"1\""),
+            "workbook xml:\n{workbook_xml}"
+        );
+        let sheet_xml = sheet1_xml(&bytes);
+        for escaped in [
+            "<t>a &amp; b</t>",
+            "<t>&lt;tag&gt; x &gt; y</t>",
+            "<t>\"double\" 'single'</t>",
+            "<t>&amp;amp; &amp;#233; &amp;foo;</t>",
+            "<t> lead &amp; trail </t>",
+            "<t>tab\there</t>",
+            "<t>caf\u{e9} \u{1F600}</t>",
+        ] {
+            assert!(
+                sheet_xml.contains(escaped),
+                "missing {escaped:?}; sheet xml:\n{sheet_xml}"
+            );
+        }
+
+        let read_back =
+            xlsx_fast_core::parse_xlsx_bytes(bytes, xlsx_fast_core::ParseOptions::default())
+                .unwrap();
+        assert_eq!(read_back.sheets[0].name, name);
+        let read: Vec<String> = read_back.sheets[0]
+            .cells
+            .iter()
+            .map(|cell| match &cell.value {
+                xlsx_fast_core::CellValue::String { v } => v.to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(read, texts);
+    }
+
     fn sheet1_xml(xlsx_bytes: &[u8]) -> String {
+        part_xml(xlsx_bytes, "xl/worksheets/sheet1.xml")
+    }
+
+    fn part_xml(xlsx_bytes: &[u8], part: &str) -> String {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(xlsx_bytes)).unwrap();
-        let mut file = archive.by_name("xl/worksheets/sheet1.xml").unwrap();
+        let mut file = archive.by_name(part).unwrap();
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut file, &mut xml).unwrap();
         xml

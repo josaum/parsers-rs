@@ -54,8 +54,10 @@ use ooxml_archive::SharedInflateBudget;
 use ooxml_archive::{
     parse_relationships, part_dir, rels_path_for_part, resolve_part, OoxmlArchive, PartReader,
 };
-use quick_xml::events::{BytesStart, BytesText, Event};
-use quick_xml::Reader;
+use quick_xml::escape::resolve_predefined_entity;
+use quick_xml::events::attributes::Attribute;
+use quick_xml::events::{BytesRef, BytesStart, Event};
+use quick_xml::{Decoder, Reader, XmlVersion};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -72,30 +74,81 @@ fn local_name(name: &[u8]) -> &[u8] {
     }
 }
 
-/// Decodes a text event leniently.
+/// Appends the character data `event` carries to `out`.
 ///
-/// A stray non-UTF-8 byte becomes U+FFFD and an unknown entity is kept as
-/// written, so one bad character costs that character rather than the whole
-/// workbook.
-fn text_event_str<'a>(event: &'a BytesText<'_>) -> Cow<'a, str> {
-    let raw = String::from_utf8_lossy(event);
-    let unescaped = match quick_xml::escape::unescape(&raw) {
-        Ok(Cow::Owned(text)) => Some(text),
-        // Nothing to unescape, or an entity this parser does not know.
-        Ok(Cow::Borrowed(_)) | Err(_) => None,
-    };
-    unescaped.map_or(raw, Cow::Owned)
+/// The reader reports the text of an element in pieces: literal text, CDATA
+/// sections, and one event per entity or character reference. Every caller
+/// that collects text passes all three kinds here, so a reference lands in
+/// the same place as the text around it. Any other event appends nothing.
+///
+/// Decoding is lenient, so one bad character costs that character rather than
+/// the whole workbook: a stray non-UTF-8 byte becomes U+FFFD, and CDATA is
+/// literal character data that is never entity-resolved.
+///
+/// Nothing is allocated here: the hot path of a sheet is the text of its
+/// `<v>` elements, which is appended straight from the reader's buffer.
+fn push_character_data(event: &Event<'_>, out: &mut String) {
+    match event {
+        Event::Text(text) => out.push_str(&String::from_utf8_lossy(text)),
+        Event::CData(data) => out.push_str(&String::from_utf8_lossy(data)),
+        Event::GeneralRef(reference) => push_reference(reference, out),
+        _ => {}
+    }
 }
 
-/// Returns the character data of a text or CDATA event, `None` for any other.
+/// Appends what the reference `&name;` stands for to `out`.
 ///
-/// CDATA is literal character data: it is decoded, never entity-unescaped.
-fn character_data<'a>(event: &'a Event<'_>) -> Option<Cow<'a, str>> {
-    match event {
-        Event::Text(text) => Some(text_event_str(text)),
-        Event::CData(data) => Some(String::from_utf8_lossy(data)),
-        _ => None,
+/// The five predefined entities and decimal or hexadecimal character
+/// references resolve to their character. Anything else (an entity this
+/// parser does not know, or a character reference that names no character,
+/// such as `&#0;`) is kept exactly as written, never dropped.
+fn push_reference(reference: &BytesRef<'_>, out: &mut String) {
+    let name: &[u8] = reference;
+    match reference.resolve_char_ref() {
+        Ok(Some(character)) => {
+            out.push(character);
+            return;
+        }
+        Ok(None) => {
+            let entity = std::str::from_utf8(name)
+                .ok()
+                .and_then(resolve_predefined_entity);
+            if let Some(text) = entity {
+                out.push_str(text);
+                return;
+            }
+        }
+        Err(_) => {}
     }
+    out.push('&');
+    out.push_str(&String::from_utf8_lossy(name));
+    out.push(';');
+}
+
+/// Makes `reader` as tolerant of character data as this parser needs.
+///
+/// Whitespace is significant in cell text, so nothing is trimmed (trimming
+/// would also delete the spaces around a reference, which arrives as its own
+/// event). A lone `&` that starts no reference is ordinary text in the files
+/// people actually have, not a reason to reject the workbook.
+fn configure_reader<R>(reader: &mut Reader<R>) {
+    let config = reader.config_mut();
+    config.trim_text(false);
+    config.allow_dangling_amp = true;
+}
+
+/// Decodes an attribute value and resolves the references in it.
+///
+/// The value is normalized as XML 1.0 requires: a literal tab, line feed or
+/// carriage return becomes a space (and a CR LF pair one space), while the
+/// same characters written as character references (`&#10;`) are kept.
+///
+/// # Errors
+///
+/// Fails when the value is not valid in the document's encoding, or holds a
+/// reference that cannot be resolved.
+fn attribute_value<'a>(attribute: &Attribute<'a>, decoder: Decoder) -> Result<Cow<'a, str>> {
+    Ok(attribute.decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)?)
 }
 
 /// Byte length of one `ST_Xstring` escape, `_xHHHH_`.
@@ -884,7 +937,7 @@ pub fn parse_xlsx_to_writer<W: std::io::Write>(
 
 fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
     let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    configure_reader(&mut reader);
     let mut buf = Vec::new();
     let mut info = WorkbookInfo::default();
     loop {
@@ -895,9 +948,7 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
                 if name == b"workbookPr" {
                     for attr in e.attributes().with_checks(false).flatten() {
                         if local_name(attr.key.as_ref()) == b"date1904" {
-                            let value = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .to_string();
+                            let value = attribute_value(&attr, reader.decoder())?.to_string();
                             info.date_1904 = value == "1" || value.eq_ignore_ascii_case("true");
                         }
                     }
@@ -907,17 +958,13 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
                         let key_raw = attr.key;
                         let key = local_name(key_raw.as_ref());
                         if key == b"name" {
-                            sheet.name = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .to_string();
+                            sheet.name = attribute_value(&attr, reader.decoder())?.to_string();
                         } else if key == b"sheetId" {
-                            let value = attr.decode_and_unescape_value(reader.decoder())?;
+                            let value = attribute_value(&attr, reader.decoder())?;
                             sheet.sheet_id =
                                 lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0);
                         } else if key == b"r:id" || key == b"id" {
-                            sheet.rel_id = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .to_string();
+                            sheet.rel_id = attribute_value(&attr, reader.decoder())?.to_string();
                         }
                     }
                     if !sheet.rel_id.is_empty() {
@@ -936,7 +983,7 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
 
 fn parse_shared_strings_reader<R: BufRead>(reader: R) -> Result<StringTable> {
     let mut reader = Reader::from_reader(reader);
-    reader.config_mut().trim_text(false);
+    configure_reader(&mut reader);
     let mut buf = Vec::new();
     let mut strings = StringTable::default();
 
@@ -971,11 +1018,9 @@ fn parse_shared_strings_reader<R: BufRead>(reader: R) -> Result<StringTable> {
                     strings.push("");
                 }
             }
-            Ok(event @ (Event::Text(_) | Event::CData(_))) => {
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
                 if in_t {
-                    if let Some(text) = character_data(&event) {
-                        current.push_str(&text);
-                    }
+                    push_character_data(&event, &mut current);
                 }
             }
             Ok(Event::End(e)) => {
@@ -1008,7 +1053,7 @@ fn parse_shared_strings_reader<R: BufRead>(reader: R) -> Result<StringTable> {
 
 fn parse_styles(xml: &[u8]) -> Result<Styles> {
     let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    configure_reader(&mut reader);
     let mut buf = Vec::new();
 
     let mut num_fmts: HashMap<u32, String> = HashMap::new();
@@ -1028,13 +1073,10 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
                         let key_raw = attr.key;
                         let key = local_name(key_raw.as_ref());
                         if key == b"numFmtId" {
-                            let value = attr.decode_and_unescape_value(reader.decoder())?;
+                            let value = attribute_value(&attr, reader.decoder())?;
                             id = lexical_core::parse::<u32>(value.as_bytes()).ok();
                         } else if key == b"formatCode" {
-                            code = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            code = Some(attribute_value(&attr, reader.decoder())?.to_string());
                         }
                     }
                     if let (Some(id), Some(code)) = (id, code) {
@@ -1046,7 +1088,7 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
                     let mut num_fmt_id = None;
                     for attr in e.attributes().with_checks(false).flatten() {
                         if local_name(attr.key.as_ref()) == b"numFmtId" {
-                            let value = attr.decode_and_unescape_value(reader.decoder())?;
+                            let value = attribute_value(&attr, reader.decoder())?;
                             num_fmt_id = lexical_core::parse::<u32>(value.as_bytes()).ok();
                         }
                     }
@@ -1137,7 +1179,7 @@ fn parse_sheet_reader_with<R: std::io::BufRead, F>(
 where
     F: for<'a> FnMut(CellPartsRef<'a>) -> Result<()>,
 {
-    reader.config_mut().trim_text(false);
+    configure_reader(&mut reader);
     let mut buf = Vec::new();
     let mut in_sheet_data = false;
     let mut current_row: u32 = 0;
@@ -1234,7 +1276,7 @@ where
                             let key_raw = attr.key;
                             let key = local_name(key_raw.as_ref());
                             if key == b"r" {
-                                let value = attr.decode_and_unescape_value(reader.decoder())?;
+                                let value = attribute_value(&attr, reader.decoder())?;
                                 if let Some((row, col)) = parse_cell_ref(value.as_ref()) {
                                     cell_ref_row = row;
                                     cell_ref_col = col;
@@ -1243,7 +1285,7 @@ where
                                     invalid_cell_ref = true;
                                 }
                             } else if key == b"t" {
-                                let value = attr.decode_and_unescape_value(reader.decoder())?;
+                                let value = attribute_value(&attr, reader.decoder())?;
                                 cell_type = match value.as_ref() {
                                     "s" => CellType::SharedString,
                                     "b" => CellType::Bool,
@@ -1253,7 +1295,7 @@ where
                                     _ => CellType::Number,
                                 };
                             } else if key == b"s" {
-                                let value = attr.decode_and_unescape_value(reader.decoder())?;
+                                let value = attribute_value(&attr, reader.decoder())?;
                                 cell_style = lexical_core::parse::<u32>(value.as_bytes()).ok();
                             }
                         }
@@ -1345,7 +1387,7 @@ where
                     }
                 }
             }
-            Ok(event @ (Event::Text(_) | Event::CData(_))) => {
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
                 if skip_row_depth > 0 || skip_cell {
                     buf.clear();
                     continue;
@@ -1368,9 +1410,7 @@ where
                     None
                 };
                 if let Some(target) = target {
-                    if let Some(text) = character_data(&event) {
-                        target.push_str(&text);
-                    }
+                    push_character_data(&event, target);
                 }
             }
             Ok(Event::End(e)) => {
@@ -1481,10 +1521,10 @@ const EXCEL_ROWS: std::ops::RangeInclusive<u32> = 1..=1_048_576;
 ///
 /// `r` is optional: without it the row is the one after `previous`. A present
 /// but unreadable `r` yields 0, which no worksheet row has.
-fn row_index(element: &BytesStart<'_>, decoder: quick_xml::Decoder, previous: u32) -> Result<u32> {
+fn row_index(element: &BytesStart<'_>, decoder: Decoder, previous: u32) -> Result<u32> {
     for attr in element.attributes().with_checks(false).flatten() {
         if attr.key.as_ref() == b"r" {
-            let value = attr.decode_and_unescape_value(decoder)?;
+            let value = attribute_value(&attr, decoder)?;
             return Ok(lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0));
         }
     }
@@ -1495,14 +1535,10 @@ fn row_index(element: &BytesStart<'_>, decoder: quick_xml::Decoder, previous: u3
 ///
 /// Mirrors how a cell with content moves the cursor: to its `r` column, to 0
 /// when `r` is unreadable, and one to the right when `r` is absent.
-fn empty_cell_column(
-    element: &BytesStart<'_>,
-    decoder: quick_xml::Decoder,
-    col_cursor: u32,
-) -> Result<u32> {
+fn empty_cell_column(element: &BytesStart<'_>, decoder: Decoder, col_cursor: u32) -> Result<u32> {
     for attr in element.attributes().with_checks(false).flatten() {
         if local_name(attr.key.as_ref()) == b"r" {
-            let value = attr.decode_and_unescape_value(decoder)?;
+            let value = attribute_value(&attr, decoder)?;
             return Ok(parse_cell_ref(value.as_ref()).map_or(0, |(_, col)| col));
         }
     }

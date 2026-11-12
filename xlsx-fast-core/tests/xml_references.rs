@@ -211,7 +211,7 @@ fn an_unknown_entity_is_kept_as_written_on_every_text_path() {
 fn an_unknown_entity_does_not_stop_its_neighbours_resolving() {
     assert_eq!(
         read_everywhere("a &foo; b &amp; c &#233;"),
-        Read::all("a &foo; b &amp; c &#233;")
+        Read::all("a &foo; b & c \u{e9}")
     );
 }
 
@@ -226,7 +226,7 @@ fn an_invalid_character_reference_is_kept_as_written_on_every_text_path() {
 
 #[test]
 fn an_invalid_character_reference_does_not_stop_its_neighbours_resolving() {
-    assert_eq!(read_everywhere("a&#0;b &lt; c"), Read::all("a&#0;b &lt; c"));
+    assert_eq!(read_everywhere("a&#0;b &lt; c"), Read::all("a&#0;b < c"));
 }
 
 #[test]
@@ -234,7 +234,9 @@ fn a_lone_ampersand_is_kept_and_does_not_fail_the_workbook() {
     assert_eq!(read_everywhere("AT&T"), Read::all("AT&T"));
     assert_eq!(read_everywhere("a & b"), Read::all("a & b"));
     assert_eq!(read_everywhere("tail &"), Read::all("tail &"));
-    assert_eq!(read_everywhere("a & b &amp; c"), Read::all("a & b &amp; c"));
+    assert_eq!(read_everywhere("a & b &amp; c"), Read::all("a & b & c"));
+    assert_eq!(read_everywhere("a &b c"), Read::all("a &b c"));
+    assert_eq!(read_everywhere("&&amp;&"), Read::all("&&&"));
 }
 
 /// `_xHHHH_` escapes are decoded on the whole text of one `<t>` element after
@@ -339,13 +341,14 @@ fn an_unreadable_reference_in_a_sheet_name_fails_the_workbook() {
 }
 
 #[test]
-fn literal_whitespace_in_an_attribute_value_is_kept_as_written() {
-    // A tab, a line feed and a carriage return typed directly into the value.
+fn literal_whitespace_in_an_attribute_value_becomes_a_space() {
+    // XML 1.0 attribute-value normalization: a tab, a line feed or a carriage
+    // return typed directly into the value is one space, and so is CR LF.
     assert_eq!(
         sheet_name("a\tb\nc\rd\r\ne").expect("workbook parses"),
-        "a\tb\nc\rd\r\ne"
+        "a b c d e"
     );
-    // The same characters written as character references.
+    // The same characters written as character references are kept.
     assert_eq!(
         sheet_name("a&#9;b&#10;c&#13;d").expect("workbook parses"),
         "a\tb\nc\rd"
