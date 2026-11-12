@@ -79,6 +79,8 @@ pub mod bitmap_components;
 #[cfg(feature = "rasterize")]
 mod ccitt;
 #[cfg(feature = "rasterize")]
+mod render_guard;
+#[cfg(feature = "rasterize")]
 pub use bitmap_components::{
     BitmapComponentOptions, BitmapComponentPage, BitmapGlyphCandidate, BitmapTextLine,
 };
@@ -857,7 +859,9 @@ impl PdfDocument {
         let (png_bytes, apply_fast_path_rotation) =
             if let Some(png) = fast_path.and_then(|(bytes, _format)| bytes) {
                 (png, true)
-            } else if let Some(png) = self.rasterized_page_image_payload_hayro(page_index, dpi)? {
+            } else if let Some(png) = self
+                .rasterized_page_image_payload_hayro((page.object_number, page.generation), dpi)?
+            {
                 // Hayro applies the page's initial transform, including
                 // `/Rotate`, while rendering.
                 (png, false)
@@ -941,7 +945,11 @@ impl PdfDocument {
         page_index: usize,
         dpi: f32,
     ) -> Result<Option<Vec<u8>>> {
-        self.rasterized_page_image_payload_hayro(page_index, dpi)
+        let pages = self.pages();
+        let Some(page) = pages.iter().find(|page| page.page_index == page_index) else {
+            return Ok(None);
+        };
+        self.rasterized_page_image_payload_hayro((page.object_number, page.generation), dpi)
     }
 
     /// Stub without the `rasterize` feature: the full interpreter is not
@@ -965,13 +973,16 @@ impl PdfDocument {
         Ok(None)
     }
 
+    /// Renders the page that is indirect object `page_object` with the full
+    /// interpreter, after [`render_guard::vet_page`] has accepted it.
     #[cfg(feature = "rasterize")]
     fn rasterized_page_image_payload_hayro(
         &self,
-        page_index: usize,
+        page_object: (u32, u16),
         dpi: f32,
     ) -> Result<Option<Vec<u8>>> {
         use hayro::hayro_interpret::InterpreterSettings;
+        use hayro::hayro_syntax::object::ObjectIdentifier;
         use hayro::hayro_syntax::Pdf;
         use hayro::RenderSettings;
         use std::sync::Arc;
@@ -979,16 +990,6 @@ impl PdfDocument {
         if !dpi.is_finite() || !(1.0..=600.0).contains(&dpi) {
             return Ok(None);
         }
-
-        // Known limit: the full interpreter follows `Do` with no cycle or
-        // depth guard, so a Form XObject that draws itself, directly or
-        // through inherited resources, recurses until the stack overflows.
-        // Walking the page with this crate's own content walker first was
-        // tried and removed: it charged the decode budget on every render,
-        // refused forms nested deeper than the fast path allows, and still
-        // missed forms reached through inherited resources. A caller that
-        // renders untrusted files with this entry point should do so in a
-        // process it can afford to lose.
 
         let replay_bytes = self.streams.iter().try_fold(0usize, |total, stream| {
             let decoded_len = stream.decoded_len.unwrap_or(stream.raw_len);
@@ -1009,9 +1010,28 @@ impl PdfDocument {
         let Ok(pdf) = Pdf::new(Arc::new(pdf_bytes)) else {
             return Ok(None);
         };
-        let Some(page) = pdf.pages().get(page_index) else {
+        // A page index counts this crate's pages, which list a page once
+        // however often `/Kids` names it. The interpreter lists it once per
+        // entry, so the same index can be a different page there. Find the
+        // interpreter's copy of the page that was asked for by its object
+        // number; a page it does not have is not rendered at all.
+        let Ok(object_number) = i32::try_from(page_object.0) else {
             return Ok(None);
         };
+        let wanted = ObjectIdentifier::new(object_number, i32::from(page_object.1));
+        let Some(page) = pdf
+            .pages()
+            .iter()
+            .find(|page| page.raw().obj_id() == Some(wanted))
+        else {
+            return Ok(None);
+        };
+        // The interpreter enters nested content streams with no cycle or
+        // depth guard of its own, and a stack overflow there aborts the
+        // process. Vet the exact page object it is about to render, on its
+        // own object model, so there is no second parser to disagree with
+        // it. Nothing here is charged to the decode budget.
+        render_guard::vet_page(page)?;
         let (width, height) = page.render_dimensions();
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return Ok(None);
