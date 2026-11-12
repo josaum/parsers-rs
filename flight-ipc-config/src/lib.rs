@@ -23,7 +23,7 @@ use thiserror::Error;
 use tonic::Status;
 
 pub const CAPABILITY_ACTION: &str = "parsers.flight.codec_capabilities.v1";
-pub const CAPABILITY_ARROW_VERSION: &str = "58.3.0";
+pub const CAPABILITY_ARROW_VERSION: &str = "58.4.1";
 pub const CAPABILITY_RECEIVER_PROFILE: &str = "unnegotiated";
 pub const CAPABILITY_BUILD_SHA: &str = "unknown";
 

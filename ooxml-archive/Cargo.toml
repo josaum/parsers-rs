@@ -22,4 +22,4 @@ rawzip = "0.4.3"
 [dev-dependencies]
 proptest = "1.10"
 tempfile = "3.10"
-zip = "0.6"
+zip = { version = "9", default-features = false, features = ["deflate"] }

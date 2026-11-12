@@ -4,7 +4,7 @@
 
 use std::io::{Cursor, Write};
 use xlsx_fast_core::{parse_xlsx_bytes, CellValue, ParseOptions, Workbook};
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const ROOT_RELS: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -45,7 +45,7 @@ fn workbook(shared_strings: &[u8], sheet_data: &[u8]) -> Vec<u8> {
     sheet.extend_from_slice(b"</sheetData></worksheet>");
 
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     for (name, body) in [
         ("_rels/.rels", ROOT_RELS),
         ("xl/workbook.xml", WORKBOOK),

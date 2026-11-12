@@ -12,7 +12,7 @@ requires-python = ">=3.9"
 authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 dependencies = [
     "numpy>=1.26",
-    "pyarrow>=25.0.1",  # IPC reader floor for Rust arrow* =58.3.0
+    "pyarrow>=25.0.1",  # IPC reader floor for Rust arrow* =58.4.1
 ]
 keywords = [
     "pdf",

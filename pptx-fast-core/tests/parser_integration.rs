@@ -2,11 +2,11 @@ use pptx_fast_core::{parse_pptx, ParseOptions};
 use std::fs::File;
 use std::path::Path;
 use tempfile::tempdir;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 fn write_part(writer: &mut ZipWriter<File>, path: &str, contents: &str) {
-    let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     writer.start_file(path, options).unwrap();
     std::io::Write::write_all(writer, contents.as_bytes()).unwrap();
 }

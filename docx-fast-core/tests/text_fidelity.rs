@@ -3,7 +3,7 @@
 
 use docx_fast_core::{parse_docx_bytes, Block, DocxDocument, ParseOptions};
 use std::io::{Cursor, Write};
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const DOCUMENT: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Body text</w:t></w:r></w:p></w:body></w:document>"#;
@@ -15,7 +15,7 @@ const CUSTOM_NS: &str = r#"xmlns="http://schemas.openxmlformats.org/officeDocume
 
 fn parse(core: &[u8], app: &[u8], custom: &[u8]) -> DocxDocument {
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     for (name, body) in [
         ("word/document.xml", DOCUMENT),
         ("docProps/core.xml", core),

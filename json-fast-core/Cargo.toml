@@ -15,7 +15,7 @@ name = "json_fast_core"
 [features]
 default = []
 # Columnar output: parse JSONL into Apache Arrow RecordBatches / IPC streams.
-# Matches the xlsx-fast-core `arrow` feature pattern (workspace arrow =58.3.0).
+# Matches the xlsx-fast-core `arrow` feature pattern (workspace arrow =58.4.1).
 # chrono parses RFC-3339/ISO-8601 strings for explicit-schema TIMESTAMP columns
 # (e.g. Databricks Delta TIMESTAMP), keeping the base crate dependency-free.
 arrow = [

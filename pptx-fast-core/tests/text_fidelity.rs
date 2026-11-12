@@ -3,7 +3,7 @@
 
 use pptx_fast_core::{parse_pptx_bytes, ParseOptions, PptxDocument};
 use std::io::{Cursor, Write};
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
@@ -101,7 +101,7 @@ impl Deck {
         ];
 
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-        let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         for (name, body) in parts {
             if body.is_empty() && name.starts_with("docProps/") {
                 continue;
