@@ -116,7 +116,11 @@ struct ValidationContext<'m> {
 impl<'m> ValidationContext<'m> {
     fn validate_document(&mut self, xml: &[u8]) -> Result<()> {
         let mut reader = Reader::from_reader(xml);
-        reader.config_mut().trim_text(true);
+        // Text is not trimmed as it is read. An element's value can arrive in
+        // several pieces (text, a CDATA section, more text), and trimming each
+        // piece would delete the spaces between them. The whole value is
+        // trimmed once, at the end tag.
+        reader.config_mut().trim_text(false);
         let mut buf = Vec::with_capacity(4096);
 
         loop {
@@ -185,7 +189,7 @@ impl<'m> ValidationContext<'m> {
                     if let Some(frame) = self.type_stack.pop() {
                         if let Some(t) = frame.xsd_type {
                             if self.opts.check_facets {
-                                self.check_text_for_type_val(t, &frame.text);
+                                self.check_text_for_type_val(t, frame.text.trim());
                             }
                             if self.opts.check_cardinality {
                                 self.check_cardinality_for_type(t, &frame.child_counts);
