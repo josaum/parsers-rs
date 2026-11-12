@@ -260,23 +260,42 @@ impl Loader {
         Ok(())
     }
 
+    /// The file a `schemaLocation` names, relative to the including file.
+    ///
+    /// A location may go up with `..` as long as it stays inside the root
+    /// schema's directory at every step. The path is folded by its text, not
+    /// by the filesystem, so a location that would leave the root is refused
+    /// without anything outside the root being looked at, and a `..` cannot
+    /// be carried elsewhere by a symbolic link. Links are settled afterwards,
+    /// when the file is opened: its canonical path must be inside the root.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a URL, an absolute path, a location that steps outside the
+    /// root schema's directory, and any location of an in-memory schema.
     fn resolve_schema_location(&self, location: &str) -> Result<PathBuf> {
+        let rejected = || anyhow::anyhow!("rejected schemaLocation: {location}");
+        let Some(root_dir) = &self.root_dir else {
+            return Err(rejected());
+        };
         let path = Path::new(location);
-        if location.contains("://")
-            || path.is_absolute()
-            || path.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
-        {
-            return Err(anyhow::anyhow!("rejected schemaLocation: {location}"));
+        if location.contains("://") || path.is_absolute() {
+            return Err(rejected());
         }
-        if self.root_dir.is_none() {
-            return Err(anyhow::anyhow!("rejected schemaLocation: {location}"));
+        let mut resolved = self.base_dir.clone();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => resolved.push(part),
+                Component::ParentDir => {
+                    if !resolved.pop() || !resolved.starts_with(root_dir) {
+                        return Err(rejected());
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => return Err(rejected()),
+            }
         }
-        Ok(self.base_dir.join(path))
+        Ok(resolved)
     }
 
     fn parse_bytes(&mut self, bytes: &[u8]) -> Result<()> {
