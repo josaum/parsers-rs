@@ -1975,9 +1975,9 @@ struct RunBuilder {
     revision: Option<RevisionRef>,
     comment_ids: Vec<i32>,
     note_references: Vec<NoteReference>,
-    /// The run's own `w:rFonts` names the Symbol font, so Private Use Area
-    /// characters in its text are Symbol code points.
-    symbol_font: bool,
+    /// The symbol fonts the run's own `w:rFonts` names. Characters of its
+    /// text that those fonts give a meaning to are font codes, not text.
+    symbol_fonts: symbol::SymbolFonts,
 }
 
 #[derive(Debug)]
@@ -2162,17 +2162,19 @@ impl<'a> DocxBodyParser<'a> {
                 }
             }
             b"rFonts" if self.in_rpr => {
-                // Direct run formatting only; a Symbol font inherited from a
+                // Direct run formatting only; a symbol font inherited from a
                 // style is not resolved here.
-                let mut symbol_font = false;
-                for key in [&b"ascii"[..], b"hAnsi", b"cs"] {
-                    if attr_value(reader, e, key)?.is_some_and(|font| symbol::is_symbol_font(&font))
-                    {
-                        symbol_font = true;
-                    }
-                }
+                let font = |key: &[u8]| -> Result<Option<symbol::SymbolFont>> {
+                    Ok(attr_value(reader, e, key)?
+                        .and_then(|font| symbol::SymbolFont::from_name(&font)))
+                };
+                let symbol_fonts = symbol::SymbolFonts {
+                    ascii: font(b"ascii")?,
+                    high_ansi: font(b"hAnsi")?,
+                    complex_script: font(b"cs")?,
+                };
                 if let Some(r) = self.current_run.as_mut() {
-                    r.symbol_font = symbol_font;
+                    r.symbol_fonts = symbol_fonts;
                 }
             }
             b"pPr" => self.in_ppr = true,
@@ -2381,8 +2383,15 @@ impl<'a> DocxBodyParser<'a> {
 
     fn handle_text(&mut self, text: &[u8]) {
         let mut value = String::from_utf8_lossy(text);
-        if self.in_text && self.current_run.as_ref().is_some_and(|run| run.symbol_font) {
-            value = symbol::map_symbol_run_text(&value).into();
+        if self.in_text {
+            if let Some(fonts) = self
+                .current_run
+                .as_ref()
+                .map(|run| run.symbol_fonts)
+                .filter(|fonts| !fonts.is_empty())
+            {
+                value = fonts.map_run_text(&value).into();
+            }
         }
         if self.in_instr {
             if let Some(field) = self.current_field_stack.last_mut() {
@@ -2665,11 +2674,11 @@ mod tests {
             ),
             ["x ≥ y"]
         );
-        // No published mapping for Wingdings: the stored code point is kept,
+        // A font without a mapping table: the stored code point is kept,
         // never dropped.
         assert_eq!(
             body_paragraphs(
-                r#"<w:p><w:r><w:t>ok</w:t><w:sym w:font="Wingdings" w:char="F0FC"/><w:t>end</w:t></w:r></w:p>"#
+                r#"<w:p><w:r><w:t>ok</w:t><w:sym w:font="Cambria Math" w:char="F0FC"/><w:t>end</w:t></w:r></w:p>"#
             ),
             ["ok\u{F0FC}end"]
         );
