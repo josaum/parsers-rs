@@ -17,4 +17,4 @@ ontology-fast-core = { path = "../ontology-fast-core" }
 pyo3 = { workspace = true }
 
 [build-dependencies]
-pyo3-build-config = "0.28.3"
+pyo3-build-config = "0.30.1"

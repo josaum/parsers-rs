@@ -17,4 +17,4 @@ pyo3 = { workspace = true }
 xlsx-fast-write = { path = "../xlsx-fast-write" }
 
 [build-dependencies]
-pyo3-build-config = "0.28.3"
+pyo3-build-config = "0.30.1"
