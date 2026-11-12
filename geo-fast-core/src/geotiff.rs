@@ -4,7 +4,9 @@
 //!   - ModelPixelScaleTag    (34264)
 //!   - ModelTiepointTag      (33922)
 //!   - ModelTransformationTag (34264 / 34264 — alias; actually 33920 for the full matrix)
-//!   - GeoKeyDirectoryTag    (34735) + GeoDoubleParamsTag (34736) + GeoAsciiParamsTag (34737)
+//!   - GeoKeyDirectoryTag    (34735), for the keys whose value is stored in the
+//!     directory itself; GeoDoubleParamsTag (34736) and GeoAsciiParamsTag
+//!     (34737) are not read
 //!
 //! Returns [`GeoTiffMetadata`] and, optionally, raster band data as `Vec<f32>`.
 
@@ -12,9 +14,10 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use tiff::decoder::ifd::Value;
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
-use tiff::ColorType;
+use tiff::{ColorType, TiffError};
 
 use crate::error::GeoError;
 use crate::types::BBox;
@@ -24,8 +27,6 @@ const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
 const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_MODEL_TRANSFORMATION: u16 = 34264;
 const TAG_GEO_KEY_DIRECTORY: u16 = 34735;
-const TAG_GEO_DOUBLE_PARAMS: u16 = 34736;
-const TAG_GEO_ASCII_PARAMS: u16 = 34737;
 
 // GeoKey IDs
 const GEOKEY_MODEL_TYPE: u16 = 1024;
@@ -130,7 +131,7 @@ pub fn parse_geotiff_metadata<P: AsRef<Path>>(path: P) -> Result<GeoTiffMetadata
 pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
     reader: R,
 ) -> Result<GeoTiffMetadata, GeoError> {
-    let mut decoder = open_decoder(reader)?;
+    let mut decoder = open_tag_decoder(reader)?;
 
     let (width, height) = decoder
         .dimensions()
@@ -173,11 +174,11 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
         });
 
     // ── GeoKey directory ────────────────────────────────────────────────────
-    let geo_double_params =
-        read_doubles_tag(&mut decoder, TAG_GEO_DOUBLE_PARAMS)?.unwrap_or_default();
-    let geo_ascii_params = read_ascii_tag(&mut decoder, TAG_GEO_ASCII_PARAMS)?.unwrap_or_default();
-
-    let geokeys = read_geokey_directory(&mut decoder, &geo_double_params, &geo_ascii_params)?;
+    // Only keys stored in the directory itself are used. The double and
+    // ASCII parameter tags hold the values of the other keys (citations,
+    // ellipsoid axes), which nothing here reads; they are left alone so that
+    // a citation in some legacy encoding cannot fail the parse.
+    let geokeys = read_geokey_directory(&mut decoder)?;
 
     let epsg_code = geokeys
         .get(&GEOKEY_PROJECTED_CS_TYPE)
@@ -260,15 +261,12 @@ pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, Geo
 /// raster), so a file of a few hundred bytes could have the whole buffer
 /// allocated from its header alone. Here the limits are also capped by what
 /// `reader` can hold: see [`COMPRESSED_EXPANSION`].
-pub(crate) fn open_decoder<R: Read + Seek>(mut reader: R) -> Result<Decoder<R>, GeoError> {
-    let start = reader.stream_position().map_err(GeoError::Io)?;
-    let input_len = reader.seek(SeekFrom::End(0)).map_err(GeoError::Io)?;
-    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
-    check_directory_fits(&mut reader, input_len)?;
-    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
-    let input_len = usize::try_from(input_len).unwrap_or(usize::MAX);
-
-    let mut decoder = Decoder::new(reader).map_err(|e| GeoError::Tiff(e.to_string()))?;
+///
+/// These limits are sized for decoding the raster. The decoder applies the
+/// same field to the arrays it builds for tag values, where it is too tight:
+/// a caller that reads tags and no pixels uses [`open_tag_decoder`].
+pub(crate) fn open_decoder<R: Read + Seek>(reader: R) -> Result<Decoder<R>, GeoError> {
+    let (mut decoder, input_len) = open_checked(reader)?;
 
     // Absent means uncompressed; a tag that cannot be read gets the looser bound.
     let uncompressed = matches!(
@@ -288,6 +286,46 @@ pub(crate) fn open_decoder<R: Read + Seek>(mut reader: R) -> Result<Decoder<R>, 
     // Tag values are stored as they are, so none is larger than the input.
     limits.ifd_value_size = limits.ifd_value_size.min(input_len);
     Ok(decoder.with_limits(limits))
+}
+
+/// Opens a TIFF decoder for reading tag values, not pixels.
+///
+/// The decoder turns a tag's array into one [`Value`] per element and
+/// refuses an array of more than `decoding_buffer_size / size_of::<Value>()`
+/// elements. An element takes at least one byte of the file, so a tag that
+/// fits in the file has at most `input_len` elements: allowing
+/// `size_of::<Value>()` bytes per input byte admits every such tag, and still
+/// ties the allocation to the size of the input. The raster limits of
+/// [`open_decoder`] allow 8 bytes per input byte of an uncompressed file,
+/// which is a quarter of that: under them a GeoKey directory that took up
+/// more than a quarter of a small file's bytes could not be read.
+fn open_tag_decoder<R: Read + Seek>(reader: R) -> Result<Decoder<R>, GeoError> {
+    let (decoder, input_len) = open_checked(reader)?;
+
+    let mut limits = Limits::default();
+    limits.decoding_buffer_size = limits
+        .decoding_buffer_size
+        .min(input_len.saturating_mul(std::mem::size_of::<Value>()));
+    // No strip or tile is decoded through this decoder.
+    limits.intermediate_buffer_size = limits.intermediate_buffer_size.min(input_len);
+    limits.ifd_value_size = limits.ifd_value_size.min(input_len);
+    Ok(decoder.with_limits(limits))
+}
+
+/// Opens a TIFF decoder after checking its first directory against the file.
+///
+/// Returns the decoder, still under the `tiff` crate's default limits, and
+/// the length of the input in bytes.
+fn open_checked<R: Read + Seek>(mut reader: R) -> Result<(Decoder<R>, usize), GeoError> {
+    let start = reader.stream_position().map_err(GeoError::Io)?;
+    let input_len = reader.seek(SeekFrom::End(0)).map_err(GeoError::Io)?;
+    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
+    check_directory_fits(&mut reader, input_len)?;
+    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
+    let input_len = usize::try_from(input_len).unwrap_or(usize::MAX);
+
+    let decoder = Decoder::new(reader).map_err(|e| GeoError::Tiff(e.to_string()))?;
+    Ok((decoder, input_len))
 }
 
 /// Reads the fixed-width integers of a TIFF header and directory.
@@ -476,37 +514,57 @@ fn tag(tag_id: u16) -> Tag {
     Tag::from_u16_exhaustive(tag_id)
 }
 
+/// Reads the value of an optional GeoTIFF tag.
+///
+/// Returns `Ok(None)` only when the image has no such tag. A tag that is
+/// present but cannot be read (its data lies outside the file, or exceeds
+/// the decoder's limits) is an error: reporting it as absent would hand back
+/// a raster that silently lost its georeferencing.
+fn find_geo_tag<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    tag_id: u16,
+) -> Result<Option<Value>, GeoError> {
+    decoder
+        .find_tag(tag(tag_id))
+        .map_err(|e| unreadable_tag(tag_id, &e))
+}
+
+fn unreadable_tag(tag_id: u16, error: &TiffError) -> GeoError {
+    GeoError::Tiff(format!("GeoTIFF tag {tag_id} cannot be read: {error}"))
+}
+
+/// Reads an optional GeoTIFF tag whose values are doubles.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Tiff`] when the tag is present but unreadable, or
+/// holds values of another type. A missing tag is `Ok(None)`.
 fn read_doubles_tag<R: Read + Seek>(
     decoder: &mut Decoder<R>,
     tag_id: u16,
 ) -> Result<Option<Vec<f64>>, GeoError> {
-    match decoder.get_tag_f64_vec(tag(tag_id)) {
-        Ok(v) => Ok(Some(v)),
-        // Tag not present in this image — not an error
-        Err(_) => Ok(None),
-    }
+    find_geo_tag(decoder, tag_id)?
+        .map(|value| value.into_f64_vec().map_err(|e| unreadable_tag(tag_id, &e)))
+        .transpose()
 }
 
-fn read_ascii_tag<R: Read + Seek>(
-    decoder: &mut Decoder<R>,
-    tag_id: u16,
-) -> Result<Option<String>, GeoError> {
-    match decoder.get_tag_ascii_string(tag(tag_id)) {
-        Ok(s) => Ok(Some(s)),
-        Err(_) => Ok(None),
-    }
-}
-
+/// Reads the GeoKey directory into a key→value map.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Tiff`] when the directory tag is present but
+/// unreadable, or is not an array of unsigned integers. A TIFF without the
+/// tag is not a GeoTIFF and yields an empty map.
 fn read_geokey_directory<R: Read + Seek>(
     decoder: &mut Decoder<R>,
-    _double_params: &[f64],
-    _ascii_params: &str,
 ) -> Result<HashMap<u16, u32>, GeoError> {
-    let raw: Vec<u16> = match decoder.get_tag_u16_vec(tag(TAG_GEO_KEY_DIRECTORY)) {
-        Ok(v) => v,
-        // Tag absent — not a GeoTIFF, but still a valid TIFF
-        Err(_) => return Ok(HashMap::new()),
+    // Tag absent: not a GeoTIFF, but still a valid TIFF.
+    let Some(value) = find_geo_tag(decoder, TAG_GEO_KEY_DIRECTORY)? else {
+        return Ok(HashMap::new());
     };
+    let raw: Vec<u16> = value
+        .into_u16_vec()
+        .map_err(|e| unreadable_tag(TAG_GEO_KEY_DIRECTORY, &e))?;
 
     // Directory header: [KeyDirectoryVersion, KeyRevision, MinorRevision, NumberOfKeys]
     // followed by one [KeyID, TIFFTagLocation, Count, ValueOffset] entry per key.
@@ -790,6 +848,128 @@ mod tests {
         let matrix = rotation(0.0, 0.01, -48.0, -15.0);
         let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix)).expect("bbox");
         assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
+    }
+
+    /// A GeoKey directory of `extra` keys beyond the model type and the
+    /// geographic CRS, for a file whose directory outweighs its pixels.
+    ///
+    /// The extra keys take IDs from the private range (32768 and up), which
+    /// no key this parser interprets falls in.
+    fn long_geokey_directory(extra: u16) -> Vec<u16> {
+        let mut keys = vec![1, 1, 0, extra + 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        for index in 0..extra {
+            keys.extend_from_slice(&[32768 + index, 0, 1, 1]);
+        }
+        keys
+    }
+
+    /// Tag arrays were read under the raster's limit of 8 bytes per input
+    /// byte, which the decoder divides by its 32-byte value type: a
+    /// directory of more than a quarter of the file's bytes was refused, and
+    /// the refusal was then taken for a missing tag. A 642-byte file with 42
+    /// keys came back with no keys, no EPSG code and `is_geographic: false`.
+    #[test]
+    fn geokey_directory_larger_than_the_pixels_is_read_in_full() {
+        // Measured before the fix on 2×2 files: 30 extra keys (132 values,
+        // 562 bytes) were read and 40 extra keys (172 values, 642 bytes)
+        // were lost. 4000 keys make the directory nearly the whole file.
+        for extra in [8u16, 30, 40, 60, 500, 4000] {
+            let keys = long_geokey_directory(extra);
+            let parsed = metadata(geotiff(
+                2,
+                2,
+                &GeoTags {
+                    pixel_scale: Some([0.01, 0.01, 0.0]),
+                    tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                    geokeys: Some(&keys),
+                    ..GeoTags::default()
+                },
+            ));
+            assert_eq!(parsed.geokeys.len(), usize::from(extra) + 2, "{extra}");
+            assert_eq!(parsed.epsg_code, Some(4326), "{extra}");
+            assert!(parsed.is_geographic, "{extra}");
+            assert!(parsed.bbox.is_some(), "{extra}");
+        }
+    }
+
+    /// Any error from reading a georeferencing tag used to mean "no such
+    /// tag", so a damaged tag produced a raster without georeferencing and
+    /// no error. Only a tag that is not there may do that.
+    #[test]
+    fn unreadable_georeferencing_tag_is_an_error_not_a_missing_tag() {
+        // A pixel scale written as text, not as doubles.
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::ModelPixelScaleTag, "0.01 0.01 0")
+                .expect("pixel scale");
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, &WGS84_KEYS[..])
+                .expect("geokeys");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let error = parse_geotiff_metadata_reader(Cursor::new(file.into_inner()))
+            .expect_err("a mistyped pixel scale is an error");
+        assert!(
+            matches!(&error, GeoError::Tiff(message) if message.contains("33550")),
+            "{error}"
+        );
+
+        // A GeoKey directory of doubles, not of unsigned integers.
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            image
+                .encoder()
+                .write_tag(Tag::GeoKeyDirectoryTag, &[1.0f64, 1.0, 0.0, 0.0][..])
+                .expect("geokeys");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let error = parse_geotiff_metadata_reader(Cursor::new(file.into_inner()))
+            .expect_err("a mistyped GeoKey directory is an error");
+        assert!(
+            matches!(&error, GeoError::Tiff(message) if message.contains("34735")),
+            "{error}"
+        );
+    }
+
+    /// A TIFF with no georeferencing tags at all is still a valid TIFF.
+    #[test]
+    fn missing_georeferencing_tags_are_not_an_error() {
+        let plain = metadata(geotiff(2, 2, &GeoTags::default()));
+        assert_eq!(plain.pixel_scale, None);
+        assert!(plain.tiepoints.is_empty());
+        assert_eq!(plain.transformation_matrix, None);
+        assert!(plain.geokeys.is_empty());
+        assert_eq!(plain.epsg_code, None);
+        assert_eq!(plain.bbox, None);
+    }
+
+    /// A citation that is not UTF-8 lives in a tag this parser does not
+    /// read, so it cannot fail the parse.
+    #[test]
+    fn non_utf8_citation_does_not_fail_the_parse() {
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, &WGS84_KEYS[..])
+                .expect("geokeys");
+            // "Córrego Alegre|" in Latin-1, as BYTE values under the ASCII
+            // parameters tag's number.
+            directory
+                .write_tag(Tag::GeoAsciiParamsTag, &b"C\xF3rrego Alegre|"[..])
+                .expect("citation");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let parsed = metadata(file.into_inner());
+        assert_eq!(parsed.epsg_code, Some(4326));
     }
 
     /// Without a GeoKey directory nothing says the coordinates are degrees.
