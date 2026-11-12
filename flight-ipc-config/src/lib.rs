@@ -1,6 +1,7 @@
 //! Dependency-light, none-only policy for public office parser Flight servers.
 
 pub mod auth;
+pub mod table_server;
 pub use auth::{
     mint_es256_workload_authorization, mint_local_workload_authorization, AuthClaim, AuthConfig,
     AuthError, FlightAuthorizationMetadata, FlightRequestAuthVerifier,
