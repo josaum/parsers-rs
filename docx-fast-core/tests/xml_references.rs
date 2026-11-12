@@ -374,20 +374,25 @@ fn a_bare_ampersand_is_kept_as_written_in_text() {
     assert_text("end &", "end &", "end &");
 }
 
-// Known defect, pinned as found: a property keeps only the text before the
-// CDATA section.
 #[test]
-fn a_reference_next_to_cdata_keeps_both_in_run_text() {
-    assert_text("x&amp;<![CDATA[<raw&amp;>]]>&lt;y", "x&<raw&amp;><y", "x&");
+fn a_reference_next_to_cdata_keeps_both_in_text() {
+    assert_text(
+        "x&amp;<![CDATA[<raw&amp;>]]>&lt;y",
+        "x&<raw&amp;><y",
+        "x&<raw&amp;><y",
+    );
 }
 
-// Known defect, pinned as found: one reference that cannot be resolved
-// leaves every other reference in the same piece of text unresolved too.
 #[test]
-fn one_bad_reference_leaves_the_text_around_it_unresolved() {
-    assert_text("a &amp; &foo;", "a &amp; &foo;", "a &amp; &foo;");
-    assert_text("a &lt; &#0; &gt;", "a &lt; &#0; &gt;", "a &lt; &#0; &gt;");
-    assert_text("AT&T &amp; co", "AT&T &amp; co", "AT&T &amp; co");
+fn one_bad_reference_does_not_cost_the_good_ones_around_it() {
+    assert_text("a &amp; &foo;", "a & &foo;", "a & &foo;");
+    assert_text("a &lt; &#0; &gt;", "a < &#0; >", "a < &#0; >");
+    assert_text("AT&T &amp; co", "AT&T & co", "AT&T & co");
+    assert_text(
+        "fish & chips; &amp; peas",
+        "fish & chips; & peas",
+        "fish & chips; & peas",
+    );
 }
 
 #[test]
@@ -406,9 +411,13 @@ fn an_attribute_with_a_reference_that_cannot_be_resolved_rejects_the_document() 
     assert_attribute("AT&T", None);
 }
 
+// XML attribute-value normalization: a literal tab or line break in an
+// attribute value reads as a space; only a character reference (`&#9;`,
+// `&#10;`, pinned above) carries the control character itself.
 #[test]
-fn literal_whitespace_in_an_attribute_is_kept_as_written() {
-    assert_attribute("a\tb\nc", Some("a\tb\nc"));
+fn literal_whitespace_in_an_attribute_reads_as_spaces() {
+    assert_attribute("a\tb\nc", Some("a b c"));
+    assert_attribute("a\r\nb", Some("a b"));
 }
 
 #[test]
