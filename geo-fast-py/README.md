@@ -5,7 +5,7 @@ shapefile → WKT records, spherical geodesic bbox area/IoU, antimeridian
 split, and an STR-packed R-tree.
 
 ```bash
-cd office-parsers-rs/geo-fast-py
+cd parsers-rs/geo-fast-py
 maturin develop
 ```
 
