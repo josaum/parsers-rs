@@ -191,9 +191,14 @@ impl<'m> ValidationContext<'m> {
                         *parent.child_counts.entry(local).or_insert(0) += 1;
                     }
 
-                    if self.opts.check_facets {
-                        if let Some(t) = xsd_type {
+                    // A self-closing element is an element with no text and
+                    // no children, and is checked as one.
+                    if let Some(t) = xsd_type {
+                        if self.opts.check_facets {
                             self.check_text_for_type_val(t, "");
+                        }
+                        if self.opts.check_cardinality {
+                            self.check_cardinality_for_type(t, &HashMap::new());
                         }
                     }
 
