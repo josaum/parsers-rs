@@ -59,6 +59,36 @@ use serde_json::Value;
 /// Maximum `$ref` hops before a schema is treated as cyclic.
 const MAX_REF_DEPTH: usize = 32;
 
+/// Deepest array/object nesting [`validate`] accepts in the schema and in the
+/// document: the parser's default, [`crate::DEFAULT_MAX_NESTING_DEPTH`].
+///
+/// Text parsed by this crate already respects it; a `Value` built in code
+/// does not, and the validator recurses once per level.
+pub const MAX_VALIDATION_NESTING_DEPTH: usize = crate::DEFAULT_MAX_NESTING_DEPTH;
+
+/// Most subschema applications that may be in progress at once.
+///
+/// `$ref` lets a schema apply itself in place, so the recursion is not
+/// bounded by the nesting of the schema alone: 32 reference hops through a
+/// schema nested 60 deep would otherwise recurse 1,920 levels and overflow
+/// the stack. 128 leaves two in-place applications for every level of a
+/// 64-level document, and at the 4 to 8 KiB a level measured in an
+/// unoptimized build stays within 1 MiB of stack.
+pub const MAX_APPLICATION_DEPTH: usize = 128;
+
+/// Subschema applications allowed per schema node and document value.
+///
+/// One validation may apply at most
+/// `VALIDATION_STEPS_PER_PAIR * (schema values + 1) * (document values + 1)`
+/// subschemas. Without `$ref`, a schema node meets each document value at
+/// most once (plus once per property name under `propertyNames`), so any
+/// reference-free schema uses under 2 steps per pair; the factor of 64
+/// leaves room for definitions legitimately reached through several
+/// references. A schema that branches into itself, such as
+/// `{"allOf":[{"$ref":"#"},{"$ref":"#"}]}`, doubles its work with every
+/// reference hop and exhausts the budget instead.
+pub const VALIDATION_STEPS_PER_PAIR: u64 = 64;
+
 /// Severity of a schema [`Finding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -221,6 +251,96 @@ struct Ctx<'a> {
     ref_depth: usize,
     /// Compiled patterns, keyed by pattern text, so rows never recompile.
     patterns: HashMap<String, Result<regex::Regex, String>>,
+    /// `$ref` hops allowed on one path.
+    max_ref_depth: usize,
+    /// Subschema applications in progress.
+    depth: usize,
+    /// Subschema applications started so far.
+    steps: u64,
+    /// Subschema applications allowed in total.
+    budget: u64,
+    /// Set once a limit is hit. Every application after that returns at
+    /// once, and `validate` reports the reason itself: a finding pushed where
+    /// the limit was hit could be discarded by `anyOf`, or turned into a pass
+    /// by `not`.
+    halted: Option<&'static str>,
+}
+
+/// Why validation stopped at the work budget.
+const BUDGET_EXHAUSTED: &str = "validation stopped: the schema needs more subschema \
+     applications than the work budget allows (a schema that branches into itself); \
+     the document was not fully validated";
+
+/// Why validation stopped at the application depth.
+const TOO_MANY_NESTED_APPLICATIONS: &str = "validation stopped: more than 128 subschema \
+     applications are nested inside each other; the document was not fully validated";
+
+/// Counts the values in `root` and its deepest array/object nesting, without
+/// recursion, so a `Value` nested without limit cannot overflow the stack.
+fn measure(root: &Value) -> (u64, usize) {
+    let mut values = 0u64;
+    let mut deepest = 0usize;
+    let mut pending: Vec<(&Value, usize)> = vec![(root, 0)];
+    while let Some((value, depth)) = pending.pop() {
+        values = values.saturating_add(1);
+        match value {
+            Value::Array(items) => {
+                deepest = deepest.max(depth + 1);
+                pending.extend(items.iter().map(|item| (item, depth + 1)));
+            }
+            Value::Object(map) => {
+                deepest = deepest.max(depth + 1);
+                pending.extend(map.values().map(|item| (item, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    (values, deepest)
+}
+
+/// Runs one validation and returns the findings with the number of subschema
+/// applications it started. `budget` of `None` applies the documented budget.
+fn run(
+    document: &Value,
+    schema: &Value,
+    max_ref_depth: usize,
+    budget: Option<u64>,
+) -> (Vec<Finding>, u64) {
+    let (schema_values, schema_depth) = measure(schema);
+    let (document_values, document_depth) = measure(document);
+    for (what, depth) in [("schema", schema_depth), ("document", document_depth)] {
+        if depth > MAX_VALIDATION_NESTING_DEPTH {
+            let message = format!(
+                "the {what} is nested {depth} levels deep; the limit is \
+                 {MAX_VALIDATION_NESTING_DEPTH}; the document was not validated"
+            );
+            return (vec![Finding::error("$", message)], 0);
+        }
+    }
+    let mut findings = Vec::new();
+    let mut ctx = Ctx {
+        root: schema,
+        anchors: collect_anchors(schema),
+        ref_depth: 0,
+        patterns: HashMap::new(),
+        max_ref_depth,
+        depth: 0,
+        steps: 0,
+        budget: budget.unwrap_or_else(|| {
+            VALIDATION_STEPS_PER_PAIR
+                .saturating_mul(schema_values.saturating_add(1))
+                .saturating_mul(document_values.saturating_add(1))
+        }),
+        halted: None,
+    };
+    let mut path = String::from("$");
+    validate_node(document, schema, &mut path, &mut ctx, &mut findings);
+    if let Some(reason) = ctx.halted {
+        // Findings gathered around an abandoned application are not
+        // verdicts, so only the reason is reported.
+        return (vec![Finding::error("$", reason)], ctx.steps);
+    }
+    (findings, ctx.steps)
 }
 
 impl Ctx<'_> {
@@ -238,17 +358,15 @@ impl Ctx<'_> {
 ///
 /// Returns every [`Finding`] (errors and warnings). Use [`has_errors`] to test
 /// whether the document violates the schema.
+///
+/// Validation is bounded. When the schema or the document is nested deeper
+/// than [`MAX_VALIDATION_NESTING_DEPTH`], when more than
+/// [`MAX_APPLICATION_DEPTH`] subschema applications nest, or when the work
+/// budget ([`VALIDATION_STEPS_PER_PAIR`]) runs out, the result is a single
+/// [`Severity::Error`] finding at `$` that says so: an unfinished validation
+/// is never reported as a clean document.
 pub fn validate(document: &Value, schema: &Value) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    let mut ctx = Ctx {
-        root: schema,
-        anchors: collect_anchors(schema),
-        ref_depth: 0,
-        patterns: HashMap::new(),
-    };
-    let mut path = String::from("$");
-    validate_node(document, schema, &mut path, &mut ctx, &mut findings);
-    findings
+    run(document, schema, MAX_REF_DEPTH, None).0
 }
 
 /// True when any finding is an [`Severity::Error`].
@@ -269,6 +387,31 @@ pub fn validate_str(document: &str, schema: &str) -> crate::Result<Vec<Finding>>
 /// currently holds the JSON pointer of `value`; nested calls push and restore
 /// their own segments, so the happy path allocates nothing.
 fn validate_node<'v>(
+    value: &'v Value,
+    schema: &Value,
+    path: &mut String,
+    ctx: &mut Ctx<'_>,
+    findings: &mut Vec<Finding>,
+) -> Evaluated<'v> {
+    if ctx.halted.is_some() {
+        return Evaluated::default();
+    }
+    ctx.steps += 1;
+    if ctx.steps > ctx.budget {
+        ctx.halted = Some(BUDGET_EXHAUSTED);
+        return Evaluated::default();
+    }
+    if ctx.depth >= MAX_APPLICATION_DEPTH {
+        ctx.halted = Some(TOO_MANY_NESTED_APPLICATIONS);
+        return Evaluated::default();
+    }
+    ctx.depth += 1;
+    let evaluated = apply_schema(value, schema, path, ctx, findings);
+    ctx.depth -= 1;
+    evaluated
+}
+
+fn apply_schema<'v>(
     value: &'v Value,
     schema: &Value,
     path: &mut String,
@@ -388,7 +531,7 @@ fn apply_object<'v>(
 
     if let Some(reference) = obj.get("$ref").and_then(|r| r.as_str()) {
         match resolve_ref(reference, ctx) {
-            Some(target) if ctx.ref_depth < MAX_REF_DEPTH => {
+            Some(target) if ctx.ref_depth < ctx.max_ref_depth => {
                 ctx.ref_depth += 1;
                 let applied = applying(value, target, path, ctx, findings);
                 ctx.ref_depth -= 1;
@@ -1900,6 +2043,60 @@ mod tests {
 
     fn passes(document: &str, schema: &Value) -> bool {
         errors(document, schema).is_empty()
+    }
+
+    #[test]
+    fn branching_reference_cycles_double_per_hop_until_the_budget_stops_them() {
+        let schema = json!({"allOf": [{"$ref": "#"}, {"$ref": "#"}]});
+        let document = json!(1);
+        // Unbounded, the applications double with every allowed hop.
+        let steps = [4, 8, 12, 16].map(|hops| run(&document, &schema, hops, Some(u64::MAX)).1);
+        assert_eq!(steps, [93, 1_533, 24_573, 393_213]);
+        // With the documented budget the same schema stops early and says so.
+        let (findings, steps) = run(&document, &schema, MAX_REF_DEPTH, None);
+        assert_eq!(steps, VALIDATION_STEPS_PER_PAIR * 7 * 2 + 1);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(findings[0].message.contains("work budget"));
+        // The exhaustion survives `not` and `anyOf`, which drop inner errors.
+        let hidden = json!({"not": {"anyOf": [{"allOf": [{"$ref": "#"}, {"$ref": "#"}]}]}});
+        assert!(has_errors(&validate(&document, &hidden)));
+    }
+
+    #[test]
+    fn large_documents_stay_inside_the_budget() {
+        let schema = json!({
+            "type": "array",
+            "items": {"$ref": "#/$defs/row"},
+            "$defs": {"row": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {"id": {"type": "integer"}, "tags": {"items": {"type": "string"}}},
+                "propertyNames": {"pattern": "^[a-z]+$"},
+                "additionalProperties": false
+            }}
+        });
+        let rows = (0..20_000)
+            .map(|id| json!({"id": id, "tags": ["a", "b"]}))
+            .collect::<Vec<_>>();
+        let mut document = Value::Array(rows);
+        assert_eq!(validate(&document, &schema), []);
+        document[19_999]["id"] = json!("x");
+        let findings = validate(&document, &schema);
+        assert!(!findings.is_empty());
+        assert!(findings.iter().all(|f| f.path.starts_with("$/19999")));
+    }
+
+    #[test]
+    fn in_place_reference_chains_stop_at_the_application_depth() {
+        // 32 hops through 60 nested `not` would recurse 1,920 levels.
+        let mut schema = json!({"$ref": "#"});
+        for _ in 0..60 {
+            schema = json!({"not": schema});
+        }
+        let findings = validate(&json!(1), &schema);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("nested inside each other"));
     }
 
     #[test]

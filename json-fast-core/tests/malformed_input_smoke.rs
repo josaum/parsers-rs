@@ -195,14 +195,15 @@ fn schemas_nested_to_the_parse_limit_fit_a_main_thread_stack() {
     validate_schemas_nested_to_the_parse_limit(MAIN_THREAD_STACK_BYTES);
 }
 
-/// The validator recurses once per schema level with large frames.
-///
-/// Measured at the 64-level limit: an optimized build fits 128 KiB, but an
-/// unoptimized build overflows 2 MiB (the default for a spawned thread) and
-/// needs the 8 MiB of a main thread. Released artifacts are optimized, so
-/// this is a debug-build hazard; shrinking the frames would remove it.
+/// Still open. Measured separately at the 64-level limit in an unoptimized
+/// build: parsing 63 nested objects into a `Value` needs between 2 and 4 MiB
+/// (the recursion is in the JSON parser dependency), while validating the
+/// already-parsed values needs 256 KiB for two of the four cases and 512 KiB
+/// for `items` and `not` (4 to 8 KiB per level). `validate_str` parses on
+/// the calling thread, so this cannot pass on 256 KiB until the parse does.
+/// An optimized build fits 128 KiB.
 #[test]
-#[ignore = "schema validation at the 64-level limit overflows a 2 MiB stack in a debug build; not fixed yet"]
+#[ignore = "parsing 63 nested objects needs 2-4 MiB of stack in a debug build; validation alone needs up to 512 KiB"]
 fn schemas_nested_to_the_parse_limit_fit_a_small_stack() {
     validate_schemas_nested_to_the_parse_limit(smoke::SMALL_STACK_BYTES);
 }
@@ -224,13 +225,56 @@ fn reference_cycles_terminate() {
 }
 
 /// `{"allOf":[{"$ref":"#"},{"$ref":"#"}]}` follows two references per level
-/// for 32 levels: 2^32 applications, each leaving a warning.
+/// for 32 levels: 2^33 applications if nothing stops it. The work budget
+/// stops it and the result is one error finding, not a clean document.
 #[test]
-#[ignore = "exponential: branching $ref cycles are bounded per chain (32 hops), not in total; not fixed yet"]
 fn branching_reference_cycles_terminate() {
     let findings =
         schema::validate_str("1", r##"{"allOf":[{"$ref":"#"},{"$ref":"#"}]}"##).expect("parses");
     assert!(findings.len() < 10_000, "{} findings", findings.len());
+    assert!(schema::has_errors(&findings));
+}
+
+/// A `Value` built in code is not subject to the parser's nesting limit; the
+/// validator must refuse it instead of recursing once per level.
+#[test]
+fn values_nested_beyond_the_limit_are_refused_on_a_small_stack() {
+    fn nest(leaf: Value, depth: usize, wrap: fn(Value) -> Value) -> Value {
+        (0..depth).fold(leaf, |inner, _| wrap(inner))
+    }
+    // `json!` would serialize `inner` recursively; build the map by hand.
+    fn keyed(key: &str, inner: Value) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert(key.to_owned(), inner);
+        Value::Object(map)
+    }
+    let wrappers: [fn(Value) -> Value; 3] = [
+        |inner| Value::Array(vec![inner]),
+        |inner| keyed("items", inner),
+        |inner| keyed("not", inner),
+    ];
+    for wrap in wrappers {
+        for depth in [schema::MAX_VALIDATION_NESTING_DEPTH + 1, 200_000] {
+            smoke::run_on_small_stack(move || {
+                let deep = nest(Value::Bool(true), depth, wrap);
+                let shallow = serde_json::json!({"items": {"type": "array"}});
+                for (document, schema_value) in [(&deep, &shallow), (&shallow, &deep)] {
+                    let findings = schema::validate(document, schema_value);
+                    assert_eq!(findings.len(), 1);
+                    assert!(schema::has_errors(&findings));
+                    assert!(findings[0].message.contains("levels deep"));
+                }
+                // Dropping a `Value` this deep recurses in `serde_json`.
+                std::mem::forget(deep);
+            });
+        }
+    }
+    let at_limit = nest(
+        Value::from(1),
+        schema::MAX_VALIDATION_NESTING_DEPTH,
+        wrappers[0],
+    );
+    assert!(schema::validate(&at_limit, &Value::Bool(true)).is_empty());
 }
 
 #[test]
