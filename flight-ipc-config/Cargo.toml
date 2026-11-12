@@ -11,6 +11,11 @@ publish = false
 [dependencies]
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
+# Not used directly. jsonwebtoken's `aws_lc_rs` backend builds AWS-LC, whose
+# x86_64 Windows assembly needs NASM. This feature lets that one target fall
+# back to the assembled objects the crate ships when NASM is not installed; it
+# changes nothing on other targets or where NASM is present.
+aws-lc-rs = { version = "1.15", default-features = false, features = ["prebuilt-nasm"] }
 futures = "0.3"
 jsonwebtoken = { workspace = true }
 prost = "0.14"
