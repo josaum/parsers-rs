@@ -414,25 +414,24 @@ fn parse_html_inner(
         });
     }
 
-    let row_selector = selector("tr")?;
-    let cell_selector = selector("th,td")?;
-    let caption_selector = selector("caption")?;
     let table_selector = selector("table")?;
     let mut tables = Vec::new();
     for table in document.select(&table_selector) {
         budget.add_node()?;
-        let caption = table
-            .select(&caption_selector)
-            .next()
+        let parts = own_table_parts(table);
+        let caption = parts
+            .caption
             .map(normalized_text)
             .filter(|value| !value.is_empty());
         if let Some(value) = &caption {
             budget.add_text(value)?;
         }
         let mut rows = Vec::new();
-        for row in table.select(&row_selector) {
+        for row in parts.rows {
             let cells = row
-                .select(&cell_selector)
+                .children()
+                .filter_map(ElementRef::wrap)
+                .filter(|cell| matches!(cell.value().name(), "th" | "td"))
                 .map(normalized_text)
                 .filter(|value| !value.is_empty())
                 .collect::<Vec<_>>();
@@ -499,6 +498,42 @@ fn parse_html_inner(
         json_ld,
         diagnostics,
     })
+}
+
+/// The caption and rows that belong to one table, in document order.
+struct TableParts<'a> {
+    caption: Option<ElementRef<'a>>,
+    rows: Vec<ElementRef<'a>>,
+}
+
+/// Collects a table's own caption and rows without entering nested tables.
+///
+/// A nested table is reported as its own [`WebTable`], so its rows are not
+/// repeated in every enclosing table. Each node is visited once per table it
+/// directly belongs to, which keeps the walk linear in the document size.
+fn own_table_parts(table: ElementRef<'_>) -> TableParts<'_> {
+    let mut parts = TableParts {
+        caption: None,
+        rows: Vec::new(),
+    };
+    // Explicit stack, pushed in reverse so nodes pop in document order.
+    let mut pending = table.children().rev().collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        let Some(element) = ElementRef::wrap(node) else {
+            continue;
+        };
+        match element.value().name() {
+            "table" => {}
+            "tr" => parts.rows.push(element),
+            "caption" => {
+                parts.caption.get_or_insert(element);
+            }
+            // Cells are only read as children of a row.
+            "th" | "td" => {}
+            _ => pending.extend(node.children().rev()),
+        }
+    }
+    parts
 }
 
 fn first_text(

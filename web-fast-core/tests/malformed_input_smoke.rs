@@ -175,6 +175,24 @@ fn nested_tables_and_blocks_are_bounded_on_a_small_stack() {
     }
 }
 
+/// Each table owns its own rows and each row its own cells.
+///
+/// Before the fix every table repeated the rows of every table nested in it
+/// and every row repeated the cells of every nested row, so 100 levels
+/// produced 5,050 rows and 171,700 cells and visited 17 million nodes for
+/// their text. The shape below is linear in the nesting depth.
+#[test]
+fn nested_tables_report_only_their_own_rows_and_cells() {
+    let depth = 100;
+    let html = smoke::nested(b"<table><tr><td>", b"x", b"</td></tr></table>", depth);
+    let html = String::from_utf8(html).expect("ascii");
+    let document = parse_html(&html, None, ParseOptions::default()).expect("parses");
+    assert_eq!(document.tables.len(), depth);
+    for table in &document.tables {
+        assert_eq!(table.rows, [["x"]], "table {}", table.ordinal);
+    }
+}
+
 /// 300 nested tables ran for more than 60 seconds in a debug build and were
 /// stopped. Table extraction selects every descendant row of every table and
 /// every descendant cell of every row, and each text block stores its full
