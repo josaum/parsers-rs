@@ -200,7 +200,7 @@ fn pack_str_level(
     let mut parent_entries = Vec::with_capacity(leaf_count);
     let mut i = 0;
     while i < n {
-        let slice_end = (i + per_slice).min(n);
+        let slice_end = i.saturating_add(per_slice).min(n);
         // Within each vertical slice, sort by center latitude (Y).
         entries[i..slice_end].sort_by(|a, b| {
             center_lat(&a.bbox)
@@ -210,7 +210,8 @@ fn pack_str_level(
 
         let mut j = i;
         while j < slice_end {
-            let node_end = (j + capacity).min(slice_end);
+            // `capacity` is the caller's; it may be as large as `usize::MAX`.
+            let node_end = j.saturating_add(capacity).min(slice_end);
             let children: Vec<Entry> = entries[j..node_end].to_vec();
             let bbox = union_entries(&children);
             let node_id = nodes.len();
