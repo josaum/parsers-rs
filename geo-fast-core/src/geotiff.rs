@@ -94,14 +94,22 @@ pub struct GeoTiffMetadata {
 }
 
 impl GeoTiffMetadata {
-    /// Computes the upper-left world coordinate from tiepoints + pixel scale.
+    /// Returns the world coordinate of the raster's upper-left corner.
+    ///
+    /// The coordinate is in the raster's own CRS and comes from the first
+    /// tiepoint. A tiepoint ties a pixel to a world coordinate, and that
+    /// pixel need not be the corner, so the pixel scale carries the
+    /// coordinate back to pixel (0, 0). Returns `None` when there is no
+    /// tiepoint, or when the tiepoint is not at the corner and there is no
+    /// pixel scale to carry it there.
     pub fn upper_left(&self) -> Option<(f64, f64)> {
-        let tp = self.tiepoints.first()?;
-        // tp = [pixel_x, pixel_y, pixel_z, world_x, world_y, world_z]
-        Some((tp[3], tp[4]))
+        tiepoint_origin(self.tiepoints.first()?, self.pixel_scale)
     }
 
-    /// Computes the lower-right world coordinate.
+    /// Returns the world coordinate of the raster's lower-right corner.
+    ///
+    /// One pixel scale per pixel away from [`Self::upper_left`], in the
+    /// raster's own CRS. Returns `None` without a tiepoint and a pixel scale.
     pub fn lower_right(&self) -> Option<(f64, f64)> {
         let (world_x, world_y) = self.upper_left()?;
         let (sx, sy) = self.pixel_scale?;
@@ -518,6 +526,21 @@ fn read_geokey_directory<R: Read + Seek>(
     Ok(keys)
 }
 
+/// World coordinate of pixel (0, 0), from one tiepoint and the pixel scale.
+///
+/// `tiepoint` is `[I, J, K, X, Y, Z]`: raster position (`I`, `J`) lies at
+/// world position (`X`, `Y`). World Y decreases as `J` grows. A tiepoint at
+/// the corner itself needs no scale; any other one cannot be carried to the
+/// corner without it.
+fn tiepoint_origin(tiepoint: &[f64; 6], pixel_scale: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let [i, j, _, x, y, _] = *tiepoint;
+    if i == 0.0 && j == 0.0 {
+        return Some((x, y));
+    }
+    let (sx, sy) = pixel_scale?;
+    Some((x - i * sx, y + j * sy))
+}
+
 fn derive_bbox(
     tiepoints: &[[f64; 6]],
     pixel_scale: Option<(f64, f64)>,
@@ -542,10 +565,8 @@ fn derive_bbox(
     }
 
     // Fall back to tiepoint + pixel scale
-    let tp = tiepoints.first()?;
     let (sx, sy) = pixel_scale?;
-    let ul_x = tp[3] - tp[0] * sx;
-    let ul_y = tp[4] + tp[1] * sy;
+    let (ul_x, ul_y) = tiepoint_origin(tiepoints.first()?, pixel_scale)?;
     let lr_x = ul_x + sx * width as f64;
     let lr_y = ul_y - sy * height as f64;
 
@@ -670,6 +691,40 @@ mod tests {
         assert!(geographic.is_geographic);
         let bbox = geographic.bbox.expect("bbox of a geographic raster");
         assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
+    }
+
+    /// `upper_left` returned the tiepoint's world coordinate as it stood, so
+    /// a raster tied at its centre reported its centre as its corner, and
+    /// disagreed with `bbox`, which did account for the tiepoint's pixel.
+    #[test]
+    fn corners_account_for_a_tiepoint_away_from_the_origin() {
+        let centred = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([50.0, 25.0, 0.0, -47.5, -15.25, 0.0]),
+                geokeys: Some(&WGS84_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        let (ul_x, ul_y) = centred.upper_left().expect("upper left");
+        let (lr_x, lr_y) = centred.lower_right().expect("lower right");
+        assert_close(ul_x, -48.0);
+        assert_close(ul_y, -15.0);
+        assert_close(lr_x, -47.0);
+        assert_close(lr_y, -15.5);
+        // The corners and the bbox describe the same rectangle.
+        let bbox = centred.bbox.expect("bbox of a geographic raster");
+        assert_bbox(&bbox, ul_x, lr_y, lr_x, ul_y);
+    }
+
+    #[test]
+    fn corner_of_an_off_origin_tiepoint_needs_the_pixel_scale() {
+        let at_origin = [0.0, 0.0, 0.0, -48.0, -15.0, 0.0];
+        assert_eq!(tiepoint_origin(&at_origin, None), Some((-48.0, -15.0)));
+        let off_origin = [50.0, 25.0, 0.0, -47.5, -15.25, 0.0];
+        assert_eq!(tiepoint_origin(&off_origin, None), None);
     }
 
     /// Without a GeoKey directory nothing says the coordinates are degrees.
