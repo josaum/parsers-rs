@@ -73,6 +73,15 @@ pub fn write_msg_cfb_fixture(subject: &str, sender: &str, to: &str, body: &str) 
     msg::write_fixture_msg(subject, sender, to, body)
 }
 
+/// Hidden CFB fixture writer for integration tests: arbitrary named streams.
+///
+/// A name of the form `storage/stream` puts the stream in a storage under the
+/// root, which is how attachment and recipient storages are written.
+#[doc(hidden)]
+pub fn write_msg_cfb_fixture_streams(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    msg::write_fixture_streams(streams)
+}
+
 /// Configuration options for email parsing.
 #[derive(Debug, Clone, Copy)]
 pub struct ParseOptions {
@@ -476,12 +485,28 @@ pub fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
 pub fn parse_mbox(
     path: impl AsRef<Path>,
     options: ParseOptions,
+    callback: impl FnMut(Email) -> Result<()>,
+) -> Result<usize> {
+    let file = File::open(path.as_ref())?;
+    parse_mbox_reader(BufReader::new(file), options, callback)
+}
+
+/// Parse an mbox mailbox from a buffered reader (streaming).
+///
+/// The reader form of [`parse_mbox`], for a caller that holds the mailbox in
+/// memory or receives it from a stream. `callback` runs once per message, in
+/// mailbox order; the return value is the number of messages delivered.
+///
+/// # Errors
+///
+/// Returns an error if the reader fails or `callback` returns one. A message
+/// that does not parse is skipped, so one bad message does not lose the
+/// mailbox.
+pub fn parse_mbox_reader(
+    mut reader: impl BufRead,
+    options: ParseOptions,
     mut callback: impl FnMut(Email) -> Result<()>,
 ) -> Result<usize> {
-    let path = path.as_ref();
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-
     let mut count = 0;
     let mut current_message: Vec<u8> = Vec::new();
     let mut in_message = false;

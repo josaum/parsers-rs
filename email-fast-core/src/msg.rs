@@ -783,6 +783,14 @@ pub fn write_fixture_msg(subject: &str, sender: &str, to: &str, body: &str) -> V
     write_ministream_cfb(&props)
 }
 
+/// Builds a fixture compound file from arbitrary named streams.
+///
+/// See [`write_ministream_cfb`] for the `storage/stream` naming.
+#[doc(hidden)]
+pub fn write_fixture_streams(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    write_ministream_cfb(streams)
+}
+
 fn utf16_le(value: &str) -> Vec<u8> {
     let mut out = Vec::new();
     for unit in value.encode_utf16() {
@@ -792,109 +800,192 @@ fn utf16_le(value: &str) -> Vec<u8> {
     out
 }
 
+/// Fixture streams at least this long are stored in regular sectors; shorter
+/// ones go to the mini stream. This is the cutoff the fixture header declares.
+const FIXTURE_MINI_CUTOFF: usize = 4096;
+
+/// One directory entry of a fixture compound file.
+struct FixtureNode<'a> {
+    name: &'a str,
+    obj_type: u8,
+    /// Index into the caller's stream list, for stream entries.
+    stream: Option<usize>,
+    /// Directory indices of the entries this storage holds, in sibling order.
+    children: Vec<usize>,
+}
+
+/// Builds a version 3 compound file holding `streams`.
+///
+/// A name of the form `storage/stream` puts the stream in a storage directly
+/// under the root, created the first time it is named; that is how attachment
+/// (`__attach_version1.0_#00000000/...`) and recipient storages are written.
+/// Siblings are chained through their `right` links in the order given.
+///
+/// # Panics
+///
+/// Panics if the file would need more FAT sectors than the header can list.
+/// This is a test fixture writer; its inputs are written by hand.
 fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     const SECTOR: usize = 512;
     const MINI: usize = 64;
-    let n = streams.len();
-    let dir_entries = 1 + n;
-    let dir_bytes = dir_entries * DIR_ENTRY_SIZE;
-    let dir_sectors = dir_bytes.div_ceil(SECTOR);
-    let mini_sectors: Vec<Vec<u8>> = streams
-        .iter()
-        .map(|(_, data)| {
-            let mut padded = data.clone();
-            let rem = padded.len() % MINI;
-            if rem != 0 {
-                padded.resize(padded.len() + (MINI - rem), 0);
-            }
-            if padded.is_empty() {
-                padded.resize(MINI, 0);
-            }
-            padded
-        })
-        .collect();
-    let mini_stream: Vec<u8> = mini_sectors.iter().flatten().copied().collect();
-    let mini_stream_sectors = mini_stream.len().div_ceil(SECTOR).max(1);
-    let mini_fat_sectors = 1;
+    const ENTRIES_PER_SECTOR: usize = SECTOR / 4;
+    /// FAT sector slots in the header; the fixture writes no DIFAT sectors.
+    const HEADER_FAT_SLOTS: usize = 109;
 
-    // Layout after the 512-byte header:
-    // 0: FAT
-    // 1..dir_sectors: directory
-    // next: mini FAT
-    // next: mini stream data
-    let fat_sect = 0u32;
-    let dir_start = 1u32;
-    let mini_fat_start = dir_start + dir_sectors as u32;
-    let mini_data_start = mini_fat_start + mini_fat_sectors as u32;
-    let total_sectors = mini_data_start as usize + mini_stream_sectors;
-
-    let mut fat = vec![FREESECT; SECTOR / 4];
-    fat[0] = FATSECT;
-    for i in 0..dir_sectors {
-        let s = dir_start as usize + i;
-        fat[s] = if i + 1 == dir_sectors {
-            ENDOFCHAIN
-        } else {
-            (s + 1) as u32
+    // Directory: entry 0 is the root, the rest follow in creation order.
+    let mut nodes = vec![FixtureNode {
+        name: "Root Entry",
+        obj_type: TYPE_ROOT,
+        stream: None,
+        children: Vec::new(),
+    }];
+    for (index, (path, _)) in streams.iter().enumerate() {
+        let (parent, leaf) = match path.split_once('/') {
+            Some((storage, leaf)) => {
+                let existing =
+                    nodes[0].children.iter().copied().find(|&id| {
+                        nodes[id].obj_type == TYPE_STORAGE && nodes[id].name == storage
+                    });
+                let parent = match existing {
+                    Some(id) => id,
+                    None => {
+                        let id = nodes.len();
+                        nodes.push(FixtureNode {
+                            name: storage,
+                            obj_type: TYPE_STORAGE,
+                            stream: None,
+                            children: Vec::new(),
+                        });
+                        nodes[0].children.push(id);
+                        id
+                    }
+                };
+                (parent, leaf)
+            }
+            None => (0, *path),
         };
-    }
-    fat[mini_fat_start as usize] = ENDOFCHAIN;
-    for i in 0..mini_stream_sectors {
-        let s = mini_data_start as usize + i;
-        fat[s] = if i + 1 == mini_stream_sectors {
-            ENDOFCHAIN
-        } else {
-            (s + 1) as u32
-        };
+        let id = nodes.len();
+        nodes.push(FixtureNode {
+            name: leaf,
+            obj_type: TYPE_STREAM,
+            stream: Some(index),
+            children: Vec::new(),
+        });
+        nodes[parent].children.push(id);
     }
 
-    let mut mini_fat = vec![FREESECT; SECTOR / 4];
-    let mut mini_index = 0u32;
-    for padded in &mini_sectors {
-        let count = (padded.len() / MINI) as u32;
-        for j in 0..count {
-            let idx = mini_index + j;
-            mini_fat[idx as usize] = if j + 1 == count { ENDOFCHAIN } else { idx + 1 };
+    // Stream data: small streams are packed into the mini stream, large ones
+    // into their own run of regular sectors. `starts` is relative to the
+    // owning area until the layout is known.
+    let mut mini_stream: Vec<u8> = Vec::new();
+    let mut mini_fat: Vec<u32> = Vec::new();
+    let mut large_data: Vec<u8> = Vec::new();
+    let mut large_runs: Vec<(usize, usize)> = Vec::new();
+    let mut starts = vec![0usize; streams.len()];
+    for (index, (_, data)) in streams.iter().enumerate() {
+        if data.len() >= FIXTURE_MINI_CUTOFF {
+            let count = data.len().div_ceil(SECTOR);
+            starts[index] = large_data.len() / SECTOR;
+            large_runs.push((starts[index], count));
+            large_data.extend_from_slice(data);
+            large_data.resize((starts[index] + count) * SECTOR, 0);
+        } else {
+            // An empty stream still owns one mini sector.
+            let count = data.len().div_ceil(MINI).max(1);
+            let first = mini_fat.len();
+            starts[index] = first;
+            for offset in 0..count {
+                mini_fat.push(if offset + 1 == count {
+                    ENDOFCHAIN
+                } else {
+                    (first + offset + 1) as u32
+                });
+            }
+            mini_stream.extend_from_slice(data);
+            mini_stream.resize((first + count) * MINI, 0);
         }
-        mini_index += count;
+    }
+
+    // Layout after the 512-byte header: FAT, directory, mini FAT, the mini
+    // stream container, then the large streams.
+    let dir_sectors = (nodes.len() * DIR_ENTRY_SIZE).div_ceil(SECTOR);
+    let mini_fat_sectors = mini_fat.len().div_ceil(ENTRIES_PER_SECTOR).max(1);
+    let mini_stream_sectors = mini_stream.len().div_ceil(SECTOR);
+    let large_sectors = large_data.len() / SECTOR;
+    let payload_sectors = dir_sectors + mini_fat_sectors + mini_stream_sectors + large_sectors;
+    let mut fat_sectors = 1;
+    while fat_sectors * ENTRIES_PER_SECTOR < fat_sectors + payload_sectors {
+        fat_sectors += 1;
+    }
+    assert!(
+        fat_sectors <= HEADER_FAT_SLOTS,
+        "fixture too large for a header-only DIFAT"
+    );
+    let dir_start = fat_sectors;
+    let mini_fat_start = dir_start + dir_sectors;
+    let mini_data_start = mini_fat_start + mini_fat_sectors;
+    let large_start = mini_data_start + mini_stream_sectors;
+    let total_sectors = large_start + large_sectors;
+
+    let mut fat = vec![FREESECT; fat_sectors * ENTRIES_PER_SECTOR];
+    fat[..fat_sectors].fill(FATSECT);
+    let mut chain = |start: usize, count: usize| {
+        for offset in 0..count {
+            fat[start + offset] = if offset + 1 == count {
+                ENDOFCHAIN
+            } else {
+                (start + offset + 1) as u32
+            };
+        }
+    };
+    chain(dir_start, dir_sectors);
+    chain(mini_fat_start, mini_fat_sectors);
+    chain(mini_data_start, mini_stream_sectors);
+    for (first, count) in &large_runs {
+        chain(large_start + first, *count);
     }
 
     let mut dir = vec![0u8; dir_sectors * SECTOR];
-    write_dir_entry(
-        &mut dir,
-        0,
-        DirWrite {
-            name: "Root Entry",
-            obj_type: TYPE_ROOT,
-            left: NOSTREAM,
-            right: NOSTREAM,
-            child: 1,
-            start: mini_data_start,
-            size: mini_stream.len() as u64,
-        },
-    );
-    let mut mini_start = 0u32;
-    for (i, (name, data)) in streams.iter().enumerate() {
-        let idx = i + 1;
-        let right = if idx + 1 < dir_entries {
-            idx as u32 + 1
-        } else {
-            NOSTREAM
+    for (id, node) in nodes.iter().enumerate() {
+        let (start, size) = match node.stream {
+            Some(index) => {
+                let len = streams[index].1.len();
+                let start = if len >= FIXTURE_MINI_CUTOFF {
+                    large_start + starts[index]
+                } else {
+                    starts[index]
+                };
+                (start as u32, len as u64)
+            }
+            None if id == 0 && mini_stream_sectors > 0 => {
+                (mini_data_start as u32, mini_stream.len() as u64)
+            }
+            None if id == 0 => (ENDOFCHAIN, 0),
+            None => (0, 0),
         };
         write_dir_entry(
             &mut dir,
-            idx,
+            id,
             DirWrite {
-                name,
-                obj_type: TYPE_STREAM,
+                name: node.name,
+                obj_type: node.obj_type,
                 left: NOSTREAM,
-                right,
-                child: NOSTREAM,
-                start: mini_start,
-                size: data.len() as u64,
+                right: NOSTREAM,
+                child: node
+                    .children
+                    .first()
+                    .map_or(NOSTREAM, |&child| child as u32),
+                start,
+                size,
             },
         );
-        mini_start += (mini_sectors[i].len() / MINI) as u32;
+    }
+    // Chain each storage's entries through their `right` links.
+    for node in &nodes {
+        for pair in node.children.windows(2) {
+            let off = pair[0] * DIR_ENTRY_SIZE + 0x48;
+            dir[off..off + 4].copy_from_slice(&(pair[1] as u32).to_le_bytes());
+        }
     }
 
     let mut out = vec![0u8; HEADER_SIZE + total_sectors * SECTOR];
@@ -904,25 +995,34 @@ fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     out[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
     out[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
     out[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
-    out[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
-    out[0x30..0x34].copy_from_slice(&dir_start.to_le_bytes());
-    out[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
-    out[0x3C..0x40].copy_from_slice(&mini_fat_start.to_le_bytes());
-    out[0x40..0x44].copy_from_slice(&1u32.to_le_bytes());
+    out[0x2C..0x30].copy_from_slice(&(fat_sectors as u32).to_le_bytes());
+    out[0x30..0x34].copy_from_slice(&(dir_start as u32).to_le_bytes());
+    out[0x38..0x3C].copy_from_slice(&(FIXTURE_MINI_CUTOFF as u32).to_le_bytes());
+    out[0x3C..0x40].copy_from_slice(&(mini_fat_start as u32).to_le_bytes());
+    out[0x40..0x44].copy_from_slice(&(mini_fat_sectors as u32).to_le_bytes());
     out[0x44..0x48].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
-    out[0x4C..0x50].copy_from_slice(&fat_sect.to_le_bytes());
-    for i in 1..109 {
-        let off = 0x4C + i * 4;
-        out[off..off + 4].copy_from_slice(&FREESECT.to_le_bytes());
+    for slot in 0..HEADER_FAT_SLOTS {
+        let sector = if slot < fat_sectors {
+            slot as u32
+        } else {
+            FREESECT
+        };
+        let off = 0x4C + slot * 4;
+        out[off..off + 4].copy_from_slice(&sector.to_le_bytes());
     }
 
-    write_u32_table(&mut out[HEADER_SIZE..HEADER_SIZE + SECTOR], &fat);
-    let dir_off = HEADER_SIZE + dir_start as usize * SECTOR;
-    out[dir_off..dir_off + dir.len()].copy_from_slice(&dir);
-    let mini_fat_off = HEADER_SIZE + mini_fat_start as usize * SECTOR;
-    write_u32_table(&mut out[mini_fat_off..mini_fat_off + SECTOR], &mini_fat);
-    let mini_data_off = HEADER_SIZE + mini_data_start as usize * SECTOR;
-    out[mini_data_off..mini_data_off + mini_stream.len()].copy_from_slice(&mini_stream);
+    let sector_off = |sector: usize| HEADER_SIZE + sector * SECTOR;
+    write_u32_table(&mut out[sector_off(0)..sector_off(fat_sectors)], &fat);
+    out[sector_off(dir_start)..sector_off(dir_start) + dir.len()].copy_from_slice(&dir);
+    mini_fat.resize(mini_fat_sectors * ENTRIES_PER_SECTOR, FREESECT);
+    write_u32_table(
+        &mut out[sector_off(mini_fat_start)..sector_off(mini_data_start)],
+        &mini_fat,
+    );
+    out[sector_off(mini_data_start)..sector_off(mini_data_start) + mini_stream.len()]
+        .copy_from_slice(&mini_stream);
+    out[sector_off(large_start)..sector_off(large_start) + large_data.len()]
+        .copy_from_slice(&large_data);
     out
 }
 
