@@ -620,7 +620,9 @@ fn load_fat(data: &[u8], sector_size: usize, first_difat: u32) -> Result<Vec<u32
     let mut is_fat_sector = vec![false; sectors];
     let mut fat_sectors: Vec<u32> = Vec::new();
     let mut add_fat_sector = |sect: u32| -> Result<()> {
-        if sect == FREESECT {
+        // An unused slot holds FREESECT; some writers fill the slots after
+        // the last FAT sector with ENDOFCHAIN instead.
+        if sect == FREESECT || sect == ENDOFCHAIN {
             return Ok(());
         }
         let slot = is_fat_sector
@@ -751,9 +753,12 @@ fn read_fat_chain_len(
         if sect == FATSECT || sect == DIFSECT {
             return Err(anyhow!("MSG CFB: FAT points at metadata sector"));
         }
-        let raw = sector_slice(data, sector_size, sect)?;
-        let take = (max_len - out.len()).min(raw.len());
-        out.extend_from_slice(&raw[..take]);
+        // Only the bytes the stream still needs are asked of the sector, so
+        // a file whose last sector is cut short after the end of its
+        // stream's data still reads. A chain of unknown length asks for
+        // whole sectors.
+        let want = (max_len - out.len()).min(sector_size);
+        out.extend_from_slice(sector_prefix(data, sector_size, sect, want)?);
         if out.len() == max_len {
             break;
         }
@@ -806,10 +811,19 @@ fn fat_next(fat: &[u32], sect: u32) -> Result<u32> {
 }
 
 fn sector_slice(data: &[u8], sector_size: usize, sect: u32) -> Result<&[u8]> {
+    sector_prefix(data, sector_size, sect, sector_size)
+}
+
+/// Returns the first `len` bytes of sector `sect`; `len` is at most
+/// `sector_size`.
+///
+/// Fails if the file ends before those bytes do. The file's last sector may
+/// be shorter than a sector as long as it holds the bytes asked for.
+fn sector_prefix(data: &[u8], sector_size: usize, sect: u32, len: usize) -> Result<&[u8]> {
     (sect as usize)
         .checked_mul(sector_size)
         .and_then(|rel| rel.checked_add(first_sector_offset(sector_size)))
-        .and_then(|off| Some(off..off.checked_add(sector_size)?))
+        .and_then(|off| Some(off..off.checked_add(len.min(sector_size))?))
         .and_then(|range| data.get(range))
         .ok_or_else(|| anyhow!("MSG CFB: sector {sect} truncated"))
 }
@@ -1918,6 +1932,47 @@ mod cfb_hardening_tests {
         );
         assert_eq!(pairs(&email.cc), [(None, "Carlos")]);
         assert!(email.bcc.is_empty());
+    }
+
+    /// Some writers fill the header's unused FAT sector slots with
+    /// ENDOFCHAIN rather than FREESECT; other readers accept that.
+    #[test]
+    fn unused_header_difat_slots_may_hold_endofchain() {
+        let mut bytes = write_ministream_cfb(&sample_message_streams());
+        let fat_sectors = u32_le(&bytes, 0x2C).expect("header") as usize;
+        for slot in fat_sectors..109 {
+            let off = 0x4C + slot * 4;
+            bytes[off..off + 4].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
+        }
+
+        let email = parse_msg_bytes(&bytes, ParseOptions::default()).expect("parses");
+
+        assert_eq!(email.subject.as_deref(), Some("Version 4 subject"));
+        assert_eq!(email.attachments[0].size, sample_attachment().len());
+    }
+
+    /// The fixture's last sector holds the end of the attachment and then
+    /// padding. A file cut inside the padding has all of its data; one cut
+    /// inside the data does not.
+    #[test]
+    fn a_short_final_sector_is_accepted_when_the_stream_data_is_complete() {
+        let whole = write_ministream_cfb(&sample_message_streams());
+        let padding = 512 - sample_attachment().len() % 512;
+        let options = ParseOptions {
+            extract_attachment_content: true,
+            ..ParseOptions::default()
+        };
+
+        let cut_in_padding = &whole[..whole.len() - padding];
+        let email = parse_msg_bytes(cut_in_padding, options).expect("complete data parses");
+        assert_eq!(
+            email.attachments[0].decode_content(),
+            Some(sample_attachment())
+        );
+
+        let cut_in_data = &whole[..whole.len() - padding - 1];
+        let err = parse_msg_bytes(cut_in_data, options).expect_err("missing data is an error");
+        assert!(err.to_string().contains("truncated"), "{err}");
     }
 
     #[test]
