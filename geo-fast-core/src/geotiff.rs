@@ -552,16 +552,20 @@ fn derive_bbox(
     if let Some(m) = transform {
         // Row-major 4×4 affine: world_x = m[0]*px + m[1]*py + m[3]
         //                        world_y = m[4]*px + m[5]*py + m[7]
-        let ul_x = m[3];
-        let ul_y = m[7];
-        let lr_x = m[0] * width as f64 + m[1] * height as f64 + m[3];
-        let lr_y = m[4] * width as f64 + m[5] * height as f64 + m[7];
-        return Some(BBox::new(
-            ul_x.min(lr_x),
-            lr_y.min(ul_y),
-            ul_x.max(lr_x),
-            lr_y.max(ul_y),
-        ));
+        // The matrix may rotate or shear the raster, and then the extremes
+        // are not at the upper-left and lower-right corners: take all four.
+        let (w, h) = (f64::from(width), f64::from(height));
+        let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)]
+            .map(|(px, py)| (m[0] * px + m[1] * py + m[3], m[4] * px + m[5] * py + m[7]));
+        let (first_x, first_y) = corners[0];
+        let mut bbox = BBox::new(first_x, first_y, first_x, first_y);
+        for (x, y) in corners {
+            bbox.min_lon = bbox.min_lon.min(x);
+            bbox.max_lon = bbox.max_lon.max(x);
+            bbox.min_lat = bbox.min_lat.min(y);
+            bbox.max_lat = bbox.max_lat.max(y);
+        }
+        return Some(bbox);
     }
 
     // Fall back to tiepoint + pixel scale
@@ -725,6 +729,67 @@ mod tests {
         assert_eq!(tiepoint_origin(&at_origin, None), Some((-48.0, -15.0)));
         let off_origin = [50.0, 25.0, 0.0, -47.5, -15.25, 0.0];
         assert_eq!(tiepoint_origin(&off_origin, None), None);
+    }
+
+    /// A 4×4 `ModelTransformation` that scales by `scale` and rotates by
+    /// `degrees`, with pixel (0, 0) at (`x`, `y`).
+    fn rotation(degrees: f64, scale: f64, x: f64, y: f64) -> [f64; 16] {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let (c, s) = (cos * scale, sin * scale);
+        [
+            c, s, 0.0, x, s, -c, 0.0, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]
+    }
+
+    /// Only the upper-left and lower-right corners were used. On a raster
+    /// rotated by 30° the other two are the northernmost and southernmost
+    /// points, so the box was too short: 4649776..4649843 for a raster that
+    /// spans 4649343..4650276.
+    #[test]
+    fn rotated_transformation_bbox_covers_all_four_corners() {
+        let matrix = rotation(30.0, 10.0, 500_000.0, 4_649_776.0);
+        let (c, s) = (matrix[0], matrix[1]);
+        let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix)).expect("bbox");
+        // Corners: UL (0, 0), UR (100, 0), LL (0, 50), LR (100, 50).
+        assert_bbox(
+            &bbox,
+            500_000.0,
+            4_649_776.0 - 50.0 * c,
+            500_000.0 + 100.0 * c + 50.0 * s,
+            4_649_776.0 + 100.0 * s,
+        );
+        assert_close(bbox.min_lat, 4_649_342.987_298_108);
+        assert_close(bbox.max_lat, 4_650_276.0);
+    }
+
+    #[test]
+    fn rotated_geographic_raster_reports_its_full_extent() {
+        let rotated = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                transformation: Some(rotation(30.0, 0.01, -48.0, -15.0)),
+                geokeys: Some(&WGS84_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        let bbox = rotated.bbox.expect("bbox of a geographic raster");
+        let (c, s) = (30f64.to_radians().cos() * 0.01, 0.005);
+        assert_bbox(
+            &bbox,
+            -48.0,
+            -15.0 - 50.0 * c,
+            -48.0 + 100.0 * c + 50.0 * s,
+            -15.0 + 100.0 * s,
+        );
+    }
+
+    /// An axis-aligned matrix is the common case and is unchanged.
+    #[test]
+    fn unrotated_transformation_bbox_is_unchanged() {
+        let matrix = rotation(0.0, 0.01, -48.0, -15.0);
+        let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix)).expect("bbox");
+        assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
     }
 
     /// Without a GeoKey directory nothing says the coordinates are degrees.
