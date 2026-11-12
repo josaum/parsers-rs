@@ -37,6 +37,9 @@ base64 = "0.22"
 
 # MSG file parsing (OLE Compound File Binary — raw FAT/mini-FAT, no crate)
 encoding_rs = "0.8"
+# HTML named character references (the full table from the HTML standard) for
+# `html_to_text`; already in the workspace lockfile through html5ever.
+web_atoms = "0.2"
 regex = { workspace = true }
 
 [dev-dependencies]
