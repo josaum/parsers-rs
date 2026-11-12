@@ -525,9 +525,20 @@ impl<'a> CfbFile<'a> {
     }
 }
 
-/// Number of whole sectors `data` holds after the header.
+/// File offset of sector 0.
+///
+/// The header occupies the whole first sector (MS-CFB 2.2): its 512 bytes
+/// are the first sector of a version 3 file, and are padded to 4096 bytes in
+/// a version 4 file. Sector `n` therefore starts at `(n + 1) * sector_size`,
+/// not at `512 + n * sector_size`. Sectors smaller than the header exist
+/// only in unit tests, which lay them out after a 512-byte header.
+fn first_sector_offset(sector_size: usize) -> usize {
+    sector_size.max(HEADER_SIZE)
+}
+
+/// Number of whole sectors `data` holds after the header's sector.
 fn sector_count(data: &[u8], sector_size: usize) -> usize {
-    data.len().saturating_sub(HEADER_SIZE) / sector_size
+    data.len().saturating_sub(first_sector_offset(sector_size)) / sector_size
 }
 
 /// Reads the file allocation table named by the header and the DIFAT chain.
@@ -731,7 +742,7 @@ fn fat_next(fat: &[u32], sect: u32) -> Result<u32> {
 fn sector_slice(data: &[u8], sector_size: usize, sect: u32) -> Result<&[u8]> {
     (sect as usize)
         .checked_mul(sector_size)
-        .and_then(|rel| rel.checked_add(HEADER_SIZE))
+        .and_then(|rel| rel.checked_add(first_sector_offset(sector_size)))
         .and_then(|off| Some(off..off.checked_add(sector_size)?))
         .and_then(|range| data.get(range))
         .ok_or_else(|| anyhow!("MSG CFB: sector {sect} truncated"))
@@ -952,6 +963,27 @@ fn utf16_le(value: &str) -> Vec<u8> {
 /// ones go to the mini stream. This is the cutoff the fixture header declares.
 const FIXTURE_MINI_CUTOFF: usize = 4096;
 
+/// Sector geometry of a fixture compound file.
+#[derive(Clone, Copy)]
+struct FixtureGeometry {
+    /// Major version written to the header: 3 or 4.
+    major_version: u16,
+    /// Sector size as a power of two: 9 (512 bytes) or 12 (4096 bytes).
+    sector_shift: u16,
+    /// File offset of sector 0. MS-CFB puts it one sector into the file; a
+    /// test passes another value to build a file laid out against the format.
+    first_sector_offset: usize,
+}
+
+impl FixtureGeometry {
+    /// The layout Outlook writes: version 3, 512-byte sectors.
+    const VERSION_3: Self = Self {
+        major_version: 3,
+        sector_shift: 9,
+        first_sector_offset: HEADER_SIZE,
+    };
+}
+
 /// One directory entry of a fixture compound file.
 struct FixtureNode<'a> {
     name: &'a str,
@@ -964,6 +996,13 @@ struct FixtureNode<'a> {
 
 /// Builds a version 3 compound file holding `streams`.
 ///
+/// See [`write_cfb_fixture`] for the `storage/stream` naming.
+fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    write_cfb_fixture(streams, FixtureGeometry::VERSION_3)
+}
+
+/// Builds a compound file holding `streams`, laid out as `geometry` says.
+///
 /// A name of the form `storage/stream` puts the stream in a storage directly
 /// under the root, created the first time it is named; that is how attachment
 /// (`__attach_version1.0_#00000000/...`) and recipient storages are written.
@@ -973,10 +1012,10 @@ struct FixtureNode<'a> {
 ///
 /// Panics if the file would need more FAT sectors than the header can list.
 /// This is a test fixture writer; its inputs are written by hand.
-fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
-    const SECTOR: usize = 512;
+fn write_cfb_fixture(streams: &[(&str, Vec<u8>)], geometry: FixtureGeometry) -> Vec<u8> {
     const MINI: usize = 64;
-    const ENTRIES_PER_SECTOR: usize = SECTOR / 4;
+    let sector_size = 1usize << geometry.sector_shift;
+    let entries_per_sector = sector_size / 4;
     /// FAT sector slots in the header; the fixture writes no DIFAT sectors.
     const HEADER_FAT_SLOTS: usize = 109;
 
@@ -1032,11 +1071,11 @@ fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let mut starts = vec![0usize; streams.len()];
     for (index, (_, data)) in streams.iter().enumerate() {
         if data.len() >= FIXTURE_MINI_CUTOFF {
-            let count = data.len().div_ceil(SECTOR);
-            starts[index] = large_data.len() / SECTOR;
+            let count = data.len().div_ceil(sector_size);
+            starts[index] = large_data.len() / sector_size;
             large_runs.push((starts[index], count));
             large_data.extend_from_slice(data);
-            large_data.resize((starts[index] + count) * SECTOR, 0);
+            large_data.resize((starts[index] + count) * sector_size, 0);
         } else {
             // An empty stream still owns one mini sector.
             let count = data.len().div_ceil(MINI).max(1);
@@ -1054,15 +1093,15 @@ fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
         }
     }
 
-    // Layout after the 512-byte header: FAT, directory, mini FAT, the mini
+    // Layout after the header's sector: FAT, directory, mini FAT, the mini
     // stream container, then the large streams.
-    let dir_sectors = (nodes.len() * DIR_ENTRY_SIZE).div_ceil(SECTOR);
-    let mini_fat_sectors = mini_fat.len().div_ceil(ENTRIES_PER_SECTOR).max(1);
-    let mini_stream_sectors = mini_stream.len().div_ceil(SECTOR);
-    let large_sectors = large_data.len() / SECTOR;
+    let dir_sectors = (nodes.len() * DIR_ENTRY_SIZE).div_ceil(sector_size);
+    let mini_fat_sectors = mini_fat.len().div_ceil(entries_per_sector).max(1);
+    let mini_stream_sectors = mini_stream.len().div_ceil(sector_size);
+    let large_sectors = large_data.len() / sector_size;
     let payload_sectors = dir_sectors + mini_fat_sectors + mini_stream_sectors + large_sectors;
     let mut fat_sectors = 1;
-    while fat_sectors * ENTRIES_PER_SECTOR < fat_sectors + payload_sectors {
+    while fat_sectors * entries_per_sector < fat_sectors + payload_sectors {
         fat_sectors += 1;
     }
     assert!(
@@ -1075,7 +1114,7 @@ fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let large_start = mini_data_start + mini_stream_sectors;
     let total_sectors = large_start + large_sectors;
 
-    let mut fat = vec![FREESECT; fat_sectors * ENTRIES_PER_SECTOR];
+    let mut fat = vec![FREESECT; fat_sectors * entries_per_sector];
     fat[..fat_sectors].fill(FATSECT);
     let mut chain = |start: usize, count: usize| {
         for offset in 0..count {
@@ -1093,7 +1132,7 @@ fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
         chain(large_start + first, *count);
     }
 
-    let mut dir = vec![0u8; dir_sectors * SECTOR];
+    let mut dir = vec![0u8; dir_sectors * sector_size];
     for (id, node) in nodes.iter().enumerate() {
         let (start, size) = match node.stream {
             Some(index) => {
@@ -1136,13 +1175,18 @@ fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
         }
     }
 
-    let mut out = vec![0u8; HEADER_SIZE + total_sectors * SECTOR];
+    let mut out = vec![0u8; geometry.first_sector_offset + total_sectors * sector_size];
     out[..8].copy_from_slice(&OLE_SIGNATURE);
     out[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
-    out[0x1A..0x1C].copy_from_slice(&0x0003u16.to_le_bytes());
+    out[0x1A..0x1C].copy_from_slice(&geometry.major_version.to_le_bytes());
     out[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
-    out[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+    out[0x1E..0x20].copy_from_slice(&geometry.sector_shift.to_le_bytes());
     out[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+    if geometry.major_version >= 4 {
+        // Version 4 records the directory's sector count; version 3 leaves
+        // the field zero (MS-CFB 2.2).
+        out[0x28..0x2C].copy_from_slice(&(dir_sectors as u32).to_le_bytes());
+    }
     out[0x2C..0x30].copy_from_slice(&(fat_sectors as u32).to_le_bytes());
     out[0x30..0x34].copy_from_slice(&(dir_start as u32).to_le_bytes());
     out[0x38..0x3C].copy_from_slice(&(FIXTURE_MINI_CUTOFF as u32).to_le_bytes());
@@ -1150,19 +1194,19 @@ fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     out[0x40..0x44].copy_from_slice(&(mini_fat_sectors as u32).to_le_bytes());
     out[0x44..0x48].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
     for slot in 0..HEADER_FAT_SLOTS {
-        let sector = if slot < fat_sectors {
+        let fat_sector = if slot < fat_sectors {
             slot as u32
         } else {
             FREESECT
         };
         let off = 0x4C + slot * 4;
-        out[off..off + 4].copy_from_slice(&sector.to_le_bytes());
+        out[off..off + 4].copy_from_slice(&fat_sector.to_le_bytes());
     }
 
-    let sector_off = |sector: usize| HEADER_SIZE + sector * SECTOR;
+    let sector_off = |index: usize| geometry.first_sector_offset + index * sector_size;
     write_u32_table(&mut out[sector_off(0)..sector_off(fat_sectors)], &fat);
     out[sector_off(dir_start)..sector_off(dir_start) + dir.len()].copy_from_slice(&dir);
-    mini_fat.resize(mini_fat_sectors * ENTRIES_PER_SECTOR, FREESECT);
+    mini_fat.resize(mini_fat_sectors * entries_per_sector, FREESECT);
     write_u32_table(
         &mut out[sector_off(mini_fat_start)..sector_off(mini_data_start)],
         &mini_fat,
@@ -1402,6 +1446,87 @@ mod cfb_hardening_tests {
             ("__substg1.0_10130102", html),
         ]);
         assert_eq!(email.body.html.as_deref(), Some("<p>Łódź</p>"));
+    }
+
+    /// A version 4 geometry: 4096-byte sectors, with sector 0 at
+    /// `first_sector_offset`.
+    fn version_4(first_sector_offset: usize) -> FixtureGeometry {
+        FixtureGeometry {
+            major_version: 4,
+            sector_shift: 12,
+            first_sector_offset,
+        }
+    }
+
+    /// A body long enough to be stored in regular sectors.
+    fn sample_body() -> String {
+        "A line of the message body. ".repeat(400)
+    }
+
+    /// Attachment bytes that differ from sector to sector.
+    fn sample_attachment() -> Vec<u8> {
+        (0..50_000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A message with a mini-stream subject, and a body and an attachment in
+    /// regular sectors, so every kind of sector a reader locates is used.
+    fn sample_message_streams() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("__substg1.0_0037001F", utf16_le("Version 4 subject")),
+            ("__substg1.0_1000001F", utf16_le(&sample_body())),
+            (
+                "__attach_version1.0_#00000000/__substg1.0_37010102",
+                sample_attachment(),
+            ),
+            (
+                "__attach_version1.0_#00000000/__substg1.0_3707001F",
+                utf16_le("data.bin"),
+            ),
+        ]
+    }
+
+    /// In a version 4 file the header fills the whole first 4096-byte
+    /// sector, so sector `n` starts at `(n + 1) * 4096`. The reader used to
+    /// look for it at `512 + n * 4096` and rejected every such file.
+    #[test]
+    fn version_4_file_with_4096_byte_sectors_parses() {
+        let bytes = write_cfb_fixture(&sample_message_streams(), version_4(4096));
+        let options = ParseOptions {
+            extract_attachment_content: true,
+            ..ParseOptions::default()
+        };
+
+        let email = parse_msg_bytes(&bytes, options).expect("version 4 file parses");
+
+        assert_eq!(email.subject.as_deref(), Some("Version 4 subject"));
+        assert_eq!(email.body.text.as_deref(), Some(sample_body().trim()));
+        assert_eq!(email.attachments.len(), 1);
+        let parsed = &email.attachments[0];
+        assert_eq!(parsed.filename, "data.bin");
+        assert_eq!(parsed.size, sample_attachment().len());
+        assert_eq!(parsed.decode_content(), Some(sample_attachment()));
+    }
+
+    /// The layout the reader used to expect is not a compound file: its
+    /// sectors sit 3584 bytes before where the format puts them.
+    #[test]
+    fn version_4_file_laid_out_after_a_512_byte_header_is_rejected() {
+        let bytes = write_cfb_fixture(&sample_message_streams(), version_4(HEADER_SIZE));
+
+        assert!(parse_msg_bytes(&bytes, ParseOptions::default()).is_err());
+    }
+
+    /// The version 3 layout is unchanged: sector 0 follows the 512-byte
+    /// header directly.
+    #[test]
+    fn version_3_file_with_regular_and_mini_streams_still_parses() {
+        let bytes = write_cfb_fixture(&sample_message_streams(), FixtureGeometry::VERSION_3);
+
+        let email = parse_msg_bytes(&bytes, ParseOptions::default()).expect("version 3 parses");
+
+        assert_eq!(email.subject.as_deref(), Some("Version 4 subject"));
+        assert_eq!(email.body.text.as_deref(), Some(sample_body().trim()));
+        assert_eq!(email.attachments[0].size, sample_attachment().len());
     }
 
     #[test]
