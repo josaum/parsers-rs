@@ -7,6 +7,7 @@
 //! the cost of an open element does not depend on the size of its type.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use anyhow::Result;
 use quick_xml::escape::resolve_predefined_entity;
@@ -103,6 +104,7 @@ impl SchemaSet {
             opts,
             path: Vec::new(),
             type_stack: Vec::new(),
+            content_indexes: HashMap::new(),
         };
         ctx.validate_document(xml)?;
         Ok(ctx.errors)
@@ -138,6 +140,27 @@ struct ValidationContext<'m> {
     opts: ValidateOptions,
     path: Vec<String>,
     type_stack: Vec<TypeFrame<'m>>,
+    /// The index of each content model met so far, keyed by its address in
+    /// the schema model, which outlives the validation.
+    content_indexes: HashMap<*const ContentModel, Rc<ContentIndex<'m>>>,
+}
+
+/// What one content model declares, arranged for lookup by child name.
+///
+/// Built once per content model per validation, so that neither finding a
+/// child's type nor checking a closed element walks every particle of a type.
+struct ContentIndex<'m> {
+    /// The type of each child name that has a declaration here or in a nested
+    /// group, as the first declaration found in document order gives it.
+    /// `None` is a declared child whose type names nothing known.
+    child_types: HashMap<&'m str, Option<ResolvedType<'m>>>,
+    /// Positions of the direct particles declaring each child name.
+    by_name: HashMap<&'m str, Vec<usize>>,
+    /// Positions of the direct particles that are nested groups.
+    groups: Vec<usize>,
+    /// Positions checked for every element whatever children it has: nested
+    /// groups, and outside a choice the particles that are required.
+    always: Vec<usize>,
 }
 
 impl<'m> ValidationContext<'m> {
@@ -335,7 +358,7 @@ impl<'m> ValidationContext<'m> {
     }
 
     /// Resolve the XSD type for a child element given the current type stack.
-    fn resolve_child_type(&self, child_local: &str) -> Option<ResolvedType<'m>> {
+    fn resolve_child_type(&mut self, child_local: &str) -> Option<ResolvedType<'m>> {
         if let Some(parent) = self.type_stack.last() {
             let ResolvedType::Complex(parent_type) = parent.xsd_type? else {
                 return None;
@@ -350,37 +373,77 @@ impl<'m> ValidationContext<'m> {
 
     /// Find a child element type within a content model, descending into nested
     /// model groups (e.g. an `xs:choice` inside an `xs:sequence`).
-    ///
-    /// The recursion follows group nesting, which the parser bounds.
     fn find_child_in_content(
-        &self,
+        &mut self,
         content: &'m ContentModel,
         child_name: &str,
     ) -> Option<ResolvedType<'m>> {
-        let model = self.model;
-        let particles = match content {
-            ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
-            _ => return None,
+        let index = self.content_index(content);
+        index.child_types.get(child_name).copied().flatten()
+    }
+
+    /// The index of `content`, built on first use.
+    ///
+    /// The recursion follows group nesting, which the parser bounds.
+    fn content_index(&mut self, content: &'m ContentModel) -> Rc<ContentIndex<'m>> {
+        let key: *const ContentModel = content;
+        if let Some(index) = self.content_indexes.get(&key) {
+            return Rc::clone(index);
+        }
+        let mut index = ContentIndex {
+            child_types: HashMap::new(),
+            by_name: HashMap::new(),
+            groups: Vec::new(),
+            always: Vec::new(),
         };
-        for particle in particles {
-            match &particle.element {
-                ElementRef::Inline(decl) if decl.name.local == child_name => {
-                    return self.resolve_xsd_type(&decl.as_ref().type_def);
+        let (particles, is_choice): (&'m [_], bool) = match content {
+            ContentModel::Sequence(p) | ContentModel::All(p) => (p, false),
+            ContentModel::Choice(p) => (p, true),
+            ContentModel::SimpleContent(_) | ContentModel::Empty => (&[], false),
+        };
+        for (position, particle) in particles.iter().enumerate() {
+            let (name, occurrence) = match &particle.element {
+                ElementRef::Inline(decl) => {
+                    let resolved = self.resolve_xsd_type(&decl.type_def);
+                    index
+                        .child_types
+                        .entry(decl.name.local.as_str())
+                        .or_insert(resolved);
+                    (decl.name.local.as_str(), decl.occurrence)
                 }
-                ElementRef::Ref(qn) if qn.local == child_name => {
-                    if let Some(decl) = model.global_elements.get(&qn.local) {
-                        return self.resolve_xsd_type(&decl.type_def);
+                ElementRef::Ref(name) => {
+                    // A reference to an element that is not declared decides
+                    // nothing: a later declaration of the name still counts.
+                    if let Some(decl) = self.model.global_elements.get(&name.local) {
+                        let resolved = self.resolve_xsd_type(&decl.type_def);
+                        index
+                            .child_types
+                            .entry(name.local.as_str())
+                            .or_insert(resolved);
                     }
+                    (name.local.as_str(), particle.occurrence)
                 }
                 ElementRef::Group(group) => {
-                    if let Some(found) = self.find_child_in_content(group, child_name) {
-                        return Some(found);
+                    // Only a child the group gives a type to is taken from it.
+                    let inner = self.content_index(group);
+                    for (name, resolved) in &inner.child_types {
+                        if resolved.is_some() {
+                            index.child_types.entry(name).or_insert(*resolved);
+                        }
                     }
+                    index.groups.push(position);
+                    index.always.push(position);
+                    continue;
                 }
-                _ => {}
+            };
+            index.by_name.entry(name).or_default().push(position);
+            if !is_choice && occurrence.min >= 1 {
+                index.always.push(position);
             }
         }
-        None
+        let index = Rc::new(index);
+        self.content_indexes.insert(key, Rc::clone(&index));
+        index
     }
 
     /// Resolve a declared type to the definition it names, without copying it.
@@ -490,6 +553,11 @@ impl<'m> ValidationContext<'m> {
     /// The recursion follows group nesting, which the parser bounds. The walk
     /// stops as soon as the finding limit is reached, so a type with many
     /// required children costs at most that many findings.
+    ///
+    /// Only the particles that can produce a finding are visited, in
+    /// declaration order: the required ones, the nested groups, and those
+    /// naming a child the element has. A particle that is optional and absent
+    /// cannot be violated, so the cost follows the element, not its type.
     fn check_cardinality_for_content(
         &mut self,
         content: &'m ContentModel,
@@ -501,8 +569,18 @@ impl<'m> ValidationContext<'m> {
             _ => return,
         };
 
+        let index = self.content_index(content);
+        let mut positions = index.always.clone();
+        for name in child_counts.keys() {
+            if let Some(declared) = index.by_name.get(name.as_str()) {
+                positions.extend_from_slice(declared);
+            }
+        }
+        positions.sort_unstable();
+        positions.dedup();
+
         let mut branch_total = 0usize;
-        for particle in particles {
+        for particle in positions.into_iter().filter_map(|at| particles.get(at)) {
             if self.errors.len() >= self.opts.max_errors {
                 return;
             }
@@ -512,7 +590,7 @@ impl<'m> ValidationContext<'m> {
                 ElementRef::Inline(decl) => (decl.name.local.as_str(), decl.occurrence),
                 ElementRef::Ref(qn) => (qn.local.as_str(), particle.occurrence),
                 ElementRef::Group(group) => {
-                    let selected = group_branch_count(group, child_counts);
+                    let selected = self.group_branch_count(group, child_counts);
                     branch_total += selected;
                     if particle.occurrence.min >= 1 && selected == 0 {
                         self.push_error(
@@ -552,6 +630,34 @@ impl<'m> ValidationContext<'m> {
                 "choice requires exactly one branch, none present".to_string(),
             );
         }
+    }
+
+    /// Total instance occurrences across the branches of a model group, nested
+    /// groups included.
+    ///
+    /// Used to decide whether a (possibly required) `xs:choice` group selected
+    /// any branch. Counted from the children the element has, so the cost
+    /// does not grow with the number of branches.
+    fn group_branch_count(
+        &mut self,
+        content: &'m ContentModel,
+        child_counts: &HashMap<String, usize>,
+    ) -> usize {
+        let particles = match content {
+            ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
+            _ => return 0,
+        };
+        let index = self.content_index(content);
+        let mut total = child_counts.iter().fold(0usize, |total, (name, count)| {
+            let declared = index.by_name.get(name.as_str()).map_or(0, Vec::len);
+            total.saturating_add(count.saturating_mul(declared))
+        });
+        for particle in index.groups.iter().filter_map(|at| particles.get(*at)) {
+            if let ElementRef::Group(inner) = &particle.element {
+                total = total.saturating_add(self.group_branch_count(inner, child_counts));
+            }
+        }
+        total
     }
 
     /// Records a finding unless [`ValidateOptions::max_errors`] is reached.
@@ -653,24 +759,4 @@ fn enumeration_listing<'a>(values: impl ExactSizeIterator<Item = &'a str>) -> St
         listing.push_str(value);
     }
     listing
-}
-
-/// Total instance occurrences across every immediate branch of a model group.
-///
-/// Used to decide whether a (possibly required) `xs:choice` group selected any
-/// branch. Only direct branches are counted; deeper nesting is validated
-/// separately by recursion in the caller.
-fn group_branch_count(content: &ContentModel, child_counts: &HashMap<String, usize>) -> usize {
-    let particles = match content {
-        ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
-        _ => return 0,
-    };
-    particles
-        .iter()
-        .map(|particle| match &particle.element {
-            ElementRef::Inline(decl) => child_counts.get(&decl.name.local).copied().unwrap_or(0),
-            ElementRef::Ref(qn) => child_counts.get(&qn.local).copied().unwrap_or(0),
-            ElementRef::Group(inner) => group_branch_count(inner, child_counts),
-        })
-        .sum()
 }
