@@ -1,6 +1,6 @@
 {
   "name": "json-fast-node",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "High-performance SIMD JSON/JSONL parsing and JSON-family helpers with native Rust core",
   "main": "index.js",
   "types": "index.d.ts",

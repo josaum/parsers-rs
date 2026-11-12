@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "xlsx-fast-write"
-version = "0.2.0"
+version = "0.2.1"
 description = "Sovereign XLSX writer powered by Rust (no external deps)"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
