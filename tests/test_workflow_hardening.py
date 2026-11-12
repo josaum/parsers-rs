@@ -213,13 +213,12 @@ def assert_ci_needs_no_secret(ci: str) -> None:
 def assert_ci_exercises_release_paths(ci: str, release: str | None = None) -> None:
     release = read(RELEASE) if release is None else release
     blocks = required_jobs(ci, "rust-platforms", "python-bindings", "node-bindings")
-    # A job that reaches Windows names its shell: PowerShell, the default
-    # there, splits the comma-separated feature list into separate arguments.
-    for name, block in blocks.items():
-        if "windows-latest" in runner_labels(block):
-            assert "    defaults:\n      run:\n        shell: bash\n" in block, (
-                f"{name}: runs on Windows without `shell: bash` as its default"
-            )
+    # The binding jobs are bash scripts and also run on Windows, where the
+    # default shell is PowerShell.
+    for name in ("python-bindings", "node-bindings"):
+        assert "    defaults:\n      run:\n        shell: bash\n" in blocks[name], (
+            f"{name}: runs on Windows without `shell: bash` as its default"
+        )
 
     platforms = blocks["rust-platforms"]
     assert runner_labels(platforms) == {"macos-latest", "windows-latest"}
@@ -342,13 +341,13 @@ def assert_dependabot_contract(dependabot: str) -> None:
         r"^        update-types:\n          - minor\n          - patch$", group["body"], re.MULTILINE
     )
     assert "major" not in group["body"]
-    # The doctors refuse Arrow crates at different versions, so one pull
-    # request must carry all of them.
-    assert re.search(
-        r"^      arrow:\n        patterns:\n          - arrow\n          - arrow-\*$",
-        cargo,
-        re.MULTILINE,
-    )
+    # Nothing is carved out of it, by an exclusion or by a group listed before
+    # it (a dependency joins the first group that matches): an excluded crate
+    # would arrive on its own, and the doctors refuse Arrow crates that are not
+    # all at one version.
+    assert "exclude-patterns" not in group["body"]
+    groups = re.findall(r"^      ([A-Za-z][A-Za-z0-9_|-]*):$", cargo, re.MULTILINE)
+    assert groups[0] == "cargo-minor-and-patch"
 
 
 def workflow_id(path: Path) -> str:
@@ -515,7 +514,8 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_dependabot_contract, DEPENDABOT, "          - minor\n", ""),
         (assert_dependabot_contract, DEPENDABOT, "          - patch\n", "          - patch\n          - major\n"),
         (assert_dependabot_contract, DEPENDABOT, "      cargo-minor-and-patch:", "      everything:"),
-        (assert_dependabot_contract, DEPENDABOT, "      arrow:\n        patterns:\n          - arrow\n          - arrow-*\n", ""),
+        (assert_dependabot_contract, DEPENDABOT, "        update-types:\n", "        exclude-patterns:\n          - arrow-*\n        update-types:\n"),
+        (assert_dependabot_contract, DEPENDABOT, "      cargo-minor-and-patch:\n", "      arrow:\n        patterns:\n          - arrow-*\n      cargo-minor-and-patch:\n"),
     ],
 )
 def test_contracts_reject_regressions(contract, path: Path, original: str, replacement: str):

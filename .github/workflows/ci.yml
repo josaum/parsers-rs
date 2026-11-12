@@ -61,11 +61,6 @@ jobs:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-    # One shell on every runner: PowerShell, the default on Windows, splits an
-    # unquoted comma-separated argument such as a feature list.
-    defaults:
-      run:
-        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -85,6 +80,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # The steps below are bash scripts; the default shell on Windows is not.
     defaults:
       run:
         shell: bash

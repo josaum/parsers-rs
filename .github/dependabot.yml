@@ -11,19 +11,11 @@ updates:
       prefix: chore
       include: scope
     groups:
-      # The Arrow crates share one exact version (Cargo.toml pins them, and the
-      # repository doctors refuse a mismatch), so they only ever move together,
-      # in a pull request of their own, whatever the size of the step.
-      arrow:
-        patterns:
-          - arrow
-          - arrow-*
+      # One pull request for every minor and patch update. Crates that must
+      # share a version, like the Arrow ones, therefore move together.
       cargo-minor-and-patch:
         patterns:
           - "*"
-        exclude-patterns:
-          - arrow
-          - arrow-*
         update-types:
           - minor
           - patch
