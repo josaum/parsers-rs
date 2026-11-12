@@ -236,7 +236,8 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
 /// Returns [`GeoError::Io`] when the file cannot be opened,
 /// [`GeoError::Tiff`] or [`GeoError::InvalidFormat`] when it is not a TIFF
 /// the decoder can read, and [`GeoError::UnsupportedFormat`] for 64-bit
-/// integer samples.
+/// integer samples and for a raster of several bands stored as separate
+/// planes (`PlanarConfiguration` 2).
 pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, GeoError> {
     let file = std::fs::File::open(path.as_ref()).map_err(GeoError::Io)?;
     let mut decoder = open_decoder(BufReader::new(file))?;
@@ -245,6 +246,8 @@ pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, Geo
         .dimensions()
         .map_err(|e| GeoError::Tiff(e.to_string()))?;
     let n_pixels = pixel_count(width, height)?;
+    // Refuses the layout whose bands the decoder would not all return.
+    band_count(&mut decoder)?;
 
     let result = decoder
         .read_image()
@@ -255,10 +258,14 @@ pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, Geo
         DecodingResult::U8(data) => split_bands(&data, n_pixels, |v| f32::from(v) / 255.0),
         DecodingResult::U16(data) => split_bands(&data, n_pixels, |v| f32::from(v) / 65535.0),
         DecodingResult::F32(data) => {
-            // Single band float
-            Ok(vec![data])
+            if data.len() == n_pixels {
+                // One band: the decoded raster is the band.
+                Ok(vec![data])
+            } else {
+                split_bands(&data, n_pixels, |v| v)
+            }
         }
-        DecodingResult::F64(data) => Ok(vec![data.iter().map(|&v| v as f32).collect()]),
+        DecodingResult::F64(data) => split_bands(&data, n_pixels, |v| v as f32),
         // Signed and 32-bit samples keep their values: they are measurements
         // (an elevation in metres, a count), not intensities with a full
         // scale to normalise by.
@@ -270,6 +277,38 @@ pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, Geo
             "Unsupported pixel type in GeoTIFF: 64-bit integer samples".into(),
         )),
     }
+}
+
+/// TIFF `PlanarConfiguration` tag value for one plane of samples per band.
+///
+/// The other value, 1 and the default, interleaves the samples of a pixel.
+const PLANAR_CONFIGURATION_SEPARATE: u16 = 2;
+
+/// Number of bands the raster's samples will be split into.
+///
+/// This is the `SamplesPerPixel` tag, 1 when absent.
+///
+/// # Errors
+///
+/// Returns [`GeoError::UnsupportedFormat`] for a raster of more than one
+/// band stored a plane per band: the decoder reads the first plane only, and
+/// handing that back would drop the other bands without a word. Returns
+/// [`GeoError::Tiff`] when either tag cannot be read.
+fn band_count<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<usize, GeoError> {
+    let samples = decoder
+        .find_tag_unsigned::<u16>(Tag::SamplesPerPixel)
+        .map_err(|e| GeoError::Tiff(e.to_string()))?
+        .unwrap_or(1);
+    let planar_configuration = decoder
+        .find_tag_unsigned::<u16>(Tag::PlanarConfiguration)
+        .map_err(|e| GeoError::Tiff(e.to_string()))?;
+    if samples > 1 && planar_configuration == Some(PLANAR_CONFIGURATION_SEPARATE) {
+        return Err(GeoError::UnsupportedFormat(format!(
+            "GeoTIFF stores its {samples} bands as separate planes \
+             (PlanarConfiguration 2); only pixel-interleaved bands are read"
+        )));
+    }
+    Ok(usize::from(samples))
 }
 
 /// Opens a TIFF decoder whose allocation limits follow the size of the input.
@@ -1062,6 +1101,96 @@ mod tests {
         assert_eq!(
             bands_of(&raster::<colortype::Gray32>(2, 1, &[0u32, 3_000_000_000])).expect("u32"),
             vec![vec![0.0, 3_000_000_000.0]]
+        );
+    }
+
+    /// A three-band float raster came back as one "band" of all twelve
+    /// interleaved samples.
+    #[test]
+    fn multi_band_float_raster_is_split_into_its_bands() {
+        let pixels = [
+            1.0f32, 10.0, 100.0, 2.0, 20.0, 200.0, 3.0, 30.0, 300.0, 4.0, 40.0, 400.0,
+        ];
+        assert_eq!(
+            bands_of(&raster::<colortype::RGB32Float>(2, 2, &pixels)).expect("f32"),
+            vec![
+                vec![1.0, 2.0, 3.0, 4.0],
+                vec![10.0, 20.0, 30.0, 40.0],
+                vec![100.0, 200.0, 300.0, 400.0],
+            ]
+        );
+        let pixels = [1.0f64, 10.0, 100.0, 2.0, 20.0, 200.0];
+        assert_eq!(
+            bands_of(&raster::<colortype::RGB64Float>(2, 1, &pixels)).expect("f64"),
+            vec![vec![1.0, 2.0], vec![10.0, 20.0], vec![100.0, 200.0]]
+        );
+        // One band stays one band.
+        assert_eq!(
+            bands_of(&raster::<colortype::Gray32Float>(2, 1, &[0.5f32, -0.5])).expect("gray"),
+            vec![vec![0.5, -0.5]]
+        );
+    }
+
+    /// A 2×2 8-bit RGB TIFF stored one plane per band (`PlanarConfiguration`
+    /// 2): three strips of four samples. The encoder cannot write one.
+    fn planar_rgb() -> Vec<u8> {
+        const SHORT: u16 = 3;
+        const LONG: u16 = 4;
+        let mut file = Vec::new();
+        file.extend_from_slice(b"II");
+        file.extend_from_slice(&42u16.to_le_bytes());
+        file.extend_from_slice(&50u32.to_le_bytes()); // directory offset
+        file.extend_from_slice(&[1, 2, 3, 4, 10, 20, 30, 40, 100, 110, 120, 130]); // at 8
+        for bits in [8u16; 3] {
+            file.extend_from_slice(&bits.to_le_bytes()); // at 20
+        }
+        for strip_offset in [8u32, 12, 16] {
+            file.extend_from_slice(&strip_offset.to_le_bytes()); // at 26
+        }
+        for strip_bytes in [4u32; 3] {
+            file.extend_from_slice(&strip_bytes.to_le_bytes()); // at 38
+        }
+        // (tag, type, count, value or offset), in tag order.
+        let entries: [(u16, u16, u32, u32); 10] = [
+            (256, SHORT, 1, 2),  // ImageWidth
+            (257, SHORT, 1, 2),  // ImageLength
+            (258, SHORT, 3, 20), // BitsPerSample
+            (259, SHORT, 1, 1),  // Compression: none
+            (262, SHORT, 1, 2),  // PhotometricInterpretation: RGB
+            (273, LONG, 3, 26),  // StripOffsets
+            (277, SHORT, 1, 3),  // SamplesPerPixel
+            (278, SHORT, 1, 2),  // RowsPerStrip
+            (279, LONG, 3, 38),  // StripByteCounts
+            (284, SHORT, 1, 2),  // PlanarConfiguration: separate planes
+        ];
+        file.extend_from_slice(&10u16.to_le_bytes());
+        for (tag, field_type, count, value) in entries {
+            file.extend_from_slice(&tag.to_le_bytes());
+            file.extend_from_slice(&field_type.to_le_bytes());
+            file.extend_from_slice(&count.to_le_bytes());
+            file.extend_from_slice(&value.to_le_bytes());
+        }
+        file.extend_from_slice(&0u32.to_le_bytes()); // no next directory
+        file
+    }
+
+    /// Of a raster stored one plane per band the decoder reads the first
+    /// plane only, so a three-band raster came back as a single band with
+    /// nothing to say two were missing.
+    #[test]
+    fn planar_multi_band_raster_is_refused_not_cut_to_one_band() {
+        let bytes = planar_rgb();
+        // What the decoder hands back: the four samples of the first plane.
+        let decoded = open_decoder(Cursor::new(bytes.clone()))
+            .expect("decoder")
+            .read_image()
+            .expect("first plane");
+        assert!(matches!(decoded, DecodingResult::U8(plane) if plane == [1, 2, 3, 4]));
+
+        let error = bands_of(&bytes).expect_err("planar RGB");
+        assert!(
+            matches!(&error, GeoError::UnsupportedFormat(message) if message.contains("3 bands")),
+            "{error}"
         );
     }
 }
