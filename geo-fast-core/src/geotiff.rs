@@ -70,7 +70,14 @@ pub struct GeoTiffMetadata {
     pub height: u32,
     /// Number of bands (samples per pixel).
     pub band_count: u16,
-    /// Geographic bounding box (EPSG:4326 when projection is known).
+    /// Bounding box in degrees of longitude and latitude.
+    ///
+    /// Set only when the raster's CRS is geographic ([`Self::is_geographic`])
+    /// and its tags locate it. The corners of a projected raster are in the
+    /// units of its projection, usually metres; a [`BBox`] holds degrees and
+    /// nothing here reprojects, so for a projected raster this is `None`.
+    /// [`Self::upper_left`] and [`Self::lower_right`] give the corners in the
+    /// raster's own CRS either way.
     pub bbox: Option<BBox>,
     /// Pixel size in projection units (x, y).
     pub pixel_scale: Option<(f64, f64)>,
@@ -177,13 +184,20 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
         .unwrap_or(false);
 
     // ── Derive bounding box ─────────────────────────────────────────────────
-    let bbox = derive_bbox(
-        &tiepoints,
-        pixel_scale,
-        width,
-        height,
-        &transformation_matrix,
-    );
+    // A `BBox` is in degrees. Only a geographic raster has corners in
+    // degrees; a projected one would put metres in the longitude and
+    // latitude fields.
+    let bbox = if is_geographic {
+        derive_bbox(
+            &tiepoints,
+            pixel_scale,
+            width,
+            height,
+            &transformation_matrix,
+        )
+    } else {
+        None
+    };
 
     Ok(GeoTiffMetadata {
         width,
@@ -545,7 +559,134 @@ fn derive_bbox(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use tiff::encoder::{colortype, TiffEncoder};
+
     use super::*;
+
+    /// GeoKey directory of a raster in UTM zone 33N (EPSG:32633), projected.
+    const UTM_33N_KEYS: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32633];
+    /// GeoKey directory of a raster in WGS 84 (EPSG:4326), geographic.
+    const WGS84_KEYS: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326];
+
+    /// The georeferencing tags of a test GeoTIFF; `None` leaves a tag out.
+    #[derive(Default)]
+    struct GeoTags<'a> {
+        pixel_scale: Option<[f64; 3]>,
+        tiepoint: Option<[f64; 6]>,
+        transformation: Option<[f64; 16]>,
+        geokeys: Option<&'a [u16]>,
+    }
+
+    /// Encodes a `width`×`height` 8-bit gray GeoTIFF carrying `tags`.
+    fn geotiff(width: u32, height: u32, tags: &GeoTags<'_>) -> Vec<u8> {
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder
+                .new_image::<colortype::Gray8>(width, height)
+                .expect("image");
+            let directory = image.encoder();
+            if let Some(scale) = &tags.pixel_scale {
+                directory
+                    .write_tag(Tag::ModelPixelScaleTag, &scale[..])
+                    .expect("pixel scale");
+            }
+            if let Some(tiepoint) = &tags.tiepoint {
+                directory
+                    .write_tag(Tag::ModelTiepointTag, &tiepoint[..])
+                    .expect("tiepoint");
+            }
+            if let Some(matrix) = &tags.transformation {
+                directory
+                    .write_tag(Tag::ModelTransformationTag, &matrix[..])
+                    .expect("transformation");
+            }
+            if let Some(geokeys) = tags.geokeys {
+                directory
+                    .write_tag(Tag::GeoKeyDirectoryTag, geokeys)
+                    .expect("geokeys");
+            }
+            let pixels = vec![0u8; pixel_count(width, height).expect("pixel count")];
+            image.write_data(&pixels).expect("pixels");
+        }
+        file.into_inner()
+    }
+
+    fn metadata(bytes: Vec<u8>) -> GeoTiffMetadata {
+        parse_geotiff_metadata_reader(Cursor::new(bytes)).expect("GeoTIFF metadata")
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn assert_bbox(bbox: &BBox, min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) {
+        assert_close(bbox.min_lon, min_lon);
+        assert_close(bbox.min_lat, min_lat);
+        assert_close(bbox.max_lon, max_lon);
+        assert_close(bbox.max_lat, max_lat);
+    }
+
+    /// A UTM raster used to report `min_lon: 500000.0, min_lat: 4648276.0`:
+    /// metres in fields that hold degrees.
+    #[test]
+    fn projected_raster_has_no_degree_bbox() {
+        let projected = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([30.0, 30.0, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, 500_000.0, 4_649_776.0, 0.0]),
+                geokeys: Some(&UTM_33N_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        assert_eq!(projected.epsg_code, Some(32633));
+        assert!(!projected.is_geographic);
+        assert_eq!(projected.bbox, None);
+        // The corners are still available, in the projection's own units.
+        assert_eq!(projected.upper_left(), Some((500_000.0, 4_649_776.0)));
+        assert_eq!(projected.lower_right(), Some((503_000.0, 4_648_276.0)));
+    }
+
+    #[test]
+    fn geographic_raster_keeps_its_degree_bbox() {
+        let geographic = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                geokeys: Some(&WGS84_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        assert_eq!(geographic.epsg_code, Some(4326));
+        assert!(geographic.is_geographic);
+        let bbox = geographic.bbox.expect("bbox of a geographic raster");
+        assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
+    }
+
+    /// Without a GeoKey directory nothing says the coordinates are degrees.
+    #[test]
+    fn raster_without_a_model_type_has_no_degree_bbox() {
+        let untyped = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                ..GeoTags::default()
+            },
+        ));
+        assert!(!untyped.is_geographic);
+        assert_eq!(untyped.bbox, None);
+    }
 
     #[test]
     fn test_bbox_derives_from_tiepoint_scale() {
