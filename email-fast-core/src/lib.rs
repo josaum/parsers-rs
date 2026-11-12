@@ -495,6 +495,8 @@ pub fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
 }
 
 /// Parse mbox file (streaming)
+///
+/// Messages are split as [`parse_mbox_reader`] describes.
 pub fn parse_mbox(
     path: impl AsRef<Path>,
     options: ParseOptions,
@@ -510,6 +512,24 @@ pub fn parse_mbox(
 /// memory or receives it from a stream. `callback` runs once per message, in
 /// mailbox order; the return value is the number of messages delivered.
 ///
+/// # Message boundaries
+///
+/// A message starts at a separator line, which begins with `From `. Which
+/// later lines count as separators is decided once per mailbox, by its first
+/// `From ` line:
+///
+/// - If that line carries a date in `asctime` form
+///   (`From a@example.com Mon Jan 15 14:30:00 2024`, with or without a time
+///   zone), the mailbox is taken to be written that way throughout. Only
+///   lines with such a date start a message, so a body line such as
+///   `From now on, ...` stays in its message.
+/// - If it does not (no date, or a date in another form such as
+///   `From a@example.com Mon, 15 Jan 2024 14:30:00 +0000` or
+///   `From a@example.com 2024-01-15T14:30:00Z`), every line that begins with
+///   `From ` starts a message. A dated rule would find no second separator in
+///   such a mailbox and deliver all of it as one message; the price is that
+///   an unquoted body line beginning with `From ` splits its message.
+///
 /// # Errors
 ///
 /// Returns an error if the reader fails or `callback` returns one. A message
@@ -522,7 +542,8 @@ pub fn parse_mbox_reader(
 ) -> Result<usize> {
     let mut count = 0;
     let mut current_message: Vec<u8> = Vec::new();
-    let mut in_message = false;
+    // `None` until the mailbox's first separator has been read.
+    let mut separators: Option<SeparatorRule> = None;
 
     // Byte-wise line reads: real-world mbox corpora (e.g. 1990s corporate
     // mail) contain non-UTF-8 bytes, so `BufRead::lines` would abort the whole
@@ -542,10 +563,22 @@ pub fn parse_mbox_reader(
         }
 
         // A message starts at a "From " separator line. The first one of the
-        // mailbox is taken as written; after that the line must carry the
-        // separator's date, or body text beginning with the word "From"
-        // would cut the message in two.
-        if line.starts_with(b"From ") && (!in_message || is_mbox_separator(line)) {
+        // mailbox is taken as written and decides the rule for the rest:
+        // see `SeparatorRule`.
+        let starts_message = line.starts_with(b"From ")
+            && match separators {
+                None => {
+                    separators = Some(if is_mbox_separator(line) {
+                        SeparatorRule::Dated
+                    } else {
+                        SeparatorRule::AnyFromLine
+                    });
+                    true
+                }
+                Some(SeparatorRule::Dated) => is_mbox_separator(line),
+                Some(SeparatorRule::AnyFromLine) => true,
+            };
+        if starts_message {
             if !current_message.is_empty() {
                 // Parse previous message
                 if let Ok(email) = parse_eml_bytes(&current_message, options) {
@@ -554,11 +587,11 @@ pub fn parse_mbox_reader(
                 }
                 current_message.clear();
             }
-            in_message = true;
             continue;
         }
 
-        if in_message {
+        // Lines before the first separator belong to no message.
+        if separators.is_some() {
             if !current_message.is_empty() {
                 current_message.push(b'\n');
             }
@@ -577,9 +610,24 @@ pub fn parse_mbox_reader(
     Ok(count)
 }
 
-/// Reports whether `line` is an mbox message separator (a "From_ line").
+/// How one mailbox marks where its messages start.
 ///
-/// A separator is `From `, an envelope sender, and a date in `asctime` form:
+/// Chosen from the mailbox's first `From ` line and kept for the rest of it,
+/// because a mailbox is written by one tool in one form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeparatorRule {
+    /// Separators carry an `asctime` date ([`is_mbox_separator`]); a line
+    /// that begins with `From ` but has no such date is body text.
+    Dated,
+    /// The first separator had no `asctime` date, so no later one can be
+    /// told from body text by its date: every line that begins with `From `
+    /// starts a message.
+    AnyFromLine,
+}
+
+/// Reports whether `line` is a dated mbox message separator (a "From_ line").
+///
+/// A dated separator is `From `, an envelope sender, and a date in `asctime` form:
 /// weekday, month, day of month, time, and a four-digit year, with an
 /// optional time zone before or after the year. All of these are accepted:
 ///
@@ -592,7 +640,12 @@ pub fn parse_mbox_reader(
 ///
 /// The sender may be missing or contain spaces, so the date is looked for
 /// anywhere in the line's first few words. A body line such as
-/// `From now on, ...` has no such date and stays in its message.
+/// `From now on, ...` has no such date.
+///
+/// Separators in other forms are not recognized here: a date with a comma
+/// after the weekday or with no weekday, an ISO 8601 timestamp, a two-digit
+/// year, or no date at all. A mailbox whose first separator is one of those
+/// is split by [`SeparatorRule::AnyFromLine`] instead.
 fn is_mbox_separator(line: &[u8]) -> bool {
     /// Words examined after `From `. A separator is a sender plus at most
     /// seven date words; the rest of a long body line is not worth scanning.
@@ -2210,10 +2263,27 @@ mod malformed_input_unit_tests {
         }
     }
 
+    /// Parses `mailbox` and returns each message's subject and text body.
+    fn mbox_subjects_and_bodies(mailbox: &str) -> Vec<(String, String)> {
+        let mut messages = Vec::new();
+        parse_mbox_reader(mailbox.as_bytes(), ParseOptions::default(), |email| {
+            messages.push((
+                email.subject.unwrap_or_default(),
+                email.body.text.unwrap_or_default(),
+            ));
+            Ok(())
+        })
+        .expect("mailbox parses");
+        messages
+    }
+
     #[test]
     fn mbox_first_separator_needs_no_date() {
         // Some tools write a bare first line. With nothing before it there is
-        // no message for it to split, so it is accepted as written.
+        // no message for it to split, so it is accepted as written. It also
+        // puts the mailbox under the any-`From `-line rule, so `From then on.`
+        // is read as a separator: it ends message one and starts a message
+        // that has no content and is not delivered.
         let mut subjects = Vec::new();
         let count = parse_mbox_reader(
             &b"From sender\nSubject: one\n\nFrom then on.\n"[..],
@@ -2225,6 +2295,87 @@ mod malformed_input_unit_tests {
         )
         .unwrap();
         assert_eq!((count, subjects), (1, vec!["one".to_string()]));
+    }
+
+    /// A mailbox whose separators are not in `asctime` form used to be
+    /// delivered as one message: after the first separator only dated lines
+    /// split, and such a mailbox has none.
+    #[test]
+    fn mbox_without_asctime_separators_splits_at_every_from_line() {
+        for (first, second) in [
+            // RFC 5322 date, comma after the weekday.
+            (
+                "From a@example.com Mon, 15 Jan 2024 14:30:00 +0000",
+                "From b@example.com Tue, 16 Jan 2024 08:00:00 +0000",
+            ),
+            // No weekday.
+            (
+                "From a@example.com 15 Jan 2024 14:30:00 +0000",
+                "From b@example.com 16 Jan 2024 08:00:00 +0000",
+            ),
+            // ISO 8601 timestamp.
+            (
+                "From a@example.com 2024-01-15T14:30:00Z",
+                "From b@example.com 2024-01-16T08:00:00Z",
+            ),
+            // No date at all.
+            ("From a@example.com", "From b@example.com"),
+            ("From MAILER-DAEMON", "From MAILER-DAEMON"),
+        ] {
+            assert!(!is_mbox_separator(first.as_bytes()), "{first}");
+            let mailbox = format!(
+                "{first}\nSubject: one\n\nbody one\n\n{second}\nSubject: two\n\nbody two\n"
+            );
+            let messages = mbox_subjects_and_bodies(&mailbox);
+            let subjects: Vec<&str> = messages.iter().map(|(subject, _)| &**subject).collect();
+            assert_eq!(subjects, ["one", "two"], "{first}");
+            assert!(messages[0].1.contains("body one"), "{first}");
+            assert!(!messages[0].1.contains("Subject: two"), "{first}");
+            assert!(messages[1].1.contains("body two"), "{first}");
+        }
+    }
+
+    /// The rule is the mailbox's, not the line's: once the first separator
+    /// is dated, an undated `From ` line is body text, whatever it looks like.
+    #[test]
+    fn mbox_with_asctime_separators_keeps_undated_from_lines_in_the_body() {
+        let messages = mbox_subjects_and_bodies(concat!(
+            "From a@example.com Mon Jan 15 14:30:00 2024\n",
+            "Subject: one\n",
+            "\n",
+            "From now on, use the new address.\n",
+            "From b@example.com\n",
+            "From b@example.com Tue, 16 Jan 2024 08:00:00 +0000\n",
+            "\n",
+            "From c@example.com Wed Jan 17 09:00:00 2024\n",
+            "Subject: two\n",
+            "\n",
+            "body two\n",
+        ));
+        let subjects: Vec<&str> = messages.iter().map(|(subject, _)| &**subject).collect();
+        assert_eq!(subjects, ["one", "two"]);
+        for line in [
+            "From now on, use the new address.",
+            "From b@example.com",
+            "From b@example.com Tue, 16 Jan 2024 08:00:00 +0000",
+        ] {
+            assert!(messages[0].1.contains(line), "{line}: {:?}", messages[0].1);
+        }
+    }
+
+    /// Text before the first separator belongs to no message, under either
+    /// rule.
+    #[test]
+    fn mbox_lines_before_the_first_separator_are_dropped() {
+        for separator in [
+            "From a@example.com Mon Jan 15 14:30:00 2024",
+            "From a@example.com",
+        ] {
+            let mailbox = format!("stray line\n{separator}\nSubject: one\n\nbody one\n");
+            let messages = mbox_subjects_and_bodies(&mailbox);
+            assert_eq!(messages.len(), 1, "{separator}");
+            assert_eq!(messages[0].0, "one", "{separator}");
+        }
     }
 
     /// Depth of the tree `mailparse` built, measured without recursion.
