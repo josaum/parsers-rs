@@ -432,7 +432,9 @@ impl Loader {
         }
     }
 
-    fn finish(self) -> SchemaModel {
+    /// The loaded model, with every type reference settled.
+    fn finish(mut self) -> SchemaModel {
+        settle_unprefixed_builtin_names(&mut self.model);
         self.model
     }
 }
@@ -760,21 +762,112 @@ fn reference_particle(attrs: &HashMap<String, String>) -> Option<Particle> {
 ///
 /// A built-in type becomes a simple type; anything else stays a reference to
 /// be resolved against the named types of the schema set.
+///
+/// A name is resolved by its namespace. With a prefix bound to the XML Schema
+/// namespace, or without a prefix where XML Schema is the default namespace,
+/// a built-in name is the built-in. Without a prefix anywhere else, a name
+/// like `short` or `date` is the schema's own type if the schema set declares
+/// one, which is only known once every file is loaded: such a reference is
+/// marked with [`UNPREFIXED_BUILTIN_NAME`] and settled by
+/// [`settle_unprefixed_builtin_names`].
 fn declared_type(
     attrs: &HashMap<String, String>,
     ns_map: &HashMap<String, String>,
 ) -> Option<Box<XsdType>> {
     let type_attr = attrs.get("type")?;
-    let (_, type_local) = split_prefix(type_attr);
-    Some(Box::new(if is_xs_primitive(type_attr, ns_map) {
-        XsdType::Simple(SimpleTypeDef {
-            name: None,
-            kind: SimpleTypeKind::from_local(type_local),
-            facets: SimpleFacets::default(),
+    let (prefix, type_local) = split_prefix(type_attr);
+    let named_like_builtin = is_xs_primitive(type_attr, ns_map);
+    let xs_is_default = ns_map
+        .get("")
+        .is_some_and(|uri| XS_URIS.contains(&uri.as_str()));
+    Some(Box::new(if !named_like_builtin {
+        XsdType::Ref(QName::local(type_local))
+    } else if prefix.is_none() && !xs_is_default {
+        XsdType::Ref(QName {
+            namespace: Some(UNPREFIXED_BUILTIN_NAME.to_owned()),
+            local: type_local.to_owned(),
         })
     } else {
-        XsdType::Ref(QName::local(type_local))
+        builtin_type(type_local)
     }))
+}
+
+/// The built-in simple type called `local`, with no facets.
+fn builtin_type(local: &str) -> XsdType {
+    XsdType::Simple(SimpleTypeDef {
+        name: None,
+        kind: SimpleTypeKind::from_local(local),
+        facets: SimpleFacets::default(),
+    })
+}
+
+/// Marks a reference, while files are loading, as an unprefixed built-in name.
+///
+/// Stored in the reference's namespace, which the parser otherwise leaves
+/// unset. It is not a namespace: it starts with a NUL, which no namespace
+/// read from XML can hold, and no reference keeps it once
+/// [`settle_unprefixed_builtin_names`] has run.
+const UNPREFIXED_BUILTIN_NAME: &str = "\0unprefixed-builtin-name";
+
+/// Decides every reference marked with [`UNPREFIXED_BUILTIN_NAME`].
+///
+/// The reference becomes a plain reference to the schema set's own type of
+/// that name when there is one, declared earlier, later or in another file,
+/// and the built-in type otherwise. A schema set that declares no type named
+/// like a built-in therefore comes out exactly as if this pass did not exist.
+fn settle_unprefixed_builtin_names(model: &mut SchemaModel) {
+    let is_builtin_name =
+        |name: &&String| !matches!(SimpleTypeKind::from_local(name), SimpleTypeKind::Other(_));
+    let own: HashSet<String> = model
+        .simple_types
+        .keys()
+        .chain(model.complex_types.keys())
+        .filter(is_builtin_name)
+        .cloned()
+        .collect();
+    for element in model.global_elements.values_mut() {
+        settle_type(&mut element.type_def, &own);
+    }
+    for complex_type in model.complex_types.values_mut() {
+        settle_content(&mut complex_type.content, &own);
+    }
+}
+
+/// Settles one declared type, and the types declared inside it.
+///
+/// The recursion follows the nesting of the model, which the parser bounds.
+fn settle_type(declared: &mut XsdType, own: &HashSet<String>) {
+    let builtin = match declared {
+        XsdType::Ref(name) if name.namespace.as_deref() == Some(UNPREFIXED_BUILTIN_NAME) => {
+            name.namespace = None;
+            (!own.contains(&name.local)).then(|| builtin_type(&name.local))
+        }
+        XsdType::Complex(complex_type) => {
+            settle_content(&mut complex_type.content, own);
+            None
+        }
+        XsdType::Ref(_) | XsdType::Simple(_) => None,
+    };
+    if let Some(builtin) = builtin {
+        *declared = builtin;
+    }
+}
+
+/// Settles the types of the elements declared in one content model.
+fn settle_content(content: &mut ContentModel, own: &HashSet<String>) {
+    let (ContentModel::Sequence(particles)
+    | ContentModel::All(particles)
+    | ContentModel::Choice(particles)) = content
+    else {
+        return;
+    };
+    for particle in particles {
+        match &mut particle.element {
+            ElementRef::Inline(element) => settle_type(&mut element.type_def, own),
+            ElementRef::Group(group) => settle_content(group, own),
+            ElementRef::Ref(_) => {}
+        }
+    }
 }
 
 /// Appends the particle for a named `<xs:element>` whose type is `type_def`.
