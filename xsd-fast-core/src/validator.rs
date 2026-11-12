@@ -82,8 +82,9 @@ impl SchemaSet {
     /// from checking the document against the schema. A parse error raised
     /// while reading the document, such as a mismatched end tag, is always
     /// among the findings, as one more than the limit if the limit was already
-    /// reached. A document that merely ends with elements still open raises
-    /// no parse error and is not reported. A result at the limit may be
+    /// reached. A document that ends with elements still open is reported the
+    /// same way. A root element the schema does not declare is a finding too,
+    /// since nothing inside it can be checked. A result at the limit may be
     /// incomplete.
     ///
     /// # Errors
@@ -164,6 +165,7 @@ impl<'m> ValidationContext<'m> {
                         strip_prefix(raw).to_owned()
                     };
                     self.path.push(local.clone());
+                    self.report_undeclared_root(&local);
 
                     let xsd_type = self.resolve_child_type(&local);
 
@@ -184,6 +186,7 @@ impl<'m> ValidationContext<'m> {
                         strip_prefix(raw).to_owned()
                     };
                     self.path.push(local.clone());
+                    self.report_undeclared_root(&local);
 
                     let xsd_type = self.resolve_child_type(&local);
 
@@ -246,7 +249,10 @@ impl<'m> ValidationContext<'m> {
                         break true;
                     }
                 }
-                Ok(Event::Eof) => break false,
+                Ok(Event::Eof) => {
+                    self.report_open_elements();
+                    break false;
+                }
                 Err(e) => {
                     self.push_parse_error(&e);
                     break false;
@@ -279,7 +285,10 @@ impl<'m> ValidationContext<'m> {
                 Ok(Event::End(_)) => {
                     self.path.pop();
                 }
-                Ok(Event::Eof) => break,
+                Ok(Event::Eof) => {
+                    self.report_open_elements();
+                    break;
+                }
                 Err(e) => {
                     self.push_parse_error(&e);
                     break;
@@ -288,6 +297,41 @@ impl<'m> ValidationContext<'m> {
             }
             buf.clear();
         }
+    }
+
+    /// Reports a root element that the schema does not declare.
+    ///
+    /// Called for every element, with the element already on the path; only
+    /// an element with no open ancestor is a root. Nothing inside an
+    /// undeclared root can be checked, so without this finding the document
+    /// would be reported clean without having been validated at all.
+    fn report_undeclared_root(&mut self, local: &str) {
+        if self.type_stack.is_empty() && !self.model.global_elements.contains_key(local) {
+            self.push_error(
+                ValidationSeverity::Error,
+                format!("root element <{local}> is not declared in the schema"),
+            );
+        }
+    }
+
+    /// Reports a document that ended while elements were still open.
+    ///
+    /// The reader raises no error for this, but such a document is not
+    /// well-formed, so like a parse error it is reported whatever the limit.
+    /// The finding's path is the innermost element left open.
+    fn report_open_elements(&mut self) {
+        let Some(innermost) = self.path.last() else {
+            return;
+        };
+        let message = format!(
+            "XML parse error: document ends with <{innermost}> still open ({} unclosed)",
+            self.path.len()
+        );
+        self.errors.push(ValidationError {
+            severity: ValidationSeverity::Error,
+            path: self.current_path(),
+            message,
+        });
     }
 
     /// Resolve the XSD type for a child element given the current type stack.
