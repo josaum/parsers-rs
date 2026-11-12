@@ -239,11 +239,16 @@ pub struct TableCell {
 #[derive(Debug, Serialize)]
 pub struct Comment {
     /// Comment ID within the comments part.
+    ///
+    /// A legacy comment carries its own index. A modern (threaded) comment is
+    /// identified by a GUID, so its ID is its 1-based position in the part,
+    /// replies included.
     pub id: u32,
     /// Author name from the comment authors list, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
-    /// ISO 8601 timestamp of the comment, if present in the XML.
+    /// ISO 8601 timestamp of the comment, if present in the XML (`dt` on a
+    /// legacy comment, `created` on a modern one).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date: Option<String>,
     /// Comment text content.
@@ -370,6 +375,12 @@ const REL_NOTES_SLIDE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";
 const REL_COMMENTS: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+/// Threaded ("modern") comments, written by PowerPoint since 2021.
+const REL_MODERN_COMMENTS: &str =
+    "http://schemas.microsoft.com/office/2018/10/relationships/comments";
+/// The author list the modern comments refer to.
+const REL_MODERN_AUTHORS: &str =
+    "http://schemas.microsoft.com/office/2018/10/relationships/authors";
 const REL_IMAGE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 
 /// Parse a .pptx file and return a fully materialized [`PptxDocument`].
@@ -605,6 +616,8 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
 
     let mut slides = Vec::new();
     let mut comments = Vec::new();
+    // Read once, on the first slide that has modern comments.
+    let mut modern_authors: Option<HashMap<String, String>> = None;
     for (id, rid) in slide_ids {
         if let Some(target) = presentation_rels.by_id.get(&rid) {
             let slide_path = resolve_part(&part_dir(&presentation_path), target);
@@ -640,6 +653,38 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
                     {
                         let authors = parse_comment_authors(&archive, options.max_inflate)?;
                         let mut slide_comments = parse_comments(&xml, &authors)?;
+                        for comment in slide_comments.iter_mut() {
+                            comment.slide_id = id;
+                        }
+                        comments.extend(slide_comments);
+                    }
+                }
+                if let Some(comments_target) = slide_rels.by_type.get(REL_MODERN_COMMENTS) {
+                    let comments_path = resolve_part(&part_dir(&slide_path), comments_target);
+                    if let Some(xml) =
+                        read_optional_part_bytes(&archive, &comments_path, options.max_inflate)?
+                    {
+                        let authors = match modern_authors.as_ref() {
+                            Some(authors) => authors,
+                            None => {
+                                // The fallback is where PowerPoint puts the part.
+                                let authors_path = presentation_rels
+                                    .by_type
+                                    .get(REL_MODERN_AUTHORS)
+                                    .map_or_else(
+                                        || "ppt/authors.xml".to_string(),
+                                        |target| {
+                                            resolve_part(&part_dir(&presentation_path), target)
+                                        },
+                                    );
+                                modern_authors.insert(parse_modern_comment_authors(
+                                    &archive,
+                                    &authors_path,
+                                    options.max_inflate,
+                                )?)
+                            }
+                        };
+                        let mut slide_comments = parse_modern_comments(&xml, authors)?;
                         for comment in slide_comments.iter_mut() {
                             comment.slide_id = id;
                         }
@@ -1150,6 +1195,112 @@ fn parse_comments(xml: &[u8], authors: &HashMap<u32, String>) -> Result<Vec<Comm
                     }
                 }
             }
+            Ok(Event::Eof) => break,
+            Err(err) => return Err(anyhow!("parse comments: {err}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(comments)
+}
+
+/// Reads the modern author list: author GUID to display name.
+fn parse_modern_comment_authors(
+    archive: &PptxArchive,
+    path: &str,
+    max_inflate: usize,
+) -> Result<HashMap<String, String>> {
+    let Some(xml) = read_optional_part_bytes(archive, path, max_inflate)? else {
+        return Ok(HashMap::new());
+    };
+    let mut reader = xml_reader(Cursor::new(xml));
+    let mut buf = Vec::new();
+    let mut authors = HashMap::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if local_name(e.name().as_ref()) == b"author" {
+                    if let [Some(id), Some(name)] = attr_values(&reader, &e, [b"id", b"name"])? {
+                        authors.insert(id, name);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => return Err(anyhow!("parse comment authors: {err}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(authors)
+}
+
+/// Reads a modern (threaded) comments part.
+///
+/// A comment and each of its replies become one [`Comment`] each, the comment
+/// first and its replies after it. Modern comments are identified by GUID,
+/// which [`Comment::id`] cannot hold, so `id` is the 1-based position in the
+/// part. Paragraphs of one comment are joined by a line feed.
+fn parse_modern_comments(xml: &[u8], authors: &HashMap<String, String>) -> Result<Vec<Comment>> {
+    let mut reader = xml_reader(Cursor::new(xml));
+    let mut buf = Vec::new();
+    let mut comments: Vec<Comment> = Vec::new();
+    // Indexes into `comments` of the open comment and, inside it, the open
+    // reply; text belongs to the innermost.
+    let mut open: Vec<usize> = Vec::new();
+    let mut in_text = false;
+
+    loop {
+        let event = reader.read_event_into(&mut buf);
+        let self_closed = matches!(event, Ok(Event::Empty(_)));
+        match event {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local_name(e.name().as_ref()) {
+                b"cm" | b"reply" => {
+                    let [author_id, date] = attr_values(&reader, &e, [b"authorId", b"created"])?;
+                    let id = u32::try_from(comments.len() + 1).unwrap_or(u32::MAX);
+                    comments.push(Comment {
+                        id,
+                        author: author_id.and_then(|id| authors.get(&id).cloned()),
+                        date,
+                        text: None,
+                        slide_id: 0,
+                    });
+                    if !self_closed {
+                        open.push(comments.len() - 1);
+                    }
+                }
+                b"p" | b"br" => {
+                    // A second paragraph, or a break, starts a new line.
+                    let text = open
+                        .last()
+                        .and_then(|index| comments.get_mut(*index))
+                        .and_then(|comment| comment.text.as_mut());
+                    if let Some(text) = text {
+                        text.push('\n');
+                    }
+                }
+                b"t" => in_text = !self_closed,
+                _ => {}
+            },
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
+                if in_text {
+                    let comment = open.last().and_then(|index| comments.get_mut(*index));
+                    if let (Some(comment), Some(value)) = (comment, character_data(&event)) {
+                        comment
+                            .text
+                            .get_or_insert_with(String::new)
+                            .push_str(&value);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => match local_name(e.name().as_ref()) {
+                b"t" => in_text = false,
+                b"cm" | b"reply" => {
+                    in_text = false;
+                    open.pop();
+                }
+                _ => {}
+            },
             Ok(Event::Eof) => break,
             Err(err) => return Err(anyhow!("parse comments: {err}")),
             _ => {}

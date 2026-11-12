@@ -9,6 +9,8 @@ use zip::{CompressionMethod, ZipWriter};
 const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
 const A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const MODERN: &str = "http://schemas.microsoft.com/office/2018/10/relationships";
+const P188: &str = "http://schemas.microsoft.com/office/powerpoint/2018/8/main";
 const PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
 /// The parts of a one-slide deck. Every body is the inner XML of the part's
@@ -21,6 +23,8 @@ struct Deck {
     notes: Vec<u8>,
     /// Inner XML of `<p:cmLst>`.
     comments: Vec<u8>,
+    /// Inner XML of the modern comments part's `<p188:cmLst>`.
+    modern_comments: Vec<u8>,
     /// Whole `docProps/core.xml`.
     core: Vec<u8>,
     /// Whole `docProps/custom.xml`.
@@ -57,6 +61,11 @@ impl Deck {
             &self.comments,
             "</p:cmLst>",
         );
+        let modern_comments = wrap(
+            format!(r#"<p188:cmLst xmlns:p188="{P188}" xmlns:a="{A}">"#),
+            &self.modern_comments,
+            "</p188:cmLst>",
+        );
         let parts: Vec<(&str, Vec<u8>)> = vec![
             (
                 "_rels/.rels",
@@ -75,7 +84,7 @@ impl Deck {
             (
                 "ppt/_rels/presentation.xml.rels",
                 format!(
-                    r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/slide" Target="slides/slide1.xml"/></Relationships>"#
+                    r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/slide" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="{MODERN}/authors" Target="authors.xml"/></Relationships>"#
                 )
                 .into_bytes(),
             ),
@@ -83,7 +92,7 @@ impl Deck {
             (
                 "ppt/slides/_rels/slide1.xml.rels",
                 format!(
-                    r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/notesSlide" Target="../notesSlides/notesSlide1.xml"/><Relationship Id="rId2" Type="{REL}/comments" Target="../comments/comment1.xml"/></Relationships>"#
+                    r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/notesSlide" Target="../notesSlides/notesSlide1.xml"/><Relationship Id="rId2" Type="{REL}/comments" Target="../comments/comment1.xml"/><Relationship Id="rId3" Type="{MODERN}/comments" Target="../comments/modernComment_100_0.xml"/></Relationships>"#
                 )
                 .into_bytes(),
             ),
@@ -96,6 +105,14 @@ impl Deck {
                 )
                 .into_bytes(),
             ),
+            ("ppt/comments/modernComment_100_0.xml", modern_comments),
+            (
+                "ppt/authors.xml",
+                format!(
+                    r#"<p188:authorLst xmlns:p188="{P188}"><p188:author id="{{AAAA}}" name="Grace &amp; Co" initials="G" userId="u1" providerId="AD"/><p188:author id="{{BBBB}}" name="Linus" initials="L" userId="u2" providerId="AD"/></p188:authorLst>"#
+                )
+                .into_bytes(),
+            ),
             ("docProps/core.xml", self.core.clone()),
             ("docProps/custom.xml", self.custom.clone()),
         ];
@@ -103,7 +120,11 @@ impl Deck {
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         for (name, body) in parts {
-            if body.is_empty() && name.starts_with("docProps/") {
+            let optional = name.starts_with("docProps/") || name.contains("modernComment");
+            if optional
+                && (body.is_empty()
+                    || self.modern_comments.is_empty() && name.contains("modernComment"))
+            {
                 continue;
             }
             zip.start_file(name, options).unwrap();
@@ -239,6 +260,7 @@ fn cdata_text_is_kept_literally() {
         notes: shape("<a:p><a:r><a:t><![CDATA[x & y]]></a:t></a:r></a:p>").into_bytes(),
         comments: br#"<p:cm authorId="0" idx="1"><p:text><![CDATA[1 < 2]]></p:text></p:cm>"#
             .to_vec(),
+        modern_comments: Vec::new(),
         core: br#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title><![CDATA[R&D <plan>]]></dc:title></cp:coreProperties>"#.to_vec(),
         custom: br#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="x" pid="2" name="Client"><vt:lpwstr><![CDATA[A&B]]></vt:lpwstr></property></Properties>"#.to_vec(),
     };
@@ -442,4 +464,63 @@ fn an_empty_paragraph_is_a_paragraph_however_it_is_written() {
         assert_eq!(note_texts(&doc), expected, "notes, written as {empty}");
         assert!(doc.slides[0].shapes[1].paragraphs[0].runs.is_empty());
     }
+}
+
+#[test]
+fn modern_comments_are_read_with_author_date_and_replies() {
+    // PowerPoint's threaded comments live in their own part, behind their own
+    // relationship type, name authors by GUID and keep text in DrawingML.
+    let deck = Deck {
+        modern_comments: concat!(
+            r#"<p188:cm id="{1111}" authorId="{AAAA}" created="2024-05-06T07:08:09.123">"#,
+            r#"<pc:sldMkLst xmlns:pc="x"><pc:docMk/><pc:sldMk cId="1" sldId="256"/></pc:sldMkLst>"#,
+            r#"<p188:replyLst><p188:reply id="{2222}" authorId="{BBBB}" created="2024-05-07T00:00:00.000">"#,
+            "<p188:txBody><a:bodyPr/><a:p><a:r><a:t>Agreed &lt;mostly&gt;</a:t></a:r></a:p></p188:txBody></p188:reply></p188:replyLst>",
+            r#"<p188:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US"/><a:t>R&amp;D </a:t></a:r><a:r><a:t>first</a:t></a:r></a:p>"#,
+            "<a:p><a:r><a:t>second line</a:t></a:r></a:p></p188:txBody></p188:cm>",
+            r#"<p188:cm id="{3333}" authorId="{ZZZZ}" created="2024-05-08T00:00:00.000"/>"#,
+        )
+        .as_bytes()
+        .to_vec(),
+        // A legacy part on the same slide is still read, and comes first.
+        comments: br#"<p:cm authorId="0" idx="9"><p:text>old style</p:text></p:cm>"#.to_vec(),
+        ..Deck::default()
+    };
+    let doc = deck.parse();
+    let seen: Vec<_> = doc
+        .comments
+        .iter()
+        .map(|c| {
+            (
+                c.id,
+                c.slide_id,
+                c.author.as_deref(),
+                c.date.as_deref(),
+                c.text.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (9, 256, Some("Ada"), None, Some("old style")),
+            (
+                1,
+                256,
+                Some("Grace & Co"),
+                Some("2024-05-06T07:08:09.123"),
+                Some("R&D first\nsecond line")
+            ),
+            // A reply is a comment of its own, right after its parent.
+            (
+                2,
+                256,
+                Some("Linus"),
+                Some("2024-05-07T00:00:00.000"),
+                Some("Agreed <mostly>")
+            ),
+            // An unknown author and a comment without a body are still listed.
+            (3, 256, None, Some("2024-05-08T00:00:00.000"), None),
+        ]
+    );
 }
