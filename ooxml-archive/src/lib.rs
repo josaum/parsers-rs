@@ -154,11 +154,11 @@ impl OoxmlArchive {
     pub fn read_part(&self, name: &str, max_inflate: usize) -> Result<PartBytes<'_>> {
         let (meta, data) = self.part_data(name)?;
         self.with_inflate_budget(name, max_inflate, |remaining| match meta.compression {
-            CompressionMethod::Store => {
+            CompressionMethod::STORE => {
                 ensure_within_max(name, data.len(), remaining)?;
                 Ok((PartBytes::Borrowed(data), data.len()))
             }
-            CompressionMethod::Deflate => {
+            CompressionMethod::DEFLATE => {
                 let inflated = inflate_capped(name, data, remaining)?;
                 let inflated_len = inflated.len();
                 Ok((PartBytes::Owned(inflated), inflated_len))
@@ -180,11 +180,11 @@ impl OoxmlArchive {
     ) -> Result<PartReader<'_>> {
         let (meta, data) = self.part_data(name)?;
         self.with_inflate_budget(name, max_inflate, |remaining| match meta.compression {
-            CompressionMethod::Store => {
+            CompressionMethod::STORE => {
                 ensure_within_max(name, data.len(), remaining)?;
                 Ok((PartReader::Stored(Cursor::new(data)), data.len()))
             }
-            CompressionMethod::Deflate => {
+            CompressionMethod::DEFLATE => {
                 let inflated = inflate_capped(name, data, remaining)?;
                 let inflated_len = inflated.len();
                 Ok((PartReader::Owned(Cursor::new(inflated)), inflated_len))
