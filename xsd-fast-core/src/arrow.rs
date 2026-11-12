@@ -51,14 +51,23 @@ const MAX_FLATTEN_DEPTH: usize = 32;
 /// limit, to fit a 256 KiB stack in an unoptimized build.
 const MAX_DERIVATION_NESTING: usize = 64;
 
-/// Most steps one derivation may take: types visited plus fields emitted.
+/// Most walk steps one derivation may take before it is refused.
 ///
-/// A type with `n` children of its own type flattens to `n^max_depth`
-/// columns, so a schema of a few hundred bytes can ask for billions, and the
-/// walk costs that much even where it emits nothing. A derived schema holds
-/// at most one field per step; no consumer can materialize a table this
-/// wide, so a derivation that needs more steps is refused instead of run.
-const MAX_DERIVATION_STEPS: usize = 100_000;
+/// A step is one type visited or one field emitted. Fields that are later
+/// wrapped into a struct or a list are counted, and so are visits that emit
+/// nothing, so this bounds the work of a derivation and not the width of its
+/// result: the S1000D Issue 4.2 schemas cost about 3.4 steps per node of the
+/// derived schema, and a flat type costs two steps per column.
+///
+/// The bound exists because a type with `n` children of its own type
+/// flattens to `n^max_depth` columns, so a schema of a few hundred bytes can
+/// ask for billions of steps, and the walk costs that much even where it
+/// emits nothing. The largest element of S1000D Issue 4.2 needs about
+/// 112,000 steps; the limit is roughly nine times that. A derivation that
+/// reaches it has run for about a third of a second and holds under 100 MiB
+/// in an unoptimized build. Lowering the limit turns large published schemas
+/// into errors, so a new value needs the Arrow resource-limit tests rerun.
+const MAX_DERIVATION_STEPS: usize = 1_000_000;
 
 /// Options for Arrow schema derivation.
 #[derive(Debug, Clone)]
@@ -94,9 +103,9 @@ impl SchemaSet {
     /// # Errors
     ///
     /// Fails when `root_element` is not a global element, and with a
-    /// `resource_limit` error when flattening would take more than 100,000
-    /// steps (types visited plus fields emitted) or its model groups nest too
-    /// deeply to walk.
+    /// `resource_limit` error when flattening would take more than 1,000,000
+    /// walk steps (types visited plus fields emitted, wrapped ones included)
+    /// or its model groups nest too deeply to walk.
     pub fn to_arrow_schema(&self, root_element: &str, opts: ArrowOptions) -> Result<SchemaRef> {
         let decl = self
             .model
