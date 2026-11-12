@@ -408,3 +408,38 @@ fn notes_shapes_carry_their_placeholder_type() {
         .collect();
     assert_eq!(placeholders, [Some("body"), Some("sldNum")]);
 }
+
+#[test]
+fn an_empty_paragraph_is_a_paragraph_however_it_is_written() {
+    // Decision: an empty paragraph is kept. It is a blank line the author
+    // put there, and `<a:p/>` and `<a:p></a:p>` are the same XML, so both
+    // give one paragraph with no runs. A shape whose only paragraph is empty
+    // is therefore emitted too (an empty notes body, for example); a shape
+    // with no paragraph at all is not.
+    for empty in [
+        "<a:p/>",
+        "<a:p></a:p>",
+        "<a:p><a:endParaRPr lang=\"en-US\"/></a:p>",
+    ] {
+        let body = format!(
+            "{}{}<p:sp><p:txBody><a:bodyPr/></p:txBody></p:sp>",
+            shape(&format!(
+                "<a:p><a:r><a:t>a</a:t></a:r></a:p>{empty}<a:p><a:r><a:t>b</a:t></a:r></a:p>"
+            )),
+            shape(empty),
+        );
+        let deck = Deck {
+            slide: body.clone().into_bytes(),
+            notes: body.into_bytes(),
+            ..Deck::default()
+        };
+        let doc = deck.parse();
+        let expected = vec![
+            vec!["a".to_string(), String::new(), "b".to_string()],
+            vec![String::new()],
+        ];
+        assert_eq!(shape_texts(&doc), expected, "slide, written as {empty}");
+        assert_eq!(note_texts(&doc), expected, "notes, written as {empty}");
+        assert!(doc.slides[0].shapes[1].paragraphs[0].runs.is_empty());
+    }
+}
