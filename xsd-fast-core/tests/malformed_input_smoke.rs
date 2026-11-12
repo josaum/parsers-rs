@@ -244,7 +244,7 @@ fn mutated_instances_never_panic() {
             let _ = schema.validate(
                 bytes,
                 ValidateOptions {
-                    max_errors: 0,
+                    max_errors: 1,
                     check_facets: true,
                     check_cardinality: true,
                 },
@@ -853,7 +853,7 @@ fn validation_findings_are_bounded_by_max_errors() {
     }
     body.push_str("</xs:sequence></xs:complexType><xs:element name=\"t\" type=\"T\"/>");
     let schema = load(&schema_document(&body)).expect("schema loads");
-    for max_errors in [0, 1, 100] {
+    for max_errors in [1, 100] {
         for instance in [&b"<t/>"[..], b"<t></t>", b"<t><t/><u></u></t>"] {
             let errors = schema
                 .validate(

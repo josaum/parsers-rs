@@ -51,14 +51,23 @@ const MAX_FLATTEN_DEPTH: usize = 32;
 /// limit, to fit a 256 KiB stack in an unoptimized build.
 const MAX_DERIVATION_NESTING: usize = 64;
 
-/// Most steps one derivation may take: types visited plus fields emitted.
+/// Most walk steps one derivation may take before it is refused.
 ///
-/// A type with `n` children of its own type flattens to `n^max_depth`
-/// columns, so a schema of a few hundred bytes can ask for billions, and the
-/// walk costs that much even where it emits nothing. A derived schema holds
-/// at most one field per step; no consumer can materialize a table this
-/// wide, so a derivation that needs more steps is refused instead of run.
-const MAX_DERIVATION_STEPS: usize = 100_000;
+/// A step is one type visited or one field emitted. Fields that are later
+/// wrapped into a struct or a list are counted, and so are visits that emit
+/// nothing, so this bounds the work of a derivation and not the width of its
+/// result: the S1000D Issue 4.2 schemas cost about 3.4 steps per node of the
+/// derived schema, and a flat type costs two steps per column.
+///
+/// The bound exists because a type with `n` children of its own type
+/// flattens to `n^max_depth` columns, so a schema of a few hundred bytes can
+/// ask for billions of steps, and the walk costs that much even where it
+/// emits nothing. The largest element of S1000D Issue 4.2 needs about
+/// 112,000 steps; the limit is roughly nine times that. A derivation that
+/// reaches it has run for about a third of a second and holds under 100 MiB
+/// in an unoptimized build. Lowering the limit turns large published schemas
+/// into errors, so a new value needs the Arrow resource-limit tests rerun.
+const MAX_DERIVATION_STEPS: usize = 1_000_000;
 
 /// Options for Arrow schema derivation.
 #[derive(Debug, Clone)]
@@ -94,9 +103,9 @@ impl SchemaSet {
     /// # Errors
     ///
     /// Fails when `root_element` is not a global element, and with a
-    /// `resource_limit` error when flattening would take more than 100,000
-    /// steps (types visited plus fields emitted) or its model groups nest too
-    /// deeply to walk.
+    /// `resource_limit` error when flattening would take more than 1,000,000
+    /// walk steps (types visited plus fields emitted, wrapped ones included)
+    /// or its model groups nest too deeply to walk.
     pub fn to_arrow_schema(&self, root_element: &str, opts: ArrowOptions) -> Result<SchemaRef> {
         let decl = self
             .model
@@ -182,7 +191,13 @@ impl SchemaSet {
         Ok(())
     }
 
-    /// Derive Arrow schemas for **all** global elements. Returns `(element_name, schema)` pairs.
+    /// Derive Arrow schemas for the global elements that can be derived.
+    ///
+    /// Returns `(element_name, schema)` pairs in declaration order. An element
+    /// whose derivation fails, which happens when it exceeds a resource limit
+    /// (see [`SchemaSet::to_arrow_schema`]), is left out without a report, so
+    /// the result can hold fewer entries than the schema has global elements.
+    /// Use [`SchemaSet::try_all_arrow_schemas`] to learn of the failure.
     pub fn all_arrow_schemas(&self, opts: ArrowOptions) -> Vec<(String, SchemaRef)> {
         self.model
             .global_elements
@@ -191,6 +206,30 @@ impl SchemaSet {
                 self.to_arrow_schema(name, opts.clone())
                     .ok()
                     .map(|s| (name.clone(), s))
+            })
+            .collect()
+    }
+
+    /// Derive Arrow schemas for **all** global elements, or fail.
+    ///
+    /// Returns `(element_name, schema)` pairs in declaration order, one for
+    /// every global element.
+    ///
+    /// # Errors
+    ///
+    /// Fails on the first element whose derivation fails. The message is the
+    /// one [`SchemaSet::to_arrow_schema`] gives, so it still starts with
+    /// `resource_limit` for a resource limit, followed by the name of the
+    /// element. No partial result is returned.
+    pub fn try_all_arrow_schemas(&self, opts: ArrowOptions) -> Result<Vec<(String, SchemaRef)>> {
+        self.model
+            .global_elements
+            .keys()
+            .map(|name| {
+                let schema = self
+                    .to_arrow_schema(name, opts.clone())
+                    .map_err(|error| anyhow::anyhow!("{error:#} (element '{name}')"))?;
+                Ok((name.clone(), schema))
             })
             .collect()
     }

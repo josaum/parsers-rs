@@ -411,13 +411,23 @@ impl SchemaModel {
     /// malformed schema can never cause unbounded recursion.
     ///
     /// Folding copies each base into every type derived from it, so the model
-    /// can grow far beyond the schema text. The copies are capped: once the
-    /// cap is reached this method stops and leaves the remaining types
-    /// unfolded. [`SchemaSet`](crate::SchemaSet) loading reports that case as
-    /// an error instead.
+    /// can grow far beyond the schema text, and the copies are capped by a
+    /// budget. **When the budget runs out this method stops quietly**: it
+    /// returns as if it had finished and reports nothing. The derived types it
+    /// had not reached keep only their own particles and attributes, the type
+    /// it was folding may be folded at its top level but not inside its inline
+    /// types, and nothing in the model marks which types were folded.
+    /// Validation and Arrow derivation then treat the missing inherited
+    /// children as undeclared.
+    ///
+    /// The form that reports this is `try_resolve_inheritance`, which is
+    /// internal to this crate. [`SchemaSet::load`](crate::SchemaSet::load) and
+    /// [`SchemaSet::load_bytes`](crate::SchemaSet::load_bytes) call it and
+    /// return its `resource_limit` error, so load through [`SchemaSet`](crate::SchemaSet)
+    /// where that failure must be seen.
     pub fn resolve_inheritance(&mut self) {
         // The only failure is the copy budget, which this signature cannot
-        // report; the types folded so far are complete and stay folded.
+        // report. What was folded before it ran out stays folded.
         let _ = self.try_resolve_inheritance();
     }
 
@@ -427,8 +437,8 @@ impl SchemaModel {
     /// # Errors
     ///
     /// Returns a `resource_limit` error when inheritance would copy more
-    /// particles and attributes than the budget allows. The model is then
-    /// partially folded and should be discarded.
+    /// particles, attributes, enumeration values and text than the budget
+    /// allows. The model is then partially folded and should be discarded.
     pub(crate) fn try_resolve_inheritance(&mut self) -> anyhow::Result<()> {
         // Snapshot of the *local* (pre-resolution) named types. All base
         // chasing reads from this immutable view, which makes the pass
@@ -437,6 +447,7 @@ impl SchemaModel {
         let originals = self.complex_types.clone();
         let mut budget = InheritanceBudget {
             remaining: MAX_INHERITED_NODES,
+            uncharged_text_bytes: 0,
         };
 
         for (name, ct) in self.complex_types.iter_mut() {
@@ -446,64 +457,183 @@ impl SchemaModel {
     }
 }
 
-/// Most particles and attributes inheritance folding may copy in one schema set.
+/// Most that inheritance folding may copy in one schema set, in budget units.
+///
+/// A unit is one copied particle, attribute, enumeration value or
+/// simple-content type, or [`TEXT_BYTES_PER_NODE`] bytes of the text they
+/// own; see [`CopyCost`].
 ///
 /// Folding is eager: every derived type receives its own copy of each
 /// ancestor's content, and an inline type that extends a named type receives
 /// a copy that can itself hold inline extensions. A schema of a few kilobytes
 /// can therefore ask for billions of copies (six inline extensions of the
-/// enclosing type, folded sixteen levels deep, is 6^16). The largest public
-/// schema sets (NIEM, FpML, HL7 CDA) fold in the tens of thousands of copies;
-/// this cap is several times that, and holds the folded model to roughly
-/// 150 MiB in the worst case.
+/// enclosing type, folded sixteen levels deep, is 6^16), and a base holding
+/// one large enumeration is copied whole into every type derived from it.
+///
+/// The limit is a bound on memory. A schema set that spends all of it peaks
+/// at about 130 MiB of process memory when the copies are plain element
+/// particles, about 120 MiB for inline types with attributes, and about
+/// 70 MiB for long names or values (the three shapes measured, on a 64-bit
+/// build, loading included). Changing what a unit charges needs those
+/// measurements repeated.
 const MAX_INHERITED_NODES: usize = 1 << 18;
 
 /// Copies still allowed during one [`SchemaModel::try_resolve_inheritance`] pass.
 struct InheritanceBudget {
+    /// Budget units left.
     remaining: usize,
+    /// Copied text bytes not yet charged: always less than one unit's worth.
+    uncharged_text_bytes: usize,
 }
 
 impl InheritanceBudget {
-    fn charge(&mut self, nodes: usize) -> anyhow::Result<()> {
-        match self.remaining.checked_sub(nodes) {
+    /// Charges one copy: a unit per node, and a unit per
+    /// [`TEXT_BYTES_PER_NODE`] bytes of text summed over the whole pass.
+    fn charge(&mut self, cost: CopyCost) -> anyhow::Result<()> {
+        let text_bytes = self.uncharged_text_bytes.saturating_add(cost.text_bytes);
+        self.uncharged_text_bytes = text_bytes % TEXT_BYTES_PER_NODE;
+        let units = cost.nodes.saturating_add(text_bytes / TEXT_BYTES_PER_NODE);
+        match self.remaining.checked_sub(units) {
             Some(remaining) => {
                 self.remaining = remaining;
                 Ok(())
             }
             None => Err(anyhow::anyhow!(
                 "resource_limit: inherited_nodes: complexContent extensions copy more than \
-                 {MAX_INHERITED_NODES} particles and attributes"
+                 {MAX_INHERITED_NODES} particles, attributes and enumeration values"
             )),
         }
     }
 }
 
-/// Particles and attributes held by `particles`, nested inline types included.
+/// Bytes of copied text charged as one node.
 ///
-/// This is what one copy of the slice costs. The recursion follows the nesting
-/// of the model, which the parser bounds.
-fn node_count(particles: &[Particle]) -> usize {
-    particles
-        .iter()
-        .map(|particle| {
-            1 + match &particle.element {
-                ElementRef::Inline(decl) => match &decl.type_def {
-                    XsdType::Complex(inner) => {
-                        inner.attributes.len() + content_node_count(&inner.content)
-                    }
-                    XsdType::Simple(_) | XsdType::Ref(_) => 0,
-                },
-                ElementRef::Group(group) => content_node_count(group),
-                ElementRef::Ref(_) => 0,
-            }
-        })
-        .sum()
+/// Names, enumeration values and patterns are copied with the node that holds
+/// them and can be as long as the schema, so their bytes are charged too. A
+/// node that carries 30 to 50 bytes of names and type references is charged
+/// 10 to 20 percent more than a node alone.
+const TEXT_BYTES_PER_NODE: usize = 256;
+
+/// What copying some inherited content costs the [`InheritanceBudget`].
+#[derive(Debug, Clone, Copy, Default)]
+struct CopyCost {
+    /// Separately allocated values: particles, attributes, enumeration values
+    /// and simple-content types.
+    nodes: usize,
+    /// Bytes of text owned by those values.
+    text_bytes: usize,
 }
 
-fn content_node_count(content: &ContentModel) -> usize {
-    match content {
-        ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => node_count(p),
-        ContentModel::SimpleContent(_) | ContentModel::Empty => 0,
+impl CopyCost {
+    /// Cost of copying `particles`, nested inline types included.
+    ///
+    /// The recursion follows the nesting of the model.
+    fn of_particles(particles: &[Particle]) -> Self {
+        let mut cost = Self::default();
+        cost.add_particles(particles);
+        cost
+    }
+
+    /// Cost of copying `attributes`.
+    fn of_attributes(attributes: &[AttributeDecl]) -> Self {
+        let mut cost = Self::default();
+        cost.add_attributes(attributes);
+        cost
+    }
+
+    fn add_node(&mut self) {
+        self.nodes = self.nodes.saturating_add(1);
+    }
+
+    fn add_text(&mut self, text: &str) {
+        self.text_bytes = self.text_bytes.saturating_add(text.len());
+    }
+
+    fn add_optional_text(&mut self, text: Option<&String>) {
+        if let Some(text) = text {
+            self.add_text(text);
+        }
+    }
+
+    fn add_qname(&mut self, name: &QName) {
+        self.add_optional_text(name.namespace.as_ref());
+        self.add_text(&name.local);
+    }
+
+    /// A simple type costs its text and one node per enumeration value; the
+    /// node that holds the type is charged by the caller.
+    fn add_simple_type(&mut self, simple: &SimpleTypeDef) {
+        if let Some(name) = &simple.name {
+            self.add_qname(name);
+        }
+        if let SimpleTypeKind::Other(kind) = &simple.kind {
+            self.add_text(kind);
+        }
+        let facets = &simple.facets;
+        for value in &facets.enumerations {
+            self.add_node();
+            self.add_text(&value.value);
+            self.add_optional_text(value.documentation.as_ref());
+        }
+        for text in [
+            &facets.pattern,
+            &facets.min_inclusive,
+            &facets.max_inclusive,
+            &facets.min_exclusive,
+            &facets.max_exclusive,
+        ] {
+            self.add_optional_text(text.as_ref());
+        }
+    }
+
+    fn add_attributes(&mut self, attributes: &[AttributeDecl]) {
+        for attribute in attributes {
+            self.add_node();
+            self.add_text(&attribute.name);
+            self.add_optional_text(attribute.default.as_ref());
+            self.add_optional_text(attribute.fixed.as_ref());
+            self.add_simple_type(&attribute.type_def);
+        }
+    }
+
+    fn add_particles(&mut self, particles: &[Particle]) {
+        for particle in particles {
+            self.add_node();
+            match &particle.element {
+                ElementRef::Inline(decl) => {
+                    self.add_qname(&decl.name);
+                    self.add_optional_text(decl.documentation.as_ref());
+                    match &decl.type_def {
+                        XsdType::Simple(simple) => self.add_simple_type(simple),
+                        XsdType::Complex(inner) => self.add_complex_type(inner),
+                        XsdType::Ref(name) => self.add_qname(name),
+                    }
+                }
+                ElementRef::Group(group) => self.add_content(group),
+                ElementRef::Ref(name) => self.add_qname(name),
+            }
+        }
+    }
+
+    fn add_complex_type(&mut self, complex: &ComplexType) {
+        for name in complex.name.iter().chain(complex.base.iter()) {
+            self.add_qname(name);
+        }
+        self.add_attributes(&complex.attributes);
+        self.add_content(&complex.content);
+    }
+
+    fn add_content(&mut self, content: &ContentModel) {
+        match content {
+            ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => {
+                self.add_particles(p);
+            }
+            ContentModel::SimpleContent(simple) => {
+                self.add_node();
+                self.add_simple_type(simple);
+            }
+            ContentModel::Empty => {}
+        }
     }
 }
 
@@ -598,8 +728,8 @@ type Inherited = (Vec<Particle>, Vec<AttributeDecl>);
 /// chasing the base chain transitively. Returns `None` if the base is unknown
 /// or already on the current chain (cycle).
 ///
-/// Every particle and attribute copied here is charged to `budget` before the
-/// copy is made.
+/// Everything copied here is charged to `budget`, at its [`CopyCost`], before
+/// the copy is made.
 fn collect_base(
     base_local: &str,
     originals: &IndexMap<String, ComplexType>,
@@ -625,10 +755,10 @@ fn collect_base(
         }
     }
     if let ContentModel::Sequence(p) = &base.content {
-        budget.charge(node_count(p))?;
+        budget.charge(CopyCost::of_particles(p))?;
         particles.extend(p.iter().cloned());
     }
-    budget.charge(base.attributes.len())?;
+    budget.charge(CopyCost::of_attributes(&base.attributes))?;
     attrs.extend(base.attributes.iter().cloned());
 
     visited.pop();

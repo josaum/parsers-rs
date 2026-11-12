@@ -48,10 +48,12 @@ const MAX_NESTING_DEPTH: usize = 64;
 
 /// Deepest chain of `xs:include` / `xs:import` files followed from the root.
 ///
-/// Each followed file is parsed while its includer is still on the stack, so
-/// the chain length, unlike the file count in [`ParseOptions::max_includes`],
-/// costs stack. The deepest chains in published schema sets (GML, NIEM) are
-/// around fifteen files long.
+/// The root is not counted: a chain of the root and 32 files, each included
+/// by the one before, loads, and a 33rd is refused. Each followed file is
+/// parsed while its includer is still on the stack, so the chain length,
+/// unlike the file count in [`ParseOptions::max_includes`], costs stack. The
+/// deepest chains in published schema sets (GML, NIEM) are around fifteen
+/// files long.
 const MAX_INCLUDE_NESTING: usize = 32;
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -218,7 +220,7 @@ impl Loader {
         }
         if self.include_nesting > MAX_INCLUDE_NESTING {
             return Err(anyhow::anyhow!(
-                "resource_limit: schema_include_nesting: include chain is deeper than {MAX_INCLUDE_NESTING} files"
+                "resource_limit: schema_include_nesting: include chain is deeper than {MAX_INCLUDE_NESTING} files below the root schema"
             ));
         }
         let next_include_count = if is_include {
