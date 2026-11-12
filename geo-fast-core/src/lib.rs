@@ -64,6 +64,22 @@ pub mod types;
 #[cfg(feature = "http")]
 pub mod wms;
 
+/// Returns the character data of an XML text event with entities resolved.
+///
+/// Text that does not decode, or that holds an entity XML does not define,
+/// yields an empty string: the readers here treat it as an absent value.
+pub(crate) fn xml_text(event: &quick_xml::events::BytesText<'_>) -> String {
+    event
+        .decode()
+        .ok()
+        .and_then(|raw| {
+            quick_xml::escape::unescape(&raw)
+                .ok()
+                .map(std::borrow::Cow::into_owned)
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(feature = "http")]
 pub mod wfs;
 

@@ -10,7 +10,7 @@ use ooxml_archive::{
     REL_OFFICE_DOCUMENT,
 };
 use std::io::{Cursor, Read, Write};
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 #[global_allocator]
@@ -32,7 +32,7 @@ const ROOT_RELS: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 /// nested folder, and a part large enough to span several deflate blocks.
 fn seed_package(method: CompressionMethod) -> Vec<u8> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let options = FileOptions::default().compression_method(method);
+    let options = SimpleFileOptions::default().compression_method(method);
     let mut body = Vec::new();
     for index in 0..60 {
         body.extend_from_slice(format!("<w:p><w:r><w:t>line {index}</w:t></w:r></w:p>").as_bytes());
@@ -41,22 +41,23 @@ fn seed_package(method: CompressionMethod) -> Vec<u8> {
     zip.write_all(b"<Types/>").unwrap();
     zip.start_file("_rels/.rels", options).unwrap();
     zip.write_all(ROOT_RELS).unwrap();
-    zip.add_directory("word/", FileOptions::default()).unwrap();
+    zip.add_directory("word/", SimpleFileOptions::default())
+        .unwrap();
     zip.start_file("word/document.xml", options).unwrap();
     zip.write_all(&body).unwrap();
     zip.start_file(
         "word/_rels/document.xml.rels",
-        FileOptions::default().compression_method(CompressionMethod::Stored),
+        SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
     )
     .unwrap();
     zip.write_all(ROOT_RELS).unwrap();
     zip.start_file(
         "word/media/image1.png",
-        FileOptions::default().compression_method(CompressionMethod::Deflated),
+        SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
     )
     .unwrap();
     zip.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
-    zip.set_comment("smoke");
+    zip.set_comment("smoke").unwrap();
     zip.finish().unwrap().into_inner()
 }
 
@@ -170,7 +171,7 @@ fn deep_nesting_is_bounded_on_a_small_stack() {
 fn a_part_that_inflates_past_the_limit_is_cut_off_at_the_limit() {
     const LIMIT: usize = 64 * 1024;
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("word/document.xml", options).unwrap();
     let chunk = vec![0u8; 1024 * 1024];
     for _ in 0..48 {

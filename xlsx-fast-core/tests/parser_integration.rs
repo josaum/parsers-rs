@@ -2,7 +2,7 @@ use std::fs::File;
 use std::path::Path;
 use tempfile::tempdir;
 use xlsx_fast_core::{parse_xlsx, CellValue, ParseOptions};
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 #[cfg(feature = "arrow")]
@@ -12,13 +12,13 @@ use xlsx_fast_core::arrow::{
 };
 
 fn write_part(writer: &mut ZipWriter<File>, path: &str, contents: &str) {
-    let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     writer.start_file(path, options).unwrap();
     std::io::Write::write_all(writer, contents.as_bytes()).unwrap();
 }
 
 fn write_bytes_part(writer: &mut ZipWriter<File>, path: &str, contents: &[u8]) {
-    let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     writer.start_file(path, options).unwrap();
     std::io::Write::write_all(writer, contents).unwrap();
 }

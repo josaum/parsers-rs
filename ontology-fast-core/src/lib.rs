@@ -37,7 +37,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
-use oxrdfio::{RdfFormat, RdfParser};
+use oxttl::TurtleParser;
 use thiserror::Error;
 
 /// The RDF type IRI, rendered as Turtle's own `a` keyword.
@@ -46,7 +46,7 @@ pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 /// The XSD `string` datatype IRI (XML Schema Part 2 §3.2.1).
 ///
 /// RDF 1.2 Concepts §3.3 makes a simple literal and `"..."^^xsd:string` the
-/// same term, and `oxrdfio` reports both with this datatype. The term view
+/// same term, and `oxttl` reports both with this datatype. The term view
 /// maps it back to "no datatype", which is how the app's previous reader
 /// (rdflib) reports a simple literal. A source that writes `^^xsd:string`
 /// explicitly therefore reads as a simple literal here while rdflib keeps the
@@ -481,14 +481,15 @@ fn read_default_graph(
     // the document as a whole is checked here, for both views alike.
     std::str::from_utf8(source).map_err(|error| OntologyError::Syntax(error.to_string()))?;
     let mut blank_labels = BlankLabels::for_document(source);
-    let mut parser = RdfParser::from_format(RdfFormat::Turtle).for_slice(source);
-    // `by_ref`: the parser is read again after the last quad, for the prefixes
-    // it saw.
-    for quad in parser.by_ref() {
-        let quad = quad.map_err(|error| OntologyError::Syntax(error.to_string()))?;
-        if !matches!(quad.graph_name, GraphName::DefaultGraph) {
-            return Err(OntologyError::NamedGraph(quad.graph_name.to_string()));
-        }
+    let mut parser = TurtleParser::new().for_slice(source);
+    // `by_ref`: the parser is read again after the last triple, for the
+    // prefixes it saw.
+    for triple in parser.by_ref() {
+        // Turtle has no graph syntax, so every statement is in the default
+        // graph; `OntologyError::NamedGraph` stays for a future quad format.
+        let quad = triple
+            .map_err(|error| OntologyError::Syntax(error.to_string()))?
+            .in_graph(GraphName::DefaultGraph);
         visit(&quad, &mut blank_labels)?;
     }
     Ok(parser

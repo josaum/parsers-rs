@@ -1176,16 +1176,16 @@ fn record_batch_to_arrow_c_array_capsules<'py>(
     // Capsule destructors free the FFI structs. PyArrow's
     // `_import_from_c_capsule` moves ownership out and clears the release
     // callbacks before the capsules are GC'd, so the destructors become no-ops.
-    let schema_capsule = PyCapsule::new_with_destructor(
+    let schema_capsule = PyCapsule::new_with_value_and_destructor(
         py,
         ffi_schema,
-        Some(c"arrow_schema".to_owned()),
+        c"arrow_schema",
         |schema: FFI_ArrowSchema, _| drop(schema),
     )?;
-    let array_capsule = PyCapsule::new_with_destructor(
+    let array_capsule = PyCapsule::new_with_value_and_destructor(
         py,
         ffi_array,
-        Some(c"arrow_array".to_owned()),
+        c"arrow_array",
         |array: FFI_ArrowArray, _| drop(array),
     )?;
     Ok((schema_capsule, array_capsule))

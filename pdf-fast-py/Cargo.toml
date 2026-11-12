@@ -51,4 +51,4 @@ pdf-fast-core = { path = "../pdf-fast-core" }
 rayon = "1.10"
 
 [build-dependencies]
-pyo3-build-config = "0.28.3"
+pyo3-build-config = "0.29.3"

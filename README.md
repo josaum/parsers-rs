@@ -40,7 +40,7 @@ A crate belongs in `parsers-rs` when it provides a deterministic, side-effect-fr
 3. **Hardened Arrow Flight Services (`*-flight`)**:
    All six Arrow Flight services (`docx`, `xlsx`, `pptx`, `email`, `xsd`, `json`) are strictly read-only (`do_put` and mutating actions fail loud), require valid JWT bearer authorization before request parsing, reject symlinks during directory enumeration across both POSIX and Windows, prevent path traversal outside `--root`, and normalize Flight tickets to canonical `/` separators on every OS.
 4. **Pinned Arrow Wire Format**:
-   All workspace members share an exact Apache Arrow wire pin (`arrow = "=58.3.0"`, `arrow-array = "=58.3.0"`, `arrow-ipc = "=58.3.0"`, `arrow-schema = "=58.3.0"`, `arrow-flight = "=58.3.0"`), enforced by `.leio-code/rust-doctors`.
+   All workspace members share an exact Apache Arrow wire pin (`arrow = "=58.4.1"`, `arrow-array = "=58.4.1"`, `arrow-ipc = "=58.4.1"`, `arrow-schema = "=58.4.1"`, `arrow-flight = "=58.4.1"`), enforced by `.leio-code/rust-doctors`.
 
 ---
 

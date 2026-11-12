@@ -12,5 +12,7 @@ categories = ["parser-implementations"]
 
 [dependencies]
 oxrdf = { version = "0.3", features = ["rdf-12"] }
-oxrdfio = { version = "0.2.5", default-features = false, features = ["rdf-12"] }
+# The Turtle parser alone, not `oxrdfio`: that crate also links the RDF/XML and
+# JSON-LD readers, which this crate never calls.
+oxttl = { version = "0.2.5", default-features = false, features = ["rdf-12"] }
 thiserror = "2.0"

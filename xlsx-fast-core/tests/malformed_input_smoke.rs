@@ -7,7 +7,7 @@ mod smoke;
 
 use std::io::{Cursor, Write};
 use xlsx_fast_core::{parse_xlsx_bytes, parse_xlsx_to_writer, CellValue, ParseOptions};
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 #[global_allocator]
@@ -115,7 +115,7 @@ fn package(
     method: CompressionMethod,
 ) -> Vec<u8> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let options = FileOptions::default().compression_method(method);
+    let options = SimpleFileOptions::default().compression_method(method);
     for (name, body) in parts {
         let body = match replacement {
             Some((replaced, bytes)) if replaced == *name => bytes,

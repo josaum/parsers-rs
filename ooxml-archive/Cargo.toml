@@ -16,10 +16,10 @@ name = "ooxml_archive"
 anyhow = "1.0"
 flate2 = "1.0"
 memmap2 = "0.9"
-quick-xml = "0.36"
+quick-xml = "0.41"
 rawzip = "0.4.3"
 
 [dev-dependencies]
 proptest = "1.10"
 tempfile = "3.10"
-zip = "0.6"
+zip = { version = "9", default-features = false, features = ["deflate"] }
