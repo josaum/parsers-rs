@@ -30,6 +30,7 @@ const TAG_GEO_KEY_DIRECTORY: u16 = 34735;
 
 // GeoKey IDs
 const GEOKEY_MODEL_TYPE: u16 = 1024;
+const GEOKEY_RASTER_TYPE: u16 = 1025;
 const GEOKEY_GEOGRAPHIC_TYPE: u16 = 2048;
 const GEOKEY_PROJECTED_CS_TYPE: u16 = 3072;
 
@@ -38,6 +39,13 @@ const GEOKEY_PROJECTED_CS_TYPE: u16 = 3072;
 /// The GeoTIFF specification defines 1 = projected, 2 = geographic,
 /// 3 = geocentric.
 const MODEL_TYPE_GEOGRAPHIC: u32 = 2;
+
+/// `GTRasterTypeGeoKey` value for a raster whose coordinates name pixel
+/// centres (`RasterPixelIsPoint`).
+///
+/// The other value, 1 and the default, is `RasterPixelIsArea`: raster
+/// coordinates name pixel corners, (0, 0) being the raster's upper-left.
+const RASTER_PIXEL_IS_POINT: u32 = 2;
 
 /// TIFF `Compression` tag value for uncompressed data.
 const COMPRESSION_NONE: u16 = 1;
@@ -103,8 +111,26 @@ impl GeoTiffMetadata {
     /// coordinate back to pixel (0, 0). Returns `None` when there is no
     /// tiepoint, or when the tiepoint is not at the corner and there is no
     /// pixel scale to carry it there.
+    ///
+    /// The corner is the outer edge of the first pixel in either raster
+    /// type. In a [`Self::pixel_is_point`] raster the tiepoint ties a pixel
+    /// centre, so the corner lies half a pixel further out and is `None`
+    /// without a pixel scale.
     pub fn upper_left(&self) -> Option<(f64, f64)> {
-        tiepoint_origin(self.tiepoints.first()?, self.pixel_scale)
+        tiepoint_origin(
+            self.tiepoints.first()?,
+            self.pixel_scale,
+            self.pixel_is_point(),
+        )
+    }
+
+    /// Returns whether raster coordinates name pixel centres.
+    ///
+    /// True when `GTRasterTypeGeoKey` (1025) is 2, `RasterPixelIsPoint`.
+    /// Otherwise, and when the key is absent, the raster is `PixelIsArea`
+    /// and raster coordinates name pixel corners.
+    pub fn pixel_is_point(&self) -> bool {
+        is_pixel_is_point(&self.geokeys)
     }
 
     /// Returns the world coordinate of the raster's lower-right corner.
@@ -118,6 +144,10 @@ impl GeoTiffMetadata {
         let lr_y = world_y - sy * self.height as f64;
         Some((lr_x, lr_y))
     }
+}
+
+fn is_pixel_is_point(geokeys: &HashMap<u16, u32>) -> bool {
+    geokeys.get(&GEOKEY_RASTER_TYPE) == Some(&RASTER_PIXEL_IS_POINT)
 }
 
 /// Parse GeoTIFF metadata from a file path.
@@ -203,6 +233,7 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
             width,
             height,
             &transformation_matrix,
+            is_pixel_is_point(&geokeys),
         )
     } else {
         None
@@ -702,8 +733,21 @@ fn read_geokey_directory<R: Read + Seek>(
 /// world position (`X`, `Y`). World Y decreases as `J` grows. A tiepoint at
 /// the corner itself needs no scale; any other one cannot be carried to the
 /// corner without it.
-fn tiepoint_origin(tiepoint: &[f64; 6], pixel_scale: Option<(f64, f64)>) -> Option<(f64, f64)> {
+///
+/// With `pixel_is_point`, (`I`, `J`) is the centre of a pixel: half a pixel
+/// right of and below the corner that the same numbers name in a
+/// `PixelIsArea` raster.
+fn tiepoint_origin(
+    tiepoint: &[f64; 6],
+    pixel_scale: Option<(f64, f64)>,
+    pixel_is_point: bool,
+) -> Option<(f64, f64)> {
     let [i, j, _, x, y, _] = *tiepoint;
+    let (i, j) = if pixel_is_point {
+        (i + 0.5, j + 0.5)
+    } else {
+        (i, j)
+    };
     if i == 0.0 && j == 0.0 {
         return Some((x, y));
     }
@@ -717,6 +761,7 @@ fn derive_bbox(
     width: u32,
     height: u32,
     transform: &Option<[f64; 16]>,
+    pixel_is_point: bool,
 ) -> Option<BBox> {
     // Try transformation matrix first
     if let Some(m) = transform {
@@ -724,8 +769,11 @@ fn derive_bbox(
         //                        world_y = m[4]*px + m[5]*py + m[7]
         // The matrix may rotate or shear the raster, and then the extremes
         // are not at the upper-left and lower-right corners: take all four.
-        let (w, h) = (f64::from(width), f64::from(height));
-        let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)]
+        // In a PixelIsPoint raster the matrix maps pixel centres, so the
+        // outer edge starts half a pixel before (0, 0).
+        let edge = if pixel_is_point { -0.5 } else { 0.0 };
+        let (w, h) = (f64::from(width) + edge, f64::from(height) + edge);
+        let corners = [(edge, edge), (w, edge), (edge, h), (w, h)]
             .map(|(px, py)| (m[0] * px + m[1] * py + m[3], m[4] * px + m[5] * py + m[7]));
         let (first_x, first_y) = corners[0];
         let mut bbox = BBox::new(first_x, first_y, first_x, first_y);
@@ -740,7 +788,7 @@ fn derive_bbox(
 
     // Fall back to tiepoint + pixel scale
     let (sx, sy) = pixel_scale?;
-    let (ul_x, ul_y) = tiepoint_origin(tiepoints.first()?, pixel_scale)?;
+    let (ul_x, ul_y) = tiepoint_origin(tiepoints.first()?, pixel_scale, pixel_is_point)?;
     let lr_x = ul_x + sx * width as f64;
     let lr_y = ul_y - sy * height as f64;
 
@@ -896,9 +944,18 @@ mod tests {
     #[test]
     fn corner_of_an_off_origin_tiepoint_needs_the_pixel_scale() {
         let at_origin = [0.0, 0.0, 0.0, -48.0, -15.0, 0.0];
-        assert_eq!(tiepoint_origin(&at_origin, None), Some((-48.0, -15.0)));
+        assert_eq!(
+            tiepoint_origin(&at_origin, None, false),
+            Some((-48.0, -15.0))
+        );
         let off_origin = [50.0, 25.0, 0.0, -47.5, -15.25, 0.0];
-        assert_eq!(tiepoint_origin(&off_origin, None), None);
+        assert_eq!(tiepoint_origin(&off_origin, None, false), None);
+        // A pixel centre is never the corner: it needs the scale as well.
+        assert_eq!(tiepoint_origin(&at_origin, None, true), None);
+        assert_eq!(
+            tiepoint_origin(&at_origin, Some((0.5, 0.25)), true),
+            Some((-48.25, -14.875))
+        );
     }
 
     /// A 4×4 `ModelTransformation` that scales by `scale` and rotates by
@@ -919,7 +976,7 @@ mod tests {
     fn rotated_transformation_bbox_covers_all_four_corners() {
         let matrix = rotation(30.0, 10.0, 500_000.0, 4_649_776.0);
         let (c, s) = (matrix[0], matrix[1]);
-        let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix)).expect("bbox");
+        let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix), false).expect("bbox");
         // Corners: UL (0, 0), UR (100, 0), LL (0, 50), LR (100, 50).
         assert_bbox(
             &bbox,
@@ -958,7 +1015,7 @@ mod tests {
     #[test]
     fn unrotated_transformation_bbox_is_unchanged() {
         let matrix = rotation(0.0, 0.01, -48.0, -15.0);
-        let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix)).expect("bbox");
+        let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix), false).expect("bbox");
         assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
     }
 
@@ -1103,7 +1160,7 @@ mod tests {
     #[test]
     fn test_bbox_derives_from_tiepoint_scale() {
         let tiepoints = vec![[0.0, 0.0, 0.0, -45.0, -10.0, 0.0]];
-        let bbox = derive_bbox(&tiepoints, Some((0.001, 0.001)), 1000, 1000, &None).unwrap();
+        let bbox = derive_bbox(&tiepoints, Some((0.001, 0.001)), 1000, 1000, &None, false).unwrap();
         assert!((bbox.min_lon - (-45.0)).abs() < 1e-9);
         assert!((bbox.max_lon - (-44.0)).abs() < 1e-9);
         assert!((bbox.min_lat - (-11.0)).abs() < 1e-9);
@@ -1287,5 +1344,61 @@ mod tests {
         assert!(check_band_bytes(8_192, 8_192, 3, limit).is_err());
         // Dimensions whose product overflows are refused, not wrapped.
         assert!(check_band_bytes(u32::MAX, u32::MAX, u16::MAX, usize::MAX).is_err());
+    }
+
+    /// GeoKey directory of a WGS 84 raster whose raster coordinates name
+    /// pixel centres (`GTRasterTypeGeoKey` = 2, `RasterPixelIsPoint`).
+    const WGS84_POINT_KEYS: [u16; 16] =
+        [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 2, 2048, 0, 1, 4326];
+
+    /// In a `PixelIsPoint` raster the tiepoint ties the centre of its pixel,
+    /// not that pixel's corner, so the raster reaches half a pixel further
+    /// up and left. The raster type was not looked at: the box and both
+    /// corners were half a pixel off, here -48.0 where the edge is -48.005.
+    #[test]
+    fn pixel_is_point_raster_extends_half_a_pixel_past_its_tiepoint() {
+        let tags = |geokeys| GeoTags {
+            pixel_scale: Some([0.01, 0.01, 0.0]),
+            tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+            geokeys: Some(geokeys),
+            ..GeoTags::default()
+        };
+
+        let area = metadata(geotiff(100, 50, &tags(&WGS84_KEYS)));
+        assert_eq!(area.upper_left(), Some((-48.0, -15.0)));
+        let bbox = area.bbox.expect("bbox of an area raster");
+        assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
+
+        let point = metadata(geotiff(100, 50, &tags(&WGS84_POINT_KEYS)));
+        let (ul_x, ul_y) = point.upper_left().expect("upper left");
+        let (lr_x, lr_y) = point.lower_right().expect("lower right");
+        assert_close(ul_x, -48.005);
+        assert_close(ul_y, -14.995);
+        assert_close(lr_x, -47.005);
+        assert_close(lr_y, -15.495);
+        let bbox = point.bbox.expect("bbox of a point raster");
+        assert_bbox(&bbox, -48.005, -15.495, -47.005, -14.995);
+        assert!(point.pixel_is_point());
+        assert!(!area.pixel_is_point());
+    }
+
+    /// The same half pixel applies when a matrix locates the raster.
+    #[test]
+    fn pixel_is_point_shifts_a_transformation_matrix_bbox_too() {
+        let tags = |geokeys| GeoTags {
+            transformation: Some(rotation(0.0, 0.01, -48.0, -15.0)),
+            geokeys: Some(geokeys),
+            ..GeoTags::default()
+        };
+        let area = metadata(geotiff(100, 50, &tags(&WGS84_KEYS)));
+        assert_bbox(&area.bbox.expect("area"), -48.0, -15.5, -47.0, -15.0);
+        let point = metadata(geotiff(100, 50, &tags(&WGS84_POINT_KEYS)));
+        assert_bbox(
+            &point.bbox.expect("point"),
+            -48.005,
+            -15.495,
+            -47.005,
+            -14.995,
+        );
     }
 }
