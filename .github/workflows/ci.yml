@@ -1,8 +1,11 @@
 # Every push and pull request: the workspace must format, lint clean and pass.
 # This is the gate a consumer relies on when it pins a commit of this repository.
 #
-# release.yml calls this file as its `verify` job, so every job here also runs
-# before a release builds. Two consequences bind every job below:
+# release.yml calls this file as its `verify` job, so the jobs here also run
+# before a release builds. The one exception is spelled out at `workflow_call`
+# below: the release asks this file to leave out `python-bindings` and
+# `node-bindings`, because its own `wheels` and `node` jobs build the same
+# artifacts. Two consequences bind every job below:
 #   - GitHub-hosted runners only. Pull requests from forks run this file, and a
 #     fork's code must never execute on a machine the project owns.
 #   - No secrets and a read-only token. Nothing here publishes anything.
@@ -15,6 +18,15 @@ on:
     branches: [main]
   pull_request:
   workflow_call:
+    inputs:
+      # Set only by release.yml. A push or a pull request has no inputs at all,
+      # so the two jobs that read this must treat an absent value as "run":
+      # their condition is `!= true`, never `== false`.
+      skip_binding_jobs:
+        description: Leave out python-bindings and node-bindings; the caller builds the wheels and Node packages itself.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -79,6 +91,11 @@ jobs:
     # Build, install and test the Python bindings the way a release does, so a
     # binding that only fails as a wheel fails on the pull request and not on
     # the tag. The tool versions are the ones release.yml pins.
+    #
+    # Left out only when release.yml calls this file with `skip_binding_jobs`:
+    # its `wheels` job builds every wheel again. On a push or a pull request
+    # the input does not exist and this job runs.
+    if: ${{ inputs.skip_binding_jobs != true }}
     strategy:
       fail-fast: false
       matrix:
@@ -123,6 +140,10 @@ jobs:
   node-bindings:
     # Build every Node-API binding, load each one and pack its tarball, as a
     # release does.
+    #
+    # Left out only when release.yml calls this file with `skip_binding_jobs`:
+    # its `node` job builds, loads and packs every binding again.
+    if: ${{ inputs.skip_binding_jobs != true }}
     strategy:
       fail-fast: false
       matrix:

@@ -31,13 +31,21 @@ env:
 
 jobs:
   verify:
-    # The whole of ci.yml, on hosted runners. A called workflow can narrow the
-    # token this job passes it but never widen it, so it is read-only here and
-    # again in ci.yml. A job that calls a workflow cannot carry a timeout;
-    # each job in ci.yml has its own.
+    # ci.yml on hosted runners, without its `python-bindings` and
+    # `node-bindings` jobs: `wheels` and `node` below build the same wheels and
+    # Node packages for the release targets, and running both made a release
+    # wait about twice as long. Every other job in ci.yml still gates the
+    # release. What this leaves out of a release run: `wheels` installs and
+    # tests the wheels only on aarch64 Linux, so the wheel tests on the other
+    # systems are the ones ci.yml ran when the commit was pushed or reviewed.
+    # A called workflow can narrow the token this job passes it but
+    # never widen it, so it is read-only here and again in ci.yml. A job that
+    # calls a workflow cannot carry a timeout; each job in ci.yml has its own.
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+    with:
+      skip_binding_jobs: true
 
   wheels:
     needs: verify

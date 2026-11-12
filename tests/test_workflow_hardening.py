@@ -28,6 +28,13 @@ WRITERS = {"release.yml": {"manifest": {"contents": "write"}}}
 # Actions that publish no version tags: the comment names the branch whose
 # history holds the pinned commit.
 BRANCH_PINNED = {"dtolnay/rust-toolchain": "master"}
+# The only ci.yml jobs that may be skipped, each mapped to the release.yml job
+# that does the same work again. They are skipped only when release.yml calls
+# ci.yml with SKIP_INPUT set; a push or a pull request has no inputs, and the
+# condition must read an absent input as "run".
+REBUILT_BY_RELEASE = {"python-bindings": "wheels", "node-bindings": "node"}
+SKIP_INPUT = "skip_binding_jobs"
+SKIP_CONDITION = "${{ inputs.skip_binding_jobs != true }}"
 
 USES = re.compile(r"^\s*(?:- )?uses:[ ]+(?P<ref>\S+)(?P<rest>.*)$")
 PINNED = re.compile(
@@ -271,9 +278,51 @@ def assert_ci_exercises_release_paths(ci: str, release: str | None = None) -> No
     assert ci_tools.groups() == release_tools.groups() == ("10", '"24"')
 
 
+def assert_ci_skips_only_what_the_release_rebuilds(ci: str) -> None:
+    """No ci.yml job can be skipped, except the two binding jobs by the release."""
+    triggers = top_level(ci, "on") or ""
+    assert re.search(r"^  workflow_call:$", triggers, re.MULTILINE)
+    # `inputs` is one context for workflow_call and workflow_dispatch: a manual
+    # trigger declaring the same name could skip the jobs outside a release.
+    assert set(re.findall(r"^  ([A-Za-z_]+):", triggers, re.MULTILINE)) == {
+        "push",
+        "pull_request",
+        "workflow_call",
+    }, "ci.yml runs on push, on pull requests and when called; nothing else may set an input"
+    declared = re.search(
+        r"^  workflow_call:\n    inputs:\n(?P<body>(?:      [^\n]*\n)+)", triggers, re.MULTILINE
+    )
+    assert declared is not None, "ci.yml declares no workflow_call inputs"
+    names = re.findall(r"^      (\S+):[ ]*$", declared["body"], re.MULTILINE)
+    assert names == [SKIP_INPUT], f"ci.yml may take exactly one input, {SKIP_INPUT}"
+    spec = mapping(declared["body"], SKIP_INPUT, 6)
+    assert spec is not None
+    assert set(spec) == {"description", "type", "required", "default"}
+    # Absent means "run": a caller that says nothing skips nothing.
+    assert (spec["type"], spec["required"], spec["default"]) == ("boolean", "false", "false")
+
+    blocks = required_jobs(ci, *REBUILT_BY_RELEASE)
+    for name, block in blocks.items():
+        condition = job_value(block, "if")
+        if name in REBUILT_BY_RELEASE:
+            # `!= true` holds for false and for the empty value a push or a
+            # pull request sees; `== false` or a bare negation is not accepted.
+            assert condition == SKIP_CONDITION, (
+                f"ci.yml job {name} must run unless the release sets {SKIP_INPUT}"
+            )
+        else:
+            assert condition is None, f"ci.yml job {name} can be skipped"
+        # A job that is allowed to fail would let a release through.
+        assert "continue-on-error" not in block, f"ci.yml job {name} can fail silently"
+    # Nothing is skipped in a spelling the loop above cannot read (a step-level
+    # `if`, another indentation), and the input steers nothing else.
+    body = code(ci)
+    assert len(re.findall(r"^\s*(?:- )?if:", body, re.MULTILINE)) == len(REBUILT_BY_RELEASE)
+    assert body.count("inputs.") == len(REBUILT_BY_RELEASE)
+
+
 def assert_release_waits_for_ci(release: str, ci: str | None = None) -> None:
     ci = read(CI) if ci is None else ci
-    assert re.search(r"^  workflow_call:$", top_level(ci, "on") or "", re.MULTILINE)
     blocks = required_jobs(release, "verify", "wheels", "node", "manifest")
     verify = blocks["verify"]
     assert job_value(verify, "uses") == "./.github/workflows/ci.yml"
@@ -281,10 +330,22 @@ def assert_release_waits_for_ci(release: str, ci: str | None = None) -> None:
     assert job_value(blocks["wheels"], "needs") == "verify"
     assert job_value(blocks["node"], "needs") == "verify"
     assert job_value(blocks["manifest"], "needs") == "[wheels, node]"
-    # A job that is skipped or allowed to fail would let a release through.
-    for name, block in jobs(ci).items():
-        assert job_value(block, "if") is None, f"ci.yml job {name} can be skipped"
-        assert "continue-on-error" not in block, f"ci.yml job {name} can fail silently"
+    assert_ci_skips_only_what_the_release_rebuilds(ci)
+    # The release leaves the two binding jobs out of the gate, and only those:
+    # it passes the one input ci.yml takes and nothing else.
+    assert mapping(verify, "with", 4) == {SKIP_INPUT: "true"}
+    # A skipped job is acceptable only while the release job that replaces it
+    # still does the work, and while the release cannot finish without it.
+    assert set(REBUILT_BY_RELEASE.values()) == {"wheels", "node"}
+    for job in REBUILT_BY_RELEASE.values():
+        assert job_value(blocks[job], "if") is None, f"release job {job} can be skipped"
+        assert "continue-on-error" not in blocks[job], f"release job {job} can fail silently"
+    assert blocks["wheels"].count("maturin build --release --locked") == 2
+    assert blocks["wheels"].count("for crate in $BINDINGS") == 2
+    node = blocks["node"]
+    assert 'scripts/build-node.sh "${node_bindings[@]}"' in node
+    assert "        run: node scripts/smoke-node.mjs\n" in node
+    assert "pnpm pack --pack-destination ../dist-node" in node
 
 
 def assert_audit_contract(audit: str) -> None:
@@ -414,8 +475,12 @@ def test_ci_exercises_what_a_release_builds():
     assert_ci_exercises_release_paths(read(CI))
 
 
-def test_release_waits_for_every_ci_job():
+def test_release_waits_for_every_ci_job_it_does_not_repeat():
     assert_release_waits_for_ci(read(RELEASE))
+
+
+def test_ci_skips_nothing_on_a_push_or_a_pull_request():
+    assert_ci_skips_only_what_the_release_rebuilds(read(CI))
 
 
 def test_audit_scans_the_lockfile_and_ignores_nothing():
@@ -511,6 +576,36 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_release_waits_for_ci, RELEASE, "  node:\n    needs: verify\n", "  node:\n    needs: []\n"),
         (assert_release_waits_for_ci, RELEASE, "    uses: ./.github/workflows/ci.yml\n", "    uses: ./.github/workflows/ci.yml\n    if: github.event_name == 'push'\n"),
         (assert_release_waits_for_ci, RELEASE, "needs: [wheels, node]", "needs: [wheels]"),
+        # The release skipping more than the two jobs it rebuilds, or no longer rebuilding them.
+        (assert_release_waits_for_ci, RELEASE, "    with:\n      skip_binding_jobs: true\n", ""),
+        (assert_release_waits_for_ci, RELEASE, "      skip_binding_jobs: true\n", "      skip_binding_jobs: false\n"),
+        (assert_release_waits_for_ci, RELEASE, "      skip_binding_jobs: true\n", "      skip_binding_jobs: true\n      skip_tests: true\n"),
+        (assert_release_waits_for_ci, RELEASE, "    needs: verify\n    timeout-minutes: 45\n", "    needs: verify\n    if: github.event_name == 'push'\n    timeout-minutes: 45\n"),
+        (assert_release_waits_for_ci, RELEASE, "    needs: verify\n    timeout-minutes: 60\n", "    needs: verify\n    continue-on-error: true\n    timeout-minutes: 60\n"),
+        (assert_release_waits_for_ci, RELEASE, "      - name: Load and parse a generated fixture through each binding\n        run: node scripts/smoke-node.mjs\n", ""),
+        (assert_release_waits_for_ci, RELEASE, 'scripts/build-node.sh "${node_bindings[@]}"', "true"),
+        (assert_release_waits_for_ci, RELEASE, "for crate in $BINDINGS; do\n            (cd", "for crate in docx-fast-py; do\n            (cd"),
+        # A CI job that can be skipped outside a release, or a third one inside it.
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "    if: ${{ inputs.skip_binding_jobs != true }}\n    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n    defaults:", "    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n    if: ${{ inputs.skip_binding_jobs == true }}\n    defaults:"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  rust:\n    runs-on: ubuntu-latest\n", "  rust:\n    if: ${{ inputs.skip_binding_jobs != true }}\n    runs-on: ubuntu-latest\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  release-tooling:\n", "  release-tooling:\n    if: github.event_name != 'workflow_call'\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  lean-formal:\n    runs-on: ubuntu-latest\n", "  lean-formal:\n    if: false\n    runs-on: ubuntu-latest\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  lean-formal:\n    runs-on: ubuntu-latest\n", "  lean-formal:\n    continue-on-error: true\n    runs-on: ubuntu-latest\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "      - run: cargo fmt --all --check\n", "      - run: cargo fmt --all --check\n        if: ${{ !inputs.skip_binding_jobs }}\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "      - run: cargo test --workspace --locked\n", "      - if: github.event_name == 'pull_request'\n        run: cargo test --workspace --locked\n"),
+        # A condition that skips when the input is absent, as on a push or a pull request.
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "inputs.skip_binding_jobs != true }}\n    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n    # The steps", "inputs.skip_binding_jobs == false }}\n    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n    # The steps"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "    if: ${{ inputs.skip_binding_jobs != true }}\n", "    if: ${{ inputs.skip_binding_jobs }}\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "    if: ${{ inputs.skip_binding_jobs != true }}\n", "    if: ${{ github.event_name != 'workflow_call' }}\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "    if: ${{ inputs.skip_binding_jobs != true }}\n", "    if: ${{ inputs.skip_binding_jobs != 'true' }}\n"),
+        # An input that skips by default, is not a boolean, or can be set by hand.
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "        default: false\n", "        default: true\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "        default: false\n", ""),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "        type: boolean\n", "        type: string\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "        required: false\n", "        required: true\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "        default: false\n", "        default: false\n      skip_tests:\n        type: boolean\n        default: false\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  pull_request:\n  workflow_call:\n", "  pull_request:\n  workflow_dispatch:\n    inputs:\n      skip_binding_jobs:\n        type: boolean\n  workflow_call:\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  pull_request:\n  workflow_call:\n", "  pull_request:\n"),
         # An audit that no longer runs, no longer fails, or looks away.
         (assert_audit_contract, AUDIT, '"23 6 * * 1"', '"23 6 1 * *"'),
         (assert_audit_contract, AUDIT, "  workflow_dispatch:\n", ""),
