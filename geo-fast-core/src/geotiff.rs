@@ -224,7 +224,19 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
 
 /// Parse GeoTIFF and return raster data as one `Vec<f32>` per band.
 ///
+/// Unsigned 8- and 16-bit samples are scaled to `0.0..=1.0` by their full
+/// range. Every other sample type (signed 8-, 16- and 32-bit integers,
+/// unsigned 32-bit integers, 32- and 64-bit floats) keeps its value, rounded
+/// to the nearest `f32` where `f32` cannot hold it exactly.
+///
 /// For large images this can be expensive; callers should check metadata first.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Io`] when the file cannot be opened,
+/// [`GeoError::Tiff`] or [`GeoError::InvalidFormat`] when it is not a TIFF
+/// the decoder can read, and [`GeoError::UnsupportedFormat`] for 64-bit
+/// integer samples.
 pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, GeoError> {
     let file = std::fs::File::open(path.as_ref()).map_err(GeoError::Io)?;
     let mut decoder = open_decoder(BufReader::new(file))?;
@@ -247,10 +259,15 @@ pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, Geo
             Ok(vec![data])
         }
         DecodingResult::F64(data) => Ok(vec![data.iter().map(|&v| v as f32).collect()]),
+        // Signed and 32-bit samples keep their values: they are measurements
+        // (an elevation in metres, a count), not intensities with a full
+        // scale to normalise by.
+        DecodingResult::I8(data) => split_bands(&data, n_pixels, f32::from),
+        DecodingResult::I16(data) => split_bands(&data, n_pixels, f32::from),
         DecodingResult::I32(data) => split_bands(&data, n_pixels, |v| v as f32),
         DecodingResult::U32(data) => split_bands(&data, n_pixels, |v| v as f32),
-        _ => Err(GeoError::UnsupportedFormat(
-            "Unsupported pixel type in GeoTIFF".into(),
+        DecodingResult::U64(_) | DecodingResult::I64(_) => Err(GeoError::UnsupportedFormat(
+            "Unsupported pixel type in GeoTIFF: 64-bit integer samples".into(),
         )),
     }
 }
@@ -996,5 +1013,55 @@ mod tests {
         assert!((bbox.max_lon - (-44.0)).abs() < 1e-9);
         assert!((bbox.min_lat - (-11.0)).abs() < 1e-9);
         assert!((bbox.max_lat - (-10.0)).abs() < 1e-9);
+    }
+
+    /// Encodes a `width`×`height` raster of colour type `C` holding `pixels`.
+    fn raster<C>(width: u32, height: u32, pixels: &[C::Inner]) -> Vec<u8>
+    where
+        C: colortype::ColorType,
+        [C::Inner]: tiff::encoder::TiffValue,
+    {
+        let mut file = Cursor::new(Vec::new());
+        TiffEncoder::new(&mut file)
+            .expect("encoder")
+            .write_image::<C>(width, height, pixels)
+            .expect("image");
+        file.into_inner()
+    }
+
+    /// Reads the bands of an encoded raster through the public, by-path API.
+    fn bands_of(bytes: &[u8]) -> Result<Vec<Vec<f32>>, GeoError> {
+        let file = tempfile::NamedTempFile::new().expect("temporary file");
+        std::fs::write(file.path(), bytes).expect("write raster");
+        parse_geotiff_bands(file.path())
+    }
+
+    /// Signed 8- and 16-bit rasters were refused with "Unsupported pixel type
+    /// in GeoTIFF". Elevation models are commonly 16-bit signed.
+    #[test]
+    fn signed_integer_rasters_are_read_as_their_values() {
+        let elevation = [-32768i16, -120, 0, 8848];
+        assert_eq!(
+            bands_of(&raster::<colortype::GrayI16>(2, 2, &elevation)).expect("i16"),
+            vec![vec![-32768.0, -120.0, 0.0, 8848.0]]
+        );
+        assert_eq!(
+            bands_of(&raster::<colortype::GrayI8>(2, 2, &[-128i8, -1, 0, 127])).expect("i8"),
+            vec![vec![-128.0, -1.0, 0.0, 127.0]]
+        );
+    }
+
+    /// 32-bit integers already had arms; they are pinned here beside the
+    /// narrower types they now sit with.
+    #[test]
+    fn wide_integer_rasters_are_read_as_their_values() {
+        assert_eq!(
+            bands_of(&raster::<colortype::GrayI32>(2, 1, &[-70_000i32, 70_000])).expect("i32"),
+            vec![vec![-70_000.0, 70_000.0]]
+        );
+        assert_eq!(
+            bands_of(&raster::<colortype::Gray32>(2, 1, &[0u32, 3_000_000_000])).expect("u32"),
+            vec![vec![0.0, 3_000_000_000.0]]
+        );
     }
 }
