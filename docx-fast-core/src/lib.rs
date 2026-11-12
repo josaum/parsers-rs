@@ -59,9 +59,10 @@ use ooxml_archive::{
 use quick_xml::events::{BytesRef, BytesText, Event};
 use quick_xml::{Reader, XmlVersion};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, Cursor};
+use std::io::{BufRead, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -517,7 +518,7 @@ struct HeaderFooterRef {
 }
 
 fn parse_header_footer_refs<R: BufRead>(reader: R) -> Result<Vec<HeaderFooterRef>> {
-    let mut reader = xml_reader(reader);
+    let mut reader = xml_reader(utf8_stream(reader)?);
     let mut buf = Vec::new();
     let mut refs = Vec::new();
     loop {
@@ -622,14 +623,14 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
     let document_rels = if archive.has_part(&document_rels_path) {
         let xml = read_part_bytes(&archive, &document_rels_path, options.max_inflate)
             .with_context(|| format!("read document rels: {document_rels_path}"))?;
-        parse_relationships(&xml)?
+        parse_relationships(&utf8_xml(&xml))?
     } else {
         // Compatibility fallback for malformed names seen in legacy producers.
         let fallback = document_rels_path.replace("document.xml.rels", "document.xm.rels");
         if fallback != document_rels_path && archive.has_part(&fallback) {
             let xml = read_part_bytes(&archive, &fallback, options.max_inflate)
                 .with_context(|| format!("read document rels fallback: {fallback}"))?;
-            parse_relationships(&xml)?
+            parse_relationships(&utf8_xml(&xml))?
         } else {
             Relationships::default()
         }
@@ -1059,7 +1060,7 @@ fn parse_settings(archive: &DocxArchive, max_inflate: usize) -> Result<HashMap<S
     let Some(xml) = read_optional_part_bytes(archive, "word/settings.xml", max_inflate)? else {
         return Ok(HashMap::new());
     };
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(Cursor::new(utf8_xml(&xml)));
     let mut buf = Vec::new();
     let mut settings = HashMap::new();
     loop {
@@ -1119,7 +1120,7 @@ fn store_property(out: &mut HashMap<String, String>, key: &mut Option<String>, v
 }
 
 fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
     let mut out = HashMap::new();
     let mut current_key: Option<String> = None;
@@ -1152,7 +1153,7 @@ fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
 }
 
 fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
     let mut out = HashMap::new();
     let mut current_name: Option<String> = None;
@@ -1208,7 +1209,7 @@ fn normalize_datetime(value: &str) -> String {
 }
 
 fn parse_styles(xml: &[u8]) -> Result<Vec<Style>> {
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
     let mut styles = Vec::new();
     let mut current: Option<Style> = None;
@@ -1368,7 +1369,7 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
         fonts: symbol::FontChoice,
     }
 
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
     let mut declared: HashMap<String, Declared> = HashMap::new();
     let mut default_paragraph: Option<String> = None;
@@ -1469,7 +1470,7 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
 }
 
 fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
     let mut numbering = Numbering::default();
     let mut current_abs: Option<AbstractNum> = None;
@@ -1567,7 +1568,7 @@ fn parse_notes(
     styles: &[Style],
     style_fonts: &StyleFonts,
 ) -> Result<Vec<Note>> {
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
     let mut notes = Vec::new();
     let mut current_id: Option<i32> = None;
@@ -1641,7 +1642,7 @@ fn parse_notes(
 }
 
 fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Result<Vec<Comment>> {
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
     let mut comments = Vec::new();
     let mut current: Option<Comment> = None;
@@ -1758,7 +1759,7 @@ fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Res
 }
 
 fn apply_extended_comments(comments: &mut [Comment], xml: &[u8]) -> Result<()> {
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1858,7 +1859,7 @@ fn collect_images(archive: &DocxArchive, max_inflate: usize) -> Result<Vec<Image
         let xml = read_part_bytes(archive, path, max_inflate)
             .with_context(|| format!("read DOCX relationships part: {path}"))?;
         {
-            let rels = parse_relationships(&xml)?;
+            let rels = parse_relationships(&utf8_xml(&xml))?;
             let source_part = source_part_from_rels(path).unwrap_or_else(|| path.to_string());
             for RelEntry {
                 id,
@@ -1900,7 +1901,7 @@ fn parse_content_types(
     let Some(xml) = read_optional_part_bytes(archive, "[Content_Types].xml", max_inflate)? else {
         return Ok(HashMap::new());
     };
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(Cursor::new(utf8_xml(&xml)));
     let mut buf = Vec::new();
     let mut map = HashMap::new();
     let mut defaults: HashMap<String, String> = HashMap::new();
@@ -2016,6 +2017,98 @@ fn attr_value<R: BufRead>(
         }
     }
     Ok(None)
+}
+
+/// Byte order of a UTF-16 part, `None` when the part is not UTF-16.
+///
+/// A byte order mark decides. Without one, the part has to open with an XML
+/// declaration, so "<?" with a zero byte on one side of each character is
+/// the only other form (XML 1.0, appendix F).
+fn utf16_big_endian(start: &[u8]) -> Option<bool> {
+    match start {
+        [0xFE, 0xFF, ..] | [0x00, b'<', 0x00, b'?', ..] => Some(true),
+        [0xFF, 0xFE, ..] | [b'<', 0x00, b'?', 0x00, ..] => Some(false),
+        _ => None,
+    }
+}
+
+/// Transcodes a UTF-16 part to UTF-8.
+///
+/// An unpaired surrogate or a trailing odd byte becomes U+FFFD. The byte
+/// order mark and the XML declaration are dropped: the declaration names an
+/// encoding the bytes no longer have.
+fn utf16_to_utf8(xml: &[u8], big_endian: bool) -> Vec<u8> {
+    let units = xml.chunks(2).map(|pair| match *pair {
+        [first, second] if big_endian => u16::from_be_bytes([first, second]),
+        [first, second] => u16::from_le_bytes([first, second]),
+        // Half a code unit at the end of the part: not a character.
+        _ => 0xDC00,
+    });
+    let text: String = char::decode_utf16(units)
+        .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
+    let text = match text.strip_prefix("<?xml") {
+        Some(rest) => rest.split_once("?>").map_or(text, |(_, body)| body),
+        None => text,
+    };
+    text.as_bytes().to_vec()
+}
+
+/// Returns a part as UTF-8, transcoding it when it is UTF-16.
+fn utf8_xml(xml: &[u8]) -> Cow<'_, [u8]> {
+    match utf16_big_endian(xml) {
+        Some(big_endian) => Cow::Owned(utf16_to_utf8(xml, big_endian)),
+        None => Cow::Borrowed(xml),
+    }
+}
+
+/// A part being read: as stored, or transcoded from UTF-16 first.
+#[derive(Debug)]
+enum Utf8Stream<R> {
+    Stored(R),
+    Transcoded(Cursor<Vec<u8>>),
+}
+
+impl<R: Read> Read for Utf8Stream<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stored(reader) => reader.read(buf),
+            Self::Transcoded(reader) => reader.read(buf),
+        }
+    }
+}
+
+impl<R: BufRead> BufRead for Utf8Stream<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        match self {
+            Self::Stored(reader) => reader.fill_buf(),
+            Self::Transcoded(reader) => reader.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, amount: usize) {
+        match self {
+            Self::Stored(reader) => reader.consume(amount),
+            Self::Transcoded(reader) => reader.consume(amount),
+        }
+    }
+}
+
+/// Wraps a part reader so that a UTF-16 part is read as UTF-8.
+///
+/// The encoding is decided from the bytes already buffered, so a UTF-8 part
+/// keeps streaming. A UTF-16 part is read whole, within whatever size limit
+/// `reader` enforces, and transcoded.
+fn utf8_stream<R: BufRead>(mut reader: R) -> Result<Utf8Stream<R>> {
+    let Some(big_endian) = utf16_big_endian(reader.fill_buf()?) else {
+        return Ok(Utf8Stream::Stored(reader));
+    };
+    let mut xml = Vec::new();
+    reader.read_to_end(&mut xml)?;
+    Ok(Utf8Stream::Transcoded(Cursor::new(utf16_to_utf8(
+        &xml, big_endian,
+    ))))
 }
 
 /// Makes the XML reader every part goes through.
@@ -2246,7 +2339,7 @@ impl<'a> DocxBodyParser<'a> {
     }
 
     fn parse<R: BufRead>(&mut self, reader: R) -> Result<Vec<Block>> {
-        let mut reader = xml_reader(reader);
+        let mut reader = xml_reader(utf8_stream(reader)?);
         let mut buf = Vec::new();
         loop {
             match reader.read_event_into(&mut buf) {
