@@ -31,13 +31,40 @@ use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use crate::parser::SchemaSet;
-use crate::schema::{ComplexType, ContentModel, ElementRef, SchemaModel, SimpleTypeKind, XsdType};
+use crate::schema::{
+    ComplexType, ContentModel, ElementDecl, ElementRef, OccurrenceConstraint, Particle,
+    SchemaModel, SimpleTypeKind, XsdType,
+};
+
+/// Deepest flattening performed, whatever [`ArrowOptions::max_depth`] asks for.
+///
+/// Flattening recurses once per level, and a type that refers to itself
+/// never runs out of levels, so the caller's value alone cannot bound the
+/// recursion. Real schemas are flattened a handful of levels deep.
+const MAX_FLATTEN_DEPTH: usize = 32;
+
+/// Deepest recursion of one derivation, counting nested model groups.
+///
+/// Model groups nest without adding a flattening level, so they are counted
+/// separately: this bounds the stack of a derivation, where
+/// [`MAX_FLATTEN_DEPTH`] bounds its output. Sized, like the parser's nesting
+/// limit, to fit a 256 KiB stack in an unoptimized build.
+const MAX_DERIVATION_NESTING: usize = 64;
+
+/// Most steps one derivation may take: types visited plus fields emitted.
+///
+/// A type with `n` children of its own type flattens to `n^max_depth`
+/// columns, so a schema of a few hundred bytes can ask for billions, and the
+/// walk costs that much even where it emits nothing. A derived schema holds
+/// at most one field per step; no consumer can materialize a table this
+/// wide, so a derivation that needs more steps is refused instead of run.
+const MAX_DERIVATION_STEPS: usize = 100_000;
 
 /// Options for Arrow schema derivation.
 #[derive(Debug, Clone)]
 pub struct ArrowOptions {
     /// Maximum nesting depth to flatten. Deeper elements are emitted as
-    /// `Utf8` (raw XML). Default: 8.
+    /// `Utf8` (raw XML). Default: 8. Values above 32 are treated as 32.
     pub max_depth: usize,
     /// Whether to map `xs:date` → `Date32` and `xs:dateTime` → `Timestamp(us, UTC)`.
     /// Default: true.
@@ -63,6 +90,13 @@ impl SchemaSet {
     /// Derive an Arrow [`Schema`] for the named root element.
     ///
     /// The element must be a global element in the schema.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `root_element` is not a global element, and with a
+    /// `resource_limit` error when flattening would take more than 100,000
+    /// steps (types visited plus fields emitted) or its model groups nest too
+    /// deeply to walk.
     pub fn to_arrow_schema(&self, root_element: &str, opts: ArrowOptions) -> Result<SchemaRef> {
         let decl = self
             .model
@@ -71,14 +105,14 @@ impl SchemaSet {
             .with_context(|| format!("element '{root_element}' not found in global elements"))?;
 
         let mut fields: Vec<Field> = Vec::new();
-        derive_fields_from_type(
-            &decl.type_def,
-            &self.model,
-            &opts,
-            0,
-            String::new(),
-            &mut fields,
-        );
+        let mut derivation = Derivation {
+            model: &self.model,
+            max_depth: opts.max_depth.min(MAX_FLATTEN_DEPTH),
+            opts: &opts,
+            steps_left: MAX_DERIVATION_STEPS,
+            nesting: 0,
+        };
+        derivation.fields_from_type(&decl.type_def, 0, String::new(), &mut fields)?;
         Ok(Arc::new(Schema::new(fields)))
     }
 
@@ -164,156 +198,231 @@ impl SchemaSet {
 
 // ── Field derivation ─────────────────────────────────────────────────────────
 
-fn derive_fields_from_type(
-    xsd: &XsdType,
-    model: &SchemaModel,
-    opts: &ArrowOptions,
-    depth: usize,
-    prefix: String,
-    fields: &mut Vec<Field>,
-) {
-    if depth > opts.max_depth {
-        // Emit a single Utf8 "raw" catch-all.
-        fields.push(Field::new(
-            if prefix.is_empty() { "value" } else { &prefix },
-            DataType::Utf8,
-            true,
-        ));
-        return;
+/// State of one schema derivation: its inputs and what is left of its budgets.
+struct Derivation<'a> {
+    model: &'a SchemaModel,
+    opts: &'a ArrowOptions,
+    /// [`ArrowOptions::max_depth`], capped at [`MAX_FLATTEN_DEPTH`].
+    max_depth: usize,
+    /// Steps that may still be taken before the derivation is refused.
+    steps_left: usize,
+    /// Content models currently being walked.
+    nesting: usize,
+}
+
+impl Derivation<'_> {
+    /// Charges one step to the derivation budget.
+    fn step(&mut self) -> Result<()> {
+        self.steps_left = self.steps_left.checked_sub(1).with_context(|| {
+            format!(
+                "resource_limit: arrow_derivation_steps: flattening takes more than {MAX_DERIVATION_STEPS} steps"
+            )
+        })?;
+        Ok(())
     }
 
-    match xsd {
-        XsdType::Simple(st) => {
-            let dt = simple_kind_to_arrow(&st.kind, opts);
-            let name = if prefix.is_empty() {
-                "value".to_string()
-            } else {
-                prefix
-            };
-            fields.push(Field::new(name, dt, true));
+    /// Appends `field`, charging it to the derivation budget.
+    fn emit(&mut self, fields: &mut Vec<Field>, field: Field) -> Result<()> {
+        self.step()?;
+        fields.push(field);
+        Ok(())
+    }
+
+    // The functions below recurse once per flattening level and once per
+    // nested model group. Everything that builds a `Field` lives in a helper
+    // that returns before the recursion continues, so a level costs a few
+    // hundred bytes of stack instead of every temporary of every branch.
+
+    fn fields_from_type(
+        &mut self,
+        xsd: &XsdType,
+        depth: usize,
+        prefix: String,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
+        self.step()?;
+        if depth > self.max_depth {
+            // Emit a single Utf8 "raw" catch-all.
+            return self.emit_leaf(prefix, None, fields);
         }
-        XsdType::Complex(ct) => {
-            derive_fields_from_complex(ct, model, opts, depth, prefix, fields);
-        }
-        XsdType::Ref(qn) => {
-            if let Some(ct) = model.complex_types.get(&qn.local) {
-                // Avoid infinite recursion on self-referential types.
-                if depth < opts.max_depth {
-                    let cloned = ct.clone();
-                    derive_fields_from_complex(&cloned, model, opts, depth, prefix, fields);
+
+        let model = self.model;
+        match xsd {
+            XsdType::Simple(st) => self.emit_leaf(prefix, Some(&st.kind), fields),
+            XsdType::Complex(ct) => self.fields_from_complex(ct, depth, &prefix, fields),
+            XsdType::Ref(qn) => {
+                if let Some(ct) = model.complex_types.get(&qn.local) {
+                    // Avoid infinite recursion on self-referential types.
+                    if depth < self.max_depth {
+                        self.fields_from_complex(ct, depth, &prefix, fields)?;
+                    }
+                    Ok(())
+                } else {
+                    // A named simple type, or unresolved: fall back to Utf8.
+                    let kind = model.simple_types.get(&qn.local).map(|st| &st.kind);
+                    self.emit_leaf(prefix, kind, fields)
                 }
-            } else if let Some(st) = model.simple_types.get(&qn.local) {
-                let dt = simple_kind_to_arrow(&st.kind, opts);
-                let name = if prefix.is_empty() {
-                    "value".to_string()
-                } else {
-                    prefix
-                };
-                fields.push(Field::new(name, dt, true));
-            } else {
-                // Unresolved — fall back to Utf8.
-                let name = if prefix.is_empty() {
-                    "value".to_string()
-                } else {
-                    prefix
-                };
-                fields.push(Field::new(name, DataType::Utf8, true));
             }
         }
     }
-}
 
-fn derive_fields_from_complex(
-    ct: &ComplexType,
-    model: &SchemaModel,
-    opts: &ArrowOptions,
-    depth: usize,
-    prefix: String,
-    fields: &mut Vec<Field>,
-) {
-    // Attributes first.
-    if opts.include_attributes {
+    /// Emits the single column of a leaf; `kind` is `None` for raw text.
+    fn emit_leaf(
+        &mut self,
+        prefix: String,
+        kind: Option<&SimpleTypeKind>,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
+        let data_type = match kind {
+            Some(kind) => simple_kind_to_arrow(kind, self.opts),
+            None => DataType::Utf8,
+        };
+        self.emit(fields, Field::new(value_name(prefix), data_type, true))
+    }
+
+    fn fields_from_complex(
+        &mut self,
+        ct: &ComplexType,
+        depth: usize,
+        prefix: &str,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
+        // Attributes first.
+        if self.opts.include_attributes {
+            self.emit_attributes(ct, prefix, fields)?;
+        }
+        self.fields_from_content(&ct.content, depth, prefix, fields)
+    }
+
+    fn emit_attributes(
+        &mut self,
+        ct: &ComplexType,
+        prefix: &str,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
         for attr in &ct.attributes {
-            let dt = simple_kind_to_arrow(&attr.type_def.kind, opts);
+            let dt = simple_kind_to_arrow(&attr.type_def.kind, self.opts);
             let name = if prefix.is_empty() {
                 format!("@{}", attr.name)
             } else {
                 format!("{prefix}.@{}", attr.name)
             };
-            fields.push(Field::new(name, dt, !attr.required));
+            self.emit(fields, Field::new(name, dt, !attr.required))?;
         }
+        Ok(())
     }
 
-    let particles = match &ct.content {
-        ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
-        ContentModel::SimpleContent(st) => {
-            let dt = simple_kind_to_arrow(&st.as_ref().kind, opts);
-            let name = if prefix.is_empty() {
-                "$text".to_string()
-            } else {
-                format!("{prefix}.$text")
-            };
-            fields.push(Field::new(name, dt, true));
-            return;
+    /// Flattens one content model into columns at `prefix`.
+    ///
+    /// This is the only function a nested model group re-enters, so it is
+    /// where the recursion of a derivation is counted and refused.
+    fn fields_from_content(
+        &mut self,
+        content: &ContentModel,
+        depth: usize,
+        prefix: &str,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
+        if self.nesting >= MAX_DERIVATION_NESTING {
+            anyhow::bail!(
+                "resource_limit: arrow_nesting_depth: content models nest deeper than {MAX_DERIVATION_NESTING}"
+            );
         }
-        ContentModel::Empty => return,
-    };
+        let particles = match content {
+            ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
+            ContentModel::SimpleContent(st) => return self.emit_text(&st.kind, prefix, fields),
+            ContentModel::Empty => return Ok(()),
+        };
+        self.nesting += 1;
+        let result = self.fields_from_particles(particles, depth, prefix, fields);
+        self.nesting -= 1;
+        result
+    }
 
-    for particle in particles {
-        let (child_name, child_type, occ, nillable) = match &particle.element {
-            ElementRef::Inline(decl) => {
-                let decl = decl.as_ref();
-                (
-                    decl.name.local.clone(),
-                    &decl.type_def,
-                    decl.occurrence,
-                    decl.nillable,
-                )
-            }
-            ElementRef::Ref(qn) => {
-                if let Some(decl) = model.global_elements.get(&qn.local) {
-                    (
-                        decl.name.local.clone(),
-                        &decl.type_def,
-                        particle.occurrence,
-                        decl.nillable,
-                    )
-                } else {
-                    let col = if prefix.is_empty() {
-                        qn.local.clone()
-                    } else {
-                        format!("{prefix}.{}", qn.local)
-                    };
-                    fields.push(Field::new(col, DataType::Utf8, true));
-                    continue;
+    /// Emits the `$text` column of a simple-content type.
+    fn emit_text(
+        &mut self,
+        kind: &SimpleTypeKind,
+        prefix: &str,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
+        let dt = simple_kind_to_arrow(kind, self.opts);
+        let name = if prefix.is_empty() {
+            "$text".to_string()
+        } else {
+            format!("{prefix}.$text")
+        };
+        self.emit(fields, Field::new(name, dt, true))
+    }
+
+    fn fields_from_particles(
+        &mut self,
+        particles: &[Particle],
+        depth: usize,
+        prefix: &str,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
+        let model = self.model;
+        for particle in particles {
+            match &particle.element {
+                ElementRef::Inline(decl) => {
+                    self.fields_from_child(decl, decl.occurrence, depth, prefix, fields)?;
                 }
-            }
-            ElementRef::Group(group) => {
+                ElementRef::Ref(qn) => match model.global_elements.get(&qn.local) {
+                    Some(decl) => {
+                        self.fields_from_child(decl, particle.occurrence, depth, prefix, fields)?;
+                    }
+                    None => self.emit_unresolved_element(&qn.local, prefix, fields)?,
+                },
                 // A nested model group (typically an xs:choice). Flatten each
                 // branch into its own column at the current prefix; mark them
                 // nullable since at most one branch is selected per instance.
-                derive_fields_from_group(group, model, opts, depth, &prefix, fields);
-                continue;
+                ElementRef::Group(group) => self.fields_from_group(group, depth, prefix, fields)?,
             }
-        };
+        }
+        Ok(())
+    }
 
-        let col_path = if prefix.is_empty() {
-            child_name
-        } else {
-            format!("{prefix}.{child_name}")
-        };
+    /// Emits a `Utf8` column for a reference to an element that is not declared.
+    fn emit_unresolved_element(
+        &mut self,
+        local: &str,
+        prefix: &str,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
+        self.emit(
+            fields,
+            Field::new(column_path(prefix, local), DataType::Utf8, true),
+        )
+    }
 
+    /// Flattens one child element, then wraps what it produced into a column.
+    fn fields_from_child(
+        &mut self,
+        decl: &ElementDecl,
+        occ: OccurrenceConstraint,
+        depth: usize,
+        prefix: &str,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
+        let mut inner_fields: Vec<Field> = Vec::new();
+        self.fields_from_type(&decl.type_def, depth + 1, String::new(), &mut inner_fields)?;
+        self.emit_child(decl, occ, prefix, inner_fields, fields)
+    }
+
+    /// Appends the column for one child element from its flattened type.
+    fn emit_child(
+        &mut self,
+        decl: &ElementDecl,
+        occ: OccurrenceConstraint,
+        prefix: &str,
+        mut inner_fields: Vec<Field>,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
+        let col_path = column_path(prefix, &decl.name.local);
+        let nillable = decl.nillable;
         if occ.is_multi() {
             // Wrap the inner type in a List.
-            let mut inner_fields: Vec<Field> = Vec::new();
-            derive_fields_from_type(
-                child_type,
-                model,
-                opts,
-                depth + 1,
-                String::new(),
-                &mut inner_fields,
-            );
             let item_field = if inner_fields.len() == 1 {
                 inner_fields
                     .remove(0)
@@ -322,66 +431,74 @@ fn derive_fields_from_complex(
             } else {
                 Field::new("item", DataType::Struct(inner_fields.into()), nillable)
             };
-            fields.push(Field::new(
-                col_path,
-                DataType::List(Arc::new(item_field)),
-                occ.min == 0,
-            ));
+            self.emit(
+                fields,
+                Field::new(col_path, DataType::List(Arc::new(item_field)), occ.min == 0),
+            )
         } else {
             let nullable = occ.min == 0 || nillable;
-            let mut inner_fields: Vec<Field> = Vec::new();
-            derive_fields_from_type(
-                child_type,
-                model,
-                opts,
-                depth + 1,
-                String::new(),
-                &mut inner_fields,
-            );
-
             if inner_fields.len() == 1 {
                 let f = inner_fields
                     .remove(0)
                     .with_name(&col_path)
                     .with_nullable(nullable);
+                // Already charged when the inner walk emitted it.
                 fields.push(f);
+                Ok(())
             } else if !inner_fields.is_empty() {
-                fields.push(Field::new(
-                    col_path,
-                    DataType::Struct(inner_fields.into()),
-                    nullable,
-                ));
+                self.emit(
+                    fields,
+                    Field::new(col_path, DataType::Struct(inner_fields.into()), nullable),
+                )
+            } else {
+                Ok(())
             }
+        }
+    }
+
+    /// Flatten a nested model group's branches into columns at `prefix`.
+    ///
+    /// Branches of an `xs:choice` are mutually exclusive, so every column produced
+    /// here is forced nullable regardless of the branch's declared `minOccurs`.
+    fn fields_from_group(
+        &mut self,
+        group: &ContentModel,
+        depth: usize,
+        prefix: &str,
+        fields: &mut Vec<Field>,
+    ) -> Result<()> {
+        let start = fields.len();
+        self.fields_from_content(group, depth, prefix, fields)?;
+        force_nullable(&mut fields[start..]);
+        Ok(())
+    }
+}
+
+/// Marks every field nullable: a choice selects at most one branch, so none
+/// of its columns are mandatory.
+fn force_nullable(fields: &mut [Field]) {
+    for field in fields {
+        if !field.is_nullable() {
+            *field = field.clone().with_nullable(true);
         }
     }
 }
 
-/// Flatten a nested model group's branches into columns at `prefix`.
-///
-/// Branches of an `xs:choice` are mutually exclusive, so every column produced
-/// here is forced nullable regardless of the branch's declared `minOccurs`.
-fn derive_fields_from_group(
-    group: &ContentModel,
-    model: &SchemaModel,
-    opts: &ArrowOptions,
-    depth: usize,
-    prefix: &str,
-    fields: &mut Vec<Field>,
-) {
-    // Reuse the complex-type walk by wrapping the group in a transient type.
-    let synthetic = ComplexType {
-        name: None,
-        content: group.clone(),
-        attributes: Vec::new(),
-        base: None,
-    };
-    let start = fields.len();
-    derive_fields_from_complex(&synthetic, model, opts, depth, prefix.to_string(), fields);
-    // A choice selects at most one branch, so none of its columns are mandatory.
-    for field in fields.iter_mut().skip(start) {
-        if !field.is_nullable() {
-            *field = field.as_ref().clone().with_nullable(true);
-        }
+/// `prefix.name`, or `name` at the top level.
+fn column_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
+/// Column name of a leaf with no enclosing element: the prefix, or `value`.
+fn value_name(prefix: String) -> String {
+    if prefix.is_empty() {
+        "value".to_string()
+    } else {
+        prefix
     }
 }
 

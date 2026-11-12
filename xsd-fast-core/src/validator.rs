@@ -3,9 +3,8 @@
 //! Validates simple-type constraints: enumerations, string length, numeric range.
 //! Complex structure checks (required children, cardinality) are also included.
 //!
-//! Each [`TypeFrame`] on the stack owns a cloned `XsdType` so there are no
-//! lifetime conflicts between the immutable schema model reference and the
-//! mutable error accumulation.
+//! Each [`TypeFrame`] on the stack borrows its type from the schema model, so
+//! the cost of an open element does not depend on the size of its type.
 
 use std::collections::HashMap;
 
@@ -16,6 +15,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::parser::SchemaSet;
 use crate::schema::{ComplexType, ContentModel, ElementRef, SchemaModel, SimpleTypeDef, XsdType};
+
+/// Most bytes of allowed values quoted in one enumeration finding.
+///
+/// A finding names the values the element could have had. An enumeration can
+/// be as large as the schema, and one finding is produced per invalid element,
+/// so quoting it in full would copy the schema once per finding. Past this
+/// many bytes the message says how many values were left out.
+const MAX_ENUMERATION_LISTING_BYTES: usize = 1024;
 
 /// Severity of a validation issue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +67,8 @@ impl Default for ValidateOptions {
 
 impl SchemaSet {
     /// Validate an XML document against this schema set.
+    ///
+    /// At most [`ValidateOptions::max_errors`] findings are returned.
     pub fn validate(&self, xml: &[u8], opts: ValidateOptions) -> Result<Vec<ValidationError>> {
         let mut ctx = ValidationContext {
             model: &self.model,
@@ -75,11 +84,21 @@ impl SchemaSet {
 
 // ── Type frame ────────────────────────────────────────────────────────────────
 
-struct TypeFrame {
+/// The schema type of an instance element, borrowed from the model.
+///
+/// A reference that names no known type resolves to nothing, so it has no
+/// variant here: such an element is validated as if it had no declaration.
+#[derive(Clone, Copy)]
+enum ResolvedType<'m> {
+    Simple(&'m SimpleTypeDef),
+    Complex(&'m ComplexType),
+}
+
+struct TypeFrame<'m> {
     /// Accumulated text content.
     text: String,
-    /// Owned clone of the resolved XSD type for this element.
-    xsd_type: Option<XsdType>,
+    /// Resolved XSD type for this element.
+    xsd_type: Option<ResolvedType<'m>>,
     /// Counts of child element occurrences.
     child_counts: HashMap<String, usize>,
 }
@@ -91,7 +110,7 @@ struct ValidationContext<'m> {
     errors: Vec<ValidationError>,
     opts: ValidateOptions,
     path: Vec<String>,
-    type_stack: Vec<TypeFrame>,
+    type_stack: Vec<TypeFrame<'m>>,
 }
 
 impl<'m> ValidationContext<'m> {
@@ -130,13 +149,14 @@ impl<'m> ValidationContext<'m> {
                     };
                     self.path.push(local.clone());
 
+                    let xsd_type = self.resolve_child_type(&local);
+
                     if let Some(parent) = self.type_stack.last_mut() {
-                        *parent.child_counts.entry(local.clone()).or_insert(0) += 1;
+                        *parent.child_counts.entry(local).or_insert(0) += 1;
                     }
 
-                    let xsd_type = self.resolve_child_type(&local);
                     if self.opts.check_facets {
-                        if let Some(ref t) = xsd_type {
+                        if let Some(t) = xsd_type {
                             self.check_text_for_type_val(t, "");
                         }
                     }
@@ -156,18 +176,12 @@ impl<'m> ValidationContext<'m> {
                 }
                 Ok(Event::End(_)) => {
                     if let Some(frame) = self.type_stack.pop() {
-                        let text = frame.text.clone();
-                        let counts = frame.child_counts.clone();
-                        let xsd_type = frame.xsd_type.clone();
-
-                        if self.opts.check_facets {
-                            if let Some(ref t) = xsd_type {
-                                self.check_text_for_type_val(t, &text);
+                        if let Some(t) = frame.xsd_type {
+                            if self.opts.check_facets {
+                                self.check_text_for_type_val(t, &frame.text);
                             }
-                        }
-                        if self.opts.check_cardinality {
-                            if let Some(ref t) = xsd_type {
-                                self.check_cardinality_for_type(t, &counts);
+                            if self.opts.check_cardinality {
+                                self.check_cardinality_for_type(t, &frame.child_counts);
                             }
                         }
                     }
@@ -191,25 +205,29 @@ impl<'m> ValidationContext<'m> {
     }
 
     /// Resolve the XSD type for a child element given the current type stack.
-    fn resolve_child_type(&self, child_local: &str) -> Option<XsdType> {
+    fn resolve_child_type(&self, child_local: &str) -> Option<ResolvedType<'m>> {
         if let Some(parent) = self.type_stack.last() {
-            let parent_type = parent.xsd_type.as_ref()?;
-            return self.find_child_xsd_type(parent_type, child_local);
+            let ResolvedType::Complex(parent_type) = parent.xsd_type? else {
+                return None;
+            };
+            return self.find_child_in_content(&parent_type.content, child_local);
         }
         // Root element — global lookup.
-        let decl = self.model.global_elements.get(child_local)?;
-        Some(self.resolve_xsd_type(&decl.type_def))
-    }
-
-    /// Find the child element type inside a parent XsdType.
-    fn find_child_xsd_type(&self, parent: &XsdType, child_name: &str) -> Option<XsdType> {
-        let ct = self.as_complex_type(parent)?;
-        self.find_child_in_content(&ct.content, child_name)
+        let model = self.model;
+        let decl = model.global_elements.get(child_local)?;
+        self.resolve_xsd_type(&decl.type_def)
     }
 
     /// Find a child element type within a content model, descending into nested
     /// model groups (e.g. an `xs:choice` inside an `xs:sequence`).
-    fn find_child_in_content(&self, content: &ContentModel, child_name: &str) -> Option<XsdType> {
+    ///
+    /// The recursion follows group nesting, which the parser bounds.
+    fn find_child_in_content(
+        &self,
+        content: &'m ContentModel,
+        child_name: &str,
+    ) -> Option<ResolvedType<'m>> {
+        let model = self.model;
         let particles = match content {
             ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
             _ => return None,
@@ -217,11 +235,11 @@ impl<'m> ValidationContext<'m> {
         for particle in particles {
             match &particle.element {
                 ElementRef::Inline(decl) if decl.name.local == child_name => {
-                    return Some(self.resolve_xsd_type(&decl.as_ref().type_def));
+                    return self.resolve_xsd_type(&decl.as_ref().type_def);
                 }
                 ElementRef::Ref(qn) if qn.local == child_name => {
-                    if let Some(decl) = self.model.global_elements.get(&qn.local) {
-                        return Some(self.resolve_xsd_type(&decl.type_def));
+                    if let Some(decl) = model.global_elements.get(&qn.local) {
+                        return self.resolve_xsd_type(&decl.type_def);
                     }
                 }
                 ElementRef::Group(group) => {
@@ -235,63 +253,40 @@ impl<'m> ValidationContext<'m> {
         None
     }
 
-    /// Resolve a Ref to its concrete type; return the type unchanged otherwise.
-    fn resolve_xsd_type(&self, xsd: &XsdType) -> XsdType {
+    /// Resolve a declared type to the definition it names, without copying it.
+    fn resolve_xsd_type(&self, xsd: &'m XsdType) -> Option<ResolvedType<'m>> {
+        let model = self.model;
         match xsd {
+            XsdType::Simple(st) => Some(ResolvedType::Simple(st)),
+            XsdType::Complex(ct) => Some(ResolvedType::Complex(ct)),
             XsdType::Ref(qn) => {
-                if let Some(ct) = self.model.complex_types.get(&qn.local) {
-                    return XsdType::Complex(ct.clone());
+                if let Some(ct) = model.complex_types.get(&qn.local) {
+                    return Some(ResolvedType::Complex(ct));
                 }
-                if let Some(st) = self.model.simple_types.get(&qn.local) {
-                    return XsdType::Simple(st.clone());
-                }
-                xsd.clone()
+                model.simple_types.get(&qn.local).map(ResolvedType::Simple)
             }
-            other => other.clone(),
         }
     }
 
-    /// Return a reference to the complex type inside an XsdType if resolvable.
-    fn as_complex_type<'a>(&'a self, xsd: &'a XsdType) -> Option<&'a ComplexType> {
-        match xsd {
-            XsdType::Complex(ct) => Some(ct),
-            XsdType::Ref(qn) => self.model.complex_types.get(&qn.local),
-            _ => None,
-        }
-    }
-
-    fn check_text_for_type_val(&mut self, xsd: &XsdType, text: &str) {
-        let st: Option<&SimpleTypeDef> = match xsd {
-            XsdType::Simple(st) => Some(st),
-            XsdType::Ref(qn) => self.model.simple_types.get(&qn.local),
-            XsdType::Complex(ct) => {
+    fn check_text_for_type_val(&mut self, xsd: ResolvedType<'m>, text: &str) {
+        let st: &'m SimpleTypeDef = match xsd {
+            ResolvedType::Simple(st) => st,
+            ResolvedType::Complex(ct) => {
                 if let ContentModel::SimpleContent(st) = &ct.content {
-                    Some(st.as_ref())
+                    st.as_ref()
                 } else {
-                    None
+                    return;
                 }
             }
-        };
-        let st = match st {
-            Some(s) => s,
-            None => return,
         };
         let facets = &st.facets;
         let kind = &st.kind;
 
         if !facets.enumerations.is_empty() && !facets.enumerations.iter().any(|e| e.value == text) {
-            let allowed: Vec<&str> = facets
-                .enumerations
-                .iter()
-                .map(|e| e.value.as_str())
-                .collect();
+            let allowed = enumeration_listing(facets.enumerations.iter().map(|e| e.value.as_str()));
             self.push_error(
                 ValidationSeverity::Error,
-                format!(
-                    "value {:?} not in enumeration [{}]",
-                    text,
-                    allowed.join(", ")
-                ),
+                format!("value {text:?} not in enumeration [{allowed}]"),
             );
         }
 
@@ -344,12 +339,14 @@ impl<'m> ValidationContext<'m> {
         }
     }
 
-    fn check_cardinality_for_type(&mut self, xsd: &XsdType, child_counts: &HashMap<String, usize>) {
-        let content = match self.as_complex_type(xsd) {
-            Some(ct) => ct.content.clone(),
-            None => return,
-        };
-        self.check_cardinality_for_content(&content, child_counts);
+    fn check_cardinality_for_type(
+        &mut self,
+        xsd: ResolvedType<'m>,
+        child_counts: &HashMap<String, usize>,
+    ) {
+        if let ResolvedType::Complex(ct) = xsd {
+            self.check_cardinality_for_content(&ct.content, child_counts);
+        }
     }
 
     /// Validate occurrence constraints for one content model.
@@ -359,9 +356,13 @@ impl<'m> ValidationContext<'m> {
     /// the choice's own occurrence), so individual branches are never reported
     /// as "missing". A nested choice surfaces as a [`ElementRef::Group`] and is
     /// validated with the same union rule.
+    ///
+    /// The recursion follows group nesting, which the parser bounds. The walk
+    /// stops as soon as the finding limit is reached, so a type with many
+    /// required children costs at most that many findings.
     fn check_cardinality_for_content(
         &mut self,
-        content: &ContentModel,
+        content: &'m ContentModel,
         child_counts: &HashMap<String, usize>,
     ) {
         let (particles, is_choice) = match content {
@@ -372,11 +373,14 @@ impl<'m> ValidationContext<'m> {
 
         let mut branch_total = 0usize;
         for particle in particles {
+            if self.errors.len() >= self.opts.max_errors {
+                return;
+            }
             // A nested model group (typically a choice) is handled as a union:
             // its branches count toward the parent only as the group's own.
             let (child_name, occ) = match &particle.element {
-                ElementRef::Inline(decl) => (decl.name.local.clone(), decl.occurrence),
-                ElementRef::Ref(qn) => (qn.local.clone(), particle.occurrence),
+                ElementRef::Inline(decl) => (decl.name.local.as_str(), decl.occurrence),
+                ElementRef::Ref(qn) => (qn.local.as_str(), particle.occurrence),
                 ElementRef::Group(group) => {
                     let selected = group_branch_count(group, child_counts);
                     branch_total += selected;
@@ -391,7 +395,7 @@ impl<'m> ValidationContext<'m> {
                 }
             };
 
-            let count = child_counts.get(&child_name).copied().unwrap_or(0);
+            let count = child_counts.get(child_name).copied().unwrap_or(0);
             branch_total += count;
             // In a choice, no single branch is individually required — only the
             // union is. Skip the per-branch required check there.
@@ -420,7 +424,14 @@ impl<'m> ValidationContext<'m> {
         }
     }
 
+    /// Records a finding unless [`ValidateOptions::max_errors`] is reached.
+    ///
+    /// Each finding carries the full element path, so the limit is what keeps
+    /// the findings of a deep document bounded.
     fn push_error(&mut self, severity: ValidationSeverity, message: String) {
+        if self.errors.len() >= self.opts.max_errors {
+            return;
+        }
         self.errors.push(ValidationError {
             severity,
             path: self.current_path(),
@@ -444,6 +455,32 @@ fn strip_prefix(name: &str) -> &str {
         Some(pos) => &name[pos + 1..],
         None => name,
     }
+}
+
+/// Joins allowed enumeration values for a finding, comma separated.
+///
+/// Values are quoted in full until [`MAX_ENUMERATION_LISTING_BYTES`] is
+/// reached; the rest are replaced by a count. The first value is always
+/// attempted, and a value that does not fit is never cut in the middle.
+fn enumeration_listing<'a>(values: impl ExactSizeIterator<Item = &'a str>) -> String {
+    let total = values.len();
+    let mut listing = String::new();
+    for (index, value) in values.enumerate() {
+        let separator = if index == 0 { 0 } else { 2 };
+        if listing.len() + separator + value.len() > MAX_ENUMERATION_LISTING_BYTES {
+            let omitted = total - index;
+            if index > 0 {
+                listing.push_str(", ");
+            }
+            listing.push_str(&format!("... {omitted} more"));
+            break;
+        }
+        if index > 0 {
+            listing.push_str(", ");
+        }
+        listing.push_str(value);
+    }
+    listing
 }
 
 /// Total instance occurrences across every immediate branch of a model group.
