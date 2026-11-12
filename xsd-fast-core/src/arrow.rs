@@ -69,6 +69,17 @@ const MAX_DERIVATION_NESTING: usize = 64;
 /// into errors, so a new value needs the Arrow resource-limit tests rerun.
 const MAX_DERIVATION_STEPS: usize = 1_000_000;
 
+/// Most walk steps one call that derives every global element may take.
+///
+/// Each element is still held to [`MAX_DERIVATION_STEPS`], but a schema can
+/// declare thousands of elements that each stay under it, and the call keeps
+/// every result: 2,000 elements of 1,000 columns are 2,000,000 fields from a
+/// schema of about 118 KiB. Four elements' worth bounds what one call can
+/// build to a few hundred MiB in an unoptimized build. The real schema sets
+/// checked when this was set (ANS TISS, S1000D Issue 6) derive every element
+/// inside it. Lowering it turns large published schemas into errors.
+const MAX_TOTAL_DERIVATION_STEPS: usize = 4 * MAX_DERIVATION_STEPS;
+
 /// Options for Arrow schema derivation.
 #[derive(Debug, Clone)]
 pub struct ArrowOptions {
@@ -107,21 +118,39 @@ impl SchemaSet {
     /// walk steps (types visited plus fields emitted, wrapped ones included)
     /// or its model groups nest too deeply to walk.
     pub fn to_arrow_schema(&self, root_element: &str, opts: ArrowOptions) -> Result<SchemaRef> {
+        let mut steps = MAX_DERIVATION_STEPS;
+        self.derive_arrow_schema(root_element, &opts, &mut steps)
+    }
+
+    /// Derives one element's schema, taking its steps out of `steps_left`.
+    ///
+    /// The derivation may use what `steps_left` holds, up to
+    /// [`MAX_DERIVATION_STEPS`]; what it used is deducted whether it succeeds
+    /// or fails.
+    fn derive_arrow_schema(
+        &self,
+        root_element: &str,
+        opts: &ArrowOptions,
+        steps_left: &mut usize,
+    ) -> Result<SchemaRef> {
         let decl = self
             .model
             .global_elements
             .get(root_element)
             .with_context(|| format!("element '{root_element}' not found in global elements"))?;
 
+        let allowed = (*steps_left).min(MAX_DERIVATION_STEPS);
         let mut fields: Vec<Field> = Vec::new();
         let mut derivation = Derivation {
             model: &self.model,
             max_depth: opts.max_depth.min(MAX_FLATTEN_DEPTH),
-            opts: &opts,
-            steps_left: MAX_DERIVATION_STEPS,
+            opts,
+            steps_left: allowed,
             nesting: 0,
         };
-        derivation.fields_from_type(&decl.type_def, 0, String::new(), &mut fields)?;
+        let walked = derivation.fields_from_type(&decl.type_def, 0, String::new(), &mut fields);
+        *steps_left -= allowed - derivation.steps_left;
+        walked?;
         Ok(Arc::new(Schema::new(fields)))
     }
 
@@ -197,17 +226,21 @@ impl SchemaSet {
     /// whose derivation fails, which happens when it exceeds a resource limit
     /// (see [`SchemaSet::to_arrow_schema`]), is left out without a report, so
     /// the result can hold fewer entries than the schema has global elements.
-    /// Use [`SchemaSet::try_all_arrow_schemas`] to learn of the failure.
+    /// The call as a whole may take 4,000,000 walk steps; once they are used,
+    /// the elements not yet derived are left out as well.
+    /// Use [`SchemaSet::try_all_arrow_schemas`] to learn of either failure.
     pub fn all_arrow_schemas(&self, opts: ArrowOptions) -> Vec<(String, SchemaRef)> {
-        self.model
-            .global_elements
-            .keys()
-            .filter_map(|name| {
-                self.to_arrow_schema(name, opts.clone())
-                    .ok()
-                    .map(|s| (name.clone(), s))
-            })
-            .collect()
+        let mut steps_left = MAX_TOTAL_DERIVATION_STEPS;
+        let mut derived = Vec::new();
+        for name in self.model.global_elements.keys() {
+            if steps_left == 0 {
+                break;
+            }
+            if let Ok(schema) = self.derive_arrow_schema(name, &opts, &mut steps_left) {
+                derived.push((name.clone(), schema));
+            }
+        }
+        derived
     }
 
     /// Derive Arrow schemas for **all** global elements, or fail.
@@ -220,18 +253,29 @@ impl SchemaSet {
     /// Fails on the first element whose derivation fails. The message is the
     /// one [`SchemaSet::to_arrow_schema`] gives, so it still starts with
     /// `resource_limit` for a resource limit, followed by the name of the
-    /// element. No partial result is returned.
+    /// element. Fails with `resource_limit: arrow_derivation_steps_total` when
+    /// the elements together take more than 4,000,000 walk steps, even if
+    /// each is inside its own limit. No partial result is returned.
     pub fn try_all_arrow_schemas(&self, opts: ArrowOptions) -> Result<Vec<(String, SchemaRef)>> {
-        self.model
-            .global_elements
-            .keys()
-            .map(|name| {
-                let schema = self
-                    .to_arrow_schema(name, opts.clone())
-                    .map_err(|error| anyhow::anyhow!("{error:#} (element '{name}')"))?;
-                Ok((name.clone(), schema))
-            })
-            .collect()
+        let mut steps_left = MAX_TOTAL_DERIVATION_STEPS;
+        let mut derived = Vec::with_capacity(self.model.global_elements.len());
+        for name in self.model.global_elements.keys() {
+            let before = steps_left;
+            match self.derive_arrow_schema(name, &opts, &mut steps_left) {
+                Ok(schema) => derived.push((name.clone(), schema)),
+                // The element ran out because the call did, not because it
+                // is too large on its own.
+                Err(_) if steps_left == 0 && before < MAX_DERIVATION_STEPS => {
+                    return Err(anyhow::anyhow!(
+                        "resource_limit: arrow_derivation_steps_total: deriving every global \
+                         element takes more than {MAX_TOTAL_DERIVATION_STEPS} steps (reached at \
+                         element '{name}')"
+                    ));
+                }
+                Err(error) => return Err(anyhow::anyhow!("{error:#} (element '{name}')")),
+            }
+        }
+        Ok(derived)
     }
 }
 
