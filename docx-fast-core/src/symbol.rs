@@ -355,6 +355,79 @@ impl SymbolFonts {
     }
 }
 
+/// What one level of formatting says about the font of one script class.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum FontSlot {
+    /// Nothing: the font comes from the next level out.
+    #[default]
+    Inherit,
+    /// A font this module has no table for, which ends the search.
+    Plain,
+    /// A symbol font.
+    Symbol(SymbolFont),
+}
+
+impl FontSlot {
+    /// Reads a font name as written in `w:rFonts`; `None` is a missing
+    /// attribute.
+    pub(crate) fn from_name(font: Option<&str>) -> Self {
+        match font {
+            None => Self::Inherit,
+            Some(font) => SymbolFont::from_name(font).map_or(Self::Plain, Self::Symbol),
+        }
+    }
+
+    fn or(self, outer: Self) -> Self {
+        match self {
+            Self::Inherit => outer,
+            _ => self,
+        }
+    }
+
+    fn symbol_font(self) -> Option<SymbolFont> {
+        match self {
+            Self::Symbol(font) => Some(font),
+            Self::Inherit | Self::Plain => None,
+        }
+    }
+}
+
+/// The `w:rFonts` of one level of formatting: a run, or a style.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FontChoice {
+    /// `w:ascii`.
+    pub(crate) ascii: FontSlot,
+    /// `w:hAnsi`.
+    pub(crate) high_ansi: FontSlot,
+    /// `w:cs`.
+    pub(crate) complex_script: FontSlot,
+}
+
+impl FontChoice {
+    /// Whether this level names no font at all.
+    pub(crate) fn is_inherit(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Fills what this level leaves open from the next level out.
+    pub(crate) fn or(self, outer: Self) -> Self {
+        Self {
+            ascii: self.ascii.or(outer.ascii),
+            high_ansi: self.high_ansi.or(outer.high_ansi),
+            complex_script: self.complex_script.or(outer.complex_script),
+        }
+    }
+
+    /// The symbol fonts among the fonts chosen.
+    pub(crate) fn symbol_fonts(&self) -> SymbolFonts {
+        SymbolFonts {
+            ascii: self.ascii.symbol_font(),
+            high_ansi: self.high_ansi.symbol_font(),
+            complex_script: self.complex_script.symbol_font(),
+        }
+    }
+}
+
 /// Resolves a `w:sym` element to the character it displays.
 ///
 /// `char_hex` is the `w:char` attribute. A character of a symbol font this
@@ -452,6 +525,27 @@ mod tests {
         assert_eq!(sym_char(None, "2022"), Some('•'));
         assert_eq!(sym_char(Some("Symbol"), "not hex"), None);
         assert_eq!(sym_char(Some("Wingdings"), "D800"), None);
+    }
+
+    #[test]
+    fn a_level_fills_only_the_slots_it_leaves_open() {
+        let symbol = FontSlot::Symbol(SymbolFont::Symbol);
+        let run = FontChoice {
+            ascii: FontSlot::from_name(Some("Arial")),
+            high_ansi: FontSlot::from_name(None),
+            complex_script: FontSlot::from_name(None),
+        };
+        let style = FontChoice {
+            ascii: symbol,
+            high_ansi: symbol,
+            complex_script: FontSlot::Inherit,
+        };
+        let fonts = run.or(style).symbol_fonts();
+        assert_eq!(fonts.ascii, None);
+        assert_eq!(fonts.high_ansi, Some(SymbolFont::Symbol));
+        assert_eq!(fonts.complex_script, None);
+        assert!(FontChoice::default().is_inherit());
+        assert!(!run.is_inherit());
     }
 
     #[test]

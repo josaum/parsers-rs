@@ -648,14 +648,14 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
     let comments_ext_path = relationship_target(&document_rels, REL_COMMENTS_EXT)
         .map(|t| resolve_part(&document_dir, t));
 
-    let styles = if let Some(path) = styles_path.as_deref() {
+    let (styles, style_fonts) = if let Some(path) = styles_path.as_deref() {
         if let Some(xml) = read_optional_part_bytes(&archive, path, options.max_inflate)? {
-            parse_styles(&xml)?
+            (parse_styles(&xml)?, parse_style_fonts(&xml)?)
         } else {
-            Vec::new()
+            (Vec::new(), StyleFonts::default())
         }
     } else {
-        Vec::new()
+        (Vec::new(), StyleFonts::default())
     };
 
     let numbering = if let Some(path) = numbering_path.as_deref() {
@@ -670,7 +670,7 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
 
     let footnotes = if let Some(path) = footnotes_path.as_deref() {
         if let Some(xml) = read_optional_part_bytes(&archive, path, options.max_inflate)? {
-            parse_notes(&xml, b"footnote", &styles)?
+            parse_notes(&xml, b"footnote", &styles, &style_fonts)?
         } else {
             Vec::new()
         }
@@ -680,7 +680,7 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
 
     let endnotes = if let Some(path) = endnotes_path.as_deref() {
         if let Some(xml) = read_optional_part_bytes(&archive, path, options.max_inflate)? {
-            parse_notes(&xml, b"endnote", &styles)?
+            parse_notes(&xml, b"endnote", &styles, &style_fonts)?
         } else {
             Vec::new()
         }
@@ -691,7 +691,7 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
     let mut comments = if options.extract_comments {
         if let Some(path) = comments_path.as_deref() {
             if let Some(xml) = read_optional_part_bytes(&archive, path, options.max_inflate)? {
-                parse_comments(&xml, &styles)?
+                parse_comments(&xml, &styles, &style_fonts)?
             } else {
                 Vec::new()
             }
@@ -737,7 +737,13 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         if let Some(target) = document_rels.by_id.get(&reference.rel_id) {
             let part = resolve_part(&document_dir, target);
             if let Some(reader) = open_optional_part_reader(&archive, &part, options.max_inflate)? {
-                let blocks = parse_document_blocks(reader, &styles, &mut fields, &mut revisions)?;
+                let blocks = parse_document_blocks(
+                    reader,
+                    &styles,
+                    &style_fonts,
+                    &mut fields,
+                    &mut revisions,
+                )?;
                 let entry = HeaderFooter {
                     kind: reference.kind,
                     ref_type: reference.ref_type,
@@ -755,7 +761,13 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
 
     let document_reader = open_part_reader(&archive, &document_path, options.max_inflate)
         .with_context(|| format!("read document: {document_path}"))?;
-    let blocks = parse_document_blocks(document_reader, &styles, &mut fields, &mut revisions)?;
+    let blocks = parse_document_blocks(
+        document_reader,
+        &styles,
+        &style_fonts,
+        &mut fields,
+        &mut revisions,
+    )?;
 
     let mut toc = Vec::new();
     collect_toc(&blocks, &mut toc);
@@ -1284,6 +1296,178 @@ fn parse_styles(xml: &[u8]) -> Result<Vec<Style>> {
     Ok(styles)
 }
 
+/// Most `basedOn` links followed from one style.
+///
+/// Real style sheets nest a handful of levels. The limit is what stops a
+/// file whose styles are based on each other in a circle.
+const MAX_STYLE_CHAIN: usize = 64;
+
+/// The fonts a run inherits from its styles.
+///
+/// Kept apart from [`Style`], which is part of the output and does not carry
+/// fonts.
+#[derive(Debug, Default)]
+struct StyleFonts {
+    /// The fonts of each style, with those of the styles it is based on
+    /// already filled in. A style that names no font anywhere in its chain
+    /// has no entry.
+    by_id: HashMap<String, symbol::FontChoice>,
+    /// The fonts of the default paragraph style, which a paragraph without a
+    /// `w:pStyle` uses.
+    default_paragraph: symbol::FontChoice,
+}
+
+impl StyleFonts {
+    /// Whether no style names a font, so only a run's own font matters.
+    fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    fn of(&self, style_id: &str) -> symbol::FontChoice {
+        self.by_id.get(style_id).copied().unwrap_or_default()
+    }
+
+    /// The fonts in effect for a run, nearest formatting first: the run's
+    /// own, its character style, then the paragraph's style.
+    fn effective(
+        &self,
+        run: symbol::FontChoice,
+        run_style: Option<&str>,
+        paragraph_style: Option<&str>,
+    ) -> symbol::FontChoice {
+        let character = run_style.map(|id| self.of(id)).unwrap_or_default();
+        let paragraph = match paragraph_style {
+            Some(id) => self.of(id),
+            None => self.default_paragraph,
+        };
+        run.or(character).or(paragraph)
+    }
+}
+
+/// Reads the three `w:rFonts` attributes this crate tells fonts apart by.
+fn font_choice<R: BufRead>(
+    reader: &Reader<R>,
+    e: &quick_xml::events::BytesStart<'_>,
+) -> Result<symbol::FontChoice> {
+    let slot = |key: &[u8]| -> Result<symbol::FontSlot> {
+        Ok(symbol::FontSlot::from_name(
+            attr_value(reader, e, key)?.as_deref(),
+        ))
+    };
+    Ok(symbol::FontChoice {
+        ascii: slot(b"ascii")?,
+        high_ansi: slot(b"hAnsi")?,
+        complex_script: slot(b"cs")?,
+    })
+}
+
+/// Reads the fonts each style gives its runs from `styles.xml`.
+fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
+    struct Declared {
+        based_on: Option<String>,
+        fonts: symbol::FontChoice,
+    }
+
+    let mut reader = xml_reader(Cursor::new(xml));
+    let mut buf = Vec::new();
+    let mut declared: HashMap<String, Declared> = HashMap::new();
+    let mut default_paragraph: Option<String> = None;
+    let mut current: Option<(String, Declared)> = None;
+    let mut in_rpr = false;
+    // Inside `w:tblStylePr`: formatting for part of a table, not the style's.
+    let mut in_table_part = false;
+    loop {
+        let event = reader.read_event_into(&mut buf);
+        match &event {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let is_start = matches!(event, Ok(Event::Start(_)));
+                let raw = e.name().as_ref().to_vec();
+                match local_name(&raw) {
+                    b"style" => {
+                        let id = attr_value(&reader, e, b"styleId")?.unwrap_or_default();
+                        let is_default = attr_value(&reader, e, b"default")?
+                            .is_some_and(|val| val == "1" || val.eq_ignore_ascii_case("true"));
+                        let is_paragraph = attr_value(&reader, e, b"type")?
+                            .is_some_and(|kind| kind == "paragraph");
+                        if is_default && is_paragraph && default_paragraph.is_none() {
+                            default_paragraph = Some(id.clone());
+                        }
+                        let style = Declared {
+                            based_on: None,
+                            fonts: symbol::FontChoice::default(),
+                        };
+                        if is_start {
+                            current = Some((id, style));
+                        } else {
+                            declared.entry(id).or_insert(style);
+                        }
+                        in_rpr = false;
+                        in_table_part = false;
+                    }
+                    b"basedOn" => {
+                        if let Some((_, style)) = current.as_mut() {
+                            style.based_on = attr_value(&reader, e, b"val")?;
+                        }
+                    }
+                    b"rPr" if is_start => in_rpr = true,
+                    b"tblStylePr" if is_start => in_table_part = true,
+                    b"rFonts" if in_rpr && !in_table_part => {
+                        if let Some((_, style)) = current.as_mut() {
+                            style.fonts = font_choice(&reader, e)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let raw = e.name().as_ref().to_vec();
+                match local_name(&raw) {
+                    b"style" => {
+                        if let Some((id, style)) = current.take() {
+                            declared.entry(id).or_insert(style);
+                        }
+                    }
+                    b"rPr" => in_rpr = false,
+                    b"tblStylePr" => in_table_part = false,
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => return Err(anyhow!("parse style fonts: {err}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    let resolve = |id: &str| {
+        let mut fonts = symbol::FontChoice::default();
+        let mut next = Some(id);
+        for _ in 0..MAX_STYLE_CHAIN {
+            let Some(style) = next.and_then(|id| declared.get(id)) else {
+                break;
+            };
+            fonts = fonts.or(style.fonts);
+            next = style.based_on.as_deref();
+        }
+        fonts
+    };
+    let mut by_id = HashMap::new();
+    for id in declared.keys() {
+        let fonts = resolve(id);
+        if !fonts.is_inherit() {
+            by_id.insert(id.clone(), fonts);
+        }
+    }
+    let default_paragraph = default_paragraph
+        .as_deref()
+        .map(|id| by_id.get(id).copied().unwrap_or_default())
+        .unwrap_or_default();
+    Ok(StyleFonts {
+        by_id,
+        default_paragraph,
+    })
+}
+
 fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
     let mut reader = xml_reader(Cursor::new(xml));
     let mut buf = Vec::new();
@@ -1377,14 +1561,19 @@ fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
     Ok(numbering)
 }
 
-fn parse_notes(xml: &[u8], tag: &[u8], styles: &[Style]) -> Result<Vec<Note>> {
+fn parse_notes(
+    xml: &[u8],
+    tag: &[u8],
+    styles: &[Style],
+    style_fonts: &StyleFonts,
+) -> Result<Vec<Note>> {
     let mut reader = xml_reader(Cursor::new(xml));
     let mut buf = Vec::new();
     let mut notes = Vec::new();
     let mut current_id: Option<i32> = None;
     let mut fields = Vec::new();
     let mut revisions = Vec::new();
-    let mut parser = DocxBodyParser::new(styles, &mut fields, &mut revisions);
+    let mut parser = DocxBodyParser::new(styles, style_fonts, &mut fields, &mut revisions);
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1451,14 +1640,14 @@ fn parse_notes(xml: &[u8], tag: &[u8], styles: &[Style]) -> Result<Vec<Note>> {
     Ok(notes)
 }
 
-fn parse_comments(xml: &[u8], styles: &[Style]) -> Result<Vec<Comment>> {
+fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Result<Vec<Comment>> {
     let mut reader = xml_reader(Cursor::new(xml));
     let mut buf = Vec::new();
     let mut comments = Vec::new();
     let mut current: Option<Comment> = None;
     let mut tmp_fields = Vec::new();
     let mut tmp_revisions = Vec::new();
-    let mut parser = DocxBodyParser::new(styles, &mut tmp_fields, &mut tmp_revisions);
+    let mut parser = DocxBodyParser::new(styles, style_fonts, &mut tmp_fields, &mut tmp_revisions);
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1620,10 +1809,11 @@ fn apply_extended_comments(comments: &mut [Comment], xml: &[u8]) -> Result<()> {
 fn parse_document_blocks<R: BufRead>(
     reader: R,
     styles: &[Style],
+    style_fonts: &StyleFonts,
     fields_out: &mut Vec<Field>,
     revisions_out: &mut Vec<Revision>,
 ) -> Result<Vec<Block>> {
-    let mut parser = DocxBodyParser::new(styles, fields_out, revisions_out);
+    let mut parser = DocxBodyParser::new(styles, style_fonts, fields_out, revisions_out);
     parser.parse(reader)
 }
 
@@ -1905,6 +2095,7 @@ fn local_name(name: &[u8]) -> &[u8] {
 #[derive(Debug)]
 struct DocxBodyParser<'a> {
     styles_by_id: HashMap<String, StyleRef>,
+    style_fonts: &'a StyleFonts,
     fields_out: &'a mut Vec<Field>,
     revisions_out: &'a mut Vec<Revision>,
     revision_ids: HashSet<String>,
@@ -1975,9 +2166,12 @@ struct RunBuilder {
     revision: Option<RevisionRef>,
     comment_ids: Vec<i32>,
     note_references: Vec<NoteReference>,
-    /// The symbol fonts the run's own `w:rFonts` names. Characters of its
-    /// text that those fonts give a meaning to are font codes, not text.
-    symbol_fonts: symbol::SymbolFonts,
+    /// The run's own `w:rFonts`.
+    fonts: symbol::FontChoice,
+    /// The symbol fonts in effect for the run, worked out from `fonts` and
+    /// the run's styles when its first text arrives. Characters those fonts
+    /// give a meaning to are font codes, not text.
+    symbol_fonts: Option<symbol::SymbolFonts>,
 }
 
 #[derive(Debug)]
@@ -1999,6 +2193,7 @@ struct RevisionInfo {
 impl<'a> DocxBodyParser<'a> {
     fn new(
         styles: &[Style],
+        style_fonts: &'a StyleFonts,
         fields_out: &'a mut Vec<Field>,
         revisions_out: &'a mut Vec<Revision>,
     ) -> Self {
@@ -2014,6 +2209,7 @@ impl<'a> DocxBodyParser<'a> {
         }
         Self {
             styles_by_id,
+            style_fonts,
             fields_out,
             revisions_out,
             revision_ids: HashSet::new(),
@@ -2162,19 +2358,10 @@ impl<'a> DocxBodyParser<'a> {
                 }
             }
             b"rFonts" if self.in_rpr => {
-                // Direct run formatting only; a symbol font inherited from a
-                // style is not resolved here.
-                let font = |key: &[u8]| -> Result<Option<symbol::SymbolFont>> {
-                    Ok(attr_value(reader, e, key)?
-                        .and_then(|font| symbol::SymbolFont::from_name(&font)))
-                };
-                let symbol_fonts = symbol::SymbolFonts {
-                    ascii: font(b"ascii")?,
-                    high_ansi: font(b"hAnsi")?,
-                    complex_script: font(b"cs")?,
-                };
+                let fonts = font_choice(reader, e)?;
                 if let Some(r) = self.current_run.as_mut() {
-                    r.symbol_fonts = symbol_fonts;
+                    r.fonts = fonts;
+                    r.symbol_fonts = None;
                 }
             }
             b"pPr" => self.in_ppr = true,
@@ -2212,6 +2399,7 @@ impl<'a> DocxBodyParser<'a> {
                 if let Some(val) = attr_value(reader, e, b"val")? {
                     if let Some(r) = self.current_run.as_mut() {
                         r.style_id = Some(val);
+                        r.symbol_fonts = None;
                     }
                 }
             }
@@ -2384,12 +2572,8 @@ impl<'a> DocxBodyParser<'a> {
     fn handle_text(&mut self, text: &[u8]) {
         let mut value = String::from_utf8_lossy(text);
         if self.in_text {
-            if let Some(fonts) = self
-                .current_run
-                .as_ref()
-                .map(|run| run.symbol_fonts)
-                .filter(|fonts| !fonts.is_empty())
-            {
+            let fonts = self.run_symbol_fonts();
+            if !fonts.is_empty() {
                 value = fonts.map_run_text(&value).into();
             }
         }
@@ -2410,6 +2594,32 @@ impl<'a> DocxBodyParser<'a> {
             }
             self.push_text(&value);
         }
+    }
+
+    /// The symbol fonts in effect for the current run.
+    ///
+    /// Run properties come before the run's text, so the answer is worked
+    /// out once, at the first text, and kept for the rest of the run.
+    fn run_symbol_fonts(&mut self) -> symbol::SymbolFonts {
+        let Some(run) = self.current_run.as_mut() else {
+            return symbol::SymbolFonts::default();
+        };
+        if let Some(fonts) = run.symbol_fonts {
+            return fonts;
+        }
+        let fonts = if self.style_fonts.is_empty() {
+            run.fonts.symbol_fonts()
+        } else {
+            let paragraph_style = self
+                .current_paragraph
+                .as_ref()
+                .and_then(|paragraph| paragraph.style_id.as_deref());
+            self.style_fonts
+                .effective(run.fonts, run.style_id.as_deref(), paragraph_style)
+                .symbol_fonts()
+        };
+        run.symbol_fonts = Some(fonts);
+        fonts
     }
 
     fn handle_end(&mut self, name: &[u8]) -> Result<()> {
@@ -2656,14 +2866,20 @@ mod tests {
     fn paragraphs_of(xml: Vec<u8>) -> Vec<String> {
         let mut fields = Vec::new();
         let mut revisions = Vec::new();
-        parse_document_blocks(Cursor::new(xml), &[], &mut fields, &mut revisions)
-            .expect("document parses")
-            .into_iter()
-            .filter_map(|block| match block {
-                Block::Paragraph(paragraph) => Some(paragraph.text),
-                _ => None,
-            })
-            .collect()
+        parse_document_blocks(
+            Cursor::new(xml),
+            &[],
+            &StyleFonts::default(),
+            &mut fields,
+            &mut revisions,
+        )
+        .expect("document parses")
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Paragraph(paragraph) => Some(paragraph.text),
+            _ => None,
+        })
+        .collect()
     }
 
     #[test]
@@ -2741,6 +2957,7 @@ mod tests {
             br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="2"><w:p><w:r><w:t><![CDATA[a<b]]></w:t><w:noBreakHyphen/><w:sym w:font="Symbol" w:char="F061"/></w:r></w:p></w:footnote></w:footnotes>"#,
             b"footnote",
             &[],
+            &StyleFonts::default(),
         )
         .unwrap();
         let Block::Paragraph(paragraph) = &notes[0].blocks[0] else {
@@ -2751,6 +2968,7 @@ mod tests {
         let comments = parse_comments(
             br#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1"><w:p><w:r><w:t><![CDATA[x&y]]></w:t><w:sym w:font="Symbol" w:char="F062"/></w:r></w:p></w:comment></w:comments>"#,
             &[],
+            &StyleFonts::default(),
         )
         .unwrap();
         let Block::Paragraph(paragraph) = &comments[0].blocks[0] else {

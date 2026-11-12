@@ -154,3 +154,126 @@ fn symbol_font_text_still_maps_only_its_private_use_characters() {
     let body = run(r#"w:ascii="Symbol" w:hAnsi="Symbol""#, "a\u{F061}");
     assert_eq!(paragraphs(&parse(&body, "")), ["a\u{3B1}"]);
 }
+
+/// A style named `id` whose run properties are `run_properties`.
+fn style(kind: &str, id: &str, attributes: &str, based_on: Option<&str>, fonts: &str) -> String {
+    let based_on = based_on
+        .map(|parent| format!(r#"<w:basedOn w:val="{parent}"/>"#))
+        .unwrap_or_default();
+    let run_properties = if fonts.is_empty() {
+        String::new()
+    } else {
+        format!("<w:rPr><w:rFonts {fonts}/></w:rPr>")
+    };
+    format!(
+        r#"<w:style w:type="{kind}" w:styleId="{id}" {attributes}><w:name w:val="{id}"/>{based_on}{run_properties}</w:style>"#
+    )
+}
+
+const SYMBOL: &str = r#"w:ascii="Symbol" w:hAnsi="Symbol""#;
+const WINGDINGS: &str = r#"w:ascii="Wingdings" w:hAnsi="Wingdings""#;
+
+#[test]
+fn a_symbol_font_from_the_paragraph_style_is_applied() {
+    let styles = style("paragraph", "Greek", "", None, SYMBOL);
+    let body = concat!(
+        r#"<w:p><w:pPr><w:pStyle w:val="Greek"/></w:pPr><w:r><w:t>"#,
+        "\u{F061}\u{F062}</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>\u{F061}</w:t></w:r></w:p>",
+    );
+    assert_eq!(
+        paragraphs(&parse(body, &styles)),
+        ["\u{3B1}\u{3B2}", "\u{F061}"]
+    );
+}
+
+#[test]
+fn a_symbol_font_from_the_character_style_chain_is_applied() {
+    let styles = [
+        style("character", "Base", "", None, WINGDINGS),
+        style("character", "Middle", "", Some("Base"), ""),
+        style("character", "Marks", "", Some("Middle"), ""),
+    ]
+    .concat();
+    let body = concat!(
+        r#"<w:p><w:r><w:rPr><w:rStyle w:val="Marks"/></w:rPr><w:t>J</w:t></w:r>"#,
+        "<w:r><w:t>J</w:t></w:r></w:p>",
+    );
+    assert_eq!(paragraphs(&parse(body, &styles)), ["\u{263A}J"]);
+}
+
+#[test]
+fn the_nearest_font_wins_over_an_inherited_symbol_font() {
+    let styles = [
+        style("paragraph", "Greek", "", None, SYMBOL),
+        style(
+            "paragraph",
+            "Plain",
+            "",
+            Some("Greek"),
+            r#"w:ascii="Arial" w:hAnsi="Arial""#,
+        ),
+        style("character", "Marks", "", None, WINGDINGS),
+    ]
+    .concat();
+    let body = concat!(
+        // The run's own font replaces the paragraph style's.
+        r#"<w:p><w:pPr><w:pStyle w:val="Greek"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/></w:rPr><w:t>"#,
+        "\u{F061}</w:t></w:r></w:p>",
+        // A style replaces the font of the style it is based on.
+        r#"<w:p><w:pPr><w:pStyle w:val="Plain"/></w:pPr><w:r><w:t>"#,
+        "\u{F061}</w:t></w:r></w:p>",
+        // The character style replaces the paragraph style's font.
+        r#"<w:p><w:pPr><w:pStyle w:val="Greek"/></w:pPr><w:r><w:rPr><w:rStyle w:val="Marks"/></w:rPr><w:t>"#,
+        "\u{F04A}</w:t></w:r></w:p>",
+    );
+    assert_eq!(
+        paragraphs(&parse(body, &styles)),
+        ["\u{F061}", "\u{F061}", "\u{263A}"]
+    );
+}
+
+#[test]
+fn the_default_paragraph_style_applies_to_a_paragraph_without_a_style() {
+    let styles = [
+        style("paragraph", "Normal", r#"w:default="1""#, None, WINGDINGS),
+        style(
+            "paragraph",
+            "Body",
+            "",
+            None,
+            r#"w:ascii="Arial" w:hAnsi="Arial""#,
+        ),
+    ]
+    .concat();
+    let body = concat!(
+        "<w:p><w:r><w:t>J</w:t></w:r></w:p>",
+        r#"<w:p><w:pPr><w:pStyle w:val="Body"/></w:pPr><w:r><w:t>J</w:t></w:r></w:p>"#,
+    );
+    assert_eq!(paragraphs(&parse(body, &styles)), ["\u{263A}", "J"]);
+}
+
+#[test]
+fn styles_based_on_each_other_in_a_circle_do_not_hang() {
+    let styles = [
+        style("paragraph", "A", "", Some("B"), ""),
+        style("paragraph", "B", "", Some("C"), SYMBOL),
+        style("paragraph", "C", "", Some("A"), ""),
+    ]
+    .concat();
+    let body = concat!(
+        r#"<w:p><w:pPr><w:pStyle w:val="A"/></w:pPr><w:r><w:t>"#,
+        "\u{F061}</w:t></w:r></w:p>",
+    );
+    assert_eq!(paragraphs(&parse(body, &styles)), ["\u{3B1}"]);
+}
+
+#[test]
+fn a_font_for_part_of_a_table_style_is_not_the_style_font() {
+    let styles = r#"<w:style w:type="table" w:styleId="Grid"><w:name w:val="Grid"/><w:tblStylePr w:type="firstRow"><w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol"/></w:rPr></w:tblStylePr></w:style>"#;
+    let body = concat!(
+        r#"<w:p><w:pPr><w:pStyle w:val="Grid"/></w:pPr><w:r><w:t>"#,
+        "\u{F061}</w:t></w:r></w:p>",
+    );
+    assert_eq!(paragraphs(&parse(body, styles)), ["\u{F061}"]);
+}
