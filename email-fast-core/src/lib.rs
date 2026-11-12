@@ -67,6 +67,12 @@ pub mod arrow;
 
 mod msg;
 
+/// The shared mutation harness, for unit tests that compare private helpers
+/// against `mailparse` over mutated input.
+#[cfg(test)]
+#[path = "../../tools/mutation_smoke.rs"]
+mod smoke;
+
 /// Hidden CFB fixture writer for integration tests (mini-stream MSG layout).
 #[doc(hidden)]
 pub fn write_msg_cfb_fixture(subject: &str, sender: &str, to: &str, body: &str) -> Vec<u8> {
@@ -383,6 +389,13 @@ pub fn parse_eml(path: impl AsRef<Path>, options: ParseOptions) -> Result<Email>
 
 /// Parse EML from bytes
 pub fn parse_eml_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
+    // `mailparse` recurses once per nested multipart, so the depth is checked
+    // before it sees the message.
+    if mime_nesting_exceeds(bytes, MAX_MIME_DEPTH) {
+        return Err(anyhow!(
+            "Failed to parse email: multipart nesting deeper than {MAX_MIME_DEPTH} levels"
+        ));
+    }
     let parsed =
         mailparse::parse_mail(bytes).map_err(|e| anyhow!("Failed to parse email: {}", e))?;
 
@@ -528,8 +541,11 @@ pub fn parse_mbox_reader(
             line = rest;
         }
 
-        // Mbox messages start with "From " at beginning of line
-        if line.starts_with(b"From ") {
+        // A message starts at a "From " separator line. The first one of the
+        // mailbox is taken as written; after that the line must carry the
+        // separator's date, or body text beginning with the word "From"
+        // would cut the message in two.
+        if line.starts_with(b"From ") && (!in_message || is_mbox_separator(line)) {
             if !current_message.is_empty() {
                 // Parse previous message
                 if let Ok(email) = parse_eml_bytes(&current_message, options) {
@@ -559,6 +575,71 @@ pub fn parse_mbox_reader(
     }
 
     Ok(count)
+}
+
+/// Reports whether `line` is an mbox message separator (a "From_ line").
+///
+/// A separator is `From `, an envelope sender, and a date in `asctime` form:
+/// weekday, month, day of month, time, and a four-digit year, with an
+/// optional time zone before or after the year. All of these are accepted:
+///
+/// ```text
+/// From a@example.com Mon Jan  1 00:00:00 2024
+/// From MAILER-DAEMON Mon Jan 15 14:30 2024
+/// From - Mon Jan 15 14:30:00 2024
+/// From 1234@xxx Mon Jan 15 14:30:00 +0000 2024
+/// ```
+///
+/// The sender may be missing or contain spaces, so the date is looked for
+/// anywhere in the line's first few words. A body line such as
+/// `From now on, ...` has no such date and stays in its message.
+fn is_mbox_separator(line: &[u8]) -> bool {
+    /// Words examined after `From `. A separator is a sender plus at most
+    /// seven date words; the rest of a long body line is not worth scanning.
+    const MAX_WORDS: usize = 16;
+    /// Words after the time that may hold the year: a zone on either side.
+    const YEAR_WINDOW: usize = 3;
+
+    fn is_name(word: &[u8], names: &[&str]) -> bool {
+        names
+            .iter()
+            .any(|name| word.eq_ignore_ascii_case(name.as_bytes()))
+    }
+    fn is_number(word: &[u8], digits: std::ops::RangeInclusive<usize>) -> bool {
+        digits.contains(&word.len()) && word.iter().all(u8::is_ascii_digit)
+    }
+    fn is_time(word: &[u8]) -> bool {
+        let mut fields = 0;
+        word.split(|byte| *byte == b':').all(|field| {
+            fields += 1;
+            is_number(field, 1..=2)
+        }) && (2..=3).contains(&fields)
+    }
+
+    let Some(rest) = line.strip_prefix(b"From ") else {
+        return false;
+    };
+    let words: Vec<&[u8]> = rest
+        .split(u8::is_ascii_whitespace)
+        .filter(|word| !word.is_empty())
+        .take(MAX_WORDS)
+        .collect();
+    words.windows(4).enumerate().any(|(at, date)| {
+        is_name(date[0], &["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+            && is_name(
+                date[1],
+                &[
+                    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                    "Dec",
+                ],
+            )
+            && is_number(date[2], 1..=2)
+            && is_time(date[3])
+            && words[at + 4..]
+                .iter()
+                .take(YEAR_WINDOW)
+                .any(|word| is_number(word, 4..=4))
+    })
 }
 
 /// Parse email to NDJSON
@@ -627,6 +708,118 @@ pub fn extract_attachments(
 }
 
 // Helper functions
+
+/// Deepest nesting of multipart containers a message may have.
+///
+/// `mailparse` builds the MIME tree by recursion, and this crate walks and
+/// drops that tree the same way. An unoptimized build spends about 2.5 KiB of
+/// stack per level: a 256 KiB stack overflows near 105 levels. Thirty-two
+/// levels keep the whole parse within a third of such a stack, and mail that
+/// nests past ten levels is not something a mail client produces.
+const MAX_MIME_DEPTH: usize = 32;
+
+/// Reports whether `raw` nests multipart containers more than `limit` deep.
+///
+/// A message of ordinary shape is answered by counting lines: every level of
+/// nesting is opened by its own boundary delimiter line, and a delimiter line
+/// starts with `--`, so a message with at most `limit` such lines cannot nest
+/// deeper than `limit`. Only a message with more of them is walked.
+fn mime_nesting_exceeds(raw: &[u8], limit: usize) -> bool {
+    let mut dash_lines = usize::from(raw.starts_with(b"--"));
+    for window in raw.windows(3) {
+        if window == b"\n--" {
+            dash_lines += 1;
+            if dash_lines > limit {
+                return mime_nesting_depth(raw, limit).is_none();
+            }
+        }
+    }
+    false
+}
+
+/// Returns how deep multipart containers nest in `raw`, or `None` once the
+/// depth passes `limit`.
+///
+/// The depth is that of the deepest part: how many containers enclose it. A
+/// message that is a single part has depth 0. The walk splits parts exactly
+/// as `mailparse::parse_mail` (version 0.15) does, with the same header
+/// parser and the same boundary search, but keeps its work list on the heap,
+/// so it can measure a tree that would overflow the stack if `mailparse`
+/// were handed it. It must agree with `mailparse` on every input;
+/// `mime_depth_walk_agrees_with_mailparse` checks that.
+fn mime_nesting_depth(raw: &[u8], limit: usize) -> Option<usize> {
+    let mut deepest = 0;
+    let mut pending: Vec<(&[u8], usize)> = vec![(raw, 0)];
+    while let Some((part, depth)) = pending.pop() {
+        // A part whose headers do not parse fails the real parse as well, but
+        // possibly only after `mailparse` has descended into earlier parts,
+        // so the remaining parts are still measured.
+        let Ok((headers, body_start)) = mailparse::parse_headers(part) else {
+            continue;
+        };
+        let Some(content_type) =
+            mailparse::MailHeaderMap::get_first_value(headers.as_slice(), "Content-Type")
+        else {
+            continue;
+        };
+        let content_type = mailparse::parse_content_type(&content_type);
+        let Some(boundary) = content_type.params.get("boundary") else {
+            continue;
+        };
+        if !content_type.mimetype.starts_with("multipart/") || part.len() <= body_start {
+            continue;
+        }
+        let delimiter = format!("--{boundary}");
+        let delimiter = delimiter.as_bytes();
+        let Some(first_delimiter) = find_line_prefix(part, body_start, delimiter) else {
+            continue;
+        };
+        let child_depth = depth + 1;
+        let mut delimiter_end = first_delimiter + delimiter.len();
+        while let Some(part_start) = find_bytes(part, delimiter_end, b"\n").map(|at| at + 1) {
+            if child_depth > limit {
+                return None;
+            }
+            deepest = deepest.max(child_depth);
+            let part_end = find_line_prefix(part, part_start, delimiter).unwrap_or(part.len());
+            pending.push((&part[part_start..part_end], child_depth));
+            delimiter_end = part_end + delimiter.len();
+            if delimiter_end + 2 > part.len() || part[delimiter_end..].starts_with(b"--") {
+                break;
+            }
+        }
+    }
+    Some(deepest)
+}
+
+/// Finds `key` in `data` at or after `start`, as `mailparse` does.
+///
+/// This reproduces one quirk of the `mailparse` search on purpose: a match
+/// that ends exactly at the end of `data` is not reported. The depth walk has
+/// to split parts where `mailparse` splits them, quirks included.
+fn find_bytes(data: &[u8], start: usize, key: &[u8]) -> Option<usize> {
+    // Candidate positions are `start..last`; the final one is left out.
+    let last = data.len().checked_sub(key.len())?;
+    if key.is_empty() || start >= last {
+        return None;
+    }
+    data[start..data.len() - 1]
+        .windows(key.len())
+        .position(|window| window == key)
+        .map(|at| start + at)
+}
+
+/// Finds `key` at `start` or at the start of a later line, as `mailparse` does.
+fn find_line_prefix(data: &[u8], start: usize, key: &[u8]) -> Option<usize> {
+    let mut from = start;
+    while let Some(at) = find_bytes(data, from, key) {
+        if at == start || data[at - 1] == b'\n' {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
+}
 
 fn parse_address_header(
     headers: &dyn mailparse::MailHeaderMap,
@@ -716,9 +909,12 @@ fn parse_email_address(s: &str) -> Result<EmailAddress> {
     let s = s.trim();
 
     if let Some(start) = s.find('<') {
-        if let Some(end) = s.find('>') {
+        // The closing bracket is looked for after the opening one. Two
+        // independent searches give an inverted range for `a> <b`.
+        let rest = &s[start + 1..];
+        if let Some(len) = rest.find('>') {
             let name = s[..start].trim().trim_matches('"').to_string();
-            let address = s[start + 1..end].to_string();
+            let address = rest[..len].to_string();
             return Ok(EmailAddress {
                 name: if name.is_empty() { None } else { Some(name) },
                 address,
@@ -737,10 +933,15 @@ fn decode_header(value: &str) -> Result<String> {
     // Handle encoded-words like =?UTF-8?B?...?=
     // Simple decoder for encoded-word syntax: =?charset?encoding?encoded-text?=
     use regex::Regex;
+    use std::sync::LazyLock;
 
-    let re = Regex::new(r"=\?([^?]+)\?([BbQq])\?([^?]+)\?=")
-        .expect("static encoded-word regex must compile");
-    let result = re.replace_all(value, |caps: &regex::Captures<'_>| {
+    // Compiled once: this runs for every header of every message, and
+    // building the automaton costs far more than matching one header.
+    static ENCODED_WORD: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"=\?([^?]+)\?([BbQq])\?([^?]+)\?=")
+            .expect("static encoded-word regex must compile")
+    });
+    let result = ENCODED_WORD.replace_all(value, |caps: &regex::Captures<'_>| {
         let charset = &caps[1];
         let encoding = &caps[2];
         let encoded = &caps[3];
@@ -1044,21 +1245,127 @@ fn extension_for_mime(content_type: &str) -> &'static str {
     }
 }
 
-fn html_to_text(html: &str) -> String {
-    // Simple HTML to text conversion
-    // A full implementation would use a proper HTML parser
-    let text = html
-        .replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<p>", "\n")
-        .replace("</p>", "\n");
+/// Elements whose content is code or style rules, never text to show.
+const RAW_TEXT_ELEMENTS: [&str; 2] = ["script", "style"];
 
-    // Remove remaining HTML tags
-    let re = regex::Regex::new(r"<[^>]+>").expect("static HTML tag regex must compile");
+/// Converts an HTML body to plain text.
+///
+/// Tags are removed, the content of `<script>` and `<style>` elements and of
+/// comments is dropped, `<br>`, `<br/>`, `<p>` and `</p>` become line breaks,
+/// and character references are decoded. This is a single pass over the
+/// text, not an HTML parser: it does not build a tree or lay out blocks.
+fn html_to_text(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut rest = html;
+    // Set once a search for `>` has failed: no later tag can be closed
+    // either, and searching again for each `<` would cost quadratic time.
+    let mut no_closing_bracket = false;
+    while let Some(open) = rest.find('<') {
+        text.push_str(&rest[..open]);
+        let tag = &rest[open..];
+
+        if let Some(comment) = tag.strip_prefix("<!--") {
+            // `<!-->` and `<!--->` are empty comments; any other comment runs
+            // to `-->`, or to the end of the text when it is never closed.
+            rest = if let Some(after) = comment.strip_prefix('>') {
+                after
+            } else if let Some(after) = comment.strip_prefix("->") {
+                after
+            } else {
+                comment
+                    .find("-->")
+                    .map_or("", |end| &comment[end + "-->".len()..])
+            };
+            continue;
+        }
+
+        if let Some(name) = raw_text_element_name(tag) {
+            // The element's content is skipped up to its end tag. With no end
+            // tag (or a start tag that never closes) the rest is all content.
+            rest = tag
+                .find('>')
+                .and_then(|start_tag_end| skip_past_end_tag(&tag[start_tag_end + 1..], name))
+                .unwrap_or("");
+            continue;
+        }
+
+        // Markup has a letter, `/`, `!` or `?` right after the `<`; any other
+        // `<` (as in `a < b`) is text.
+        if !tag[1..]
+            .starts_with(|ch: char| ch.is_ascii_alphabetic() || matches!(ch, '/' | '!' | '?'))
+        {
+            text.push('<');
+            rest = &tag[1..];
+            continue;
+        }
+
+        let closing = if no_closing_bracket {
+            None
+        } else {
+            tag.find('>')
+        };
+        match closing {
+            // `<` with nothing to close it, or the empty `<>`, is text.
+            None | Some(1) => {
+                no_closing_bracket |= closing.is_none();
+                text.push('<');
+                rest = &tag[1..];
+            }
+            Some(end) => {
+                if matches!(&tag[1..end], "br" | "br/" | "p" | "/p") {
+                    text.push('\n');
+                }
+                rest = &tag[end + 1..];
+            }
+        }
+    }
+    text.push_str(rest);
     // Character references are decoded only after the tags are gone, so an
     // escaped `&lt;b&gt;` survives as the literal text `<b>` instead of being
     // stripped as markup.
-    decode_html_entities(&re.replace_all(&text, ""))
+    decode_html_entities(&text)
+}
+
+/// Returns the element name if `tag` opens a `<script>` or `<style>` element.
+///
+/// `tag` starts at a `<`. The name is matched without regard to case and
+/// must end at a tag-name boundary, so `<scripted>` is not a script.
+fn raw_text_element_name(tag: &str) -> Option<&'static str> {
+    RAW_TEXT_ELEMENTS
+        .into_iter()
+        .find(|name| names_element(&tag[1..], name))
+}
+
+/// Reports whether `after_bracket`, the text after `<` or `</`, starts with
+/// the tag name `name` followed by whitespace, `/`, `>` or the end.
+fn names_element(after_bracket: &str, name: &str) -> bool {
+    let bytes = after_bracket.as_bytes();
+    bytes
+        .get(..name.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(name.as_bytes()))
+        && bytes
+            .get(name.len())
+            .is_none_or(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+}
+
+/// Returns what follows the `</name>` end tag in `content`, if there is one.
+///
+/// An end tag whose `>` is missing swallows the rest of the text.
+fn skip_past_end_tag<'a>(content: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(found) = content[from..].find("</") {
+        let after_bracket = from + found + "</".len();
+        if names_element(&content[after_bracket..], name) {
+            let after_name = &content[after_bracket + name.len()..];
+            return Some(
+                after_name
+                    .find('>')
+                    .map_or("", |end| &after_name[end + 1..]),
+            );
+        }
+        from = after_bracket;
+    }
+    None
 }
 
 /// Longest character reference name in the HTML standard, without the `&`.
@@ -1667,5 +1974,321 @@ mod tests {
             "≂̸ \u{fffd} \u{fffd} \u{fffd}"
         );
         assert_eq!(html_to_text("ol&aacute;"), "olá");
+    }
+}
+
+/// Regressions for malformed and adversarial input. Each test here failed
+/// before the fix it covers.
+#[cfg(test)]
+mod malformed_input_regression_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Parses `mailbox` and returns each message's subject and text body.
+    fn mbox_messages(mailbox: &[u8]) -> Vec<(String, String)> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mailbox.mbox");
+        std::fs::write(&path, mailbox).unwrap();
+        let mut messages = Vec::new();
+        parse_mbox(&path, ParseOptions::default(), |email| {
+            messages.push((
+                email.subject.unwrap_or_default(),
+                email.body.text.unwrap_or_default(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+        messages
+    }
+
+    #[test]
+    fn address_with_the_closing_bracket_first_is_kept_as_written() {
+        let addr = parse_email_address("a> <b").unwrap();
+        assert_eq!(addr.name, None);
+        assert_eq!(addr.address, "a> <b");
+
+        // A stray `>` before the real brackets does not hide them.
+        let addr = parse_email_address("x> Name <a@example.com> tail>").unwrap();
+        assert_eq!(addr.name.as_deref(), Some("x> Name"));
+        assert_eq!(addr.address, "a@example.com");
+    }
+
+    #[test]
+    fn mbox_body_lines_starting_with_from_do_not_split_the_message() {
+        let messages = mbox_messages(
+            concat!(
+                "From a@example.com Mon Jan 15 14:30:00 2024\n",
+                "Subject: one\n",
+                "\n",
+                "From now on, use the new address.\n",
+                "From Monday to Friday, 9:00 to 17:00\n",
+                "From me, Mon Jan 15 at noon\n",
+                "\n",
+                "From b@example.com Tue Jan 16 08:00:00 2024\n",
+                "Subject: two\n",
+                "\n",
+                "body two\n",
+            )
+            .as_bytes(),
+        );
+        let subjects: Vec<&str> = messages.iter().map(|(subject, _)| &**subject).collect();
+        assert_eq!(subjects, ["one", "two"]);
+        assert!(
+            messages[0].1.contains("From now on, use the new address.")
+                && messages[0].1.contains("From Monday to Friday")
+                && messages[0].1.contains("From me, Mon Jan 15 at noon"),
+            "{:?}",
+            messages[0].1
+        );
+    }
+
+    #[test]
+    fn html_to_text_drops_script_style_and_comment_content() {
+        assert_eq!(
+            html_to_text("<style>p { color: red }</style><p>Hi</p><script>alert('x < y')</script>"),
+            "\nHi\n"
+        );
+        assert_eq!(html_to_text("a<!-- hidden <b> -->b"), "ab");
+        // Names match without regard to case, attributes are allowed, and a
+        // `</b>` inside the script is script text, not markup.
+        assert_eq!(
+            html_to_text("a<SCRIPT type=\"text/javascript\">var x = '</b>';</ScRiPt >b"),
+            "ab"
+        );
+        assert_eq!(html_to_text("a<style\nmedia=print>p{}</style\n>b"), "ab");
+        // Unterminated elements and comments swallow the rest, as in a browser.
+        assert_eq!(html_to_text("a<style>p{} b"), "a");
+        assert_eq!(html_to_text("a<script>x() b"), "a");
+        assert_eq!(html_to_text("a<script x() b"), "a");
+        assert_eq!(html_to_text("a<!-- never closed b"), "a");
+    }
+}
+
+/// Tests of the helpers the malformed-input fixes introduced, and of valid
+/// input those fixes must keep accepting.
+#[cfg(test)]
+mod malformed_input_unit_tests {
+    use super::*;
+
+    #[test]
+    fn html_to_text_keeps_text_that_only_resembles_markup() {
+        // Escaped markup is text, whatever element it names.
+        assert_eq!(
+            html_to_text("&lt;script&gt;x&lt;/script&gt; &lt;!-- c --&gt;"),
+            "<script>x</script> <!-- c -->"
+        );
+        // `<scripted>` and `<styles>` are ordinary tags.
+        assert_eq!(html_to_text("<scripted>x</scripted>"), "x");
+        assert_eq!(html_to_text("<styles>y</styles>"), "y");
+        // The two empty comment forms end where they start.
+        assert_eq!(html_to_text("<!-->a<!--->b"), "ab");
+        // A `<` that nothing closes, and `<>`, are text.
+        assert_eq!(html_to_text("a << b"), "a << b");
+        assert_eq!(html_to_text("x <> y < z"), "x <> y < z");
+        assert_eq!(html_to_text("<b>bold</b> < <i>i</i>"), "bold < i");
+        assert_eq!(
+            html_to_text("<P>one<br>two<br/>three</p>"),
+            "one\ntwo\nthree\n"
+        );
+    }
+
+    #[test]
+    fn mbox_separator_accepts_the_date_forms_mail_software_writes() {
+        for line in [
+            "From a@example.com Mon Jan 15 14:30:00 2024",
+            "From a@example.com Mon Jan  1 00:00:00 2024",
+            "From a@b Thu Jan  1 00:00:00 2024",
+            "From MAILER-DAEMON Mon Jan 15 14:30 2024",
+            "From - Mon Jan 15 14:30:00 2024",
+            "From 1719000000000000000@xxx Mon Jan 15 14:30:00 +0000 2024",
+            "From a@example.com Mon Jan 15 14:30:00 2024 +0000",
+            "From a@example.com Mon Jan 15 14:30:00 EST 2024",
+            "From \"a b\"@example.com Mon Jan 15 14:30:00 2024",
+            "From  Mon Jan 15 14:30:00 2024",
+            "From a@example.com mon jan 15 14:30:00 2024 remote from host",
+        ] {
+            assert!(is_mbox_separator(line.as_bytes()), "{line}");
+        }
+    }
+
+    #[test]
+    fn mbox_separator_rejects_body_text() {
+        for line in [
+            "From now on, use the new address.",
+            "From Monday to Friday, 9:00 to 17:00",
+            "From me, Mon Jan 15 at noon",
+            "From a@example.com Mon Jan 15 14:30:00",
+            "From a@example.com Mon Jan 15 2024",
+            "From a@example.com Mon Jan 150 14:30:00 2024",
+            "From a@example.com Mon Jan 15 14:30:00:00:00 2024",
+            "From a@example.com Mon Jan 15 14:30:00 a b c 2024",
+            "From: a@example.com",
+            "From ",
+            ">From a@example.com Mon Jan 15 14:30:00 2024",
+        ] {
+            assert!(!is_mbox_separator(line.as_bytes()), "{line}");
+        }
+    }
+
+    #[test]
+    fn mbox_first_separator_needs_no_date() {
+        // Some tools write a bare first line. With nothing before it there is
+        // no message for it to split, so it is accepted as written.
+        let mut subjects = Vec::new();
+        let count = parse_mbox_reader(
+            &b"From sender\nSubject: one\n\nFrom then on.\n"[..],
+            ParseOptions::default(),
+            |email| {
+                subjects.push(email.subject.unwrap_or_default());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!((count, subjects), (1, vec!["one".to_string()]));
+    }
+
+    /// Depth of the tree `mailparse` built, measured without recursion.
+    fn parsed_depth(mail: &mailparse::ParsedMail<'_>) -> usize {
+        let mut deepest = 0;
+        let mut pending = vec![(mail, 0)];
+        while let Some((part, depth)) = pending.pop() {
+            deepest = deepest.max(depth);
+            pending.extend(part.subparts.iter().map(|sub| (sub, depth + 1)));
+        }
+        deepest
+    }
+
+    /// Writes one MIME part: a leaf, or a container of up to three parts.
+    ///
+    /// Boundaries are chosen to collide on purpose (one is a prefix of the
+    /// others, some repeat), headers vary in case and quoting, and closing
+    /// delimiters are sometimes left out, so the generated trees exercise the
+    /// corners of the splitting rules rather than only well-formed mail.
+    fn write_part(rng: &mut smoke::Rng, out: &mut Vec<u8>, levels: usize, next_id: &mut usize) {
+        if levels == 0 || rng.below(4) == 0 {
+            out.extend_from_slice(b"Content-Type: text/plain\r\n\r\nleaf\r\n-- \r\nsignature\r\n");
+            return;
+        }
+        *next_id += 1;
+        let boundary = match rng.below(4) {
+            0 => "b".to_string(),
+            1 => format!("b{}", *next_id % 3),
+            _ => format!("part{next_id:03}"),
+        };
+        let header = match rng.below(4) {
+            0 => format!("content-type: MULTIPART/Mixed; BOUNDARY=\"{boundary}\""),
+            1 => format!("Content-Type: multipart/alternative;\r\n boundary={boundary}"),
+            2 => format!("Content-Type: multipart/digest; boundary=\"{boundary}\"; x=y"),
+            _ => format!("Content-Type: multipart/mixed; boundary={boundary}"),
+        };
+        let newline: &[u8] = if rng.below(4) == 0 { b"\n" } else { b"\r\n" };
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(newline);
+        out.extend_from_slice(newline);
+        if rng.below(3) == 0 {
+            out.extend_from_slice(b"preamble\r\n");
+        }
+        for _ in 0..1 + rng.below(3) {
+            out.extend_from_slice(format!("--{boundary}").as_bytes());
+            out.extend_from_slice(newline);
+            write_part(rng, out, levels - 1, next_id);
+        }
+        match rng.below(4) {
+            0 => {}
+            1 => out.extend_from_slice(format!("--{boundary}--").as_bytes()),
+            _ => out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes()),
+        }
+    }
+
+    #[test]
+    fn mime_depth_walk_agrees_with_mailparse() {
+        let mut rng = smoke::Rng::new(0x00C0_FFEE);
+        let mut compared = 0;
+        let mut deepest_seen = 0;
+        for _ in 0..400 {
+            let mut message = b"From: a@example.com\r\nSubject: tree\r\n".to_vec();
+            let levels = 1 + rng.below(9);
+            write_part(&mut rng, &mut message, levels, &mut 0);
+            let mut inputs = vec![message.clone()];
+            inputs.extend((0..6).map(|_| smoke::mutate(&message, &mut rng)));
+            for input in inputs {
+                let Ok(mail) = mailparse::parse_mail(&input) else {
+                    // The walk must still terminate on what `mailparse` rejects.
+                    let _ = mime_nesting_depth(&input, usize::MAX);
+                    continue;
+                };
+                let depth = parsed_depth(&mail);
+                assert_eq!(
+                    mime_nesting_depth(&input, usize::MAX),
+                    Some(depth),
+                    "walk disagrees with mailparse on {:?}",
+                    String::from_utf8_lossy(&input)
+                );
+                for limit in 0..=depth + 1 {
+                    assert_eq!(
+                        mime_nesting_exceeds(&input, limit),
+                        depth > limit,
+                        "limit {limit}, depth {depth}: {:?}",
+                        String::from_utf8_lossy(&input)
+                    );
+                }
+                compared += 1;
+                deepest_seen = deepest_seen.max(depth);
+            }
+        }
+        // Guard against a generator that stops producing nested, parseable mail.
+        assert!(compared > 1_500, "only {compared} inputs compared");
+        assert!(deepest_seen >= 6, "deepest tree was {deepest_seen}");
+    }
+
+    #[test]
+    fn many_dash_lines_in_a_shallow_message_are_not_nesting() {
+        // Quoted replies, signatures and diffs are full of lines starting
+        // with `--`. They cost a walk of the tree, not a rejection.
+        let mut message = concat!(
+            "From: a@example.com\r\n",
+            "Subject: thread\r\n",
+            "Content-Type: multipart/mixed; boundary=outer\r\n",
+            "\r\n",
+            "--outer\r\n",
+            "Content-Type: text/plain\r\n",
+            "\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        for _ in 0..500 {
+            message.extend_from_slice(b"-----Original Message-----\r\n-- \r\n--- a/file\r\n");
+        }
+        message.extend_from_slice(b"--outer--\r\n");
+        assert_eq!(mime_nesting_depth(&message, MAX_MIME_DEPTH), Some(1));
+        let email = parse_eml_bytes(&message, ParseOptions::default()).expect("shallow mail");
+        assert!(email
+            .body
+            .text
+            .unwrap_or_default()
+            .contains("-----Original Message-----"));
+    }
+
+    #[test]
+    fn nesting_at_the_limit_parses_and_one_past_it_does_not() {
+        let nested = |depth: usize| {
+            let mut out = b"Subject: deep\r\n".to_vec();
+            for level in 0..depth {
+                out.extend_from_slice(
+                    format!(
+                        "Content-Type: multipart/mixed; boundary=b{level:04}\r\n\r\n--b{level:04}\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            out.extend_from_slice(b"Content-Type: text/plain\r\n\r\nleaf\r\n");
+            out
+        };
+        let at_limit = parse_eml_bytes(&nested(MAX_MIME_DEPTH), ParseOptions::default())
+            .expect("nesting at the limit");
+        assert_eq!(at_limit.body.text.as_deref().map(str::trim), Some("leaf"));
+        let error = parse_eml_bytes(&nested(MAX_MIME_DEPTH + 1), ParseOptions::default())
+            .expect_err("nesting past the limit");
+        assert!(error.to_string().contains("nesting"), "{error}");
     }
 }
