@@ -680,7 +680,19 @@ pub fn parse_mbox_to_ndjson(
     Ok(count)
 }
 
-/// Extract attachments from email
+/// Writes every attachment of an email into `out_dir`.
+///
+/// The file name comes from the message, so it is untrusted: only its final
+/// path component is used, characters a file system refuses are replaced, and
+/// a name that repeats within the message gets a numeric suffix. Every file
+/// is therefore written directly inside `out_dir`, never above or below it.
+///
+/// Returns the paths written, in attachment order.
+///
+/// # Errors
+///
+/// Returns an error if the email cannot be parsed, an attachment's content is
+/// not valid base64, or a file cannot be written.
 pub fn extract_attachments(
     path: impl AsRef<Path>,
     out_dir: impl AsRef<Path>,
@@ -691,10 +703,15 @@ pub fn extract_attachments(
     std::fs::create_dir_all(out_dir)?;
 
     let mut paths = Vec::new();
+    let mut used_names = std::collections::HashSet::new();
 
-    for attachment in email.attachments {
+    for (index, attachment) in email.attachments.into_iter().enumerate() {
         if let Some(content) = attachment.content {
-            let out_path = out_dir.join(&attachment.filename);
+            let file_name = unique_file_name(
+                attachment_file_name(&attachment.filename, index),
+                &mut used_names,
+            );
+            let out_path = out_dir.join(file_name);
             use base64::Engine;
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(&content)
@@ -708,6 +725,69 @@ pub fn extract_attachments(
 }
 
 // Helper functions
+
+/// Turns the file name a message gives an attachment into one that is safe
+/// to create inside a directory.
+///
+/// The sender chooses the name, so it may be a path (`../../etc/cron.d/x`,
+/// `C:\Windows\x`), may be empty, or may be a name a file system treats
+/// specially. Only the text after the last `/` or `\` is kept; control
+/// characters and the characters Windows refuses in a name are replaced with
+/// `_`; trailing dots and spaces, which Windows drops silently, are removed.
+/// A name that ends up empty, `.` or `..` becomes `attachment-<index>`, and a
+/// Windows device name such as `NUL` is prefixed with `_`.
+fn attachment_file_name(raw: &str, index: usize) -> String {
+    /// Device names Windows resolves in every directory, with any extension.
+    const DEVICE_NAMES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+
+    let last_component = raw.rsplit(['/', '\\']).next().unwrap_or_default();
+    let cleaned: String = last_component
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+    let name = cleaned.trim().trim_end_matches(['.', ' ']);
+    if name.is_empty() || name == "." || name == ".." {
+        return format!("attachment-{index}");
+    }
+    let stem = name.split('.').next().unwrap_or_default();
+    if DEVICE_NAMES
+        .iter()
+        .any(|device| stem.eq_ignore_ascii_case(device))
+    {
+        return format!("_{name}");
+    }
+    name.to_owned()
+}
+
+/// Returns `name`, or `name` with a numeric suffix if it was already used.
+///
+/// Names are compared without regard to case, because the common desktop
+/// file systems would otherwise write two attachments to one file. The
+/// suffix goes before the extension: `report.pdf`, then `report-1.pdf`.
+fn unique_file_name(name: String, used: &mut std::collections::HashSet<String>) -> String {
+    if used.insert(name.to_lowercase()) {
+        return name;
+    }
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 => name.split_at(dot),
+        _ => (name.as_str(), ""),
+    };
+    let mut counter = 1usize;
+    loop {
+        let candidate = format!("{stem}-{counter}{extension}");
+        if used.insert(candidate.to_lowercase()) {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
 
 /// Deepest nesting of multipart containers a message may have.
 ///
@@ -2290,5 +2370,100 @@ mod malformed_input_unit_tests {
         let error = parse_eml_bytes(&nested(MAX_MIME_DEPTH + 1), ParseOptions::default())
             .expect_err("nesting past the limit");
         assert!(error.to_string().contains("nesting"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod attachment_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn a_path_in_the_file_name_keeps_only_its_last_component() {
+        assert_eq!(attachment_file_name("../../etc/cron.d/job", 0), "job");
+        assert_eq!(attachment_file_name("/etc/passwd", 0), "passwd");
+        assert_eq!(attachment_file_name(r"..\..\Windows\win.ini", 0), "win.ini");
+        assert_eq!(
+            attachment_file_name(r"C:\Users\a\report.pdf", 0),
+            "report.pdf"
+        );
+        assert_eq!(attachment_file_name("report.pdf", 0), "report.pdf");
+        assert_eq!(
+            attachment_file_name("relatório é.pdf", 0),
+            "relatório é.pdf"
+        );
+    }
+
+    #[test]
+    fn a_name_with_no_usable_text_is_replaced() {
+        for raw in ["", "..", ".", "a/..", "dir/", "   ", "..."] {
+            assert_eq!(attachment_file_name(raw, 3), "attachment-3", "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn characters_and_names_a_file_system_treats_specially_are_defused() {
+        assert_eq!(attachment_file_name("a:b?c*.txt", 0), "a_b_c_.txt");
+        assert_eq!(attachment_file_name("x\u{0}y\n.txt", 0), "x_y_.txt");
+        assert_eq!(attachment_file_name("notes.txt. .", 0), "notes.txt");
+        assert_eq!(attachment_file_name("NUL", 0), "_NUL");
+        assert_eq!(attachment_file_name("com1.txt", 0), "_com1.txt");
+        assert_eq!(attachment_file_name("console.txt", 0), "console.txt");
+    }
+
+    #[test]
+    fn repeated_names_get_a_suffix_before_the_extension() {
+        let mut used = std::collections::HashSet::new();
+        let names: Vec<String> = ["a.txt", "A.TXT", "a.txt", "noext", "noext", ".env", ".env"]
+            .into_iter()
+            .map(|name| unique_file_name(name.to_owned(), &mut used))
+            .collect();
+        assert_eq!(
+            names,
+            ["a.txt", "A-1.TXT", "a-2.txt", "noext", "noext-1", ".env", ".env-1"]
+        );
+    }
+
+    #[test]
+    fn extraction_never_writes_outside_the_output_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "email-fast-core-attachments-{}",
+            std::process::id()
+        ));
+        let out_dir = root.join("out");
+        std::fs::create_dir_all(&root).expect("create scratch directory");
+        let message = root.join("message.eml");
+        std::fs::write(
+            &message,
+            concat!(
+                "From: a@example.com\r\n",
+                "Subject: s\r\n",
+                "MIME-Version: 1.0\r\n",
+                "Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n",
+                "--b\r\nContent-Type: text/plain\r\n\r\nbody\r\n",
+                "--b\r\nContent-Type: application/octet-stream\r\n",
+                "Content-Disposition: attachment; filename=\"../escaped.txt\"\r\n",
+                "Content-Transfer-Encoding: base64\r\n\r\nb25l\r\n",
+                "--b\r\nContent-Type: application/octet-stream\r\n",
+                "Content-Disposition: attachment; filename=\"escaped.txt\"\r\n",
+                "Content-Transfer-Encoding: base64\r\n\r\ndHdv\r\n",
+                "--b--\r\n",
+            ),
+        )
+        .expect("write message");
+
+        let options = ParseOptions {
+            extract_attachment_content: true,
+            ..ParseOptions::default()
+        };
+        let written = extract_attachments(&message, &out_dir, options).expect("extract");
+
+        assert_eq!(
+            written,
+            [out_dir.join("escaped.txt"), out_dir.join("escaped-1.txt")]
+        );
+        assert_eq!(std::fs::read(&written[0]).expect("first"), b"one");
+        assert_eq!(std::fs::read(&written[1]).expect("second"), b"two");
+        assert!(!root.join("escaped.txt").exists(), "written above out_dir");
+        std::fs::remove_dir_all(&root).expect("remove scratch directory");
     }
 }
