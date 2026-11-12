@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status, Streaming};
 #[path = "../../flight-ipc-config/test-support/mod.rs"]
 mod flight_auth_test_support;
 use xlsx_fast_core::arrow::{self, ArrowOptions, RangeFilter};
-use xlsx_fast_core::ParseOptions;
+use xlsx_fast_core::{find_first_digit, ParseOptions};
 
 #[derive(Clone)]
 struct XlsxFlightService {
@@ -845,160 +845,6 @@ fn parse_ref_kind(input: &str) -> Option<RefKind> {
     }
 }
 
-#[inline]
-fn find_first_digit(bytes: &[u8]) -> Option<usize> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if bytes.len() >= 16 {
-            // SAFETY: NEON is baseline on aarch64.
-            unsafe {
-                if let Some(idx) = find_first_digit_neon(bytes) {
-                    return Some(idx);
-                }
-            }
-        }
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    {
-        if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
-            // SAFETY: we gate on AVX2 support.
-            unsafe {
-                if let Some(idx) = find_first_digit_avx2(bytes) {
-                    return Some(idx);
-                }
-            }
-        }
-        if bytes.len() >= 16
-            && (cfg!(target_arch = "x86_64") || std::is_x86_feature_detected!("sse2"))
-        {
-            // SAFETY: we gate on SSE2 support.
-            unsafe {
-                if let Some(idx) = find_first_digit_sse2(bytes) {
-                    return Some(idx);
-                }
-            }
-        }
-    }
-
-    for (idx, &b) in bytes.iter().enumerate() {
-        if b.is_ascii_digit() {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
-    use std::arch::aarch64 as arch;
-
-    let mut i = 0usize;
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-    let lower = arch::vdupq_n_u8(b'0');
-    let upper = arch::vdupq_n_u8(b'9');
-
-    while i + 16 <= len {
-        let chunk = arch::vld1q_u8(ptr.add(i));
-        let ge0 = arch::vcgeq_u8(chunk, lower);
-        let le9 = arch::vcleq_u8(chunk, upper);
-        let mask = arch::vandq_u8(ge0, le9);
-        if arch::vmaxvq_u8(mask) != 0 {
-            for j in 0..16 {
-                let b = *ptr.add(i + j);
-                if b.is_ascii_digit() {
-                    return Some(i + j);
-                }
-            }
-        }
-        i += 16;
-    }
-
-    while i < len {
-        let b = *ptr.add(i);
-        if b.is_ascii_digit() {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse2")]
-unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86 as arch;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64 as arch;
-
-    let mut i = 0usize;
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-    let lower = arch::_mm_set1_epi8((b'0' - 1) as i8);
-    let upper = arch::_mm_set1_epi8((b'9' + 1) as i8);
-
-    while i + 16 <= len {
-        let chunk = arch::_mm_loadu_si128(ptr.add(i) as *const arch::__m128i);
-        let ge0 = arch::_mm_cmpgt_epi8(chunk, lower);
-        let le9 = arch::_mm_cmplt_epi8(chunk, upper);
-        let mask = arch::_mm_and_si128(ge0, le9);
-        let bits = arch::_mm_movemask_epi8(mask) as u32;
-        if bits != 0 {
-            let offset = bits.trailing_zeros() as usize;
-            return Some(i + offset);
-        }
-        i += 16;
-    }
-
-    while i < len {
-        let b = *ptr.add(i);
-        if b.is_ascii_digit() {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx2")]
-unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86 as arch;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64 as arch;
-
-    let mut i = 0usize;
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-    let lower = arch::_mm256_set1_epi8((b'0' - 1) as i8);
-    let upper = arch::_mm256_set1_epi8((b'9' + 1) as i8);
-
-    while i + 32 <= len {
-        let chunk = arch::_mm256_loadu_si256(ptr.add(i) as *const arch::__m256i);
-        let ge0 = arch::_mm256_cmpgt_epi8(chunk, lower);
-        let le9 = arch::_mm256_cmpgt_epi8(upper, chunk);
-        let mask = arch::_mm256_and_si256(ge0, le9);
-        let bits = arch::_mm256_movemask_epi8(mask) as u32;
-        if bits != 0 {
-            let offset = bits.trailing_zeros() as usize;
-            return Some(i + offset);
-        }
-        i += 32;
-    }
-
-    while i < len {
-        let b = *ptr.add(i);
-        if b.is_ascii_digit() {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
 fn to_status(err: impl std::fmt::Display) -> Status {
     Status::internal(err.to_string())
 }
@@ -1030,17 +876,17 @@ mod range_reference_tests {
         inputs
     }
 
-    /// WHY: this server carried its own copy of the vectorized digit scan.
-    /// Before that copy is deleted, both must give the same answer for the
-    /// same bytes.
+    /// WHY: this server used to carry its own copy of the vectorized digit
+    /// scan. It now calls the one in xlsx-fast-core, which must keep giving
+    /// the answer a plain byte-by-byte scan gives.
     #[test]
-    fn the_local_digit_scan_agrees_with_the_one_in_xlsx_fast_core() {
+    fn the_shared_digit_scan_agrees_with_a_byte_by_byte_scan() {
         let inputs = digit_scan_inputs();
         assert!(inputs.len() > 150_000, "{} inputs", inputs.len());
         for input in &inputs {
             assert_eq!(
                 find_first_digit(input),
-                xlsx_fast_core::find_first_digit(input),
+                input.iter().position(u8::is_ascii_digit),
                 "input {input:?}"
             );
         }
