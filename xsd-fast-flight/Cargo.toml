@@ -1,6 +1,6 @@
 [package]
 name = "xsd-fast-flight"
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 authors.workspace = true
 description = "Apache Arrow Flight server for xsd-fast-core"
