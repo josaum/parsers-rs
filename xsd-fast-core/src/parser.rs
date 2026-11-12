@@ -634,7 +634,11 @@ fn parse_complex_type_into(
                         depth -= 1;
                     }
                     "attribute" => {
-                        push_attribute_decl(&attrs, &mut complex_type.attributes);
+                        // The attribute's children are read here, up to its
+                        // end tag, so they are not taken for children of the
+                        // complex type.
+                        let inline_type = parse_attribute_children(reader, ns_map)?;
+                        push_attribute_decl(&attrs, inline_type, &mut complex_type.attributes);
                         depth -= 1;
                     }
                     "annotation" => {
@@ -646,7 +650,7 @@ fn parse_complex_type_into(
             }
             Tag::Empty { local, attrs } => {
                 if local == "attribute" {
-                    push_attribute_decl(&attrs, &mut complex_type.attributes);
+                    push_attribute_decl(&attrs, None, &mut complex_type.attributes);
                 }
             }
             Tag::End { .. } => {
@@ -789,10 +793,43 @@ fn push_choice_group(
 }
 
 /// Appends the declaration for an `<xs:attribute>`, if it has a name.
-fn push_attribute_decl(attrs: &HashMap<String, String>, attributes: &mut Vec<AttributeDecl>) {
-    if let Some(attr_decl) = parse_attribute_decl(attrs) {
+///
+/// `inline_type` is the `<xs:simpleType>` written inside the attribute, if any.
+fn push_attribute_decl(
+    attrs: &HashMap<String, String>,
+    inline_type: Option<SimpleTypeDef>,
+    attributes: &mut Vec<AttributeDecl>,
+) {
+    if let Some(attr_decl) = parse_attribute_decl(attrs, inline_type) {
         attributes.push(attr_decl);
     }
+}
+
+/// Reads the children of an `<xs:attribute>` up to and including its end tag.
+///
+/// Returns the attribute's inline `<xs:simpleType>`, if it has one. Anything
+/// else inside the attribute (an annotation) is skipped.
+///
+/// Kept out of line so the complex-type parser, which recurses once per
+/// nested inline type, does not carry this function's locals in its frame.
+#[inline(never)]
+fn parse_attribute_children(
+    reader: &mut Reader<&[u8]>,
+    ns_map: &HashMap<String, String>,
+) -> Result<Option<SimpleTypeDef>> {
+    let mut inline_type = None;
+    let mut buf = Vec::new();
+    loop {
+        match next_tag(reader, &mut buf, "attribute")? {
+            Tag::Start { local, .. } => match local.as_str() {
+                "simpleType" => inline_type = Some(parse_simple_type(reader, ns_map)?),
+                other => skip_element(reader, other)?,
+            },
+            Tag::Empty { .. } => {}
+            Tag::End { .. } | Tag::Eof => break,
+        }
+    }
+    Ok(inline_type)
 }
 
 /// Parses a `simpleContent`/`complexContent` element into `complex_type`.
@@ -999,7 +1036,14 @@ fn parse_facets(reader: &mut Reader<&[u8]>, facets: &mut SimpleFacets) -> Result
 
 // ── Attribute declaration parser ─────────────────────────────────────────────
 
-fn parse_attribute_decl(attrs: &HashMap<String, String>) -> Option<AttributeDecl> {
+/// The declaration an `<xs:attribute>` makes, or `None` without a `name`.
+///
+/// A `type` attribute decides the type; without one the inline simple type
+/// does, and without either the attribute is an unconstrained string.
+fn parse_attribute_decl(
+    attrs: &HashMap<String, String>,
+    inline_type: Option<SimpleTypeDef>,
+) -> Option<AttributeDecl> {
     let name = attrs.get("name")?.clone();
     let required = attrs.get("use").is_some_and(|u| u == "required");
     let default = attrs.get("default").cloned();
@@ -1012,7 +1056,7 @@ fn parse_attribute_decl(attrs: &HashMap<String, String>) -> Option<AttributeDecl
             facets: SimpleFacets::default(),
         }
     } else {
-        SimpleTypeDef::string_unbounded()
+        inline_type.unwrap_or_else(SimpleTypeDef::string_unbounded)
     };
     Some(AttributeDecl {
         name,
