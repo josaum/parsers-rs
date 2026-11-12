@@ -56,7 +56,7 @@ use ooxml_archive::{
     parse_relationships, part_dir, relationship_matches, relationship_target, rels_path_for_part,
     resolve_part, source_part_from_rels, OoxmlArchive, PartReader, RelEntry, Relationships,
 };
-use quick_xml::events::Event;
+use quick_xml::events::{BytesText, Event};
 use quick_xml::Reader;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -69,6 +69,7 @@ use std::sync::Arc;
 /// Apache Arrow export helpers for shredding `.docx` documents into typed
 /// table streams (metadata, paragraphs, runs, images, tables, comments, etc.).
 pub mod arrow;
+mod symbol;
 
 // The GLiNER extractor and the API embedder that were declared here are
 // consumer integrations: they depend on one product's SDK and belong in that
@@ -1383,7 +1384,12 @@ fn parse_notes(xml: &[u8], tag: &[u8], styles: &[Style]) -> Result<Vec<Note>> {
             }
             Ok(Event::Text(e)) => {
                 if current_id.is_some() {
-                    parser.handle_text(e.unescape()?.as_bytes());
+                    parser.handle_text(text_event_string(&e).as_bytes());
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if current_id.is_some() {
+                    parser.handle_text(&e);
                 }
             }
             Ok(Event::End(e)) => {
@@ -1477,7 +1483,12 @@ fn parse_comments(xml: &[u8], styles: &[Style]) -> Result<Vec<Comment>> {
             }
             Ok(Event::Text(e)) => {
                 if current.is_some() {
-                    parser.handle_text(e.unescape()?.as_bytes());
+                    parser.handle_text(text_event_string(&e).as_bytes());
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if current.is_some() {
+                    parser.handle_text(&e);
                 }
             }
             Ok(Event::End(e)) => {
@@ -1746,6 +1757,19 @@ fn attr_value<R: BufRead>(
     Ok(None)
 }
 
+/// Decodes a text event leniently.
+///
+/// A stray non-UTF-8 byte becomes U+FFFD and an unknown entity is kept as
+/// written, so one bad character costs that character rather than the whole
+/// document.
+fn text_event_string(event: &BytesText<'_>) -> String {
+    let raw = String::from_utf8_lossy(event);
+    match quick_xml::escape::unescape(&raw) {
+        Ok(text) => text.into_owned(),
+        Err(_) => raw.into_owned(),
+    }
+}
+
 fn local_name(name: &[u8]) -> &[u8] {
     match name.iter().position(|b| *b == b':') {
         Some(idx) => &name[idx + 1..],
@@ -1823,6 +1847,9 @@ struct RunBuilder {
     revision: Option<RevisionRef>,
     comment_ids: Vec<i32>,
     note_references: Vec<NoteReference>,
+    /// The run's own `w:rFonts` names the Symbol font, so Private Use Area
+    /// characters in its text are Symbol code points.
+    symbol_font: bool,
 }
 
 #[derive(Debug)]
@@ -1909,7 +1936,11 @@ impl<'a> DocxBodyParser<'a> {
                     self.handle_empty(&reader, &e, name)?;
                 }
                 Ok(Event::Text(e)) => {
-                    self.handle_text(e.unescape()?.as_bytes());
+                    self.handle_text(text_event_string(&e).as_bytes());
+                }
+                // CDATA is literal character data: no entity unescaping.
+                Ok(Event::CData(e)) => {
+                    self.handle_text(&e);
                 }
                 Ok(Event::End(e)) => {
                     let raw = e.name().as_ref().to_vec();
@@ -1971,11 +2002,41 @@ impl<'a> DocxBodyParser<'a> {
             b"instrText" => {
                 self.in_instr = true;
             }
-            b"tab" => {
+            b"tab" | b"ptab" => {
                 self.push_text("\t");
             }
             b"br" | b"cr" => {
                 self.push_text("\n");
+            }
+            // The output is plain text for matching, so a non-breaking hyphen
+            // is an ordinary hyphen: "non-breaking", not "nonbreaking".
+            b"noBreakHyphen" => {
+                self.push_text("-");
+            }
+            // A soft hyphen is only a line-break opportunity; the word is
+            // written without it.
+            b"softHyphen" => {}
+            b"sym" => {
+                let font = attr_value(reader, e, b"font")?;
+                if let Some(ch) = attr_value(reader, e, b"char")?
+                    .and_then(|code| symbol::sym_char(font.as_deref(), &code))
+                {
+                    self.push_text(ch.encode_utf8(&mut [0; 4]));
+                }
+            }
+            b"rFonts" if self.in_rpr => {
+                // Direct run formatting only; a Symbol font inherited from a
+                // style is not resolved here.
+                let mut symbol_font = false;
+                for key in [&b"ascii"[..], b"hAnsi", b"cs"] {
+                    if attr_value(reader, e, key)?.is_some_and(|font| symbol::is_symbol_font(&font))
+                    {
+                        symbol_font = true;
+                    }
+                }
+                if let Some(r) = self.current_run.as_mut() {
+                    r.symbol_font = symbol_font;
+                }
             }
             b"pPr" => self.in_ppr = true,
             b"rPr" => self.in_rpr = true,
@@ -2167,7 +2228,10 @@ impl<'a> DocxBodyParser<'a> {
     }
 
     fn handle_text(&mut self, text: &[u8]) {
-        let value = String::from_utf8_lossy(text);
+        let mut value = String::from_utf8_lossy(text);
+        if self.in_text && self.current_run.as_ref().is_some_and(|run| run.symbol_font) {
+            value = symbol::map_symbol_run_text(&value).into();
+        }
         if self.in_instr {
             if let Some(field) = self.current_field_stack.last_mut() {
                 field.instr.push_str(&value);
@@ -2380,6 +2444,7 @@ fn parse_bool_attr<R: BufRead>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use ooxml_archive::{parse_root_rels, rels_path_for_part, resolve_part};
 
     #[test]
@@ -2409,5 +2474,118 @@ mod tests {
             resolve_part("word", "../docProps/core.xml"),
             "docProps/core.xml"
         );
+    }
+
+    fn body_paragraphs(inner: &str) -> Vec<String> {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{inner}</w:body></w:document>"#
+        );
+        paragraphs_of(xml.into_bytes())
+    }
+
+    fn paragraphs_of(xml: Vec<u8>) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut revisions = Vec::new();
+        parse_document_blocks(Cursor::new(xml), &[], &mut fields, &mut revisions)
+            .expect("document parses")
+            .into_iter()
+            .filter_map(|block| match block {
+                Block::Paragraph(paragraph) => Some(paragraph.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sym_elements_contribute_their_character() {
+        assert_eq!(
+            body_paragraphs(
+                r#"<w:p><w:r><w:t>x </w:t><w:sym w:font="Symbol" w:char="F0B3"/><w:t> y</w:t></w:r></w:p>"#
+            ),
+            ["x ≥ y"]
+        );
+        // No published mapping for Wingdings: the stored code point is kept,
+        // never dropped.
+        assert_eq!(
+            body_paragraphs(
+                r#"<w:p><w:r><w:t>ok</w:t><w:sym w:font="Wingdings" w:char="F0FC"/><w:t>end</w:t></w:r></w:p>"#
+            ),
+            ["ok\u{F0FC}end"]
+        );
+    }
+
+    #[test]
+    fn symbol_font_run_text_maps_private_use_characters() {
+        assert_eq!(
+            body_paragraphs(concat!(
+                r#"<w:p><w:r><w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol"/></w:rPr>"#,
+                "<w:t>\u{F061}\u{F062}</w:t></w:r>",
+                "<w:r><w:t>\u{F061} plain</w:t></w:r></w:p>",
+            )),
+            ["αβ\u{F061} plain"]
+        );
+    }
+
+    #[test]
+    fn hyphen_and_tab_elements_become_text() {
+        assert_eq!(
+            body_paragraphs(concat!(
+                "<w:p><w:r><w:t>non</w:t><w:noBreakHyphen/><w:t>breaking co</w:t>",
+                "<w:softHyphen/><w:t>op a</w:t><w:ptab w:alignment=\"right\"/><w:t>b</w:t>",
+                "<w:tab/><w:t>c</w:t></w:r></w:p>",
+            )),
+            ["non-breaking coop a\tb\tc"]
+        );
+    }
+
+    #[test]
+    fn cdata_text_is_kept_literally() {
+        assert_eq!(
+            body_paragraphs("<w:p><w:r><w:t><![CDATA[café <raw> &amp;]]></w:t></w:r></w:p>"),
+            ["café <raw> &amp;"]
+        );
+    }
+
+    #[test]
+    fn entities_and_unicode_text_round_trip() {
+        assert_eq!(
+            body_paragraphs(concat!(
+                "<w:p><w:r><w:t xml:space=\"preserve\"> a &amp; b &lt;c&gt; &#233; &#x1F600; ",
+                "caf\u{e9}\u{a0}日本語 e\u{301} </w:t></w:r></w:p>",
+            )),
+            [" a & b <c> é 😀 café\u{a0}日本語 e\u{301} "]
+        );
+    }
+
+    #[test]
+    fn one_invalid_byte_costs_one_character_not_the_document() {
+        let mut xml = br#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>caf@ ok &amp; fine</w:t></w:r></w:p></w:body></w:document>"#.to_vec();
+        let at = xml.iter().position(|byte| *byte == b'@').unwrap();
+        xml[at] = 0xE9;
+        assert_eq!(paragraphs_of(xml), ["caf\u{fffd} ok & fine"]);
+    }
+
+    #[test]
+    fn notes_and_comments_share_the_text_handling() {
+        let notes = parse_notes(
+            br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="2"><w:p><w:r><w:t><![CDATA[a<b]]></w:t><w:noBreakHyphen/><w:sym w:font="Symbol" w:char="F061"/></w:r></w:p></w:footnote></w:footnotes>"#,
+            b"footnote",
+            &[],
+        )
+        .unwrap();
+        let Block::Paragraph(paragraph) = &notes[0].blocks[0] else {
+            panic!("footnote holds a paragraph");
+        };
+        assert_eq!(paragraph.text, "a<b-α");
+
+        let comments = parse_comments(
+            br#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1"><w:p><w:r><w:t><![CDATA[x&y]]></w:t><w:sym w:font="Symbol" w:char="F062"/></w:r></w:p></w:comment></w:comments>"#,
+            &[],
+        )
+        .unwrap();
+        let Block::Paragraph(paragraph) = &comments[0].blocks[0] else {
+            panic!("comment holds a paragraph");
+        };
+        assert_eq!(paragraph.text, "x&yβ");
     }
 }
