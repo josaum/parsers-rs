@@ -1760,8 +1760,30 @@ fn alpha_index(b: u8) -> Option<u32> {
     }
 }
 
+/// Returns the index of the first ASCII digit (`0`-`9`) in `bytes`.
+///
+/// This is the split point of a cell reference: in `AB12` the column letters
+/// end and the row number starts at index 2. It is the one copy of the
+/// vectorized scan that both the sheet parser and the Flight server's range
+/// queries use. Inputs of 16 bytes or more are scanned 16 bytes at a time
+/// with NEON on aarch64 and SSE2 on x86 (32 at a time with AVX2 when the CPU
+/// has it); shorter inputs, and the tail of longer ones, are scanned byte by
+/// byte. The result is the same as
+/// `bytes.iter().position(u8::is_ascii_digit)` for every input.
+///
+/// Returns `None` when `bytes` holds no ASCII digit.
+///
+/// # Examples
+///
+/// ```
+/// use xlsx_fast_core::find_first_digit;
+///
+/// assert_eq!(find_first_digit(b"AB12"), Some(2));
+/// assert_eq!(find_first_digit(b"$A$1"), Some(3));
+/// assert_eq!(find_first_digit(b"ABC"), None);
+/// ```
 #[inline]
-fn find_first_digit(bytes: &[u8]) -> Option<usize> {
+pub fn find_first_digit(bytes: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "aarch64")]
     {
         if bytes.len() >= 16 {
@@ -1916,8 +1938,49 @@ unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_has_date_tokens, parse_cell_ref_bytes};
+    use super::{find_first_digit, format_has_date_tokens, parse_cell_ref_bytes};
     use ooxml_archive::{parse_root_rels, resolve_part};
+
+    /// The vectorized scan must agree with a byte-by-byte scan whatever the
+    /// length, wherever the digit is, and whatever surrounds it. The filler
+    /// bytes include the neighbours of `0`-`9` in ASCII (`/` and `:`) and the
+    /// bytes that differ from a digit only in the high bit.
+    #[test]
+    fn find_first_digit_matches_a_byte_by_byte_scan() {
+        let fillers = [b'A', b'$', b'/', b':', 0x00, 0x7F, 0xB0, 0xB9, 0xFF];
+        let mut checked = 0u32;
+        for len in 0..=80usize {
+            for &filler in &fillers {
+                let mut bytes = vec![filler; len];
+                assert_eq!(
+                    find_first_digit(&bytes),
+                    None,
+                    "len {len} filler {filler:#x}"
+                );
+                for position in 0..len {
+                    for digit in *b"059" {
+                        bytes[position] = digit;
+                        assert_eq!(
+                            find_first_digit(&bytes),
+                            bytes.iter().position(u8::is_ascii_digit),
+                            "len {len} filler {filler:#x} digit at {position}"
+                        );
+                        // A later digit never hides an earlier one.
+                        let saved = bytes[len - 1];
+                        bytes[len - 1] = b'7';
+                        assert_eq!(
+                            find_first_digit(&bytes),
+                            bytes.iter().position(u8::is_ascii_digit)
+                        );
+                        bytes[len - 1] = saved;
+                        bytes[position] = filler;
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 80_000, "checked {checked} inputs");
+    }
 
     #[test]
     fn parse_cell_ref_basic() {

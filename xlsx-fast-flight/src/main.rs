@@ -1004,6 +1004,97 @@ fn to_status(err: impl std::fmt::Display) -> Status {
 }
 
 #[cfg(test)]
+mod range_reference_tests {
+    use super::*;
+
+    /// Inputs for the digit scan: every length up to 80 bytes, a digit at
+    /// every position, surrounded by letters, `$`, the ASCII neighbours of
+    /// the digits, and bytes that differ from a digit only in the high bit.
+    fn digit_scan_inputs() -> Vec<Vec<u8>> {
+        let fillers = [b'A', b'$', b'/', b':', 0x00, 0x7F, 0xB0, 0xB9, 0xFF];
+        let mut inputs = Vec::new();
+        for len in 0..=80usize {
+            for &filler in &fillers {
+                inputs.push(vec![filler; len]);
+                for position in 0..len {
+                    for digit in *b"059" {
+                        let mut bytes = vec![filler; len];
+                        bytes[position] = digit;
+                        inputs.push(bytes.clone());
+                        bytes[len - 1] = b'7';
+                        inputs.push(bytes);
+                    }
+                }
+            }
+        }
+        inputs
+    }
+
+    /// WHY: this server carried its own copy of the vectorized digit scan.
+    /// Before that copy is deleted, both must give the same answer for the
+    /// same bytes.
+    #[test]
+    fn the_local_digit_scan_agrees_with_the_one_in_xlsx_fast_core() {
+        let inputs = digit_scan_inputs();
+        assert!(inputs.len() > 150_000, "{} inputs", inputs.len());
+        for input in &inputs {
+            assert_eq!(
+                find_first_digit(input),
+                xlsx_fast_core::find_first_digit(input),
+                "input {input:?}"
+            );
+        }
+    }
+
+    fn range(input: &str) -> Option<(u32, u32, u32, u32)> {
+        parse_range_part(input).ok().map(|range| {
+            (
+                range.row_start,
+                range.row_end,
+                range.col_start,
+                range.col_end,
+            )
+        })
+    }
+
+    /// WHY: range queries are parsed around the digit scan. These results
+    /// were recorded with the server's own copy of the scan and must not move
+    /// when it is replaced by the shared one. The long references are 16
+    /// bytes or more, which is where the vectorized path starts.
+    #[test]
+    fn range_queries_parse_the_same_references() {
+        let all = u32::MAX;
+        assert_eq!(range("A1:C3"), Some((1, 3, 1, 3)));
+        assert_eq!(range("c3:a1"), Some((1, 3, 1, 3)));
+        assert_eq!(range("$B$2:$D$10"), Some((2, 10, 2, 4)));
+        assert_eq!(range("B2"), Some((2, all, 2, all)));
+        assert_eq!(range(":B2"), Some((1, 2, 1, 2)));
+        assert_eq!(range("2:5"), Some((2, 5, 1, all)));
+        assert_eq!(range("B:D"), Some((1, all, 2, 4)));
+        assert_eq!(range("AA10:XFD1048576"), Some((10, 1_048_576, 27, 16_384)));
+        assert_eq!(range("$$$$$$$$$$$$$$$$AB$12"), Some((12, all, 28, all)));
+        assert_eq!(
+            range("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$C7:$$$$$$$$$$$$$$$$$$$$E9"),
+            Some((7, 9, 3, 5))
+        );
+        assert_eq!(
+            range("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$ZZ"),
+            Some((1, all, 702, all))
+        );
+        assert_eq!(
+            range("0000000000000000000000000000000000042"),
+            Some((42, all, 1, all))
+        );
+        assert_eq!(range("A1:5"), None);
+        assert_eq!(range("A:5"), None);
+        assert_eq!(range("A0"), None);
+        assert_eq!(range("!!"), None);
+        assert_eq!(range(""), None);
+        assert_eq!(range(":"), None);
+    }
+}
+
+#[cfg(test)]
 mod symlink_listing_tests {
     use super::*;
     #[cfg(unix)]
