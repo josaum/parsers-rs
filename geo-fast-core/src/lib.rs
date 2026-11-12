@@ -60,6 +60,7 @@ pub mod sar;
 pub mod shapefile;
 pub mod thermal;
 pub mod types;
+mod xml_text;
 
 #[cfg(feature = "http")]
 pub mod wms;
