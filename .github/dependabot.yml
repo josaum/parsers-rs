@@ -1,5 +1,6 @@
 # Weekly dependency updates. Major versions arrive one pull request each, so
-# each can be judged on its own; everything smaller arrives together.
+# each can be judged on its own (the Arrow crates together, as one); everything
+# smaller arrives together.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -19,6 +20,20 @@ updates:
         update-types:
           - minor
           - patch
+      # The Arrow crates share one exact version (the doctors refuse a mix),
+      # so a new major must move all of them in one pull request.
+      arrow-major:
+        patterns:
+          - "arrow"
+          - "arrow-*"
+        update-types:
+          - major
+    ignore:
+      # pyo3 0.30 drops `abi3-py38`. The wheels are built for Python 3.8 and
+      # later, so that upgrade waits for a decision to raise the floor.
+      - dependency-name: "pyo3*"
+        versions:
+          - ">=0.30"
 
   - package-ecosystem: github-actions
     # Every action is pinned by commit SHA with its version in a trailing

@@ -896,10 +896,7 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
                     for attr in e.attributes().flatten() {
                         if local_name(attr.key.as_ref()) == b"date1904" {
                             let value = attr
-                                .decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                                .decode_and_unescape_value(reader.decoder())?
                                 .to_string();
                             info.date_1904 = value == "1" || value.eq_ignore_ascii_case("true");
                         }
@@ -911,24 +908,15 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
                         let key = local_name(key_raw.as_ref());
                         if key == b"name" {
                             sheet.name = attr
-                                .decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                                .decode_and_unescape_value(reader.decoder())?
                                 .to_string();
                         } else if key == b"sheetId" {
-                            let value = attr.decoded_and_normalized_value(
-                                quick_xml::XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?;
+                            let value = attr.decode_and_unescape_value(reader.decoder())?;
                             sheet.sheet_id =
                                 lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0);
                         } else if key == b"r:id" || key == b"id" {
                             sheet.rel_id = attr
-                                .decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                                .decode_and_unescape_value(reader.decoder())?
                                 .to_string();
                         }
                     }
@@ -1040,18 +1028,12 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
                         let key_raw = attr.key;
                         let key = local_name(key_raw.as_ref());
                         if key == b"numFmtId" {
-                            let value = attr.decoded_and_normalized_value(
-                                quick_xml::XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?;
+                            let value = attr.decode_and_unescape_value(reader.decoder())?;
                             id = lexical_core::parse::<u32>(value.as_bytes()).ok();
                         } else if key == b"formatCode" {
                             code = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         }
                     }
@@ -1064,10 +1046,7 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
                     let mut num_fmt_id = None;
                     for attr in e.attributes().flatten() {
                         if local_name(attr.key.as_ref()) == b"numFmtId" {
-                            let value = attr.decoded_and_normalized_value(
-                                quick_xml::XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?;
+                            let value = attr.decode_and_unescape_value(reader.decoder())?;
                             num_fmt_id = lexical_core::parse::<u32>(value.as_bytes()).ok();
                         }
                     }
@@ -1255,10 +1234,7 @@ where
                             let key_raw = attr.key;
                             let key = local_name(key_raw.as_ref());
                             if key == b"r" {
-                                let value = attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?;
+                                let value = attr.decode_and_unescape_value(reader.decoder())?;
                                 if let Some((row, col)) = parse_cell_ref(value.as_ref()) {
                                     cell_ref_row = row;
                                     cell_ref_col = col;
@@ -1267,10 +1243,7 @@ where
                                     invalid_cell_ref = true;
                                 }
                             } else if key == b"t" {
-                                let value = attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?;
+                                let value = attr.decode_and_unescape_value(reader.decoder())?;
                                 cell_type = match value.as_ref() {
                                     "s" => CellType::SharedString,
                                     "b" => CellType::Bool,
@@ -1280,10 +1253,7 @@ where
                                     _ => CellType::Number,
                                 };
                             } else if key == b"s" {
-                                let value = attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?;
+                                let value = attr.decode_and_unescape_value(reader.decoder())?;
                                 cell_style = lexical_core::parse::<u32>(value.as_bytes()).ok();
                             }
                         }
@@ -1514,8 +1484,7 @@ const EXCEL_ROWS: std::ops::RangeInclusive<u32> = 1..=1_048_576;
 fn row_index(element: &BytesStart<'_>, decoder: quick_xml::Decoder, previous: u32) -> Result<u32> {
     for attr in element.attributes().flatten() {
         if attr.key.as_ref() == b"r" {
-            let value =
-                attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)?;
+            let value = attr.decode_and_unescape_value(decoder)?;
             return Ok(lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0));
         }
     }
@@ -1533,8 +1502,7 @@ fn empty_cell_column(
 ) -> Result<u32> {
     for attr in element.attributes().flatten() {
         if local_name(attr.key.as_ref()) == b"r" {
-            let value =
-                attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)?;
+            let value = attr.decode_and_unescape_value(decoder)?;
             return Ok(parse_cell_ref(value.as_ref()).map_or(0, |(_, col)| col));
         }
     }

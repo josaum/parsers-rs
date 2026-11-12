@@ -197,7 +197,7 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                 }
             }
             Ok(Event::Text(e)) => {
-                let text = crate::xml_text(e);
+                let text = e.unescape().unwrap_or_default().to_string();
                 if let Some(ref mut builder) = current_layer {
                     if capture_name {
                         builder.name = text;

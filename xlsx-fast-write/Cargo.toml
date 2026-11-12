@@ -16,7 +16,7 @@ name = "xlsx_fast_write"
 [dependencies]
 zip = { version = "9", default-features = false, features = ["deflate"] }
 serde = { version = "1.0", features = ["derive"] }
-quick-xml = "0.41"
+quick-xml = "0.36"
 serde_json = "1.0"
 
 [dev-dependencies]

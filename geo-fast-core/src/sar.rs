@@ -100,7 +100,7 @@ impl SarParser {
                     current_tag.clear();
                 }
                 Ok(Event::Text(ref e)) => {
-                    let text = crate::xml_text(e);
+                    let text = e.unescape().unwrap_or_default().to_string();
                     let text = text.trim().to_string();
                     if text.is_empty() {
                         continue;
@@ -362,7 +362,7 @@ impl SarParser {
                     current_tag.clear();
                 }
                 Ok(Event::Text(ref e)) if in_gcp => {
-                    let text = crate::xml_text(e);
+                    let text = e.unescape().unwrap_or_default().to_string();
                     let text = text.trim();
                     match current_tag.as_str() {
                         "line" => gcp_line = text.parse().unwrap_or(0.0),

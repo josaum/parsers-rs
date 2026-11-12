@@ -969,7 +969,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "ooxml-archive",
- "quick-xml 0.41.0",
+ "quick-xml 0.36.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -1412,7 +1412,7 @@ name = "geo-fast-core"
 version = "0.2.3"
 dependencies = [
  "byteorder",
- "quick-xml 0.41.0",
+ "quick-xml 0.36.2",
  "reqwest",
  "serde",
  "serde_json",
@@ -2530,7 +2530,7 @@ dependencies = [
  "flate2",
  "memmap2",
  "proptest",
- "quick-xml 0.41.0",
+ "quick-xml 0.36.2",
  "rawzip",
  "tempfile",
  "zip",
@@ -2891,7 +2891,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "ooxml-archive",
- "quick-xml 0.41.0",
+ "quick-xml 0.36.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -3115,9 +3115,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
-version = "0.41.0"
+version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
 dependencies = [
  "memchr",
 ]
@@ -4750,7 +4750,7 @@ dependencies = [
  "chrono",
  "lexical-core",
  "ooxml-archive",
- "quick-xml 0.41.0",
+ "quick-xml 0.36.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -4802,7 +4802,7 @@ dependencies = [
 name = "xlsx-fast-write"
 version = "0.2.2"
 dependencies = [
- "quick-xml 0.41.0",
+ "quick-xml 0.36.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -4839,7 +4839,7 @@ dependencies = [
  "arrow-schema",
  "indexmap",
  "memmap2",
- "quick-xml 0.41.0",
+ "quick-xml 0.36.2",
  "serde",
  "serde_json",
  "tempfile",

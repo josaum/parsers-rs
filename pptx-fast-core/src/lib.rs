@@ -695,19 +695,13 @@ fn parse_presentation(
                         let raw = attr.key.as_ref();
                         if raw == b"id" {
                             id = attr
-                                .decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                                .decode_and_unescape_value(reader.decoder())?
                                 .parse::<u32>()
                                 .unwrap_or(0);
                         } else if raw == b"r:id" {
                             rid = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         }
                     }
@@ -719,11 +713,8 @@ fn parse_presentation(
                     for attr in e.attributes().flatten() {
                         if attr.key.as_ref() == b"r:id" {
                             rid = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         }
                     }
@@ -740,11 +731,8 @@ fn parse_presentation(
                     for attr in e.attributes().flatten() {
                         if attr.key.as_ref() == b"r:id" {
                             rid = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         }
                     }
@@ -1081,19 +1069,13 @@ fn parse_comment_authors(
                         let key = local_name(attr.key.as_ref());
                         if key == b"id" {
                             id = attr
-                                .decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                                .decode_and_unescape_value(reader.decoder())?
                                 .parse::<u32>()
                                 .ok();
                         } else if key == b"name" {
                             name = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         }
                     }
@@ -1134,27 +1116,18 @@ fn parse_comments(xml: &[u8], authors: &HashMap<u32, String>) -> Result<Vec<Comm
                         let key = local_name(attr.key.as_ref());
                         if key == b"idx" || key == b"id" {
                             id = attr
-                                .decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                                .decode_and_unescape_value(reader.decoder())?
                                 .parse::<u32>()
                                 .unwrap_or(0);
                         } else if key == b"authorId" {
                             author_id = attr
-                                .decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                                .decode_and_unescape_value(reader.decoder())?
                                 .parse::<u32>()
                                 .ok();
                         } else if key == b"dt" {
                             date = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         }
                     }
@@ -1270,11 +1243,8 @@ fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                     for attr in e.attributes().flatten() {
                         if local_name(attr.key.as_ref()) == b"name" {
                             current_name = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         }
                     }
@@ -1375,19 +1345,13 @@ fn parse_content_types(
                         let key = local_name(attr.key.as_ref());
                         if key == b"Extension" {
                             ext = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         } else if key == b"ContentType" {
                             ct = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         }
                     }
@@ -1401,19 +1365,13 @@ fn parse_content_types(
                         let key = local_name(attr.key.as_ref());
                         if key == b"PartName" {
                             part_name = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         } else if key == b"ContentType" {
                             ct = Some(
-                                attr.decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
+                                attr.decode_and_unescape_value(reader.decoder())?
+                                    .to_string(),
                             );
                         }
                     }
@@ -1469,11 +1427,8 @@ fn attr_value<R: BufRead>(
     for attr in e.attributes().flatten() {
         if local_name(attr.key.as_ref()) == key {
             return Ok(Some(
-                attr.decoded_and_normalized_value(
-                    quick_xml::XmlVersion::Implicit1_0,
-                    reader.decoder(),
-                )?
-                .to_string(),
+                attr.decode_and_unescape_value(reader.decoder())?
+                    .to_string(),
             ));
         }
     }
@@ -1496,11 +1451,8 @@ fn attr_values<R: BufRead, const N: usize>(
         if let Some(slot) = keys.iter().position(|candidate| *candidate == key) {
             if values[slot].is_none() {
                 values[slot] = Some(
-                    attr.decoded_and_normalized_value(
-                        quick_xml::XmlVersion::Implicit1_0,
-                        reader.decoder(),
-                    )?
-                    .to_string(),
+                    attr.decode_and_unescape_value(reader.decoder())?
+                        .to_string(),
                 );
             }
         }

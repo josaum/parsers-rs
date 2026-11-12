@@ -351,6 +351,21 @@ def assert_dependabot_contract(dependabot: str) -> None:
     assert "exclude-patterns" not in group["body"]
     groups = re.findall(r"^      ([A-Za-z][A-Za-z0-9_|-]*):$", cargo, re.MULTILINE)
     assert groups[0] == "cargo-minor-and-patch"
+    # A new Arrow major moves every Arrow crate in one pull request.
+    arrow = re.search(
+        r"^      arrow-major:\n(?P<body>(?:        [^\n]*\n)+)", cargo, re.MULTILINE
+    )
+    assert arrow is not None, "Arrow majors must arrive as one pull request"
+    assert re.search(
+        r'^        patterns:\n          - "arrow"\n          - "arrow-\*"$', arrow["body"], re.MULTILINE
+    )
+    assert re.search(r"^        update-types:\n          - major$", arrow["body"], re.MULTILINE)
+    # pyo3 0.30 drops abi3-py38, which the wheels are built for.
+    assert re.search(
+        r'^      - dependency-name: "pyo3\*"\n        versions:\n          - ">=0\.30"$',
+        cargo,
+        re.MULTILINE,
+    ), "pyo3 0.30 and later must be ignored while the wheels support Python 3.8"
 
 
 def workflow_id(path: Path) -> str:
@@ -517,6 +532,9 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_dependabot_contract, DEPENDABOT, "          - minor\n", ""),
         (assert_dependabot_contract, DEPENDABOT, "          - patch\n", "          - patch\n          - major\n"),
         (assert_dependabot_contract, DEPENDABOT, "      cargo-minor-and-patch:", "      everything:"),
+        (assert_dependabot_contract, DEPENDABOT, "      arrow-major:", "      arrow-anything:"),
+        (assert_dependabot_contract, DEPENDABOT, '          - "arrow-*"\n', ""),
+        (assert_dependabot_contract, DEPENDABOT, '          - ">=0.30"', '          - ">=0.31"'),
         (assert_dependabot_contract, DEPENDABOT, "        update-types:\n", "        exclude-patterns:\n          - arrow-*\n        update-types:\n"),
         (assert_dependabot_contract, DEPENDABOT, "      cargo-minor-and-patch:\n", "      arrow:\n        patterns:\n          - arrow-*\n      cargo-minor-and-patch:\n"),
     ],

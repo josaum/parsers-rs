@@ -368,27 +368,18 @@ pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
                     let key = local_name(attr.key.as_ref());
                     if key == b"Id" {
                         id = Some(
-                            attr.decoded_and_normalized_value(
-                                quick_xml::XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string(),
+                            attr.decode_and_unescape_value(reader.decoder())?
+                                .to_string(),
                         );
                     } else if key == b"Type" {
                         rel_type = Some(
-                            attr.decoded_and_normalized_value(
-                                quick_xml::XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string(),
+                            attr.decode_and_unescape_value(reader.decoder())?
+                                .to_string(),
                         );
                     } else if key == b"Target" {
                         target = Some(
-                            attr.decoded_and_normalized_value(
-                                quick_xml::XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string(),
+                            attr.decode_and_unescape_value(reader.decoder())?
+                                .to_string(),
                         );
                     }
                 }
