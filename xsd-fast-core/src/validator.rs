@@ -807,6 +807,15 @@ impl<'m> ValidationContext<'m> {
     fn check_simple_value(&mut self, st: &'m SimpleTypeDef, text: &str, depth: usize) {
         let facets = &st.facets;
         let kind = &st.kind;
+        // A list's white space collapses: items are separated by single
+        // spaces, with none at either end, before any facet is checked.
+        let collapsed;
+        let text = if st.list_item.is_some() {
+            collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            collapsed.as_str()
+        } else {
+            text
+        };
 
         if !facets.enumerations.is_empty() && !facets.enumerations.iter().any(|e| e.value == text) {
             let allowed = enumeration_listing(facets.enumerations.iter().map(|e| e.value.as_str()));

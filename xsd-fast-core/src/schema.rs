@@ -224,7 +224,10 @@ pub enum XsdType {
 }
 
 /// A named simple type with its primitive kind and facets.
+///
+/// Non-exhaustive: later versions may add fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SimpleTypeDef {
     /// Optional qualified name for named simple types.
     pub name: Option<QName>,
@@ -410,7 +413,11 @@ pub struct Particle {
 }
 
 /// A reference or inline declaration of an element inside a content model.
+///
+/// Non-exhaustive: match it with a wildcard arm, as later versions may add
+/// kinds of particle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ElementRef {
     /// Inline element declaration nested inside a complex type.
     Inline(Box<ElementDecl>),
@@ -430,7 +437,10 @@ pub enum ElementRef {
 }
 
 /// An `xs:any` element wildcard.
+///
+/// Non-exhaustive: later versions may add fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Wildcard {
     /// The `namespace` attribute as written: `##any` (the default),
     /// `##other`, or a list of URIs, `##targetNamespace` and `##local`.
@@ -476,7 +486,10 @@ pub struct ElementDecl {
 }
 
 /// An attribute declaration inside a complex type.
+///
+/// Non-exhaustive: later versions may add fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AttributeDecl {
     /// Attribute local name.
     pub name: String,

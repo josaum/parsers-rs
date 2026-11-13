@@ -330,3 +330,23 @@ mod arrow {
         assert_eq!(fields[0].data_type(), &DataType::Date32);
     }
 }
+
+#[test]
+fn a_list_value_is_compared_with_its_white_space_collapsed() {
+    const LISTS: &[u8] = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:simpleType name="Ints"><xs:list itemType="xs:int"/></xs:simpleType>
+      <xs:simpleType name="Pair"><xs:restriction base="Ints">
+        <xs:enumeration value="1 2"/></xs:restriction></xs:simpleType>
+      <xs:element name="p" type="Pair"/>
+    </xs:schema>"#;
+    let schema = SchemaSet::load_bytes(LISTS, ParseOptions::default()).expect("schema loads");
+    let findings = |xml: &str| {
+        schema
+            .validate(xml.as_bytes(), ValidateOptions::default())
+            .expect("validation runs")
+            .len()
+    };
+    assert_eq!(findings("<p>1   2</p>"), 0);
+    assert_eq!(findings("<p>\n 1\t2 </p>"), 0);
+    assert_eq!(findings("<p>1 3</p>"), 1);
+}
