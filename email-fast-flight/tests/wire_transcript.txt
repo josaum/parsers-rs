@@ -79,7 +79,7 @@ DoGet
 DoGet �
     InvalidArgument: Invalid ticket: invalid utf-8 sequence of 1 bytes from index 0
 DoPut without a bearer
-    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
+    Unauthenticated: missing authorization metadata
 DoPut
     Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
 DoExchange descriptor mail.eml without a bearer

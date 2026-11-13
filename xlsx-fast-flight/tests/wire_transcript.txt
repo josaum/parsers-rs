@@ -101,7 +101,7 @@ DoGet
 DoGet �
     InvalidArgument: ticket must be utf-8 path
 DoPut without a bearer
-    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
+    Unauthenticated: missing authorization metadata
 DoPut
     Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
 DoExchange descriptor book.xlsx without a bearer

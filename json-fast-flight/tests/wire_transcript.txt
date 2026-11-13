@@ -120,9 +120,9 @@ DoGet
 DoGet �
     InvalidArgument: ticket must be utf-8 path
 DoPut without a bearer
-    Unimplemented: json-fast-flight is reader-only (use json-fast-zerobus for writes)
+    Unauthenticated: missing authorization metadata
 DoPut
-    Unimplemented: json-fast-flight is reader-only (use json-fast-zerobus for writes)
+    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
 DoExchange descriptor data.jsonl without a bearer
     Unauthenticated: missing authorization metadata
 DoExchange descriptor data.jsonl

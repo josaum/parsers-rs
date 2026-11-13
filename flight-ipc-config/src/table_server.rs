@@ -439,8 +439,11 @@ impl<P: TableParser> FlightService for TableFlightService<P> {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        // The bearer is checked first: an unauthenticated caller learns
+        // nothing about the server, not even that it is read-only.
+        self.authorize(&request)?;
         Err(do_put_unsupported())
     }
 

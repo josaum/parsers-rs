@@ -266,7 +266,7 @@ DoGet missing.pptx
 DoGet ../minimal.pptx
     NotFound: file not found
 DoPut without a bearer
-    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
+    Unauthenticated: missing authorization metadata
 DoPut
     Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
 "#;

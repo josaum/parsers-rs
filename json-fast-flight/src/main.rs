@@ -25,8 +25,8 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::SchemaRef;
 use flight_ipc_config::{
-    capability_json, FlightIpcDirection, FlightIpcObservationGuard, FlightRequestAuthVerifier,
-    FlightRpcAction, ParserRoute, CAPABILITY_ACTION,
+    capability_json, do_put_unsupported, FlightIpcDirection, FlightIpcObservationGuard,
+    FlightRequestAuthVerifier, FlightRpcAction, ParserRoute, CAPABILITY_ACTION,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -481,11 +481,12 @@ impl FlightService for JsonFlightService {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented(
-            "json-fast-flight is reader-only (use json-fast-zerobus for writes)",
-        ))
+        // The bearer is checked first: an unauthenticated caller learns
+        // nothing about the server, not even that it is read-only.
+        self.authorize(&request)?;
+        Err(do_put_unsupported())
     }
 
     async fn do_exchange(
