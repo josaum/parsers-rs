@@ -288,8 +288,8 @@ pub struct ComplexType {
     /// After [`SchemaModel::resolve_inheritance`] runs, inherited attributes are
     /// prepended ahead of locally declared ones (for inheriting types only).
     pub attributes: Vec<AttributeDecl>,
-    /// Base type of a `complexContent` extension or restriction against a
-    /// *complex* base.
+    /// Base type of an extension or restriction against a *complex* base,
+    /// under `complexContent` or, for a restriction, `simpleContent`.
     ///
     /// `None` for types that do not derive from a complex base (the common
     /// case). When set, [`SchemaModel::resolve_inheritance`] uses it to fold
@@ -450,7 +450,8 @@ impl SchemaModel {
     /// prepends the (transitively) resolved base's particles and attributes
     /// ahead of the type's own. A restriction keeps the particles it states
     /// and takes only the base's attributes: those it prohibits are left
-    /// out, and one it declares again keeps the base's type. Inline complex types nested in particles, and
+    /// out, and one it declares again keeps the base's type. A restriction
+    /// of a base with simple content also takes the type of its text. Inline complex types nested in particles, and
     /// the inline types of global elements, are resolved too, so inheritance
     /// works regardless of where it appears. A chain of bases is followed to
     /// its end, however long. Types that do not inherit are left
@@ -853,15 +854,20 @@ fn resolve_complex_type<'a>(
         } else {
             None
         };
-        if let Some((mut base_particles, mut base_attrs)) = inherited {
+        if let Some((mut base_particles, mut base_attrs, base_text)) = inherited {
             if ct.derivation == Derivation::Restriction {
                 // A restriction states its particles itself; only the
-                // attributes come from the base.
+                // attributes come from the base, and the type of the text
+                // when the base has simple content and the restriction
+                // states no content of its own.
                 restrict_attributes(
                     &mut base_attrs,
                     std::mem::take(&mut ct.attributes),
                     &ct.prohibited_attributes,
                 );
+                if let (ContentModel::Empty, Some(text)) = (&ct.content, base_text) {
+                    ct.content = ContentModel::SimpleContent(text);
+                }
             } else {
                 match &mut ct.content {
                     // The type's own particles move behind the inherited ones.
@@ -940,8 +946,13 @@ fn resolve_element_ref<'a>(
     Ok(())
 }
 
-/// One base's effective particles and attributes, ancestors first.
-type Inherited = (Vec<Particle>, Vec<AttributeDecl>);
+/// One base's effective particles and attributes, ancestors first, and the
+/// type of its text when the base has simple content.
+type Inherited = (
+    Vec<Particle>,
+    Vec<AttributeDecl>,
+    Option<Box<SimpleTypeDef>>,
+);
 
 /// Collect a base type's effective particles and attributes, oldest ancestor
 /// first, following the whole chain of bases. Returns `None` if the base is
@@ -990,7 +1001,12 @@ fn collect_base<'a>(
 
     let mut particles: Vec<Particle> = Vec::new();
     let mut attrs: Vec<AttributeDecl> = Vec::new();
+    // The simple content nearest to the derived type.
+    let mut text: Option<&SimpleTypeDef> = None;
     for base in chain.into_iter().rev() {
+        if let ContentModel::SimpleContent(simple) = &base.content {
+            text = Some(simple);
+        }
         let restricts = base.base.is_some() && base.derivation == Derivation::Restriction;
         if restricts {
             // A restriction on the chain replaces the particles of
@@ -1012,7 +1028,17 @@ fn collect_base<'a>(
             attrs.extend(base.attributes.iter().cloned());
         }
     }
-    Ok(Some((particles, attrs)))
+    let text = match text {
+        Some(simple) => {
+            let mut cost = CopyCost::default();
+            cost.add_node();
+            cost.add_simple_type(simple);
+            budget.charge(cost)?;
+            Some(Box::new(simple.clone()))
+        }
+        None => None,
+    };
+    Ok(Some((particles, attrs, text)))
 }
 
 /// Applies a restriction's attribute declarations to the attributes it

@@ -104,6 +104,53 @@ fn an_extension_of_a_restriction_inherits_the_restricted_type() {
     assert_eq!(children(extension), ["a", "b", "z"]);
 }
 
+const SIMPLE_CONTENT: &[u8] = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:complexType name="Money"><xs:simpleContent><xs:extension base="xs:int"><xs:attribute name="cur" type="xs:string"/><xs:attribute name="old" type="xs:int"/></xs:extension></xs:simpleContent></xs:complexType>
+<xs:complexType name="SR"><xs:simpleContent><xs:restriction base="Money"><xs:attribute name="old" use="prohibited"/></xs:restriction></xs:simpleContent></xs:complexType>
+<xs:complexType name="SR0"><xs:simpleContent><xs:restriction base="Money"/></xs:simpleContent></xs:complexType>
+<xs:complexType name="SR2"><xs:simpleContent><xs:restriction base="SR"><xs:attribute name="cur" type="xs:string" use="required"/></xs:restriction></xs:simpleContent></xs:complexType>
+<xs:complexType name="L0"><xs:sequence><xs:element name="a" type="xs:string"/></xs:sequence><xs:attribute name="k0" type="xs:int" use="required"/></xs:complexType>
+<xs:complexType name="RE"><xs:complexContent><xs:restriction base="L0"/></xs:complexContent></xs:complexType>
+<xs:element name="sr" type="SR"/><xs:element name="sr0" type="SR0"/><xs:element name="sr2" type="SR2"/><xs:element name="re" type="RE"/><xs:element name="money" type="Money"/></xs:schema>"#;
+
+/// The kind of a type's text, `None` when it has no simple content.
+fn text_kind(complex: &ComplexType) -> Option<&SimpleTypeKind> {
+    match &complex.content {
+        ContentModel::SimpleContent(simple) => Some(&simple.kind),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_simple_content_restriction_keeps_the_text_and_attributes_of_its_base() {
+    let schema =
+        SchemaSet::load_bytes(SIMPLE_CONTENT, ParseOptions::default()).expect("schema loads");
+    let types = &schema.model().complex_types;
+
+    assert_eq!(text_kind(&types["SR"]), Some(&SimpleTypeKind::Int));
+    assert_eq!(
+        attributes(&types["SR"]),
+        [("cur", &SimpleTypeKind::String, false)]
+    );
+    // The self-closing form restricts nothing.
+    assert_eq!(text_kind(&types["SR0"]), Some(&SimpleTypeKind::Int));
+    assert_eq!(
+        attributes(&types["SR0"]),
+        [
+            ("cur", &SimpleTypeKind::String, false),
+            ("old", &SimpleTypeKind::Int, false),
+        ]
+    );
+    // A restriction of the restriction starts from the restricted type.
+    assert_eq!(text_kind(&types["SR2"]), Some(&SimpleTypeKind::Int));
+    assert_eq!(
+        attributes(&types["SR2"]),
+        [("cur", &SimpleTypeKind::String, true)]
+    );
+    // A restriction of a type with element content gains no text.
+    assert_eq!(text_kind(&types["RE"]), None);
+    assert_eq!(children(&types["RE"]), Vec::<&str>::new());
+}
+
 #[cfg(feature = "arrow")]
 mod arrow {
     use arrow_schema::DataType;
@@ -129,6 +176,46 @@ mod arrow {
 
     fn column(name: &str, data_type: DataType, nullable: bool) -> (String, DataType, bool) {
         (name.to_string(), data_type, nullable)
+    }
+
+    #[test]
+    fn a_simple_content_restriction_has_typed_text_and_attribute_columns() {
+        let schema = xsd_fast_core::SchemaSet::load_bytes(
+            super::SIMPLE_CONTENT,
+            xsd_fast_core::ParseOptions::default(),
+        )
+        .expect("schema loads");
+        let columns = |element: &str| -> Vec<(String, DataType, bool)> {
+            let arrow = schema
+                .to_arrow_schema(element, ArrowOptions::default())
+                .expect("schema derives");
+            arrow
+                .fields()
+                .iter()
+                .map(|field| {
+                    (
+                        field.name().clone(),
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            columns("sr"),
+            [
+                column("@cur", DataType::Utf8, true),
+                column("$text", DataType::Int64, true),
+            ]
+        );
+        assert_eq!(
+            columns("money"),
+            [
+                column("@cur", DataType::Utf8, true),
+                column("@old", DataType::Int64, true),
+                column("$text", DataType::Int64, true),
+            ]
+        );
     }
 
     #[test]

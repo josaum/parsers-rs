@@ -1127,10 +1127,11 @@ fn parse_attribute_children(
 /// from a *complex* base, the base's qualified name so
 /// [`SchemaModel::resolve_inheritance`] can fold the base in afterwards:
 /// particles and attributes for an extension, attributes only for a
-/// `complexContent` restriction, which keeps the particles it states itself.
-/// The attributes a restriction prohibits are recorded by name and are not
-/// attributes of the type. An extension of a built-in type, a restriction of
-/// `xs:anyType` and a `simpleContent` restriction leave the base unset.
+/// `complexContent` restriction, which keeps the particles it states itself,
+/// and attributes and the type of the text for a `simpleContent`
+/// restriction. The attributes a restriction prohibits are recorded by name
+/// and are not attributes of the type. An extension or restriction of a
+/// built-in type and a restriction of `xs:anyType` leave the base unset.
 ///
 /// [`SchemaModel::resolve_inheritance`]: crate::schema::SchemaModel::resolve_inheritance
 fn parse_content_extension(
@@ -1185,9 +1186,14 @@ fn parse_content_extension(
                     skip_element(reader, outer_tag)?;
                     if outer_tag == "simpleContent" {
                         // The text keeps the kind of a built-in base. The
-                        // facets the restriction adds are not read.
+                        // facets the restriction adds are not read. Any
+                        // other base is a complex type with simple content:
+                        // it is recorded, and its text and attributes are
+                        // folded in afterwards.
                         if let Some(content) = simple_extension_content(&attrs, ns_map) {
                             complex_type.content = content;
+                        } else {
+                            record_restriction_base(&attrs, ns_map, complex_type);
                         }
                     } else {
                         // A restriction states its particles again, so they
@@ -1212,7 +1218,10 @@ fn parse_content_extension(
                         complex_type.content = ContentModel::Sequence(Vec::new());
                         complex_type.base = Some(extension_base(&attrs));
                     }
-                } else if local == "restriction" && outer_tag == "complexContent" {
+                } else if local == "restriction"
+                    && (outer_tag == "complexContent"
+                        || simple_extension_content(&attrs, ns_map).is_none())
+                {
                     record_restriction_base(&attrs, ns_map, complex_type);
                 }
             }
@@ -1304,7 +1313,7 @@ fn push_prohibited(attrs: &HashMap<String, String>, prohibited: Option<&mut Vec<
     true
 }
 
-/// Records the complex base of a `complexContent` restriction.
+/// Records the complex base of a restriction.
 ///
 /// A restriction of the built-in `xs:anyType` has no base to take attributes
 /// from, and neither has one that names no base.
