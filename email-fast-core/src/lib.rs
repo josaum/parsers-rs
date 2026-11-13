@@ -88,6 +88,27 @@ pub fn write_msg_cfb_fixture_streams(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     msg::write_fixture_streams(streams)
 }
 
+/// Serializes the raw headers with their names in order.
+///
+/// A `HashMap` iterates in an order that changes from one process to the
+/// next; the same message must give the same bytes every time.
+fn serialize_sorted_headers<S>(
+    headers: &Option<HashMap<String, Vec<String>>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match headers {
+        Some(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            serializer.collect_map(entries)
+        }
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Configuration options for email parsing.
 #[derive(Debug, Clone, Copy)]
 pub struct ParseOptions {
@@ -267,7 +288,10 @@ pub struct Email {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
     /// All headers (if include_raw_headers is enabled)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_sorted_headers"
+    )]
     pub headers: Option<HashMap<String, Vec<String>>>,
 }
 

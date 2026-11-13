@@ -143,9 +143,15 @@ impl OoxmlArchive {
         self.entries.contains_key(name)
     }
 
-    /// Central-directory part names, in hash order.
+    /// Central-directory part names, sorted.
+    ///
+    /// The index is a hash map, whose own order changes from one process to
+    /// the next. A caller that walks the parts must meet them in the same
+    /// order every time, or which part it reports a failure for would vary.
     pub fn part_names(&self) -> impl Iterator<Item = &str> {
-        self.entries.keys().map(String::as_str)
+        let mut names: Vec<&str> = self.entries.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names.into_iter()
     }
 
     /// Read a part, borrowing stored bytes and owning inflated bytes.
