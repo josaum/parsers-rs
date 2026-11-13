@@ -51,14 +51,14 @@ fn js_error(err: impl std::fmt::Display) -> Error {
 }
 
 /// Parse a DOCX file and return the whole document as a JSON value.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_docx_js(path: String, options: Option<ParseOptionsJs>) -> Result<serde_json::Value> {
     let doc = parse_docx(path, to_parse_options(options)).map_err(js_error)?;
     serde_json::to_value(&doc).map_err(js_error)
 }
 
 /// Parse a DOCX file and write one NDJSON record per block to `out_path`.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_docx_ndjson_js(
     path: String,
     out_path: String,
@@ -68,7 +68,7 @@ pub fn parse_docx_ndjson_js(
 }
 
 /// Extract every embedded image into `out_dir` and return the written paths.
-#[napi]
+#[napi(catch_unwind)]
 pub fn extract_docx_images_js(path: String, out_dir: String) -> Result<Vec<String>> {
     let images = extract_docx_images(path, out_dir).map_err(js_error)?;
     Ok(images
@@ -78,7 +78,7 @@ pub fn extract_docx_images_js(path: String, out_dir: String) -> Result<Vec<Strin
 }
 
 /// Parse a DOCX file and write its Arrow IPC tables under `out_dir`.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_docx_arrow_ipc_js(
     path: String,
     out_dir: String,
@@ -95,7 +95,7 @@ pub fn parse_docx_arrow_ipc_js(
 }
 
 /// Parse a DOCX file into an Arrow dataset under `out_dir` and return the written files.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_docx_arrow_dataset_js(
     path: String,
     out_dir: String,
