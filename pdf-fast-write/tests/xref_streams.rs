@@ -351,3 +351,185 @@ fn malformed_streams_are_refused_with_their_reason() {
         assert!(error.contains(reason), "{name}: {error}");
     }
 }
+
+/// The page of [`three_objects`], with `extra` added to its dictionary.
+fn page_with(extra: &str) -> Vec<u8> {
+    format!(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 9 9] /Resources << /Font << /F1 {FONT} >> >> /Contents 11 0 R {extra} >>"
+    )
+    .into_bytes()
+}
+
+/// An object stream that claims nine objects and lists one: object 50.
+fn broken_object_stream() -> Vec<u8> {
+    stream("/Type /ObjStm /N 9 /First 5", b"50 0 << /Subtype /Text >>")
+}
+
+/// A cross-reference-stream document whose page is in object stream 90 and
+/// whose object 50 is in the broken object stream 91.
+fn compressed_with_broken_stream(page_extra: &str) -> Vec<u8> {
+    let mut objects = three_objects();
+    objects.objects[2].1 = page_with(page_extra);
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let content = append_object(&mut pdf, 11, &text_stream("x"));
+    let good = append_object(&mut pdf, 90, &object_stream(&objects));
+    let broken = append_object(&mut pdf, 91, &broken_object_stream());
+    let xref_at = pdf.len();
+    let mut rows = plain_rows(content, good);
+    rows.push((50, Row::In(91, 0)));
+    rows.push((91, Row::At(broken)));
+    rows.push((99, Row::At(xref_at)));
+    append_object(&mut pdf, 99, &xref_stream(&rows, "/Root 1 0 R", Rows::Raw));
+    pdf.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
+    pdf
+}
+
+/// A hybrid document whose page is entirely in the classic table and whose
+/// object 50 is in the broken object stream 91, placed by `/XRefStm`.
+/// `hidden_edit` rewrites the `/XRefStm` stream object before it is written.
+fn hybrid_with_broken_stream(
+    page_extra: &str,
+    hidden_edit: impl Fn(Vec<u8>) -> Vec<u8>,
+) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let mut table: Vec<(u32, String)> = Vec::new();
+    let mut place = |pdf: &mut Vec<u8>, number: u32, body: &[u8]| {
+        let at = append_object(pdf, number, body);
+        table.push((number, format!("{at:010} 00000 n \n")));
+    };
+    place(&mut pdf, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+    place(&mut pdf, 2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>");
+    place(&mut pdf, 3, &page_with(page_extra));
+    place(&mut pdf, 11, &text_stream("x"));
+    place(&mut pdf, 91, &broken_object_stream());
+    let hidden = hidden_edit(xref_stream(&[(50, Row::In(91, 0))], "", Rows::Raw));
+    let hidden_at = pdf.len();
+    place(&mut pdf, 98, &hidden);
+    table.push((50, "0000000000 00001 f \n".to_string()));
+    table.sort();
+    let xref_at = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    for (number, entry) in table {
+        pdf.extend_from_slice(format!("{number} 1\n{entry}").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 99 /Root 1 0 R /XRefStm {hidden_at} >>\nstartxref\n{xref_at}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+/// WHY: one object stream that cannot be read must not cost the pages that
+/// never use it. Main extracted page 1 of such a hybrid file from its
+/// classic table; the pure stream file is the same case.
+#[test]
+fn a_broken_object_stream_a_page_does_not_need_is_skipped() {
+    for pdf in [
+        compressed_with_broken_stream(""),
+        hybrid_with_broken_stream("", |hidden| hidden),
+    ] {
+        let output = extract(&pdf, &[1]).expect("page 1 does not need the broken stream");
+        assert_eq!(page_texts(&output), ["x"]);
+    }
+}
+
+/// WHY: when a page does need an object of a stream that could not be read,
+/// the error must say why that stream could not be read, not only that the
+/// object is missing.
+#[test]
+fn a_page_that_needs_a_broken_object_stream_is_refused_with_its_reason() {
+    for pdf in [
+        compressed_with_broken_stream("/Annots [50 0 R]"),
+        hybrid_with_broken_stream("/Annots [50 0 R]", |hidden| hidden),
+    ] {
+        let error = extract(&pdf, &[1]).expect_err("object 50 is unreadable");
+        assert!(
+            error.contains("object 50")
+                && error.contains("object stream 91, which could not be read")
+                && error.contains("/N claims 9 objects"),
+            "{error}"
+        );
+    }
+}
+
+/// WHY: a hybrid file whose `/XRefStm` stream is corrupt fails closed. Read
+/// from the table alone, an older revision's copy of an object the stream
+/// places could come back as silently stale content.
+#[test]
+fn a_hybrid_file_with_a_corrupt_hidden_stream_is_refused() {
+    let pdf = hybrid_with_broken_stream("", |hidden| {
+        String::from_utf8_lossy(&hidden)
+            .replace("/W [1 4 2]", "/W [1 9 2]")
+            .into_bytes()
+    });
+    let error = extract(&pdf, &[1]).expect_err("corrupt /XRefStm");
+    assert!(
+        error.contains("cross-reference stream at byte") && error.contains("/W"),
+        "{error}"
+    );
+}
+
+/// WHY: an editor that writes the whole table on every save re-lists every
+/// object in each section. Rows for objects a newer section already gave
+/// store nothing, so they must not count against the entry cap. The 3,000
+/// free entries compress to almost nothing, so the file is small and its cap
+/// (one entry per 8 bytes plus 4,096) holds them once but not twice; with
+/// fewer objects the 4,096-entry floor alone would hide the double count.
+#[test]
+fn full_re_listings_in_incremental_saves_are_not_counted_twice() {
+    let mut objects = three_objects();
+    objects.flate = true;
+    // Padding brings the decode budget (16 times the file) above the eleven
+    // decoded sections while the cap stays below two listings.
+    let mut pdf = b"%PDF-1.5\n%".to_vec();
+    pdf.resize(10_000, b'x');
+    pdf.push(b'\n');
+    let content = append_object(&mut pdf, 11, &text_stream("x"));
+    let container = append_object(&mut pdf, 90, &object_stream(&objects));
+    let mut rows = plain_rows(content, container);
+    for number in 100..3100 {
+        rows.push((number, Row::Free));
+    }
+    let mut previous: Option<usize> = None;
+    for save in 0..11 {
+        let xref_at = pdf.len();
+        let mut section = rows.clone();
+        section.push((5000 + save, Row::At(xref_at)));
+        let prev = previous.map_or(String::new(), |at| format!(" /Prev {at}"));
+        append_object(
+            &mut pdf,
+            5000 + save,
+            &xref_stream(&section, &format!("/Root 1 0 R{prev}"), Rows::Flate),
+        );
+        pdf.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
+        previous = Some(xref_at);
+    }
+    assert!(pdf.len() < 8 * (2 * 3000 - 4096), "{} bytes", pdf.len());
+    let output = extract(&pdf, &[1]).expect("eleven listings of the same objects");
+    assert_eq!(page_texts(&output), ["x"]);
+}
+
+/// WHY: main kept the last of two entries for one object number in one
+/// classic table; the classic path must read the same document as main.
+#[test]
+fn a_number_repeated_in_one_classic_table_keeps_its_last_entry() {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let catalog = append_object(&mut pdf, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+    let pages = append_object(&mut pdf, 2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>");
+    let page = append_object(&mut pdf, 3, &page_with(""));
+    let old = append_object(&mut pdf, 11, &text_stream("old"));
+    let new = append_object(&mut pdf, 11, &text_stream("new"));
+    let xref_at = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 4\n0000000000 65535 f \n{catalog:010} 00000 n \n{pages:010} 00000 n \n{page:010} 00000 n \n\
+             11 1\n{old:010} 00000 n \n11 1\n{new:010} 00000 n \n\
+             trailer\n<< /Size 12 /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    let output = extract(&pdf, &[1]).expect("extracts");
+    assert_eq!(page_texts(&output), ["new"]);
+}

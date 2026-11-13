@@ -25,9 +25,18 @@
 //!   object; the output has no object streams.
 //! - Cross-reference and object streams are decoded only when unfiltered or
 //!   `/FlateDecode`, with no predictor or a PNG predictor. Together they may
-//!   decode to at most 16 times the source's length plus 64 KiB; past that,
-//!   or when a row, an `/Index`, a `/W` or an object stream header does not
+//!   decode to at most 16 times the source's length plus 64 KiB, and the
+//!   cross-reference may store at most one entry per 8 bytes of the source
+//!   plus 4,096; past either, or when a row, an `/Index` or a `/W` does not
 //!   fit the data, the source is refused.
+//! - An object stream that cannot be read (corrupt, over budget, or whose
+//!   header does not fit its data) costs only the pages that use it: a page
+//!   that refers to one of its objects is refused, and the error says why
+//!   the stream could not be read.
+//! - A hybrid file whose `/XRefStm` stream cannot be read is refused, even
+//!   when its classic table looks complete: read from the table alone, an
+//!   older revision's copy of an object the stream places would come back as
+//!   silently stale content.
 //! - A cross-reference or object stream is never copied: a page that refers
 //!   to one is refused.
 //! - `/Count` is not trusted: the pages are the leaves reachable from the
@@ -150,11 +159,18 @@ impl PdfWriter {
     /// # Errors
     ///
     /// Returns an error when the source cannot be read as an unencrypted PDF
-    /// (its cross-reference tables or streams, or its object streams, are
-    /// malformed or decode past their bound), when the selection is empty,
-    /// names a page outside
-    /// the document or is too long, or when a selected page refers to an
-    /// unselected one.
+    /// (its cross-reference tables or streams are malformed, decode past
+    /// their bound, or name more objects than a file of its length holds),
+    /// when the selection is empty, names a page outside the document or is
+    /// too long, when a selected page refers to an unselected one, or when a
+    /// selected page needs an object from an object stream that could not
+    /// be read; that error carries the stream's own reason.
+    ///
+    /// A hybrid file (a classic table whose trailer has `/XRefStm`) whose
+    /// cross-reference stream cannot be read is refused even when the table
+    /// alone looks complete: the table may hold an older revision's copy of
+    /// an object the stream places, and extracting it would hand back stale
+    /// content without any sign of it.
     pub fn extract_pages_from_bytes_with(
         data: &[u8],
         pages: &[usize],
@@ -647,6 +663,11 @@ struct Xref {
     entries: HashMap<u32, (u64, u16)>,
     /// Every offset in `entries`, ascending and without repeats.
     starts: Vec<u64>,
+    /// Objects of object streams that could not be read, by object number:
+    /// the object stream each is in.
+    unreadable: HashMap<u32, u32>,
+    /// Why each object stream in `unreadable` could not be read.
+    stream_errors: HashMap<u32, String>,
 }
 
 impl Xref {
@@ -673,7 +694,26 @@ impl Xref {
             .collect();
         starts.sort_unstable();
         starts.dedup();
-        Self { entries, starts }
+        Self {
+            entries,
+            starts,
+            unreadable: HashMap::new(),
+            stream_errors: HashMap::new(),
+        }
+    }
+
+    /// Returns the error for `object` missing from the table: `message`, and
+    /// why its object stream could not be read when that is the cause.
+    fn missing(&self, object: u32, message: String) -> anyhow::Error {
+        match self.unreadable.get(&object) {
+            Some(stream) => anyhow!(
+                "{message}: it is in object stream {stream}, which could not be read ({})",
+                self.stream_errors
+                    .get(stream)
+                    .map_or("no reason recorded", String::as_str)
+            ),
+            None => anyhow!("{message}"),
+        }
     }
 
     /// Returns the offset of the first object that starts after `offset`.
@@ -773,15 +813,6 @@ impl Entries {
             map: HashMap::new(),
             limit: (length / SOURCE_BYTES_PER_ENTRY).saturating_add(ENTRY_FLOOR),
         }
-    }
-
-    /// Fails unless `count` more entries could still be stored.
-    fn ensure_room(&self, count: u64) -> Result<()> {
-        let room = self.limit.saturating_sub(self.map.len());
-        if usize::try_from(count).map_or(true, |count| count > room) {
-            return Err(self.full());
-        }
-        Ok(())
     }
 
     fn full(&self) -> anyhow::Error {
@@ -895,7 +926,7 @@ fn read_xref_sections(data: &[u8], start: u64, budget: &mut DecodeBudget) -> Res
         let trailer = if looks_like_compressed_xref(slice) {
             read_xref_stream(data, current, budget, &mut merged, &Default::default())?
         } else {
-            let (trailer, table_free) = parse_xref_section(data, current, &mut merged)?;
+            let (trailer, table_stored) = parse_xref_section(data, current, &mut merged)?;
             if let Some(hidden) = trailer.get("/XRefStm") {
                 let hidden = hidden
                     .parse::<u64>()
@@ -909,7 +940,7 @@ fn read_xref_sections(data: &[u8], start: u64, budget: &mut DecodeBudget) -> Res
                 // cannot be read fails the source: read from the table alone,
                 // an older revision's copy of such an object would come back
                 // as silently stale content.
-                read_xref_stream(data, hidden, budget, &mut merged, &table_free)?;
+                read_xref_stream(data, hidden, budget, &mut merged, &table_stored)?;
             }
             trailer
         };
@@ -951,8 +982,8 @@ fn parse_xref(data: &[u8], start: u64) -> Result<(Xref, HashMap<String, String>)
 }
 
 /// Reads the classic table at `start` into `entries`; returns its trailer
-/// entries and the objects it newly marked free, which the table's
-/// `/XRefStm` stream may still place.
+/// entries and the objects it stored, whose free entries the table's
+/// `/XRefStm` stream may still replace.
 fn parse_xref_section(
     data: &[u8],
     start: u64,
@@ -963,7 +994,7 @@ fn parse_xref_section(
         .and_then(|start| data.get(start..))
         .filter(|slice| !slice.is_empty())
         .ok_or_else(|| anyhow!("xref offset {} is outside the file", start))?;
-    let mut table_free = std::collections::HashSet::new();
+    let mut stored_here = std::collections::HashSet::new();
 
     // The section is read line by line up to its `trailer` keyword and no
     // further: in a file saved more than once, later revisions follow this
@@ -1020,8 +1051,12 @@ fn parse_xref_section(
                     } else {
                         XrefEntry::Free
                     };
-                    if entries.offer(object, entry)? && entry == XrefEntry::Free {
-                        table_free.insert(object);
+                    // Within one table the last entry for a number wins, as
+                    // it did before cross-reference streams were read.
+                    if entries.offer(object, entry)? {
+                        stored_here.insert(object);
+                    } else if stored_here.contains(&object) {
+                        entries.map.insert(object, entry);
                     }
                     current_obj = object.checked_add(1);
                 }
@@ -1058,7 +1093,7 @@ fn parse_xref_section(
     // A trailer's /ID strings are arbitrary bytes, so the text is lossy; the
     // values read from it are names, numbers and references.
     let dict = String::from_utf8_lossy(&after_keyword[..dict_end]);
-    Ok((trailer_entries(&dict), table_free))
+    Ok((trailer_entries(&dict), stored_here))
 }
 
 /// Returns the trailer entries this crate uses from a trailer dictionary or
@@ -1079,8 +1114,8 @@ fn trailer_entries(dict: &str) -> HashMap<String, String> {
 /// Reads the cross-reference stream at `offset`: its entries, and the
 /// trailer entries of its dictionary.
 /// Reads the cross-reference stream at `offset` into `entries`, and returns
-/// the trailer entries of its dictionary. It may replace the entries named
-/// in `overridable`: free entries its own section's table gave.
+/// the trailer entries of its dictionary. It may replace the free entries
+/// among `overridable`: the ones its own section's table gave.
 fn read_xref_stream(
     data: &[u8],
     offset: u64,
@@ -1153,8 +1188,12 @@ fn read_xref_stream_at(
             "/Index names {claimed} entries but the stream holds {rows} rows"
         ));
     }
-    // Refused before any row is stored, not after memory is spent.
-    entries.ensure_room(claimed)?;
+    // Rows for objects a newer section gave store nothing, so the cap is
+    // charged as entries are stored; a stream that claims more rows than
+    // the whole cap is refused before any is read.
+    if usize::try_from(claimed).map_or(true, |claimed| claimed > entries.limit) {
+        return Err(entries.full());
+    }
     let mut row_bytes = decoded.chunks_exact(row_width);
     for (first, count) in subsections {
         for step in 0..count {
@@ -1166,7 +1205,7 @@ fn read_xref_stream_at(
                 .and_then(|object| u32::try_from(object).ok())
                 .ok_or_else(|| anyhow!("/Index numbers an object past 4294967295"))?;
             let entry = xref_row(row, widths)?;
-            if overridable.contains(&object) {
+            if overridable.contains(&object) && entries.map.get(&object) == Some(&XrefEntry::Free) {
                 entries.map.insert(object, entry);
             } else {
                 entries.offer(object, entry)?;
@@ -1468,13 +1507,28 @@ fn unpack_object_streams(
         .map(|(_, object)| *object)
         .collect();
     for (stream, members) in packed {
-        if compressed.contains(&stream) {
-            return Err(anyhow!(
+        let objects = if compressed.contains(&stream) {
+            Err(anyhow!(
                 "object stream {stream} is itself in an object stream"
-            ));
-        }
-        let objects = read_object_stream(source, &xref, stream, &members, budget)
-            .with_context(|| format!("object stream {stream}"))?;
+            ))
+        } else {
+            read_object_stream(source, &xref, stream, &members, budget)
+                .with_context(|| format!("object stream {stream}"))
+        };
+        // A stream that cannot be read costs only the pages that use it:
+        // its members stay absent, and a reference to one says why. Their
+        // compressed entries already hide any older copy, so nothing stale
+        // can come back in their place.
+        let objects = match objects {
+            Ok(objects) => objects,
+            Err(error) => {
+                for (_, object) in members {
+                    xref.unreadable.insert(object, stream);
+                }
+                xref.stream_errors.insert(stream, format!("{error:#}"));
+                continue;
+            }
+        };
         for (object, body) in objects {
             data.push(b'\n');
             let offset = u64::try_from(data.len())
@@ -1655,7 +1709,7 @@ struct SyntaxToken<'a> {
 fn get_object(data: &[u8], xref: &Xref, obj_num: u32) -> Result<Vec<u8>> {
     let (offset, generation) = xref
         .get(&obj_num)
-        .ok_or_else(|| anyhow!("object {} not in xref", obj_num))?;
+        .ok_or_else(|| xref.missing(obj_num, format!("object {obj_num} not in xref")))?;
     let slice = usize::try_from(*offset)
         .ok()
         .and_then(|offset| data.get(offset..))
@@ -1689,7 +1743,7 @@ fn get_object(data: &[u8], xref: &Xref, obj_num: u32) -> Result<Vec<u8>> {
 fn indirect_integer(data: &[u8], xref: &Xref, obj_num: u32) -> Result<usize> {
     let (offset, generation) = xref
         .get(&obj_num)
-        .ok_or_else(|| anyhow!("object {} not in xref", obj_num))?;
+        .ok_or_else(|| xref.missing(obj_num, format!("object {obj_num} not in xref")))?;
     let slice = usize::try_from(*offset)
         .ok()
         .and_then(|offset| data.get(offset..))
@@ -2042,9 +2096,9 @@ fn syntax_references(bytes: &[u8]) -> Vec<PdfRef> {
 
 fn validate_reference(xref: &Xref, reference: PdfRef) -> Result<()> {
     let Some((_, actual_generation)) = xref.get(&reference.object) else {
-        return Err(anyhow!(
-            "referenced object {} is absent from xref",
-            reference.object
+        return Err(xref.missing(
+            reference.object,
+            format!("referenced object {} is absent from xref", reference.object),
         ));
     };
     if *actual_generation != reference.generation {
@@ -3325,5 +3379,74 @@ mod tests {
         pdf.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
         let error = format!("{:#}", Pdf::parse(&pdf).err().expect("refused"));
         assert!(error.contains("entries"), "{error}");
+    }
+
+    /// Two rows of three bytes, the second differing from the first.
+    const ROWS: [[u8; 3]; 2] = [[10, 200, 30], [11, 25, 255]];
+
+    /// Encodes [`ROWS`] with PNG filter `kind`, independently of the decoder.
+    fn png_encode(kind: u8) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut above = [0u8; 3];
+        for row in ROWS {
+            encoded.push(kind);
+            for column in 0..3 {
+                let left = if column > 0 { row[column - 1] } else { 0 };
+                let up = above[column];
+                let upper_left = if column > 0 { above[column - 1] } else { 0 };
+                let predicted = match kind {
+                    0 => 0,
+                    1 => left,
+                    2 => up,
+                    3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                    _ => {
+                        let estimate = i16::from(left) + i16::from(up) - i16::from(upper_left);
+                        let distance = |value: u8| (estimate - i16::from(value)).abs();
+                        if distance(left) <= distance(up) && distance(left) <= distance(upper_left)
+                        {
+                            left
+                        } else if distance(up) <= distance(upper_left) {
+                            up
+                        } else {
+                            upper_left
+                        }
+                    }
+                };
+                encoded.push(row[column].wrapping_sub(predicted));
+            }
+            above = row;
+        }
+        encoded
+    }
+
+    /// WHY: writers pick any PNG filter per row (None, Sub, Up, Average,
+    /// Paeth); each must decode to the rows that were written.
+    #[test]
+    fn every_png_predictor_row_type_is_undone() {
+        let expected: Vec<u8> = ROWS.concat();
+        for kind in 0..=4 {
+            let decoded = undo_png_predictor(b"<< /Predictor 12 /Columns 3 >>", png_encode(kind))
+                .expect("decodes");
+            assert_eq!(decoded, expected, "filter type {kind}");
+        }
+        // Sub, worked by hand: each byte less the one before it.
+        assert_eq!(png_encode(1), [1, 10, 190, 86, 1, 11, 14, 230]);
+        // Paeth, worked by hand for the second row: the first byte is
+        // predicted from above (10), the second from above (200, estimate
+        // 201) and the third from the left (25, estimate -145).
+        assert_eq!(png_encode(4)[4..], [4, 1, 81, 230]);
+    }
+
+    /// WHY: `/DecodeParms` may be an array with one dictionary per filter.
+    #[test]
+    fn decode_parameters_given_as_an_array_are_read() {
+        let mut budget = DecodeBudget::for_source(1024);
+        let decoded = decode_stream(
+            b"<< /DecodeParms [<< /Predictor 12 /Columns 3 >>] >>",
+            &png_encode(2),
+            &mut budget,
+        )
+        .expect("decodes");
+        assert_eq!(decoded, ROWS.concat());
     }
 }
