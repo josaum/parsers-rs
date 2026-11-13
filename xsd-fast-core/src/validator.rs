@@ -83,8 +83,9 @@ impl SchemaSet {
     /// from checking the document against the schema. A parse error raised
     /// while reading the document, such as a mismatched end tag, is always
     /// among the findings, as one more than the limit if the limit was already
-    /// reached. A document that ends with elements still open is reported the
-    /// same way. A root element the schema does not declare is a finding too,
+    /// reached. A document that ends with elements still open, has no root
+    /// element, has a second top-level element, has character data outside
+    /// the root or holds an ill-formed reference is reported the same way. A root element the schema does not declare is a finding too,
     /// since nothing inside it can be checked. A result at the limit may be
     /// incomplete.
     ///
@@ -107,6 +108,8 @@ impl SchemaSet {
             content_indexes: HashMap::new(),
             entities: HashMap::new(),
             reference_reported: false,
+            roots: 0,
+            outside_text_reported: false,
         };
         ctx.validate_document(xml)?;
         Ok(ctx.errors)
@@ -152,6 +155,10 @@ struct ValidationContext<'m> {
     entities: HashMap<String, String>,
     /// Whether the one finding for an ill-formed reference was recorded.
     reference_reported: bool,
+    /// Top-level elements opened so far; a document has exactly one.
+    roots: usize,
+    /// Whether the one finding for character data outside the root was recorded.
+    outside_text_reported: bool,
 }
 
 /// What one content model declares, arranged for lookup by child name.
@@ -199,6 +206,7 @@ impl<'m> ValidationContext<'m> {
                         strip_prefix(raw).to_owned()
                     };
                     self.path.push(local.clone());
+                    self.count_root();
                     self.report_undeclared_root(&local);
                     self.check_attribute_references(e);
 
@@ -223,6 +231,7 @@ impl<'m> ValidationContext<'m> {
                         strip_prefix(raw).to_owned()
                     };
                     self.path.push(local.clone());
+                    self.count_root();
                     self.report_undeclared_root(&local);
                     self.check_attribute_references(e);
 
@@ -254,6 +263,7 @@ impl<'m> ValidationContext<'m> {
                 // reports as events of their own, in document order.
                 Ok(Event::Text(ref t)) => {
                     self.check_text_references(t);
+                    self.check_outside_text(t);
                     if let Ok(text) = t.decode() {
                         if let Some(frame) = self.type_stack.last_mut() {
                             frame.text.push_str(&text);
@@ -265,6 +275,7 @@ impl<'m> ValidationContext<'m> {
                     if !push_reference(&mut resolved, reference, &self.entities) {
                         self.report_reference(&resolved);
                     }
+                    self.report_outside_text();
                     if let Some(frame) = self.type_stack.last_mut() {
                         frame.text.push_str(&resolved);
                     }
@@ -277,6 +288,7 @@ impl<'m> ValidationContext<'m> {
                 // A CDATA section is element text written literally: it is
                 // decoded but never entity-unescaped.
                 Ok(Event::CData(ref data)) => {
+                    self.report_outside_text();
                     if let Some(frame) = self.type_stack.last_mut() {
                         frame.text.push_str(&String::from_utf8_lossy(data));
                     }
@@ -330,15 +342,28 @@ impl<'m> ValidationContext<'m> {
                     let name_bytes = e.name();
                     let raw = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("?");
                     self.path.push(strip_prefix(raw).to_owned());
+                    self.count_root();
                     self.check_attribute_references(e);
                 }
-                Ok(Event::Empty(ref e)) => self.check_attribute_references(e),
-                Ok(Event::Text(ref t)) => self.check_text_references(t),
+                Ok(Event::Empty(ref e)) => {
+                    let name_bytes = e.name();
+                    let raw = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("?");
+                    self.path.push(strip_prefix(raw).to_owned());
+                    self.count_root();
+                    self.check_attribute_references(e);
+                    self.path.pop();
+                }
+                Ok(Event::Text(ref t)) => {
+                    self.check_text_references(t);
+                    self.check_outside_text(t);
+                }
+                Ok(Event::CData(_)) => self.report_outside_text(),
                 Ok(Event::GeneralRef(ref reference)) => {
                     let mut resolved = String::new();
                     if !push_reference(&mut resolved, reference, &self.entities) {
                         self.report_reference(&resolved);
                     }
+                    self.report_outside_text();
                 }
                 Ok(Event::End(_)) => {
                     self.path.pop();
@@ -432,12 +457,70 @@ impl<'m> ValidationContext<'m> {
         }
     }
 
-    /// Reports a document that ended while elements were still open.
+    /// Counts a top-level element, and reports the second one.
+    ///
+    /// Called for every element, with the element already on the path. A
+    /// document has one root, so a second top-level element is not
+    /// well-formed, declared or not; like a parse error it is reported
+    /// whatever the limit, once. The element is still validated as a root.
+    fn count_root(&mut self) {
+        let [name] = self.path.as_slice() else {
+            return;
+        };
+        self.roots += 1;
+        if self.roots == 2 {
+            let message = format!(
+                "XML parse error: second top-level element <{name}>: a document has one root"
+            );
+            self.errors.push(ValidationError {
+                severity: ValidationSeverity::Error,
+                path: self.current_path(),
+                message,
+            });
+        }
+    }
+
+    /// Reports text outside the root element, unless it is only white space.
+    fn check_outside_text(&mut self, text: &BytesText<'_>) {
+        let blank = text
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'));
+        if !blank {
+            self.report_outside_text();
+        }
+    }
+
+    /// Records the finding for character data outside the root, once.
+    ///
+    /// Does nothing inside an element. Only white space, comments and
+    /// processing instructions may stand outside the root, so anything else
+    /// is reported whatever the limit, like a parse error.
+    fn report_outside_text(&mut self) {
+        if self.outside_text_reported || !self.path.is_empty() {
+            return;
+        }
+        self.outside_text_reported = true;
+        self.errors.push(ValidationError {
+            severity: ValidationSeverity::Error,
+            path: self.current_path(),
+            message: "XML parse error: character data outside the root element".to_string(),
+        });
+    }
+
+    /// Reports a document that ended without a root or with elements still open.
     ///
     /// The reader raises no error for this, but such a document is not
     /// well-formed, so like a parse error it is reported whatever the limit.
     /// The finding's path is the innermost element left open.
     fn report_open_elements(&mut self) {
+        if self.roots == 0 {
+            self.errors.push(ValidationError {
+                severity: ValidationSeverity::Error,
+                path: self.current_path(),
+                message: "XML parse error: no root element".to_string(),
+            });
+            return;
+        }
         let Some(innermost) = self.path.last() else {
             return;
         };

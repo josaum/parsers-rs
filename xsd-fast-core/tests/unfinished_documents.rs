@@ -78,6 +78,4 @@ fn complete_documents_with_a_declared_root_are_unaffected() {
         100
     )
     .is_empty());
-    // A document with no element at all has no root to declare.
-    assert!(findings("", 100).is_empty());
 }
