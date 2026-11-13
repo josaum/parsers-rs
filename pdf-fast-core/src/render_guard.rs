@@ -68,11 +68,13 @@
 //!   uses this crate's parser, not the interpreter's.
 //! * **The image decoders** were not examined.
 //!
+//! Every font a stream selects, and every object it reaches, is held to
+//! [`MAX_OBJECT_DEPTH`] like the resources are, although no recursion over
+//! font objects is known in the interpreter.
+//!
 //! `/UseCMap` chains need no bound: `hayro-interpret` 0.5.0 logs the key
 //! and treats the `usecmap` operator as a no-op, so it never loads a second
 //! CMap, and a chain or a cycle costs it nothing.
-//! * **Objects reached only through fonts.** Font dictionaries are not
-//!   followed by the object-depth check.
 //! * **Memory and time.** Every nested tiling cell and soft mask gets a
 //!   renderer the size of the page, the interpreter's saved-state stack is
 //!   unbounded, and a sampled function's cost doubles with each input.
@@ -167,7 +169,8 @@ const MAX_VETTED_CONTEXTS: usize = 1_000_000;
 const MAX_VETTED_OBJECTS: usize = 2_000_000;
 
 /// Deepest array, dictionary and reference nesting accepted in a colour
-/// space, function, shading, pattern, graphics state or image dictionary.
+/// space, function, shading, pattern, graphics state, image dictionary or
+/// font (with its descendant fonts, descriptor, widths and encodings).
 ///
 /// The interpreter builds these by recursion: about 2.7 KB of stack per
 /// nested stitching function and 1.6 KB per nested colour space in the
@@ -198,6 +201,9 @@ const MAX_PROGRAM_NESTING: usize = 256;
 /// unoptimized frame of that lexer needs, this many levels cost 8 MiB of
 /// [`RENDER_STACK_BYTES`] beyond [`STACK_BUDGET`].
 const MAX_CMAP_COMMENT_RUN: usize = 4_096;
+
+/// What `vet_object` names in a refusal for objects reached from resources.
+const RESOURCE_OBJECTS: &str = "a colour space, function or shading";
 
 /// Identity of a stream: where its dictionary sits in the file.
 type StreamId = (usize, usize);
@@ -459,7 +465,7 @@ impl<'a> Walk<'a> {
             &resources.patterns,
             &resources.x_objects,
         ] {
-            self.vet_object(Object::Dict(dict.clone()))?;
+            self.vet_object(Object::Dict(dict.clone()), RESOURCE_OBJECTS)?;
         }
         Ok(())
     }
@@ -474,10 +480,10 @@ impl<'a> Walk<'a> {
     /// render. An object that does hold a reference is followed again each
     /// time it is reached. It does not follow `/Resources`, `/Parent`
     /// or a soft mask's `/G`, which lead to content streams and are bounded
-    /// by the walk over those.
-    fn vet_object(&mut self, root: Object<'a>) -> Result<()> {
-        let too_deep =
-            || refused("a colour space, function or shading is nested deeper than can be built");
+    /// by the walk over those, nor `/UseCMap`, which the interpreter ignores.
+    /// `what` names the kind of object in the refusal.
+    fn vet_object(&mut self, root: Object<'a>, what: &str) -> Result<()> {
+        let too_deep = || refused(&format!("{what} is nested deeper than can be built"));
         // Each entry: the object's identity, the children still to visit,
         // and the tallest child seen so far.
         let mut path: Vec<(Option<StreamId>, Vec<Object<'a>>, usize)> = Vec::new();
@@ -544,7 +550,7 @@ impl<'a> Walk<'a> {
         };
         Ok(dict
             .keys()
-            .filter(|key| !matches!(&**key, b"Resources" | b"Parent" | b"G"))
+            .filter(|key| !matches!(&**key, b"Resources" | b"Parent" | b"G" | b"UseCMap"))
             .filter_map(|key| dict.get::<Object<'a>>(key))
             .filter(nested)
             .collect())
@@ -651,7 +657,7 @@ impl<'a> Walk<'a> {
     fn queue(&mut self, frame: &mut Frame<'a>, route: Route, stream: &Stream<'a>) -> Result<()> {
         // The stream's dictionary carries objects of its own, such as a
         // transparency group's colour space.
-        self.vet_object(Object::Dict(stream.dict().clone()))?;
+        self.vet_object(Object::Dict(stream.dict().clone()), RESOURCE_OBJECTS)?;
         let Some(scan) = self.scan(stream)? else {
             return Ok(());
         };
@@ -739,11 +745,15 @@ impl<'a> Walk<'a> {
     }
 
     /// Checks what the interpreter builds from a font dictionary as soon as
-    /// the font is selected: the CMaps of its `/Encoding` and `/ToUnicode`.
+    /// the font is selected: the objects it reaches, to [`MAX_OBJECT_DEPTH`],
+    /// and the CMaps of its `/Encoding` and `/ToUnicode`.
     ///
     /// `/UseCMap` and the `usecmap` operator are not followed: the
     /// interpreter ignores both.
     fn vet_font_dict(&mut self, font: &Dict<'a>) -> Result<()> {
+        // Descendant fonts, the descriptor, widths, encodings and glyph
+        // procedure dictionaries are held to the same depth as resources.
+        self.vet_object(Object::Dict(font.clone()), "a font")?;
         for key in [&b"Encoding"[..], b"ToUnicode"] {
             let Some(cmap) = font.get::<Stream<'a>>(key) else {
                 continue;
@@ -791,7 +801,7 @@ impl<'a> Walk<'a> {
                     b"XObject",
                 ] {
                     if let Some(dict) = resources.get::<Dict<'a>>(category) {
-                        self.vet_object(Object::Dict(dict))?;
+                        self.vet_object(Object::Dict(dict), RESOURCE_OBJECTS)?;
                     }
                 }
             }
@@ -1147,7 +1157,7 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
         else {
             continue;
         };
-        walk.vet_object(Object::Dict(appearance.dict().clone()))?;
+        walk.vet_object(Object::Dict(appearance.dict().clone()), RESOURCE_OBJECTS)?;
         let own =
             Resources::from_parent(own_resources(appearance.dict()), page.resources().clone());
         let Some(scan) = walk.scan(&appearance)? else {

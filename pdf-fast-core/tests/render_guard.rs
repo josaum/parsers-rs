@@ -918,6 +918,43 @@ fn a_cmap_opening_with_a_million_comment_lines_is_refused() {
     assert_renders("twenty comment lines", &cmap_with_comments(20));
 }
 
+/// A page showing text in a Type 1 font whose descriptor holds a chain of
+/// `depth` arrays, each the next object; nothing but the font reaches them.
+fn deep_object_in_font(depth: u32) -> Vec<u8> {
+    let mut rest = vec![
+        (
+            10,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FontDescriptor 11 0 R >>"
+                .to_vec(),
+        ),
+        (
+            11,
+            b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 \
+              /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+              /CapHeight 700 /StemV 80 /Extra 12 0 R >>"
+                .to_vec(),
+        ),
+    ];
+    for level in 0..depth {
+        rest.push((12 + level, format!("[{} 0 R]", 13 + level).into_bytes()));
+    }
+    rest.push((12 + depth, b"[0]".to_vec()));
+    one_page(
+        "/Resources << /Font << /F1 10 0 R >> >>",
+        "BT /F1 12 Tf 10 10 Td (a) Tj ET",
+        rest,
+    )
+}
+
+#[test]
+fn an_object_nested_deeply_inside_a_font_is_refused() {
+    assert_refused(
+        "1,000 arrays under a font descriptor",
+        &deep_object_in_font(1_000),
+    );
+    assert_renders("8 arrays under a font descriptor", &deep_object_in_font(8));
+}
+
 /// Runs the interpreter with no guard, on a thread with a chosen stack.
 ///
 /// Not a test: it exists to confirm that a fixture aborts the process and to
