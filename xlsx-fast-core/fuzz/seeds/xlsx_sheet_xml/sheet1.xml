@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:F4"/>
+  <sheetData>
+    <row r="1" spans="1:6">
+      <c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c>
+      <c r="D1" t="s"><v>3</v></c><c r="E1" t="s"><v>4</v></c><c r="F1" t="s"><v>5</v></c>
+    </row>
+    <row r="2">
+      <c r="A2"><v>42.5</v></c><c r="B2" s="1"><v>45000.75</v></c><c r="C2" s="2"><v>59</v></c>
+      <c r="D2" t="b"><v>1</v></c><c r="E2" t="e"><v>#DIV/0!</v></c>
+      <c r="F2" t="str"><f>A2&amp;"x"</f><v>42.5x</v></c>
+    </row>
+    <row>
+      <c t="inlineStr"><is><t>inline</t><rPh sb="0" eb="1"><t>x</t></rPh></is></c>
+      <c s="1"/><c><f t="shared" ref="C3:C4" si="0">SUM(A2:A2)</f><v>-1.5e3</v></c>
+      <c r="$E$3" t="inlineStr"><is><r><t>a</t></r><r><t>b_x0041_</t></r></is></c>
+    </row>
+    <row r="1048576"><c r="XFD1048576" s="1"><v>2958465</v></c></row>
+  </sheetData>
+  <mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>
+</worksheet>

@@ -9,6 +9,10 @@
 # and on any pull request that changes what the lockfile resolves.
 #
 # No advisory is ignored. A finding is answered by upgrading the dependency.
+#
+# `cargo-deny` checks the policy in deny.toml on the same triggers: which
+# licences a dependency may carry, that every crate comes from crates.io, and
+# the advisories once more through a second tool.
 name: audit
 
 on:
@@ -22,6 +26,7 @@ on:
       - .leio-code/rust-doctors/Cargo.lock
       - Cargo.toml
       - "**/Cargo.toml"
+      - deny.toml
 
 permissions:
   contents: read
@@ -61,3 +66,20 @@ jobs:
         run: cargo install cargo-audit --locked --version 0.23.0
       - name: Fail on a vulnerability or an unsoundness advisory in the doctors' lockfile
         run: cargo audit --deny unsound --file .leio-code/rust-doctors/Cargo.lock
+
+  cargo-deny:
+    # A job of its own for the same reason: a licence or source finding must
+    # report even when an advisory has already failed a scan above.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - name: Check advisories, licences, duplicate versions and sources against deny.toml
+        run: cargo deny --locked check

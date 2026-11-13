@@ -24,3 +24,17 @@ See [`index.d.ts`](./index.d.ts) for the full typed surface.
 
 - Object inputs accept both `camelCase` and Python-style `snake_case` keys where applicable.
 - Arrow data is returned as **IPC `Buffer`s** (consume with the `apache-arrow` package), not raw C-Data pointers.
+
+## Every element's Arrow schema in one call
+
+```js
+const xsd = require('xsd-fast-node');
+
+const schemas = JSON.parse(xsd.allArrowSchemasJson('schema.xsd'));
+for (const [element, fields] of Object.entries(schemas)) {
+  console.log(element, fields.map((f) => `${f.path}: ${f.arrow_type}`));
+}
+```
+
+Each value has the shape `describeElementJson` returns for one element. An
+element whose schema cannot be derived makes the call throw.

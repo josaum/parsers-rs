@@ -6,6 +6,9 @@ authors.workspace = true
 description = "High-performance email parser for .eml and .msg formats"
 license.workspace = true
 rust-version.workspace = true
+# Benchmarks and the one-shot bench drivers are for this repository, not for
+# users of the crate: they stay out of the published package.
+exclude = ["benches/", "examples/"]
 keywords = ["email", "eml", "msg", "outlook", "parser", "mime"]
 categories = ["parser-implementations", "email"]
 
@@ -43,4 +46,9 @@ web_atoms = "0.2"
 regex = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3.10"
+
+[[bench]]
+name = "parse"
+harness = false
