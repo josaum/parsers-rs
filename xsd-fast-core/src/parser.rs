@@ -1109,11 +1109,12 @@ fn parse_attribute_children(
 
 /// Parses a `simpleContent`/`complexContent` element into `complex_type`.
 ///
-/// Sets the locally declared content and, for an extension against a
-/// *complex* base, the base's qualified name so
+/// Sets the locally declared content and attributes and, for an extension
+/// against a *complex* base, the base's qualified name so
 /// [`SchemaModel::resolve_inheritance`] can fold the inherited particles and
-/// attributes in afterwards. Simple-content and unknown extensions leave the
-/// base unset.
+/// attributes in afterwards. An extension of a built-in type and every
+/// restriction leave the base unset: a restriction keeps the particles and
+/// attributes it states itself, and inherits none.
 ///
 /// [`SchemaModel::resolve_inheritance`]: crate::schema::SchemaModel::resolve_inheritance
 fn parse_content_extension(
@@ -1131,18 +1132,50 @@ fn parse_content_extension(
         match next_tag(reader, &mut buf, "content extension")? {
             Tag::Start { local, attrs } => match local.as_str() {
                 "extension" => {
-                    if let Some(content) = simple_extension_content(&attrs, ns_map) {
-                        skip_element(reader, "extension")?;
-                        skip_element(reader, outer_tag)?;
-                        complex_type.content = content;
-                        return Ok(());
-                    }
-                    // Complex base: record the base name so inheritance can
-                    // be resolved later, and keep the locally added particles.
-                    let particles = parse_particles(reader, ns_map, "extension", depth + 1)?;
+                    let mut particles = Vec::new();
+                    parse_derivation_children(
+                        reader,
+                        ns_map,
+                        "extension",
+                        depth + 1,
+                        &mut particles,
+                        &mut complex_type.attributes,
+                    )?;
                     skip_element(reader, outer_tag)?;
-                    complex_type.content = ContentModel::Sequence(particles);
-                    complex_type.base = Some(extension_base(&attrs));
+                    if let Some(content) = simple_extension_content(&attrs, ns_map) {
+                        complex_type.content = content;
+                    } else {
+                        // Complex base: record the base name so inheritance
+                        // can be resolved later, and keep the locally added
+                        // particles.
+                        complex_type.content = ContentModel::Sequence(particles);
+                        complex_type.base = Some(extension_base(&attrs));
+                    }
+                    return Ok(());
+                }
+                "restriction" => {
+                    let mut particles = Vec::new();
+                    parse_derivation_children(
+                        reader,
+                        ns_map,
+                        "restriction",
+                        depth + 1,
+                        &mut particles,
+                        &mut complex_type.attributes,
+                    )?;
+                    skip_element(reader, outer_tag)?;
+                    if outer_tag == "simpleContent" {
+                        // The text keeps the kind of a built-in base. The
+                        // facets the restriction adds are not read.
+                        if let Some(content) = simple_extension_content(&attrs, ns_map) {
+                            complex_type.content = content;
+                        }
+                    } else if !particles.is_empty() {
+                        // A restriction states its whole content again, so
+                        // nothing is folded in from the base: it is not
+                        // recorded.
+                        complex_type.content = ContentModel::Sequence(particles);
+                    }
                     return Ok(());
                 }
                 other => skip_element(reader, other)?,
@@ -1161,6 +1194,59 @@ fn parse_content_extension(
             }
             Tag::End { local } => {
                 if local == outer_tag {
+                    break;
+                }
+            }
+            Tag::Eof => break,
+        }
+    }
+    Ok(())
+}
+
+/// Reads the children of an `<xs:extension>` or `<xs:restriction>` up to and
+/// including its end tag, `end_tag`.
+///
+/// Model groups are appended to `particles` as they are inside a sequence:
+/// a sequence or an `xs:all` by its particles (or as a group when it does not
+/// occur exactly once), a choice as a group. Attribute declarations are
+/// appended to `attributes`. Anything else (annotations, facets, attribute
+/// group references, wildcards) is skipped.
+fn parse_derivation_children(
+    reader: &mut Reader<&[u8]>,
+    ns_map: &HashMap<String, String>,
+    end_tag: &str,
+    depth: usize,
+    particles: &mut Vec<Particle>,
+    attributes: &mut Vec<AttributeDecl>,
+) -> Result<()> {
+    check_nesting(depth)?;
+    let mut buf = Vec::new();
+    loop {
+        match next_tag(reader, &mut buf, "derivation")? {
+            Tag::Start { local, attrs } => match local.as_str() {
+                "sequence" | "all" => {
+                    let inner = parse_particles(reader, ns_map, &local, depth + 1)?;
+                    push_nested_sequence(&attrs, inner, particles);
+                }
+                "choice" => {
+                    let inner = parse_particles(reader, ns_map, "choice", depth + 1)?;
+                    push_choice_group(&attrs, inner, particles);
+                }
+                "attribute" => {
+                    let inline_type = parse_attribute_children(reader, ns_map)?;
+                    push_attribute_decl(&attrs, inline_type, ns_map, attributes);
+                }
+                other => skip_element(reader, other)?,
+            },
+            Tag::Empty { local, attrs } => {
+                if local == "attribute" {
+                    push_attribute_decl(&attrs, None, ns_map, attributes);
+                }
+            }
+            // Every nested element is read to its end above, so the first
+            // end tag met here closes the derivation itself.
+            Tag::End { local } => {
+                if local == end_tag {
                     break;
                 }
             }
