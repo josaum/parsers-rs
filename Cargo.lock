@@ -1692,6 +1692,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2db6494c3070f0e3cd9de52ee1a562ba3b2f832cd17b5537180c28294ca088eb"
 
 [[package]]
+name = "hayro-ccitt"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adbed896e99325bc312778bb9c9c289d795d51c12775c44dd5e4352f679c7e46"
+
+[[package]]
 name = "hayro-font"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1727,7 +1733,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d7d4358462d3e5aeeb4dcfdea5467821d6551f6cb4607cc037ac99131bc1e32"
 dependencies = [
- "hayro-ccitt",
+ "hayro-ccitt 0.2.0",
 ]
 
 [[package]]
@@ -1747,7 +1753,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b08efad1aa85ea1e19ae3bb46832779222c32887fae7b30d53a07b1d1c0ba553"
 dependencies = [
  "flate2",
- "hayro-ccitt",
+ "hayro-ccitt 0.2.0",
  "hayro-jbig2",
  "hayro-jpeg2000",
  "log",
@@ -2818,7 +2824,7 @@ dependencies = [
  "csv",
  "flate2",
  "hayro",
- "hayro-ccitt",
+ "hayro-ccitt 0.5.0",
  "image",
  "libdeflater",
  "memchr",
