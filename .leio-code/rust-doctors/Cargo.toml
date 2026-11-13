@@ -8,7 +8,10 @@ publish = false
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# A pure-Rust YAML parser. serde_yaml is unmaintained and brings
+# unsafe-libyaml (RUSTSEC-2024-0449, unsound, no fixed version). The doctors
+# read a handful of keys from ci.yml, so a generic value is all they need.
+yaml-rust2 = { version = "0.13", default-features = false }
 toml = "0.8"
 [dev-dependencies]
 tempfile = "3"

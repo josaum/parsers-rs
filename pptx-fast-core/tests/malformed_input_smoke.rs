@@ -16,6 +16,8 @@ static ALLOCATOR: smoke::CappedAllocator = smoke::CappedAllocator;
 const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
 const A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const MODERN: &str = "http://schemas.microsoft.com/office/2018/10/relationships";
+const P188: &str = "http://schemas.microsoft.com/office/powerpoint/2018/8/main";
 const PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
 /// Wraps `body` as the shape tree of a slide-like part rooted at `root`.
@@ -30,8 +32,8 @@ fn sp_tree(root: &str, body: &[u8]) -> Vec<u8> {
 }
 
 /// A small deck that reaches every reader: a master, a layout, a slide with a
-/// grouped shape, a field, a line break and a table, notes, comments with an
-/// author, an image relationship, and all three property parts.
+/// grouped shape, a field, a line break and a table, notes, legacy and modern
+/// comments with their authors, an image relationship, and all three property parts.
 fn seed_parts() -> Vec<(&'static str, Vec<u8>)> {
     let slide_body = concat!(
         r#"<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>"#,
@@ -76,14 +78,14 @@ fn seed_parts() -> Vec<(&'static str, Vec<u8>)> {
         (
             "ppt/_rels/presentation.xml.rels",
             text(format!(
-                r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/slide" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="{REL}/slideMaster" Target="slideMasters/slideMaster1.xml"/></Relationships>"#
+                r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/slide" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="{REL}/slideMaster" Target="slideMasters/slideMaster1.xml"/><Relationship Id="rId3" Type="{MODERN}/authors" Target="authors.xml"/></Relationships>"#
             )),
         ),
         ("ppt/slides/slide1.xml", sp_tree("sld", slide_body.as_bytes())),
         (
             "ppt/slides/_rels/slide1.xml.rels",
             text(format!(
-                r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/notesSlide" Target="../notesSlides/notesSlide1.xml"/><Relationship Id="rId2" Type="{REL}/comments" Target="../comments/comment1.xml"/><Relationship Id="rId3" Type="{REL}/image" Target="../media/image1.png"/></Relationships>"#
+                r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/notesSlide" Target="../notesSlides/notesSlide1.xml"/><Relationship Id="rId2" Type="{REL}/comments" Target="../comments/comment1.xml"/><Relationship Id="rId3" Type="{REL}/image" Target="../media/image1.png"/><Relationship Id="rId4" Type="{MODERN}/comments" Target="../comments/modernComment_100_0.xml"/></Relationships>"#
             )),
         ),
         (
@@ -100,6 +102,18 @@ fn seed_parts() -> Vec<(&'static str, Vec<u8>)> {
             "ppt/commentAuthors.xml",
             text(format!(
                 r#"<p:cmAuthorLst xmlns:p="{P}"><p:cmAuthor id="0" name="Ada &amp; Co" initials="A" lastIdx="2" clrIdx="0"/></p:cmAuthorLst>"#
+            )),
+        ),
+        (
+            "ppt/comments/modernComment_100_0.xml",
+            text(format!(
+                r#"<p188:cmLst xmlns:p188="{P188}" xmlns:a="{A}"><p188:cm id="{{1111}}" authorId="{{AAAA}}" created="2024-05-06T07:08:09.123"><p188:replyLst><p188:reply id="{{2222}}" authorId="{{aaaa}}" created="2024-05-07T00:00:00.000"><p188:txBody><a:bodyPr/><a:p><a:r><a:t>Agreed</a:t></a:r></a:p></p188:txBody></p188:reply></p188:replyLst><p188:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US"/><a:t>Thread &amp; reply</a:t></a:r><a:br/></a:p><a:p/></p188:txBody><p188:extLst><p188:ext uri="x"><a:t>ignored</a:t></p188:ext></p188:extLst></p188:cm></p188:cmLst>"#
+            )),
+        ),
+        (
+            "ppt/authors.xml",
+            text(format!(
+                r#"<p188:authorLst xmlns:p188="{P188}"><p188:author id="{{AAAA}}" name="Grace &amp; Co" initials="G" userId="u1" providerId="AD"/></p188:authorLst>"#
             )),
         ),
         (
@@ -178,8 +192,13 @@ fn the_seed_deck_parses() {
     );
     assert_eq!(slide.tables[0].rows[0].cells.len(), 3);
     assert_eq!(slide.notes[0].paragraphs[0].text, "Speaker note\n1");
-    assert_eq!(doc.comments.len(), 2);
+    assert_eq!(doc.comments.len(), 4);
     assert_eq!(doc.comments[0].text.as_deref(), Some("Review & fix"));
+    // The modern comment and its reply, after the two legacy ones.
+    assert_eq!(doc.comments[2].text.as_deref(), Some("Thread & reply\n\n"));
+    assert_eq!(doc.comments[2].author.as_deref(), Some("Grace & Co"));
+    assert_eq!(doc.comments[3].text.as_deref(), Some("Agreed"));
+    assert_eq!(doc.comments[3].author.as_deref(), Some("Grace & Co"));
     assert_eq!(doc.masters.len(), 1);
     assert_eq!(doc.images.len(), 1);
 }

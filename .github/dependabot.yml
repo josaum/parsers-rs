@@ -35,6 +35,23 @@ updates:
         versions:
           - ">=0.30"
 
+  - package-ecosystem: cargo
+    # The repository doctors: a package outside the workspace, with its own
+    # Cargo.lock that the entry above never reads.
+    directory: /.leio-code/rust-doctors
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      doctors-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
   - package-ecosystem: github-actions
     # Every action is pinned by commit SHA with its version in a trailing
     # comment; Dependabot moves both.

@@ -28,6 +28,15 @@ WRITERS = {"release.yml": {"manifest": {"contents": "write"}}}
 # Actions that publish no version tags: the comment names the branch whose
 # history holds the pinned commit.
 BRANCH_PINNED = {"dtolnay/rust-toolchain": "master"}
+# The only ci.yml jobs that may be skipped, each mapped to the release.yml job
+# that does the same work again. They are skipped only when release.yml calls
+# ci.yml with SKIP_INPUT set; a push or a pull request has no inputs, and the
+# condition must read an absent input as "run".
+REBUILT_BY_RELEASE = {"python-bindings": "wheels", "node-bindings": "node"}
+SKIP_INPUT = "skip_binding_jobs"
+# The doctors are a package outside the workspace; this is its own lockfile.
+DOCTORS_LOCK = ".leio-code/rust-doctors/Cargo.lock"
+SKIP_CONDITION = "${{ inputs.skip_binding_jobs != true }}"
 
 USES = re.compile(r"^\s*(?:- )?uses:[ ]+(?P<ref>\S+)(?P<rest>.*)$")
 PINNED = re.compile(
@@ -125,6 +134,81 @@ def assert_actions_pinned(text: str) -> None:
             f"{ref}: the pin must be followed by a comment naming its version"
         )
     assert seen, "workflow uses no action at all"
+
+
+def assert_checkouts_keep_no_credentials(text: str) -> None:
+    """No job pushes, so no checkout may leave the token in .git/config."""
+    steps = re.split(r"^      - ", code(text), flags=re.MULTILINE)
+    checkouts = [step for step in steps if step.startswith("uses: actions/checkout@")]
+    assert len(checkouts) == code(text).count("actions/checkout@"), "a checkout in a spelling this cannot read"
+    assert checkouts, "workflow checks nothing out"
+    for step in checkouts:
+        assert mapping(step, "with", 8) == {"persist-credentials": "false"}, (
+            "every checkout must set persist-credentials: false and nothing else"
+        )
+
+
+DOWNLOAD = re.compile(
+    r'curl -sSfL -o "\$RUNNER_TEMP/(?P<file>[\w.-]+)" \\\n\s+(?P<url>https://\S+)\n'
+    r'\s+echo "[0-9a-f]{64}  \$RUNNER_TEMP/(?P=file)" \\\n\s+\| sha256sum --check --strict\n'
+)
+# A download names exactly what it fetches: a file at a full commit, or one
+# asset of one numbered release.
+IMMUTABLE_URL = re.compile(
+    r"https://raw\.githubusercontent\.com/[\w.-]+/[\w.-]+/[0-9a-f]{40}/\S+"
+    r"|https://github\.com/[\w.-]+/[\w.-]+/releases/download/v\d+\.\d+\.\d+/[\w.-]+"
+)
+
+
+def assert_installers_are_pinned(text: str) -> None:
+    """Nothing fetched from the network runs unchecked, and no tool floats.
+
+    The only download spelling accepted is `curl` writing a file under
+    $RUNNER_TEMP from an immutable URL, with the very next command checking
+    that file against a SHA-256. Every other way of fetching, or of running
+    fetched bytes, is refused outright instead of being recognized case by case.
+    """
+    body = code(text)
+    accepted = list(DOWNLOAD.finditer(body))
+    assert len(re.findall(r"\bcurl\b", body)) == len(accepted), (
+        "every curl must write a file and be followed at once by its SHA-256 check"
+    )
+    for download in accepted:
+        assert IMMUTABLE_URL.fullmatch(download["url"]), (
+            f"{download['url']}: not a commit-pinned file or a versioned release asset"
+        )
+    for fetcher in ("wget", "Invoke-WebRequest", "iwr ", "irm "):
+        assert fetcher not in body, f"{fetcher.strip()}: downloads go through the checked curl spelling"
+    # Fetched bytes reaching an interpreter without touching the checked file.
+    assert not re.search(r"\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", body), "something is piped into a shell"
+    assert not re.search(r"\|\s*(?:python3?|node|perl|ruby|pwsh|iex)\b", body), (
+        "something is piped into an interpreter"
+    )
+    assert "<(" not in body, "process substitution can run a download unchecked"
+    assert not re.search(r"\beval\b|\bsource\s+/dev/stdin", body), (
+        "a command built from output can run a download unchecked"
+    )
+    for install in re.findall(r"cargo install [^\n]+", body):
+        assert re.search(r" --locked\b", install) and re.search(
+            r" --version [0-9]+\.[0-9]+\.[0-9]+(?:\s|$)", install
+        ), f"`{install}`: not pinned to an exact version"
+
+
+def assert_ci_runs_on_every_push_and_pull_request(ci: str) -> None:
+    """ci.yml's jobs are required checks: no trigger filter may leave one unreported."""
+    triggers = top_level(ci, "on") or ""
+    # A pull request with no qualifier at all, and pushes to main.
+    assert re.search(r"^  pull_request:\n(?!    )", triggers, re.MULTILINE), (
+        "pull_request must carry no filter: a filtered run leaves required checks pending"
+    )
+    assert re.search(r"^  push:\n    branches: \[main\]\n(?!    )", triggers, re.MULTILINE), (
+        "push must run for every commit on main"
+    )
+    for filtered in ("paths", "paths-ignore", "branches-ignore", "tags-ignore", "types"):
+        assert not re.search(rf"^\s+{filtered}:", triggers, re.MULTILINE), (
+            f"ci.yml must not filter its triggers with `{filtered}`"
+        )
+    assert len(re.findall(r"^\s+branches:", triggers, re.MULTILINE)) == 1
 
 
 def assert_toolchain_named(text: str) -> None:
@@ -271,20 +355,130 @@ def assert_ci_exercises_release_paths(ci: str, release: str | None = None) -> No
     assert ci_tools.groups() == release_tools.groups() == ("10", '"24"')
 
 
+def assert_ci_skips_only_what_the_release_rebuilds(ci: str) -> None:
+    """No ci.yml job can be skipped, except the two binding jobs by the release."""
+    triggers = top_level(ci, "on") or ""
+    assert re.search(r"^  workflow_call:$", triggers, re.MULTILINE)
+    # `inputs` is one context for workflow_call and workflow_dispatch: a manual
+    # trigger declaring the same name could skip the jobs outside a release.
+    assert set(re.findall(r"^  ([A-Za-z_]+):", triggers, re.MULTILINE)) == {
+        "push",
+        "pull_request",
+        "workflow_call",
+    }, "ci.yml runs on push, on pull requests and when called; nothing else may set an input"
+    declared = re.search(
+        r"^  workflow_call:\n    inputs:\n(?P<body>(?:      [^\n]*\n)+)", triggers, re.MULTILINE
+    )
+    assert declared is not None, "ci.yml declares no workflow_call inputs"
+    names = re.findall(r"^      (\S+):[ ]*$", declared["body"], re.MULTILINE)
+    assert names == [SKIP_INPUT], f"ci.yml may take exactly one input, {SKIP_INPUT}"
+    spec = mapping(declared["body"], SKIP_INPUT, 6)
+    assert spec is not None
+    assert set(spec) == {"description", "type", "required", "default"}
+    # Absent means "run": a caller that says nothing skips nothing.
+    assert (spec["type"], spec["required"], spec["default"]) == ("boolean", "false", "false")
+
+    blocks = required_jobs(ci, *REBUILT_BY_RELEASE)
+    for name, block in blocks.items():
+        condition = job_value(block, "if")
+        if name in REBUILT_BY_RELEASE:
+            # `!= true` holds for false and for the empty value a push or a
+            # pull request sees; `== false` or a bare negation is not accepted.
+            assert condition == SKIP_CONDITION, (
+                f"ci.yml job {name} must run unless the release sets {SKIP_INPUT}"
+            )
+        else:
+            assert condition is None, f"ci.yml job {name} can be skipped"
+        # A job that is allowed to fail would let a release through.
+        assert "continue-on-error" not in block, f"ci.yml job {name} can fail silently"
+    # Nothing is skipped in a spelling the loop above cannot read (a step-level
+    # `if`, another indentation), and the input steers nothing else.
+    body = code(ci)
+    assert len(re.findall(r"^\s*(?:- )?if:", body, re.MULTILINE)) == len(REBUILT_BY_RELEASE)
+    assert body.count("inputs.") == len(REBUILT_BY_RELEASE)
+
+
+def assert_release_tag_is_on_main(blocks: dict[str, str]) -> None:
+    """A tag is released only if its commit is on main, where CI ran in full."""
+    gate = blocks["on-main"]
+    # Everything else waits for it, through `verify`.
+    assert job_value(blocks["verify"], "needs") == "on-main"
+    assert job_value(gate, "needs") is None and job_value(gate, "if") is None
+    assert "continue-on-error" not in gate
+    assert not re.search(r"^\s*(?:- )?if:", gate, re.MULTILINE), "the check itself can be skipped"
+    assert "self-hosted" not in gate and job_value(gate, "runs-on") == "ubuntu-latest"
+    script = re.search(r"^        run: \|\n(?P<body>(?:          [^\n]*\n|\n)+)", gate, re.MULTILINE)
+    assert script is not None
+    lines = [line.strip() for line in script["body"].splitlines() if line.strip()]
+    lines = [line for line in lines if not line.startswith("#")]
+    assert lines[0] == "set -euo pipefail"
+    # Only a ref that is not a release tag leaves early; a manual trial
+    # publishes nothing (the publish step has the same condition).
+    assert lines[1:5] == [
+        'case "$GITHUB_REF" in',
+        "refs/tags/v*) ;;",
+        '*) echo "$GITHUB_REF is not a release tag; nothing will be published."; exit 0 ;;',
+        "esac",
+    ]
+    assert lines[5:] == [
+        "git fetch --no-tags --depth=2147483647 origin '+refs/heads/main:refs/remotes/origin/main'",
+        'git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
+    ]
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in blocks["manifest"]
+
+
+def assert_every_wheel_leg_imports_its_wheels(wheels: str) -> None:
+    """No leg uploads a wheel that nothing installed and imported."""
+    steps = re.split(r"^      - ", wheels, flags=re.MULTILINE)
+    names = [step.split("\n", 1)[0] for step in steps]
+    smoke = [i for i, step in enumerate(steps) if step.startswith("name: Install and import every wheel")]
+    arm = [i for i, step in enumerate(steps) if step.startswith("name: Smoke native ARM wheel artifacts")]
+    upload = [i for i, name in enumerate(names) if name.startswith("uses: actions/upload-artifact@")]
+    assert len(smoke) == len(arm) == len(upload) == 1
+    assert smoke[0] < upload[0] and arm[0] < upload[0], "wheels are uploaded before they are imported"
+    step = steps[smoke[0]]
+    # Between them the two smokes cover every leg: this one is every target
+    # but ARM Linux, the other one is ARM Linux.
+    conditions = re.findall(r"^        if: (.+)$", step, re.MULTILINE)
+    assert conditions == ["matrix.target != 'aarch64-unknown-linux-gnu'"]
+    assert re.findall(r"^        if: (.+)$", steps[arm[0]], re.MULTILINE) == [
+        "matrix.target == 'aarch64-unknown-linux-gnu'"
+    ]
+    assert "continue-on-error" not in wheels
+    assert "set -euo pipefail" in step
+    assert 'test "${#built_wheels[@]}" -eq "${#built_bindings[@]}"' in step
+    assert "python -m pip install --no-index --no-deps dist/*.whl" in step
+    assert "python -I -c" in step and "importlib.import_module" in step
+    assert "os.environ['BINDINGS'].split()" in step
+
+
 def assert_release_waits_for_ci(release: str, ci: str | None = None) -> None:
     ci = read(CI) if ci is None else ci
-    assert re.search(r"^  workflow_call:$", top_level(ci, "on") or "", re.MULTILINE)
-    blocks = required_jobs(release, "verify", "wheels", "node", "manifest")
+    blocks = required_jobs(release, "on-main", "verify", "wheels", "node", "manifest")
     verify = blocks["verify"]
     assert job_value(verify, "uses") == "./.github/workflows/ci.yml"
     assert job_value(verify, "if") is None, "the CI gate must never be skipped"
+    assert_release_tag_is_on_main(blocks)
+    assert_every_wheel_leg_imports_its_wheels(blocks["wheels"])
     assert job_value(blocks["wheels"], "needs") == "verify"
     assert job_value(blocks["node"], "needs") == "verify"
     assert job_value(blocks["manifest"], "needs") == "[wheels, node]"
-    # A job that is skipped or allowed to fail would let a release through.
-    for name, block in jobs(ci).items():
-        assert job_value(block, "if") is None, f"ci.yml job {name} can be skipped"
-        assert "continue-on-error" not in block, f"ci.yml job {name} can fail silently"
+    assert_ci_skips_only_what_the_release_rebuilds(ci)
+    # The release leaves the two binding jobs out of the gate, and only those:
+    # it passes the one input ci.yml takes and nothing else.
+    assert mapping(verify, "with", 4) == {SKIP_INPUT: "true"}
+    # A skipped job is acceptable only while the release job that replaces it
+    # still does the work, and while the release cannot finish without it.
+    assert set(REBUILT_BY_RELEASE.values()) == {"wheels", "node"}
+    for job in REBUILT_BY_RELEASE.values():
+        assert job_value(blocks[job], "if") is None, f"release job {job} can be skipped"
+        assert "continue-on-error" not in blocks[job], f"release job {job} can fail silently"
+    assert blocks["wheels"].count("maturin build --release --locked") == 2
+    assert blocks["wheels"].count("for crate in $BINDINGS") == 2
+    node = blocks["node"]
+    assert 'scripts/build-node.sh "${node_bindings[@]}"' in node
+    assert "        run: node scripts/smoke-node.mjs\n" in node
+    assert "pnpm pack --pack-destination ../dist-node" in node
 
 
 def assert_audit_contract(audit: str) -> None:
@@ -301,15 +495,33 @@ def assert_audit_contract(audit: str) -> None:
     )
     assert paths is not None, "the audit must run on pull requests that change dependencies"
     listed = {line.strip()[2:].strip('"') for line in paths["paths"].splitlines()}
-    assert {"Cargo.lock", "Cargo.toml", "**/Cargo.toml"} <= listed
+    assert {"Cargo.lock", "Cargo.toml", "**/Cargo.toml", DOCTORS_LOCK} <= listed
     assert "workflow_call" not in triggers, "the audit must not be callable from a release"
-    assert re.search(
-        r"^ +run: cargo install cargo-audit --locked --version [0-9]+\.[0-9]+\.[0-9]+$",
-        body,
-        re.MULTILINE,
-    ), "cargo-audit must be installed at a pinned version"
-    scans = re.findall(r"^ +run: (cargo audit\b.*)$", body, re.MULTILINE)
-    assert scans == ["cargo audit --deny unsound"], scans
+    # One job per lockfile. As steps of one job the second scan would be
+    # skipped whenever the first one fails, and so would never report.
+    expected = {
+        "cargo-audit": "cargo audit --deny unsound",
+        "cargo-audit-doctors": f"cargo audit --deny unsound --file {DOCTORS_LOCK}",
+    }
+    assert (ROOT / DOCTORS_LOCK).is_file()
+    blocks = jobs(audit)
+    assert set(blocks) == set(expected), "one audit job per lockfile, and nothing else"
+    versions = set()
+    for name, block in blocks.items():
+        install = re.findall(
+            r"^ +run: cargo install cargo-audit --locked --version ([0-9]+\.[0-9]+\.[0-9]+)$",
+            block,
+            re.MULTILINE,
+        )
+        assert len(install) == 1, f"{name}: cargo-audit must be installed at a pinned version"
+        versions.add(install[0])
+        scans = re.findall(r"^ +run: (cargo audit\b.*)$", block, re.MULTILINE)
+        assert scans == [expected[name]], f"{name}: {scans}"
+        # Each scan reports on its own: no job waits for, or is gated by, another.
+        assert job_value(block, "needs") is None, f"{name}: must not wait for another job"
+        assert job_value(block, "if") is None, f"{name}: can be skipped"
+        assert not re.search(r"^\s*(?:- )?if:", block, re.MULTILINE), f"{name}: a step can be skipped"
+    assert len(versions) == 1, "both scans must use the same cargo-audit"
     # No advisory is waved through, here or in cargo-audit's own configuration.
     assert "--ignore" not in body
     assert "continue-on-error" not in body
@@ -327,14 +539,27 @@ def assert_dependabot_contract(dependabot: str) -> None:
     body = code(dependabot)
     assert re.search(r"^version: 2$", body, re.MULTILINE)
     parts = re.split(r"^  - package-ecosystem: (\S+)\n", body, flags=re.MULTILINE)
-    updates = dict(zip(parts[1::2], parts[2::2]))
-    assert set(updates) == {"cargo", "github-actions"}
-    for ecosystem, block in updates.items():
-        assert re.search(r"^    directory: /$", block, re.MULTILINE), ecosystem
+    updates = {}
+    for ecosystem, block in zip(parts[1::2], parts[2::2]):
+        directory = re.search(r"^    directory: (\S+)$", block, re.MULTILINE)
+        assert directory is not None, f"{ecosystem}: no directory"
+        assert (ecosystem, directory[1]) not in updates, "the same directory is listed twice"
+        updates[ecosystem, directory[1]] = block
         assert re.search(
             r"^    schedule:\n      interval: weekly$", block, re.MULTILINE
         ), f"{ecosystem}: not weekly"
-    cargo = updates["cargo"]
+    # One cargo entry per lockfile, and the actions.
+    doctors = "/" + str(Path(DOCTORS_LOCK).parent)
+    assert set(updates) == {("cargo", "/"), ("cargo", doctors), ("github-actions", "/")}
+    grouped = re.search(
+        r"^      [A-Za-z][A-Za-z0-9_|-]*:\n(?P<body>(?:        [^\n]*\n)+)",
+        updates["cargo", doctors],
+        re.MULTILINE,
+    )
+    assert grouped is not None, "the doctors' minor and patch updates must arrive together"
+    assert re.search(r'^        patterns:\n          - "\*"$', grouped["body"], re.MULTILINE)
+    assert "ignore:" not in updates["cargo", doctors]
+    cargo = updates["cargo", "/"]
     group = re.search(
         r"^      cargo-minor-and-patch:\n(?P<body>(?:        [^\n]*\n)+)", cargo, re.MULTILINE
     )
@@ -383,6 +608,16 @@ def test_every_action_is_pinned_by_commit_sha(path: Path):
 
 
 @pytest.mark.parametrize("path", ALL_WORKFLOWS, ids=workflow_id)
+def test_checkouts_keep_no_credentials_and_installers_are_pinned(path: Path):
+    assert_checkouts_keep_no_credentials(read(path))
+    assert_installers_are_pinned(read(path))
+
+
+def test_ci_triggers_carry_no_filter():
+    assert_ci_runs_on_every_push_and_pull_request(read(CI))
+
+
+@pytest.mark.parametrize("path", ALL_WORKFLOWS, ids=workflow_id)
 def test_only_the_publishing_job_holds_a_write_token(path: Path):
     assert_least_privilege(read(path), WRITERS.get(path.name))
 
@@ -414,8 +649,12 @@ def test_ci_exercises_what_a_release_builds():
     assert_ci_exercises_release_paths(read(CI))
 
 
-def test_release_waits_for_every_ci_job():
+def test_release_waits_for_every_ci_job_it_does_not_repeat():
     assert_release_waits_for_ci(read(RELEASE))
+
+
+def test_ci_skips_nothing_on_a_push_or_a_pull_request():
+    assert_ci_skips_only_what_the_release_rebuilds(read(CI))
 
 
 def test_audit_scans_the_lockfile_and_ignores_nothing():
@@ -433,6 +672,8 @@ def test_dependabot_updates_cargo_and_actions_weekly():
 
 
 SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+ELAN_URL = "https://github.com/leanprover/elan/releases/download/v4.2.4/elan-x86_64-unknown-linux-gnu.tar.gz"
+ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-toolchain none\n'
 
 
 @pytest.mark.parametrize(
@@ -451,6 +692,37 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_toolchain_named, CI, "          toolchain: 1.98.1\n          components", "          components"),
         (assert_toolchain_named, RELEASE, "          toolchain: 1.98.1\n          targets", "          targets"),
         (assert_toolchain_named, AUDIT, "toolchain: 1.98.1", "toolchain: stable"),
+        # A checkout that keeps the token, an installer from a branch or unchecked, a tool at any version.
+        (assert_checkouts_keep_no_credentials, CI, "          persist-credentials: false\n      - name: Install elan", "          persist-credentials: true\n      - name: Install elan"),
+        (assert_checkouts_keep_no_credentials, RELEASE, "        with:\n          persist-credentials: false\n      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master\n        with:\n          toolchain: 1.98.1\n      - uses: actions/setup-python", "      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master\n        with:\n          toolchain: 1.98.1\n      - uses: actions/setup-python"),
+        (assert_checkouts_keep_no_credentials, AUDIT, "          persist-credentials: false\n", "          persist-credentials: false\n          fetch-depth: 0\n"),
+        (assert_installers_are_pinned, CI, "releases/download/v4.2.4/elan-x86_64", "releases/latest/download/elan-x86_64"),
+        (assert_installers_are_pinned, CI, "releases/download/v4.2.4/elan-x86_64", "releases/download/v4/elan-x86_64"),
+        (assert_installers_are_pinned, CI, ELAN_URL, "https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh"),
+        (assert_installers_are_pinned, CI, ELAN_URL, "https://example.invalid/elan.tar.gz"),
+        (assert_installers_are_pinned, CI, "            | sha256sum --check --strict\n", "            | cat\n"),
+        (assert_installers_are_pinned, CI, '$RUNNER_TEMP/elan.tar.gz" \\\n            | sha256sum', '$RUNNER_TEMP/other.tar.gz" \\\n            | sha256sum'),
+        (assert_installers_are_pinned, CI, '          echo "42b94d42', '          tar -tzf "$RUNNER_TEMP/elan.tar.gz"\n          echo "42b94d42'),
+        (assert_installers_are_pinned, CI, ELAN_RUN, "          curl -sSf https://example.invalid/install.sh | sh -s -- -y\n"),
+        (assert_installers_are_pinned, CI, ELAN_RUN, "          bash <(curl -sSf https://example.invalid/install.sh)\n"),
+        (assert_installers_are_pinned, CI, ELAN_RUN, "          curl -sSfL -o /tmp/install.sh https://example.invalid/install.sh\n          sh /tmp/install.sh\n"),
+        (assert_installers_are_pinned, CI, ELAN_RUN, '          sh -c "$(curl -sSf https://example.invalid/install.sh)"\n'),
+        (assert_installers_are_pinned, CI, ELAN_RUN, '          eval "$(cat "$RUNNER_TEMP/elan.tar.gz")"\n'),
+        (assert_installers_are_pinned, CI, ELAN_RUN, "          wget -qO- https://example.invalid/install.sh | sh\n"),
+        (assert_installers_are_pinned, CI, ELAN_RUN, "          wget -q https://example.invalid/elan-init && chmod +x elan-init && ./elan-init -y\n"),
+        (assert_installers_are_pinned, CI, ELAN_RUN, '          cat "$RUNNER_TEMP/elan.tar.gz" | python3\n'),
+        # A trigger filter that leaves a required check unreported.
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "  pull_request:\n", '  pull_request:\n    paths-ignore:\n      - "**.md"\n'),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "  pull_request:\n", '  pull_request:\n    paths:\n      - "**.rs"\n'),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "  pull_request:\n", "  pull_request:\n    branches: [main]\n"),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "  pull_request:\n", "  pull_request:\n    types: [opened]\n"),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "    branches: [main]\n", "    branches: [main]\n    paths-ignore:\n      - docs/**\n"),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "    branches: [main]\n", '    branches: [main]\n    paths:\n      - "**.rs"\n'),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "    branches: [main]\n", "    branches-ignore: [main]\n"),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "    branches: [main]\n", "    branches: [release]\n"),
+        (assert_installers_are_pinned, RELEASE, "cargo install cargo-cyclonedx --locked --version 0.5.10", "cargo install cargo-cyclonedx --locked"),
+        (assert_installers_are_pinned, RELEASE, "cargo install cargo-cyclonedx --locked --version 0.5.10", "cargo install cargo-cyclonedx --version 0.5.10"),
+        (assert_installers_are_pinned, AUDIT, " --locked --version 0.23.0", " --locked --version 0.23"),
         # A wider default token, a second writer, a spelling that hides a grant.
         (assert_release_token_scopes, RELEASE, "permissions:\n  contents: read", "permissions:\n  contents: write"),
         (assert_release_token_scopes, RELEASE, "permissions:\n  contents: read", "permissions: write-all"),
@@ -511,6 +783,51 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_release_waits_for_ci, RELEASE, "  node:\n    needs: verify\n", "  node:\n    needs: []\n"),
         (assert_release_waits_for_ci, RELEASE, "    uses: ./.github/workflows/ci.yml\n", "    uses: ./.github/workflows/ci.yml\n    if: github.event_name == 'push'\n"),
         (assert_release_waits_for_ci, RELEASE, "needs: [wheels, node]", "needs: [wheels]"),
+        # The release skipping more than the two jobs it rebuilds, or no longer rebuilding them.
+        (assert_release_waits_for_ci, RELEASE, "    with:\n      skip_binding_jobs: true\n", ""),
+        (assert_release_waits_for_ci, RELEASE, "      skip_binding_jobs: true\n", "      skip_binding_jobs: false\n"),
+        (assert_release_waits_for_ci, RELEASE, "      skip_binding_jobs: true\n", "      skip_binding_jobs: true\n      skip_tests: true\n"),
+        (assert_release_waits_for_ci, RELEASE, "    needs: verify\n    timeout-minutes: 45\n", "    needs: verify\n    if: github.event_name == 'push'\n    timeout-minutes: 45\n"),
+        (assert_release_waits_for_ci, RELEASE, "    needs: verify\n    timeout-minutes: 60\n", "    needs: verify\n    continue-on-error: true\n    timeout-minutes: 60\n"),
+        (assert_release_waits_for_ci, RELEASE, "      - name: Load and parse a generated fixture through each binding\n        run: node scripts/smoke-node.mjs\n", ""),
+        (assert_release_waits_for_ci, RELEASE, 'scripts/build-node.sh "${node_bindings[@]}"', "true"),
+        (assert_release_waits_for_ci, RELEASE, "for crate in $BINDINGS; do\n            (cd", "for crate in docx-fast-py; do\n            (cd"),
+        # A tag released from a commit that never went through CI on main.
+        (assert_release_waits_for_ci, RELEASE, "  verify:\n    needs: on-main\n", "  verify:\n"),
+        (assert_release_waits_for_ci, RELEASE, "          git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main\n", ""),
+        (assert_release_waits_for_ci, RELEASE, "          git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main\n", "          git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main || true\n"),
+        (assert_release_waits_for_ci, RELEASE, "--is-ancestor \"$GITHUB_SHA\" origin/main", "--is-ancestor origin/main \"$GITHUB_SHA\""),
+        (assert_release_waits_for_ci, RELEASE, "            refs/tags/v*) ;;\n", "            refs/tags/v*) exit 0 ;;\n"),
+        (assert_release_waits_for_ci, RELEASE, "            refs/tags/v*) ;;\n", "            refs/tags/v0*) ;;\n"),
+        (assert_release_waits_for_ci, RELEASE, "      - name: Refuse a release tag whose commit is not on main\n", "      - name: Refuse a release tag whose commit is not on main\n        if: github.event_name == 'workflow_dispatch'\n"),
+        (assert_release_waits_for_ci, RELEASE, "    runs-on: ubuntu-latest\n    timeout-minutes: 10\n", "    runs-on: ubuntu-latest\n    continue-on-error: true\n    timeout-minutes: 10\n"),
+        (assert_release_waits_for_ci, RELEASE, "'+refs/heads/main:refs/remotes/origin/main'", "'+refs/heads/*:refs/remotes/origin/*'"),
+        # A wheel uploaded from a leg where nothing installed and imported it.
+        (assert_release_waits_for_ci, RELEASE, "          python -m pip install --no-index --no-deps dist/*.whl\n", ""),
+        (assert_release_waits_for_ci, RELEASE, "          python -I -c \"import importlib, os; [importlib.import_module", "          python -I -c \"import importlib, os; [importlib.util.find_spec"),
+        (assert_release_waits_for_ci, RELEASE, "        if: matrix.target != 'aarch64-unknown-linux-gnu'\n        shell: bash\n        run: |\n          set -euo pipefail\n          read -r -a built_bindings", "        if: matrix.target == 'x86_64-unknown-linux-gnu'\n        shell: bash\n        run: |\n          set -euo pipefail\n          read -r -a built_bindings"),
+        (assert_release_waits_for_ci, RELEASE, '          test "${#built_wheels[@]}" -eq "${#built_bindings[@]}"\n', ""),
+        # A CI job that can be skipped outside a release, or a third one inside it.
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "    if: ${{ inputs.skip_binding_jobs != true }}\n    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n    defaults:", "    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n    if: ${{ inputs.skip_binding_jobs == true }}\n    defaults:"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  rust:\n    runs-on: ubuntu-latest\n", "  rust:\n    if: ${{ inputs.skip_binding_jobs != true }}\n    runs-on: ubuntu-latest\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  release-tooling:\n", "  release-tooling:\n    if: github.event_name != 'workflow_call'\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  lean-formal:\n    runs-on: ubuntu-latest\n", "  lean-formal:\n    if: false\n    runs-on: ubuntu-latest\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  lean-formal:\n    runs-on: ubuntu-latest\n", "  lean-formal:\n    continue-on-error: true\n    runs-on: ubuntu-latest\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "      - run: cargo fmt --all --check\n", "      - run: cargo fmt --all --check\n        if: ${{ !inputs.skip_binding_jobs }}\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "      - run: cargo test --workspace --locked\n", "      - if: github.event_name == 'pull_request'\n        run: cargo test --workspace --locked\n"),
+        # A condition that skips when the input is absent, as on a push or a pull request.
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "inputs.skip_binding_jobs != true }}\n    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n    # The steps", "inputs.skip_binding_jobs == false }}\n    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n    # The steps"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "    if: ${{ inputs.skip_binding_jobs != true }}\n", "    if: ${{ inputs.skip_binding_jobs }}\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "    if: ${{ inputs.skip_binding_jobs != true }}\n", "    if: ${{ github.event_name != 'workflow_call' }}\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "    if: ${{ inputs.skip_binding_jobs != true }}\n", "    if: ${{ inputs.skip_binding_jobs != 'true' }}\n"),
+        # An input that skips by default, is not a boolean, or can be set by hand.
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "        default: false\n", "        default: true\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "        default: false\n", ""),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "        type: boolean\n", "        type: string\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "        required: false\n", "        required: true\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "        default: false\n", "        default: false\n      skip_tests:\n        type: boolean\n        default: false\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  pull_request:\n  workflow_call:\n", "  pull_request:\n  workflow_dispatch:\n    inputs:\n      skip_binding_jobs:\n        type: boolean\n  workflow_call:\n"),
+        (assert_ci_skips_only_what_the_release_rebuilds, CI, "  pull_request:\n  workflow_call:\n", "  pull_request:\n"),
         # An audit that no longer runs, no longer fails, or looks away.
         (assert_audit_contract, AUDIT, '"23 6 * * 1"', '"23 6 1 * *"'),
         (assert_audit_contract, AUDIT, "  workflow_dispatch:\n", ""),
@@ -523,12 +840,25 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_audit_contract, AUDIT, "cargo audit --deny unsound", "cargo audit --deny unsound --ignore RUSTSEC-2026-0001"),
         (assert_audit_contract, AUDIT, "cargo audit --deny unsound", "cargo audit --deny unsound || true"),
         (assert_audit_contract, AUDIT, "        run: cargo audit --deny unsound", "        continue-on-error: true\n        run: cargo audit --deny unsound"),
+        (assert_audit_contract, AUDIT, "        run: cargo audit --deny unsound --file .leio-code/rust-doctors/Cargo.lock\n", "        run: cargo audit --version\n"),
+        (assert_audit_contract, AUDIT, "\n  cargo-audit-doctors:\n", "\n"),
+        (assert_audit_contract, AUDIT, "  cargo-audit-doctors:\n", "  cargo-audit-doctors:\n    needs: cargo-audit\n"),
+        (assert_audit_contract, AUDIT, "  cargo-audit-doctors:\n", "  cargo-audit-doctors:\n    if: success()\n"),
+        (assert_audit_contract, AUDIT, "      - name: Fail on a vulnerability or an unsoundness advisory in the doctors' lockfile\n", "      - name: Fail on a vulnerability or an unsoundness advisory in the doctors' lockfile\n        if: github.event_name == 'schedule'\n"),
+        (assert_audit_contract, AUDIT, "    timeout-minutes: 20\n", "    timeout-minutes: 20\n    continue-on-error: true\n"),
+        (assert_audit_contract, AUDIT, "cargo audit --deny unsound --file", "cargo audit --file"),
+        (assert_audit_contract, AUDIT, "--file .leio-code/rust-doctors/Cargo.lock", "--file Cargo.lock"),
+        (assert_audit_contract, AUDIT, "      - .leio-code/rust-doctors/Cargo.lock\n", ""),
         (assert_no_audit_in_the_release_path, CI, "      - run: cargo fmt --all --check", "      - run: cargo audit"),
         (assert_no_audit_in_the_release_path, RELEASE, "    uses: ./.github/workflows/ci.yml", "    uses: ./.github/workflows/audit.yml"),
         # Dependabot left without an ecosystem, a schedule or its grouping.
         (assert_dependabot_contract, DEPENDABOT, "package-ecosystem: github-actions", "package-ecosystem: npm"),
         (assert_dependabot_contract, DEPENDABOT, "interval: weekly", "interval: monthly"),
-        (assert_dependabot_contract, DEPENDABOT, "directory: /\n", "directory: /docx-fast-core\n"),
+        (assert_dependabot_contract, DEPENDABOT, "    directory: /\n    schedule:\n      interval: weekly\n    commit-message:\n      prefix: chore", "    directory: /docx-fast-core\n    schedule:\n      interval: weekly\n    commit-message:\n      prefix: chore"),
+        (assert_dependabot_contract, DEPENDABOT, "    directory: /\n    schedule:\n      interval: weekly\n    commit-message:\n      prefix: ci", "    directory: /.github\n    schedule:\n      interval: weekly\n    commit-message:\n      prefix: ci"),
+        (assert_dependabot_contract, DEPENDABOT, "directory: /.leio-code/rust-doctors\n", "directory: /\n"),
+        (assert_dependabot_contract, DEPENDABOT, "directory: /.leio-code/rust-doctors\n", "directory: /.leio-code\n"),
+        (assert_dependabot_contract, DEPENDABOT, "      doctors-minor-and-patch:\n        patterns:\n          - \"*\"\n", "      doctors-minor-and-patch:\n        patterns:\n          - \"serde*\"\n"),
         (assert_dependabot_contract, DEPENDABOT, "          - minor\n", ""),
         (assert_dependabot_contract, DEPENDABOT, "          - patch\n", "          - patch\n          - major\n"),
         (assert_dependabot_contract, DEPENDABOT, "      cargo-minor-and-patch:", "      everything:"),

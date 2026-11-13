@@ -1,14 +1,18 @@
 //! Symbol-font characters to Unicode.
 //!
 //! WordprocessingML stores a character set in a symbol-encoded font either as
-//! a `w:sym` element (`w:font` plus a hexadecimal `w:char`) or as run text in
-//! the Private Use Area. Either way the stored value is a position in the
-//! font, not the character a reader sees, so plain-text extraction has to map
-//! it.
+//! a `w:sym` element (`w:font` plus a hexadecimal `w:char`) or as run text,
+//! in the Private Use Area or as the plain 8-bit code. Either way the stored
+//! value is a position in the font, not the character a reader sees, so
+//! plain-text extraction has to map it.
 //!
-//! Only the Symbol font has a published Unicode mapping, so only it is mapped.
-//! Characters of other symbol fonts (Wingdings, Webdings, ...) are kept at the
-//! code point the document stores; they are never dropped.
+//! Five fonts are mapped: Symbol, from Adobe's table below, and Webdings,
+//! Wingdings, Wingdings 2 and Wingdings 3, from the tables in [`dingbats`].
+//! A character of any other font, or one these tables have no entry for, is
+//! kept at the code point the document stores; it is never dropped and
+//! never replaced.
+
+mod dingbats;
 
 /// First code point of the Private Use Area window that symbol fonts occupy.
 ///
@@ -220,89 +224,333 @@ const SYMBOL_TO_UNICODE: [(u8, char); 189] = [
     (0xFE, '\u{F8FE}'), // RIGHT CURLY BRACKET BOTTOM
 ];
 
-/// Returns whether `font` names the Symbol font.
-pub(crate) fn is_symbol_font(font: &str) -> bool {
-    font.trim().eq_ignore_ascii_case("Symbol")
+/// A font whose character codes are positions in the font, not Unicode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SymbolFont {
+    Symbol,
+    Webdings,
+    Wingdings,
+    Wingdings2,
+    Wingdings3,
 }
 
-/// Maps a Symbol-font code to Unicode.
+impl SymbolFont {
+    /// Recognizes a font name as written in `w:rFonts` or `w:sym`.
+    pub(crate) fn from_name(font: &str) -> Option<Self> {
+        const NAMES: [(&str, SymbolFont); 5] = [
+            ("Symbol", SymbolFont::Symbol),
+            ("Webdings", SymbolFont::Webdings),
+            ("Wingdings", SymbolFont::Wingdings),
+            ("Wingdings 2", SymbolFont::Wingdings2),
+            ("Wingdings 3", SymbolFont::Wingdings3),
+        ];
+        let font = font.trim();
+        NAMES
+            .iter()
+            .find(|(name, _)| font.eq_ignore_ascii_case(name))
+            .map(|(_, symbol_font)| *symbol_font)
+    }
+
+    /// The font's table, sorted by code.
+    fn table(self) -> &'static [(u8, char)] {
+        match self {
+            Self::Symbol => &SYMBOL_TO_UNICODE,
+            Self::Webdings => &dingbats::WEBDINGS,
+            Self::Wingdings => &dingbats::WINGDINGS,
+            Self::Wingdings2 => &dingbats::WINGDINGS_2,
+            Self::Wingdings3 => &dingbats::WINGDINGS_3,
+        }
+    }
+
+    /// Whether text typed in the font is stored as plain 8-bit characters
+    /// that have to be mapped too.
+    ///
+    /// True for the Webdings and Wingdings fonts. For the Symbol font only
+    /// the Private Use Area form is mapped, as it always was.
+    fn is_dingbat(self) -> bool {
+        !matches!(self, Self::Symbol)
+    }
+
+    /// Looks an 8-bit code up in the font's table.
+    fn lookup(self, code: u8) -> Option<char> {
+        let table = self.table();
+        table
+            .binary_search_by_key(&code, |(font_code, _)| *font_code)
+            .ok()
+            .map(|index| table[index].1)
+    }
+
+    /// Maps a stored code to the character the font displays for it.
+    ///
+    /// Accepts the 8-bit code or its Private Use Area form (`0xF061` and
+    /// `0x61` are the same glyph). Returns `None` when the code is not one
+    /// the font gives a meaning to, and the caller keeps what is stored.
+    fn to_unicode(self, code: u32) -> Option<char> {
+        let code = match code {
+            SYMBOL_PUA_BASE..=SYMBOL_PUA_LAST => code - SYMBOL_PUA_BASE,
+            _ => code,
+        };
+        self.lookup(u8::try_from(code).ok()?)
+    }
+}
+
+/// The symbol fonts in effect for the three kinds of character a run holds.
 ///
-/// Accepts the 8-bit code or its Private Use Area form (`0xF061` and `0x61`
-/// are both alpha). Returns `None` for codes the font does not define.
-pub(crate) fn symbol_to_unicode(code: u32) -> Option<char> {
-    let code = match code {
-        SYMBOL_PUA_BASE..=SYMBOL_PUA_LAST => code - SYMBOL_PUA_BASE,
-        _ => code,
-    };
-    let code = u8::try_from(code).ok()?;
-    SYMBOL_TO_UNICODE
-        .binary_search_by_key(&code, |(symbol, _)| *symbol)
-        .ok()
-        .map(|index| SYMBOL_TO_UNICODE[index].1)
+/// `w:rFonts` names a font per script class, and a symbol font can be named
+/// for one and not another.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SymbolFonts {
+    /// `w:ascii`: the font for U+0000..=U+007F.
+    pub(crate) ascii: Option<SymbolFont>,
+    /// `w:hAnsi`: the font for the other characters of Latin text.
+    pub(crate) high_ansi: Option<SymbolFont>,
+    /// `w:cs`: the font for complex-script text.
+    pub(crate) complex_script: Option<SymbolFont>,
+}
+
+impl SymbolFonts {
+    /// Whether no symbol font is in effect, so text is left alone.
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The font for a Private Use Area character.
+    ///
+    /// Such a character has no meaning outside a symbol font, so any of the
+    /// three will do.
+    fn private_use(&self) -> Option<SymbolFont> {
+        self.ascii.or(self.high_ansi).or(self.complex_script)
+    }
+
+    /// Maps one character of run text.
+    fn map_char(&self, ch: char) -> char {
+        let code = u32::from(ch);
+        let font = match code {
+            SYMBOL_PUA_BASE..=SYMBOL_PUA_LAST => self.private_use(),
+            // Typing in a dingbat font stores the key's own character. The
+            // Symbol font is left as it was: only its Private Use Area form
+            // is mapped.
+            0x00..=0x7F => self.ascii.filter(|font| font.is_dingbat()),
+            0x80..=0xFF => self.high_ansi.filter(|font| font.is_dingbat()),
+            _ => None,
+        };
+        font.and_then(|font| font.to_unicode(code)).unwrap_or(ch)
+    }
+
+    /// Maps the symbol-font characters of run text to Unicode.
+    ///
+    /// Only characters the fonts in effect give a meaning to are touched, so
+    /// ordinary text in the same run is unchanged.
+    pub(crate) fn map_run_text(&self, text: &str) -> String {
+        text.chars().map(|ch| self.map_char(ch)).collect()
+    }
+}
+
+/// What one level of formatting says about the font of one script class.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum FontSlot {
+    /// Nothing: the font comes from the next level out.
+    #[default]
+    Inherit,
+    /// A font this module has no table for, which ends the search.
+    Plain,
+    /// A symbol font.
+    Symbol(SymbolFont),
+}
+
+impl FontSlot {
+    /// Reads a font name as written in `w:rFonts`; `None` is a missing
+    /// attribute.
+    pub(crate) fn from_name(font: Option<&str>) -> Self {
+        match font {
+            None => Self::Inherit,
+            Some(font) => SymbolFont::from_name(font).map_or(Self::Plain, Self::Symbol),
+        }
+    }
+
+    fn or(self, outer: Self) -> Self {
+        match self {
+            Self::Inherit => outer,
+            _ => self,
+        }
+    }
+
+    fn symbol_font(self) -> Option<SymbolFont> {
+        match self {
+            Self::Symbol(font) => Some(font),
+            Self::Inherit | Self::Plain => None,
+        }
+    }
+}
+
+/// The `w:rFonts` of one level of formatting: a run, or a style.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FontChoice {
+    /// `w:ascii`.
+    pub(crate) ascii: FontSlot,
+    /// `w:hAnsi`.
+    pub(crate) high_ansi: FontSlot,
+    /// `w:cs`.
+    pub(crate) complex_script: FontSlot,
+}
+
+impl FontChoice {
+    /// Whether this level names no font at all.
+    pub(crate) fn is_inherit(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Fills what this level leaves open from the next level out.
+    pub(crate) fn or(self, outer: Self) -> Self {
+        Self {
+            ascii: self.ascii.or(outer.ascii),
+            high_ansi: self.high_ansi.or(outer.high_ansi),
+            complex_script: self.complex_script.or(outer.complex_script),
+        }
+    }
+
+    /// The symbol fonts among the fonts chosen.
+    pub(crate) fn symbol_fonts(&self) -> SymbolFonts {
+        SymbolFonts {
+            ascii: self.ascii.symbol_font(),
+            high_ansi: self.high_ansi.symbol_font(),
+            complex_script: self.complex_script.symbol_font(),
+        }
+    }
 }
 
 /// Resolves a `w:sym` element to the character it displays.
 ///
-/// `char_hex` is the `w:char` attribute. Symbol-font characters are mapped to
-/// Unicode; any other font keeps the stored code point, since no mapping for
-/// it is published. Returns `None` only when `char_hex` is not a code point.
+/// `char_hex` is the `w:char` attribute. A character of a symbol font this
+/// module has a table for is mapped to Unicode; any other font keeps the
+/// stored code point. Returns `None` only when `char_hex` is not a code
+/// point.
 pub(crate) fn sym_char(font: Option<&str>, char_hex: &str) -> Option<char> {
     let code = u32::from_str_radix(char_hex.trim(), 16).ok()?;
-    if font.is_some_and(is_symbol_font) {
-        if let Some(mapped) = symbol_to_unicode(code) {
-            return Some(mapped);
-        }
+    if let Some(mapped) = font
+        .and_then(SymbolFont::from_name)
+        .and_then(|font| font.to_unicode(code))
+    {
+        return Some(mapped);
     }
     char::from_u32(code).filter(|ch| *ch != '\0')
-}
-
-/// Maps Private Use Area characters of Symbol-font run text to Unicode.
-///
-/// Only code points in the symbol window are touched, so ordinary text in the
-/// same run is unchanged.
-pub(crate) fn map_symbol_run_text(text: &str) -> String {
-    text.chars()
-        .map(|ch| match u32::from(ch) {
-            code @ SYMBOL_PUA_BASE..=SYMBOL_PUA_LAST => symbol_to_unicode(code).unwrap_or(ch),
-            _ => ch,
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const ALL_FONTS: [SymbolFont; 5] = [
+        SymbolFont::Symbol,
+        SymbolFont::Webdings,
+        SymbolFont::Wingdings,
+        SymbolFont::Wingdings2,
+        SymbolFont::Wingdings3,
+    ];
+
     #[test]
-    fn table_is_sorted_so_binary_search_is_valid() {
-        assert!(SYMBOL_TO_UNICODE
-            .windows(2)
-            .all(|pair| pair[0].0 < pair[1].0));
+    fn tables_are_sorted_so_binary_search_is_valid() {
+        for font in ALL_FONTS {
+            assert!(
+                font.table().windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "{font:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dingbat_tables_hold_no_ascii_or_private_use_characters() {
+        for font in ALL_FONTS.into_iter().filter(|font| font.is_dingbat()) {
+            for (code, mapped) in font.table() {
+                assert!(*code > b' ', "{font:?} {code:#04X}");
+                assert!(!mapped.is_ascii(), "{font:?} {code:#04X}");
+                assert!(
+                    !(0xE000..=0xF8FF).contains(&u32::from(*mapped)),
+                    "{font:?} {code:#04X}"
+                );
+            }
+        }
     }
 
     #[test]
     fn symbol_codes_map_in_both_forms() {
-        assert_eq!(symbol_to_unicode(0x61), Some('α'));
-        assert_eq!(symbol_to_unicode(0xF061), Some('α'));
-        assert_eq!(symbol_to_unicode(0xF0B0), Some('°'));
-        assert_eq!(symbol_to_unicode(0xF0A0), Some('€'));
-        assert_eq!(symbol_to_unicode(0x44), Some('Δ'));
-        assert_eq!(symbol_to_unicode(0x1F), None);
-        assert_eq!(symbol_to_unicode(0x1_0000), None);
+        let symbol = SymbolFont::Symbol;
+        assert_eq!(symbol.to_unicode(0x61), Some('α'));
+        assert_eq!(symbol.to_unicode(0xF061), Some('α'));
+        assert_eq!(symbol.to_unicode(0xF0B0), Some('°'));
+        assert_eq!(symbol.to_unicode(0xF0A0), Some('€'));
+        assert_eq!(symbol.to_unicode(0x44), Some('Δ'));
+        assert_eq!(symbol.to_unicode(0x1F), None);
+        assert_eq!(symbol.to_unicode(0x1_0000), None);
+    }
+
+    #[test]
+    fn font_names_are_matched_whole_and_without_case() {
+        assert_eq!(SymbolFont::from_name(" symbol "), Some(SymbolFont::Symbol));
+        assert_eq!(
+            SymbolFont::from_name("WINGDINGS 2"),
+            Some(SymbolFont::Wingdings2)
+        );
+        assert_eq!(SymbolFont::from_name("Wingdings 4"), None);
+        assert_eq!(SymbolFont::from_name("Segoe UI Symbol"), None);
+    }
+
+    #[test]
+    fn dingbat_codes_without_an_entry_are_not_mapped() {
+        let wingdings = SymbolFont::Wingdings;
+        assert_eq!(wingdings.to_unicode(0xF04A), Some('\u{263A}'));
+        assert_eq!(wingdings.to_unicode(0x4A), Some('\u{263A}'));
+        assert_eq!(wingdings.to_unicode(0xFF), None);
+        assert_eq!(wingdings.to_unicode(0xF026), None);
+        assert_eq!(wingdings.to_unicode(0x7F), None);
+        assert_eq!(wingdings.to_unicode(0x20), None);
+        assert_eq!(wingdings.to_unicode(0x09), None);
+        assert_eq!(wingdings.to_unicode(0x2014), None);
     }
 
     #[test]
     fn sym_keeps_the_code_point_for_fonts_without_a_mapping() {
         assert_eq!(sym_char(Some("Symbol"), "F0B3"), Some('≥'));
         assert_eq!(sym_char(Some("symbol"), "00B3"), Some('≥'));
-        assert_eq!(sym_char(Some("Wingdings"), "F0FC"), Some('\u{F0FC}'));
+        assert_eq!(sym_char(Some("Wingdings"), "F0FC"), Some('\u{2713}'));
+        assert_eq!(sym_char(Some("Cambria Math"), "F0FC"), Some('\u{F0FC}'));
         assert_eq!(sym_char(None, "2022"), Some('•'));
         assert_eq!(sym_char(Some("Symbol"), "not hex"), None);
         assert_eq!(sym_char(Some("Wingdings"), "D800"), None);
     }
 
     #[test]
+    fn a_level_fills_only_the_slots_it_leaves_open() {
+        let symbol = FontSlot::Symbol(SymbolFont::Symbol);
+        let run = FontChoice {
+            ascii: FontSlot::from_name(Some("Arial")),
+            high_ansi: FontSlot::from_name(None),
+            complex_script: FontSlot::from_name(None),
+        };
+        let style = FontChoice {
+            ascii: symbol,
+            high_ansi: symbol,
+            complex_script: FontSlot::Inherit,
+        };
+        let fonts = run.or(style).symbol_fonts();
+        assert_eq!(fonts.ascii, None);
+        assert_eq!(fonts.high_ansi, Some(SymbolFont::Symbol));
+        assert_eq!(fonts.complex_script, None);
+        assert!(FontChoice::default().is_inherit());
+        assert!(!run.is_inherit());
+    }
+
+    #[test]
     fn run_text_mapping_touches_only_the_symbol_window() {
-        assert_eq!(map_symbol_run_text("a\u{F061}\u{F062} é"), "aαβ é");
+        let symbol = SymbolFonts {
+            ascii: Some(SymbolFont::Symbol),
+            high_ansi: Some(SymbolFont::Symbol),
+            complex_script: None,
+        };
+        assert_eq!(symbol.map_run_text("a\u{F061}\u{F062} é"), "aαβ é");
+        assert_eq!(
+            SymbolFonts::default().map_run_text("a\u{F061}"),
+            "a\u{F061}"
+        );
     }
 }
