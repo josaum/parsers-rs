@@ -78,6 +78,9 @@ impl Hasher for Position {
 }
 
 impl Depths {
+    /// How far past the end a position may be and still be recorded.
+    const MAX_POSITION_GAP: usize = 1 << 16;
+
     fn position(handle: Handle) -> usize {
         let mut position = Position::default();
         handle.hash(&mut position);
@@ -90,10 +93,12 @@ impl Depths {
 
     fn set(&mut self, handle: Handle, depth: u32) {
         let position = Self::position(handle);
-        // Positions are small and dense for any real tree; a handle that
-        // hashes to something else is not tracked (its depth reads as 0,
-        // and the finished tree is still checked exactly).
-        if position > (1 << 32) {
+        // The tree hands out positions in order, so a new one is at most a
+        // little past the end. A handle that hashes to anything else (the
+        // tree's `Hash` is not a documented contract) is not tracked: its
+        // depth reads as 0 and the finished tree is still checked exactly.
+        // Without this bound one odd position would size the vector.
+        if position > self.0.len().saturating_add(Self::MAX_POSITION_GAP) {
             return;
         }
         if position >= self.0.len() {
@@ -346,8 +351,45 @@ pub(crate) fn parse_document_within(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_document_within;
+    use super::{parse_document_within, Depths};
     use scraper::Html;
+
+    /// The depth store reads a handle's position through `Hash`, which the
+    /// tree does not promise. If an update changes that, this fails instead
+    /// of the depth limit quietly falling back to the final check.
+    #[test]
+    fn handles_hash_to_dense_positions() {
+        let document = Html::parse_document(&"<p>a<b>b</b></p>".repeat(500));
+        let mut positions: Vec<usize> = document
+            .tree
+            .nodes()
+            .map(|node| Depths::position(node.id()))
+            .collect();
+        let count = positions.len();
+        assert!(count > 2_000);
+        positions.sort_unstable();
+        positions.dedup();
+        assert_eq!(positions.len(), count, "two nodes share a position");
+        assert!(positions.last().is_some_and(|last| *last <= count + 1));
+    }
+
+    /// One position far past the end is ignored, not allocated for.
+    #[test]
+    fn a_position_far_past_the_end_is_not_recorded() {
+        let document = Html::parse_document(&"<i></i>".repeat(70_000));
+        let Some(far) = document.tree.nodes().next_back() else {
+            panic!("the document has nodes");
+        };
+        assert!(Depths::position(far.id()) > Depths::MAX_POSITION_GAP);
+        let mut depths = Depths::default();
+        depths.set(far.id(), 7);
+        assert_eq!(depths.get(far.id()), 0);
+        assert!(depths.0.is_empty());
+
+        let near = document.tree.root();
+        depths.set(near.id(), 7);
+        assert_eq!(depths.get(near.id()), 7);
+    }
 
     /// Feeding the input in pieces must build the same tree as one call.
     #[test]
