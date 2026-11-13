@@ -53,11 +53,21 @@ optimizations below were judged by:
   (`perf stat -e instructions` on Linux). Run to run it moves by about 1%.
 - **User CPU time** summed over many parses in a loop.
 
-Both need a one-shot driver: a few lines that call the parser on a file and
-serialize the result. Setting `PARSERS_BENCH_DUMP_INPUT=<path>` when running
-the xlsx or docx bench writes the generated input to that path for such a
-driver. Peak memory comes from the same `/usr/bin/time -l` run (`maximum
-resident set size`).
+Both need a one-shot driver: a process that parses one file, serializes the
+result and exits. Each of `xlsx-fast-core`, `docx-fast-core`,
+`pptx-fast-core` and `email-fast-core` has one in `examples/bench_driver.rs`,
+and one script runs them all on the benchmark inputs:
+
+```bash
+scripts/bench-instructions.sh        # three runs per input
+scripts/bench-instructions.sh 5
+```
+
+It prints instructions retired, user CPU time and peak resident memory per
+run (`/usr/bin/time -l` on macOS, `perf stat` on Linux). It measures and
+never gates. Setting `PARSERS_BENCH_DUMP_INPUT=<path>` when running a bench
+writes its generated input to that path, which is how the script gets the
+files.
 
 Compare builds made the same way. `cargo bench -p a -p b` and
 `cargo bench -p a` can enable different features in shared dependencies, and
@@ -107,7 +117,7 @@ One parse plus JSON as a whole process:
 | Input | Instructions retired | Peak resident memory |
 |---|---|---|
 | xlsx, 200,000 cells | 1.262e9 | 51.5 MB |
-| docx, 2,000 paragraphs | 152.0 M | 11.8-13.2 MB |
+| docx, 2,000 paragraphs | 122.6 M | 11.8-12.9 MB |
 
 From reading the code, neither parser holds a decompressed part twice: a
 part is inflated once into one buffer and read from it, and a UTF-16 part is
@@ -150,6 +160,10 @@ its own time:
 |---|---|---|
 | docx: borrow the element name and text of each XML event instead of copying them | 201.5 M to 152.0 M (-24.5%) | 100 parses: 2.29-2.38 s to 1.82-1.89 s (-20%) |
 | xlsx: write a date cell's ISO text directly instead of through `strftime` | 1.337e9 to 1.262e9 (-5.6%) | 20 parses: 2.80-3.07 s to 2.62-2.91 s (-6%) |
+| docx: find header and footer references while parsing the body, instead of in a pass of their own | 150.5 M to 122.6 M (-18%) | not measured |
+
+The docx criterion rows in the table above were taken before the last
+change.
 
 Peak memory did not change with either (xlsx 51.5 MB, docx 11.8-13.2 MB
 before and after).
@@ -165,13 +179,19 @@ measure used:
 
 Known and not yet done:
 
-- docx reads the document part twice, once only for header and footer
-  references. Folding that into the body pass would remove about a fifth of
-  the parse, but changes which error a malformed document reports first.
 - email: a third of a large message's time is `mailparse` filtering
-  whitespace out of base64 one byte at a time. Decoding with the `base64`
-  crate directly would be faster but must be shown to accept and reject
-  exactly the same input.
+  whitespace out of base64 one byte at a time. Separately, with
+  `extract_attachment_content` an attachment is decoded and then encoded to
+  base64 again for output (16% of the benchmark). Passing the original
+  through is only the same output when it is canonical base64, which has to
+  be checked byte for byte; not done yet.
+- xlsx JSON: the workbook is serialized straight into the output, with no
+  intermediate value. The `memmove` share is the output buffer and the cell
+  vector doubling as they grow; the buffer belongs to the caller of
+  `serde_json`, not to this crate.
+- pptx and ooxml-archive: each part is inflated with a fresh decoder. Reusing
+  one would save its set-up and zeroing, not the Huffman tables, which are
+  built per deflate block; not measured yet.
 - ooxml-archive: the part index is a `HashMap` with SipHash. It only shows
   for stored archives with thousands of parts, where the whole open takes
   under a millisecond.
@@ -188,11 +208,18 @@ Speed never buys a change in output.
 2. Parsed output on real files is identical before and after. Parse a set of
    real `.xlsx`, `.docx`, `.pptx` and `.eml` files with the old and the new
    build and compare the JSON (and for xlsx the NDJSON and Arrow IPC bytes)
-   file by file, including the error text of files that fail. Compare the
-   old build with itself first: the `metadata` and header maps of docx, pptx
-   and email are `HashMap`s, so their key order differs from run to run and
-   the JSON has to be compared with object keys sorted.
-3. No `unsafe` is added, and nothing that depends on the input may
+   file by file, byte for byte, including the error text of files that fail.
+   Compare the old build with itself first. Builds from before the maps of
+   docx, pptx and email (`metadata`, `settings`, raw headers) were written
+   in key order give different bytes on every run, and can only be compared
+   with object keys sorted.
+3. The same input gives the same bytes every time, for JSON, NDJSON and
+   Arrow IPC: `tests/deterministic_output.rs` in docx, pptx and email. A
+   `HashMap` may hold data, but nothing is written in its iteration order.
+4. `docx-fast-core/tests/header_footer_pass.rs` passes: the error a
+   malformed document reports and the numbering of fields both follow the
+   order header, footer, body.
+5. No `unsafe` is added, and nothing that depends on the input may
    `unwrap()` or `expect()`.
-4. A claimed gain is larger than the run-to-run spread of the measure it was
+6. A claimed gain is larger than the run-to-run spread of the measure it was
    taken with, and that spread is stated next to it.
