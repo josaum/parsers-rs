@@ -677,6 +677,48 @@ fn deeply_nested_arrays_in_content_are_refused() {
 }
 
 #[test]
+fn many_shallow_brackets_are_not_mistaken_for_nesting() {
+    // 60,000 arrays, hex strings and inline dictionaries, none nested, with
+    // brackets inside strings, a comment and inline image data.
+    let mut content = String::from("BT /F1 10 Tf ");
+    for _ in 0..60_000 {
+        content.push_str("[(a[[\\(b) <5b5b>] TJ /P <</MCID 1>> BDC EMC % [[[[\n");
+    }
+    content.push_str("ET BI /W 1 /H 1 /BPC 8 /CS /G ID [ EI 0 0 10 10 re f");
+    assert_renders("shallow brackets", &one_page("", &content, Vec::new()));
+}
+
+#[test]
+fn a_type3_glyph_that_draws_a_local_form_renders() {
+    // What Typst and Chromium write: the glyph procedure draws a form named
+    // in the font's own resources.
+    let bytes = one_page(
+        "/Resources << /Font << /T 10 0 R >> >>",
+        "BT /T 10 Tf 10 50 Td (a) Tj ET",
+        vec![
+            (
+                10,
+                type3_font("/Resources << /XObject << /X 12 0 R >> >>", 11),
+            ),
+            (11, stream("", "10 0 d0 /X Do")),
+            (12, form("/Resources << >>", "0 0 8 8 re f")),
+        ],
+    );
+    assert_renders("glyph with a local form", &bytes);
+    // The same glyph naming a form only the page defines is still refused.
+    let bytes = one_page(
+        "/Resources << /Font << /T 10 0 R >> /XObject << /X 12 0 R >> >>",
+        "BT /T 10 Tf 10 50 Td (a) Tj ET",
+        vec![
+            (10, type3_font("", 11)),
+            (11, stream("", "10 0 d0 /X Do")),
+            (12, form("/Resources << >>", "0 0 8 8 re f")),
+        ],
+    );
+    assert_refused("glyph using the page's resources", &bytes);
+}
+
+#[test]
 fn a_form_stamped_300_times_renders_and_keeps_rendering() {
     let content = "/F1 Do\n".repeat(300);
     let bytes = one_page(

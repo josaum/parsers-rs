@@ -30,8 +30,8 @@
 //! | `page::resolve_pages` over `/Kids` | `MAX_PAGE_TREE_DEPTH`, checked on this crate's own reading of the file before the interpreter opens it |
 //! | `Function::new` through stitching functions | [`MAX_OBJECT_DEPTH`] |
 //! | `ColorSpace::new` through `/Indexed`, `/Separation`, `/DeviceN`, `/ICCBased` | [`MAX_OBJECT_DEPTH`] |
-//! | `function::type4::parse_procedure_inner` | [`MAX_PROGRAM_OPENINGS`] |
-//! | the content tokenizer's `skip` and `read` of nested arrays and dictionaries | [`MAX_CONTENT_OPENINGS`] |
+//! | `function::type4::parse_procedure_inner` | [`MAX_PROGRAM_NESTING`] |
+//! | the content tokenizer's `skip` and `read` of nested arrays and dictionaries | [`MAX_CONTENT_NESTING`] |
 //!
 //! # What is not bounded
 //!
@@ -136,7 +136,9 @@ const GLYPH_COST: u32 = 30_000;
 const MAX_VETTED_CONTEXTS: usize = 1_000_000;
 
 /// Most objects (arrays, dictionaries, streams) one render will follow
-/// while bounding the depth of colour spaces, functions and shadings.
+/// while bounding the depth of colour spaces, functions and shadings. Each
+/// object is followed once per render, so this is a bound on distinct
+/// objects, not on uses.
 const MAX_VETTED_OBJECTS: usize = 2_000_000;
 
 /// Deepest array, dictionary and reference nesting accepted in a colour
@@ -149,16 +151,21 @@ const MAX_VETTED_OBJECTS: usize = 2_000_000;
 /// deepest common case.
 const MAX_OBJECT_DEPTH: usize = 64;
 
-/// Most opening brackets accepted in one content stream. See
-/// [`check_nesting`]. The tokenizer was measured to overflow 8 MiB at about
-/// 131,000 nested arrays, some 64 bytes a level; allowing four times that
-/// for an unoptimized build, this many cost under 13 MiB of the render
-/// stack.
-const MAX_CONTENT_OPENINGS: usize = 50_000;
+/// Deepest nesting of arrays and dictionaries accepted in a content stream.
+///
+/// The tokenizer recurses once per level. It overflowed 8 MiB at about
+/// 131,000 levels in an optimized build, some 64 bytes a level; at eight
+/// times that for an unoptimized build this many levels cost about 2 MiB of
+/// the 64 MiB render stack. Real content nests a handful deep.
+const MAX_CONTENT_NESTING: usize = 4_096;
 
-/// Most opening brackets accepted in one PostScript calculator function,
-/// whose parser recurses once per `{` at about 400 bytes a level.
-const MAX_PROGRAM_OPENINGS: usize = 1_000;
+/// Deepest nesting of `{ }` procedures accepted in a PostScript calculator
+/// function, whose parser recurses once per level at about 400 bytes
+/// optimized: under 1 MiB unoptimized at this depth.
+const MAX_PROGRAM_NESTING: usize = 256;
+
+/// Deepest chain of forms accepted inside a Type 3 glyph procedure.
+const MAX_GLYPH_FORM_DEPTH: usize = 16;
 
 /// Identity of a stream: where its dictionary sits in the file.
 type StreamId = (usize, usize);
@@ -260,6 +267,17 @@ fn remember(
     }
 }
 
+/// Identity of an array, dictionary or stream, when it has bytes of its own.
+fn object_id(object: &Object<'_>) -> Option<StreamId> {
+    let data = match object {
+        Object::Array(array) => array.data(),
+        Object::Dict(dict) => dict.data(),
+        Object::Stream(stream) => stream.dict().data(),
+        _ => return None,
+    };
+    (!data.is_empty()).then(|| (data.as_ptr() as usize, data.len()))
+}
+
 fn stream_id(stream: &Stream<'_>) -> StreamId {
     let data = stream.dict().data();
     (data.as_ptr() as usize, data.len())
@@ -300,8 +318,9 @@ struct Frame<'a> {
     through_forms: u32,
     /// Most stack a pattern or soft mask set here needs once entered.
     target: Option<u32>,
-    /// Whether this stream selects a Type 3 font.
-    shows_glyphs: bool,
+    /// Stack the deepest glyph procedure of a Type 3 font selected here
+    /// needs, when one is selected.
+    glyphs: Option<u32>,
 }
 
 impl Frame<'_> {
@@ -312,15 +331,16 @@ impl Frame<'_> {
         // deepest run of forms, under a glyph procedure that may be the
         // thing painting with it.
         let mut height = self.through_forms;
+        let glyphs = self.glyphs.unwrap_or(GLYPH_COST);
         if let Some(target) = self.target {
             height = height.max(
                 self.form_chain
-                    .saturating_add(GLYPH_COST)
+                    .saturating_add(glyphs)
                     .saturating_add(target),
             );
         }
-        if self.shows_glyphs {
-            height = height.max(self.form_chain.saturating_add(GLYPH_COST));
+        if self.glyphs.is_some() {
+            height = height.max(self.form_chain.saturating_add(glyphs));
         }
         height
     }
@@ -330,10 +350,12 @@ impl Frame<'_> {
 struct Walk<'a> {
     scans: HashMap<StreamId, Option<Rc<Scan>>>,
     /// Type 3 fonts already checked, by the context whose resources name them.
-    fonts: HashMap<(u32, u32, Vec<u8>), ()>,
+    fonts: HashMap<(u32, u32, Vec<u8>), u32>,
     stack: Vec<Frame<'a>>,
     visited: usize,
     objects: usize,
+    /// Height of every object already followed by `vet_object`.
+    heights: HashMap<StreamId, usize>,
     /// The page's own resources, the chain every stream ends in.
     root: Resources<'a>,
     /// Decoded bytes scanned so far, and the most this render may scan.
@@ -384,7 +406,7 @@ impl<'a> Walk<'a> {
     /// allowance.
     fn scan_content(&mut self, content: &[u8]) -> Result<Scan> {
         self.spend(content.len())?;
-        check_nesting(content, MAX_CONTENT_OPENINGS)?;
+        check_nesting(content, MAX_CONTENT_NESTING)?;
         Ok(Scan::of(content))
     }
 
@@ -408,56 +430,84 @@ impl<'a> Walk<'a> {
     ///
     /// The interpreter builds functions and colour spaces by plain
     /// recursion over arrays, dictionaries and references. This follows the
-    /// same graph with a stack of its own. It does not follow `/Resources`,
-    /// `/Parent` or a soft mask's `/G`, which lead to content streams and
-    /// are bounded by the walk over those.
+    /// same graph with a stack of its own and remembers the height of every
+    /// object it has finished, so resources shared by many streams are
+    /// followed once per render. It does not follow `/Resources`, `/Parent`
+    /// or a soft mask's `/G`, which lead to content streams and are bounded
+    /// by the walk over those.
     fn vet_object(&mut self, root: Object<'a>) -> Result<()> {
-        let mut pending = vec![(root, 0usize)];
-        while let Some((object, depth)) = pending.pop() {
-            if depth > MAX_OBJECT_DEPTH {
-                return Err(refused(
-                    "a colour space, function or shading is nested deeper than can be built",
-                ));
+        let too_deep =
+            || refused("a colour space, function or shading is nested deeper than can be built");
+        // Each entry: the object's identity, the children still to visit,
+        // and the tallest child seen so far.
+        let mut path: Vec<(Option<StreamId>, Vec<Object<'a>>, usize)> = Vec::new();
+        let mut next = Some(root);
+        loop {
+            if let Some(object) = next.take() {
+                let key = object_id(&object);
+                if let Some(height) = key.and_then(|key| self.heights.get(&key)).copied() {
+                    if path.len() + height > MAX_OBJECT_DEPTH {
+                        return Err(too_deep());
+                    }
+                    if let Some((_, _, tallest)) = path.last_mut() {
+                        *tallest = (*tallest).max(height);
+                    }
+                } else {
+                    self.count_object()?;
+                    let children = self.children_of(object)?;
+                    path.push((key, children, 0));
+                    if path.len() > MAX_OBJECT_DEPTH {
+                        return Err(too_deep());
+                    }
+                }
             }
-            self.count_object()?;
-            let dict = match object {
-                Object::Array(array) => {
-                    for item in array.iter::<Object<'a>>() {
-                        if matches!(item, Object::Array(_) | Object::Dict(_) | Object::Stream(_)) {
-                            pending.push((item, depth + 1));
-                        }
-                    }
-                    continue;
-                }
-                Object::Dict(dict) => dict,
-                Object::Stream(stream) => {
-                    if stream.dict().get::<u8>(&b"FunctionType"[..]) == Some(4) {
-                        // The calculator parser recurses once per `{`.
-                        if let Ok(program) = stream.decoded() {
-                            self.spend(program.len())?;
-                            check_nesting(&program, MAX_PROGRAM_OPENINGS)?;
-                        }
-                    }
-                    stream.dict().clone()
-                }
-                _ => continue,
+            let Some((key, children, tallest)) = path.last_mut() else {
+                return Ok(());
             };
-            for key in dict.keys() {
-                if matches!(&*key, b"Resources" | b"Parent" | b"G") {
-                    continue;
-                }
-                let Some(value) = dict.get::<Object<'a>>(key) else {
-                    continue;
-                };
-                if matches!(
-                    value,
-                    Object::Array(_) | Object::Dict(_) | Object::Stream(_)
-                ) {
-                    pending.push((value, depth + 1));
-                }
+            if let Some(child) = children.pop() {
+                next = Some(child);
+                continue;
+            }
+            let height = *tallest + 1;
+            if let Some(key) = *key {
+                self.heights.insert(key, height);
+            }
+            path.pop();
+            if let Some((_, _, tallest)) = path.last_mut() {
+                *tallest = (*tallest).max(height);
             }
         }
-        Ok(())
+    }
+
+    /// The arrays, dictionaries and streams directly inside `object`.
+    fn children_of(&mut self, object: Object<'a>) -> Result<Vec<Object<'a>>> {
+        let nested = |object: &Object<'a>| {
+            matches!(
+                object,
+                Object::Array(_) | Object::Dict(_) | Object::Stream(_)
+            )
+        };
+        let dict = match object {
+            Object::Array(array) => return Ok(array.iter::<Object<'a>>().filter(nested).collect()),
+            Object::Dict(dict) => dict,
+            Object::Stream(stream) => {
+                if stream.dict().get::<u8>(&b"FunctionType"[..]) == Some(4) {
+                    // The calculator parser recurses once per `{`.
+                    if let Ok(program) = stream.decoded() {
+                        self.spend(program.len())?;
+                        check_nesting(&program, MAX_PROGRAM_NESTING)?;
+                    }
+                }
+                stream.dict().clone()
+            }
+            _ => return Ok(Vec::new()),
+        };
+        Ok(dict
+            .keys()
+            .filter(|key| !matches!(&**key, b"Resources" | b"Parent" | b"G"))
+            .filter_map(|key| dict.get::<Object<'a>>(key))
+            .filter(nested)
+            .collect())
     }
 
     fn count_object(&mut self) -> Result<()> {
@@ -503,7 +553,7 @@ impl<'a> Walk<'a> {
             form_chain: 0,
             through_forms: 0,
             target: None,
-            shows_glyphs: false,
+            glyphs: None,
         };
         self.vet_resource_objects(&frame.resources)?;
         self.expand(&mut frame, &child.scan)?;
@@ -609,7 +659,7 @@ impl<'a> Walk<'a> {
         if !has_subtype(&font, b"Type3") {
             return Ok(());
         }
-        frame.shows_glyphs = true;
+        frame.glyphs = Some(frame.glyphs.unwrap_or(GLYPH_COST));
         // The stack holds this frame's ancestors; `above` levels up is one of
         // them, or one of the page tree's own resource levels past the root.
         let ancestors = self.stack.len();
@@ -619,80 +669,119 @@ impl<'a> Walk<'a> {
             _ => 0,
         };
         let beyond_root = u32::try_from(above.saturating_sub(ancestors)).unwrap_or(u32::MAX);
-        if self
-            .fonts
-            .insert((owner, beyond_root, name.to_vec()), ())
-            .is_some()
-        {
+        let memo = (owner, beyond_root, name.to_vec());
+        if let Some(known) = self.fonts.get(&memo) {
+            frame.glyphs = Some(frame.glyphs.unwrap_or(0).max(*known));
             return Ok(());
         }
 
         let font_resources = own_resources(&font);
         let procedures = font.get::<Dict<'_>>(&b"CharProcs"[..]).unwrap_or_default();
+        let mut deepest = 0usize;
         for glyph in procedures.keys() {
             self.count()?;
             let Some(procedure) = procedures.get::<Stream<'a>>(glyph) else {
                 continue;
             };
-            let Some(scan) = self.scan(&procedure)? else {
-                continue;
-            };
-            if scan.is_empty() {
-                continue;
-            }
             // Mirrors `Type3::render_glyph`: the procedure's own resources
             // come first, then the font's.
-            let local = [
-                procedure
-                    .dict()
-                    .get::<Dict<'_>>(&b"Resources"[..])
-                    .unwrap_or_default(),
-                font_resources.clone(),
-            ];
-            let category = |key: &[u8]| {
-                local
-                    .iter()
-                    .map(|resources| resources.get::<Dict<'_>>(key).unwrap_or_default())
-                    .collect::<Vec<_>>()
+            let local = vec![own_resources(procedure.dict()), font_resources.clone()];
+            deepest = deepest.max(self.vet_glyph(&procedure, local)?);
+        }
+        let cost = GLYPH_COST
+            .saturating_add(FORM_COST.saturating_mul(u32::try_from(deepest).unwrap_or(u32::MAX)));
+        self.fonts.insert(memo, cost);
+        frame.glyphs = Some(frame.glyphs.unwrap_or(0).max(cost));
+        Ok(())
+    }
+
+    /// Walks one glyph procedure and the forms it draws, using only the
+    /// resources that travel with the font. Returns the deepest chain of
+    /// forms beneath the procedure.
+    ///
+    /// A name that none of those resources define would be looked up in the
+    /// stream showing the text, which is not known here, so it is refused.
+    /// So is a pattern, soft mask or Type 3 font inside a glyph.
+    fn vet_glyph(&mut self, procedure: &Stream<'a>, local: Vec<Dict<'a>>) -> Result<usize> {
+        let outside = || refused("a Type 3 glyph procedure uses resources from outside its font");
+        let nested = || {
+            refused("a Type 3 glyph procedure reaches a pattern, soft mask or another Type 3 font")
+        };
+        let find = |chain: &[Dict<'a>], category: &[u8], name: &[u8]| -> Option<Object<'a>> {
+            chain.iter().find_map(|resources| {
+                resources
+                    .get::<Dict<'_>>(category)
+                    .and_then(|dict| dict.get::<Object<'a>>(Name::new(name)))
+            })
+        };
+        let mut deepest = 0usize;
+        // Streams still to look inside, with their resources and depth.
+        let mut pending = vec![(procedure.clone(), local, 0usize, vec![stream_id(procedure)])];
+        while let Some((stream, chain, depth, path)) = pending.pop() {
+            self.count()?;
+            deepest = deepest.max(depth);
+            for resources in &chain {
+                for category in [
+                    &b"ColorSpace"[..],
+                    b"Shading",
+                    b"ExtGState",
+                    b"Pattern",
+                    b"XObject",
+                ] {
+                    if let Some(dict) = resources.get::<Dict<'a>>(category) {
+                        self.vet_object(Object::Dict(dict))?;
+                    }
+                }
+            }
+            let Some(scan) = self.scan(&stream)? else {
+                continue;
             };
-            let x_objects = category(b"XObject");
-            let harmless = scan.x_objects.iter().all(|name| {
-                x_objects
-                    .iter()
-                    .find_map(|dict| dict.get::<Stream<'_>>(Name::new(name)))
-                    .is_some_and(|stream| !has_subtype(stream.dict(), b"Form"))
-            });
-            let patterns = category(b"Pattern");
-            let harmless = harmless
-                && scan.patterns.iter().all(|name| {
-                    patterns
-                        .iter()
-                        .find_map(|dict| dict.get::<Object<'_>>(Name::new(name)))
-                        .is_some_and(|pattern| pattern.into_stream().is_none())
-                });
-            let states = category(b"ExtGState");
-            let harmless = harmless
-                && scan.ext_g_states.iter().all(|name| {
-                    states
-                        .iter()
-                        .find_map(|dict| dict.get::<Dict<'_>>(Name::new(name)))
-                        .is_some_and(|state| state.get::<Dict<'_>>(&b"SMask"[..]).is_none())
-                });
-            let fonts = category(b"Font");
-            let harmless = harmless
-                && scan.fonts.iter().all(|name| {
-                    fonts
-                        .iter()
-                        .find_map(|dict| dict.get::<Dict<'_>>(Name::new(name)))
-                        .is_some_and(|font| !has_subtype(&font, b"Type3"))
-                });
-            if !harmless {
-                return Err(refused(
-                    "a Type 3 glyph procedure can reach another content stream",
-                ));
+            for name in &scan.x_objects {
+                let target = find(&chain, b"XObject", name)
+                    .and_then(Object::into_stream)
+                    .ok_or_else(outside)?;
+                if !has_subtype(target.dict(), b"Form") {
+                    continue;
+                }
+                let id = stream_id(&target);
+                if path.contains(&id) {
+                    return Err(refused("a content stream draws itself"));
+                }
+                if depth + 1 > MAX_GLYPH_FORM_DEPTH {
+                    return Err(refused(
+                        "content streams nest deeper than the interpreter's stack allows",
+                    ));
+                }
+                let mut inner = vec![own_resources(target.dict())];
+                inner.extend(chain.iter().cloned());
+                let mut inner_path = path.clone();
+                inner_path.push(id);
+                pending.push((target, inner, depth + 1, inner_path));
+            }
+            for name in &scan.patterns {
+                let pattern = find(&chain, b"Pattern", name).ok_or_else(outside)?;
+                if pattern.into_stream().is_some() {
+                    return Err(nested());
+                }
+            }
+            for name in &scan.ext_g_states {
+                let state = find(&chain, b"ExtGState", name)
+                    .and_then(Object::into_dict)
+                    .ok_or_else(outside)?;
+                if state.get::<Dict<'_>>(&b"SMask"[..]).is_some() {
+                    return Err(nested());
+                }
+            }
+            for name in &scan.fonts {
+                let font = find(&chain, b"Font", name)
+                    .and_then(Object::into_dict)
+                    .ok_or_else(outside)?;
+                if has_subtype(&font, b"Type3") {
+                    return Err(nested());
+                }
             }
         }
-        Ok(())
+        Ok(deepest)
     }
 
     /// Vets `root` and everything beneath it; `floor` is the stack already in
@@ -742,23 +831,108 @@ fn settle(parent: &mut Frame<'_>, route: Route, form_chain: u32, height: u32) {
     }
 }
 
-/// Refuses content whose brackets could nest deeper than `limit`.
+/// Refuses content whose arrays, dictionaries or procedures nest deeper
+/// than `limit`.
 ///
-/// The tokenizer recurses once per nested `[`, `<<` or `{`. Telling real
-/// nesting from brackets inside strings and inline image data would take
-/// the tokenizer itself, so this counts every opening bracket in the
-/// stream: nesting can never be deeper than that. It is coarse on purpose.
-/// A stream with more opening brackets than the limit is refused even when
-/// none of them nest.
+/// The tokenizer recurses once per nested `[`, `<<` or `{`. This is a
+/// linear scan with no recursion that tracks the same nesting. Brackets
+/// inside literal strings (with their escapes and balanced parentheses),
+/// hex strings, comments and inline image data do not count.
+///
+/// Inline image data is skipped from `ID` to the next `EI` that stands as a
+/// token of its own. If the interpreter ends an image somewhere else the
+/// two readings of what follows can differ; that is the one place this
+/// scan is an approximation of the tokenizer and not a mirror of it.
 fn check_nesting(content: &[u8], limit: usize) -> Result<()> {
-    let openings = content
-        .iter()
-        .filter(|byte| matches!(byte, b'[' | b'<' | b'{'))
-        .count();
-    if openings > limit {
-        return Err(refused(
-            "a stream has more opening brackets than the tokenizer can safely nest",
-        ));
+    let blank = |byte: u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0);
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    let mut in_image_dict = false;
+    while let Some(&byte) = content.get(index) {
+        index += 1;
+        match byte {
+            b'%' => {
+                while content
+                    .get(index)
+                    .is_some_and(|&b| b != b'\n' && b != b'\r')
+                {
+                    index += 1;
+                }
+            }
+            b'(' => {
+                let mut open = 1usize;
+                while let Some(&inner) = content.get(index) {
+                    index += 1;
+                    match inner {
+                        b'\\' => index += 1,
+                        b'(' => open += 1,
+                        b')' => {
+                            open -= 1;
+                            if open == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            b'<' => {
+                if content.get(index) == Some(&b'<') {
+                    index += 1;
+                    depth += 1;
+                } else {
+                    while content.get(index).is_some_and(|&b| b != b'>') {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+            }
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            b'>' => {
+                if content.get(index) == Some(&b'>') {
+                    index += 1;
+                    depth = depth.saturating_sub(1);
+                }
+            }
+            b'B' if content.get(index) == Some(&b'I')
+                && content
+                    .get(index + 1)
+                    .is_none_or(|&b| blank(b) || b == b'/') =>
+            {
+                index += 1;
+                in_image_dict = true;
+            }
+            b'I' if in_image_dict
+                && content.get(index) == Some(&b'D')
+                && index >= 2
+                && content.get(index - 2).is_some_and(|&b| blank(b))
+                && content.get(index + 1).is_none_or(|&b| blank(b)) =>
+            {
+                in_image_dict = false;
+                index += 2;
+                // Skip the data: up to `EI` standing alone.
+                while index < content.len() {
+                    if content.get(index) == Some(&b'E')
+                        && content.get(index + 1) == Some(&b'I')
+                        && content
+                            .get(index.wrapping_sub(1))
+                            .is_some_and(|&b| blank(b))
+                        && content.get(index + 2).is_none_or(|&b| blank(b))
+                    {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            _ => {}
+        }
+        if depth > limit {
+            return Err(refused(
+                "a stream nests arrays or dictionaries deeper than the tokenizer can safely follow",
+            ));
+        }
     }
     Ok(())
 }
@@ -801,6 +975,7 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
         stack: Vec::new(),
         visited: 0,
         objects: 0,
+        heights: HashMap::new(),
         root: page.resources().clone(),
         decoded: 0,
         decode_allowance,
