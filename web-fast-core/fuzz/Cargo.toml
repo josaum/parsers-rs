@@ -1,0 +1,24 @@
+[package]
+name = "web-fast-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+web-fast-core = { path = ".." }
+
+[[bin]]
+name = "html"
+path = "fuzz_targets/html.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone fuzz crate: intentionally outside the office-parsers-rs
+# workspace (members are explicit) and outside any parent workspace, so the
+# workspace lockfile and build never see libFuzzer.
+[workspace]

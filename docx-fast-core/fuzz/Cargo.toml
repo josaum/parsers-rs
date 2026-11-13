@@ -1,0 +1,33 @@
+[package]
+name = "docx-fast-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+docx-fast-core = { path = ".." }
+serde_json = "1.0"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[[bin]]
+name = "docx_container"
+path = "fuzz_targets/docx_container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "docx_document_xml"
+path = "fuzz_targets/docx_document_xml.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone fuzz crate: intentionally outside the office-parsers-rs
+# workspace (members are explicit) and outside any parent workspace, so the
+# workspace lockfile and build never see libFuzzer.
+[workspace]

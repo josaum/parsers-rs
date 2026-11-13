@@ -1,7 +1,7 @@
 //! `geo-fast-core` — high-performance GIS format parser and spatial index.
 //!
 //! # Features
-//! - **`http`** (optional): enables [`wms`] and [`wfs`] async HTTP clients.
+//! - **`http`** (optional): enables `wms` and `wfs` async HTTP clients.
 //!
 //! # Coordinate system
 //! Shared types ([`Coordinate`], [`BBox`], [`Geometry`]) use **EPSG:4326**
@@ -19,8 +19,8 @@
 //! | GeoTIFF         | [`geotiff`]         | ✓    | –     |
 //! | Shapefile       | [`shapefile`]       | ✓¹   | –     |
 //! | GeoJSON         | [`geojson`]         | ✓    | ✓     |
-//! | WMS (OGC)       | [`wms`]             | ✓    | –     |
-//! | WFS (OGC)       | [`wfs`]             | ✓    | –     |
+//! | WMS (OGC)       | `wms`               | ✓    | –     |
+//! | WFS (OGC)       | `wfs`               | ✓    | –     |
 //! | SAR (SAFE/CEOS) | [`sar`]             | ✓    | –     |
 //! | Thermal (FLIR)  | [`thermal`]         | ✓    | –     |
 //! | Hyperspectral   | [`hyperspectral`]   | ✓    | –     |

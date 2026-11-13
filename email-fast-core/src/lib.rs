@@ -91,12 +91,13 @@ pub fn write_msg_cfb_fixture_streams(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
 /// Configuration options for email parsing.
 #[derive(Debug, Clone, Copy)]
 pub struct ParseOptions {
-    /// Max uncompressed part size to load into memory (bytes).
+    /// Has no effect today: nothing in this crate reads it.
     ///
-    /// Parts larger than this threshold are streamed rather than
-    /// loaded entirely into memory. Default: 128 MiB.
-    /// Mirrors the `max_inflate` field in the OOXML parsers for API
-    /// consistency across all `*-fast-core` crates.
+    /// The field mirrors `max_inflate` in the OOXML parsers so that every
+    /// `*-fast-core` crate takes the same options, but an email is not a
+    /// compressed container and this crate inflates nothing. The sizes that
+    /// are enforced are `max_attachment_size` and
+    /// `max_total_attachment_bytes`. Default: 128 MiB.
     pub max_inflate: usize,
     /// Maximum size of attachments to process in bytes (default: 100 MB)
     pub max_attachment_size: usize,
