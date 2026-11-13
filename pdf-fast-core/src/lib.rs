@@ -1098,7 +1098,9 @@ impl PdfDocument {
         // caller happens to have left. The stack is reserved address space;
         // the system commits pages only as they are touched. If the thread
         // cannot be created the render fails: it never falls back to the
-        // caller's stack.
+        // caller's stack. A panic on that thread is the interpreter failing
+        // on this file, so it ends the render with an error and never
+        // reaches the caller as a panic.
         let pdf_bytes = self.bytes().to_vec();
         let budget = &self.decoded_byte_budget;
         std::thread::scope(|scope| {
@@ -1117,10 +1119,13 @@ impl PdfDocument {
                 .map_err(|error| {
                     anyhow!("interpreted render refused: no render thread ({error})")
                 })?;
-            match worker.join() {
-                Ok(result) => result,
-                Err(panic) => std::panic::resume_unwind(panic),
-            }
+            // The payload is dropped unread: it is the interpreter's own
+            // text, and the error names the failure without it.
+            worker.join().unwrap_or_else(|_| {
+                Err(anyhow!(
+                    "interpreted render failed: the interpreter panicked on this page"
+                ))
+            })
         })
     }
 
