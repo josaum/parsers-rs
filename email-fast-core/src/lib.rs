@@ -1773,16 +1773,23 @@ fn html_to_text(html: &str) -> String {
 /// Finds the `>` that ends the tag at the start of `tag`, skipping any `>`
 /// inside a single- or double-quoted attribute value.
 ///
-/// Returns `None` when the text ends first, inside a quoted value or not.
+/// A quote character opens a value only when it directly follows `=`,
+/// spaces aside; anywhere else (`<a title=don't>`) it is an ordinary
+/// character. Returns `None` when the text ends first, inside a quoted
+/// value or not.
 fn tag_end(tag: &str) -> Option<usize> {
     let mut quote = None;
+    let mut after_equals = false;
     for (at, byte) in tag.bytes().enumerate() {
         match quote {
             Some(open) if byte == open => quote = None,
             Some(_) => {}
             None if byte == b'>' => return Some(at),
-            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None if after_equals && matches!(byte, b'"' | b'\'') => quote = Some(byte),
             None => {}
+        }
+        if !byte.is_ascii_whitespace() {
+            after_equals = quote.is_none() && byte == b'=';
         }
     }
     None
@@ -2618,6 +2625,13 @@ mod malformed_input_unit_tests {
     fn html_to_text_keeps_a_quoted_bracket_inside_its_tag() {
         assert_eq!(html_to_text("<img alt=\"1 > 0\">after"), "after");
         assert_eq!(html_to_text("<a title='a > b' href=\"x\">link</a>"), "link");
+        // A quote character opens a value only right after `=`; an
+        // apostrophe elsewhere in a tag is just a character.
+        assert_eq!(
+            html_to_text("<a title=don't>link</a> text <b>isn't</b> more"),
+            "link text isn't more"
+        );
+        assert_eq!(html_to_text("<a title = \"a > b\">link</a>"), "link");
         // A quote that never closes does not swallow the rest of the text.
         assert_eq!(html_to_text("<a title=\"x>one</a> <b>two</b>"), "one two");
         // Many unclosed quotes are still one pass.
