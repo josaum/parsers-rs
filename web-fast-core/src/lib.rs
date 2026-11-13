@@ -600,7 +600,7 @@ fn parse_html_inner(
     }
 
     Ok(WebDocument {
-        source_sha256: format!("{:x}", Sha256::digest(source_bytes)),
+        source_sha256: lower_hex(&Sha256::digest(source_bytes)),
         base_url: effective_base.map(Into::into),
         title,
         language,
@@ -989,4 +989,18 @@ pub(crate) fn block_kind_name(kind: BlockKind) -> &'static str {
         BlockKind::TableHeader => "table_header",
         BlockKind::TableCell => "table_cell",
     }
+}
+
+/// Lower-case hexadecimal of `bytes`, two digits per byte.
+///
+/// The digest type of `sha2` 0.11 has no `LowerHex` implementation, so the
+/// digest is written out here; the text is the same as `{:x}` gave before.
+fn lower_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        text.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    text
 }
