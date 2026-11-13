@@ -143,6 +143,57 @@ fn offsets_aimed_at_one_object_materialize_it_once() {
     assert_eq!(found, 1, "an overlapping offset must not be read again");
 }
 
+/// A page whose content opens 300 saved states, changes something inside
+/// the last one, closes it, then draws. 300 is past the 256 the content
+/// interpreters keep, so that last save is counted and not stored.
+fn page_past_the_saved_state_limit(inside: &str, after: &str) -> Vec<u8> {
+    let content = format!("{}{inside} Q {after}", "q ".repeat(300));
+    pdf(&[
+        (1u32, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(),
+        ),
+        (4, stream("", content.as_bytes())),
+        (
+            5,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ),
+    ])
+}
+
+#[test]
+fn text_after_a_restore_past_the_limit_does_not_keep_a_color_set_inside() {
+    let bytes = page_past_the_saved_state_limit("1 0 0 rg", "BT /F1 12 Tf 10 50 Td (Hi) Tj ET");
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+    let runs = document.semantic_text_runs();
+    let run = runs
+        .iter()
+        .find(|run| run.text.contains("Hi"))
+        .expect("text found");
+    assert_eq!(
+        run.fill_color.components,
+        vec![0.0],
+        "the text kept the red set inside the closed state"
+    );
+}
+
+#[test]
+fn a_line_after_a_restore_past_the_limit_does_not_keep_a_matrix_set_inside() {
+    let bytes = page_past_the_saved_state_limit("1 0 0 1 40 40 cm", "10 10 m 90 10 l S");
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+    let segments = document.page_line_segments(0).expect("segments");
+    let segment = segments.first().expect("one line");
+    let left = segment.x0.min(segment.x1);
+    assert!(
+        (left - 10.0).abs() < 0.01,
+        "the line kept the translation set inside the closed state: starts at {left}"
+    );
+}
+
 #[cfg(feature = "rasterize")]
 mod rendering {
     use super::{pdf, stream};
@@ -284,6 +335,31 @@ mod rendering {
         let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
         let png = document.page_rasterized_png(0, 300.0).expect("renders");
         assert!(png.is_some());
+    }
+
+    #[test]
+    fn a_restore_past_the_saved_state_limit_does_not_leak_what_was_set_inside() {
+        // 300 saves is past the 256 the rasterizer keeps. The red set after
+        // them sits inside a save that was counted, not stored; the `Q` that
+        // closes it used to restore nothing, so the square came out red.
+        let content = format!("{}1 0 0 rg Q 0 0 100 100 re f", "q ".repeat(300));
+        let bytes = pdf(&[
+            (1u32, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>".to_vec(),
+            ),
+            (4, stream("", content.as_bytes())),
+        ]);
+        let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+        let png = document
+            .page_rasterized_png(0, 72.0)
+            .expect("renders")
+            .expect("paints");
+        let image = image::load_from_memory(&png).expect("decodes").to_rgba8();
+        let pixel = image.get_pixel(50, 50).0;
+        assert_eq!(pixel, [0, 0, 0, 255], "the fill kept a color set inside");
     }
 
     #[test]
