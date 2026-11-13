@@ -87,7 +87,7 @@ DoGet link.xsd?element=order
 DoGet <base>/outside.xsd?element=order
     NotFound: file not found
 DoGet 
-    InvalidArgument: ticket must specify ?element=<name>
+    NotFound: file not found
 DoGet �
     InvalidArgument: ticket must be utf-8
 DoPut without a bearer
@@ -135,7 +135,7 @@ DoAction list_elements {"root":"../outside.xsd"}
 DoAction list_elements {"root":"link.xsd"}
     NotFound: file not found
 DoAction list_elements 
-    ["Internal: mmap: ."]
+    NotFound: file not found
 DoAction describe {"root":"order.xsd","element":"order"} without a bearer
     Unauthenticated: missing authorization metadata
 DoAction describe {"root":"order.xsd","element":"order"}
@@ -175,9 +175,9 @@ GetFlightInfo ..%2fprobe-outside.xsd
 GetFlightInfo probe\u{0}nul.xsd
     NotFound: file not found
 GetFlightInfo probe-dir
-    path=probe-dir tickets=["probe-dir"] total_bytes=64 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+    NotFound: file not found
 GetFlightInfo 
-    path= tickets=[""] total_bytes=288 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+    NotFound: file not found
 DoGet <base>/probe-nope.xsd
     NotFound: file not found
 DoGet <base>/probe-outside.xsd
@@ -195,6 +195,6 @@ DoGet ..%2fprobe-outside.xsd
 DoGet probe\u{0}nul.xsd
     NotFound: file not found
 DoGet probe-dir
-    InvalidArgument: ticket must specify ?element=<name>
+    NotFound: file not found
 DoGet 
-    InvalidArgument: ticket must specify ?element=<name>
+    NotFound: file not found

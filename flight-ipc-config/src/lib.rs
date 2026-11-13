@@ -498,28 +498,30 @@ pub const FILE_NOT_FOUND: &str = "file not found";
 
 /// The one answer for every path this server will not serve.
 ///
-/// A missing file, a file outside the root, a dangling link and a path
-/// that cannot be read all get this `NotFound`, so an answer never says
-/// what exists on the server.
+/// A missing file, a file outside the root, a dangling link, a directory
+/// and a path that cannot be read all get this `NotFound`, so an answer
+/// never says what exists on the server.
 pub fn file_not_found() -> Status {
     Status::not_found(FILE_NOT_FOUND)
 }
 
-/// Resolves `path` to its canonical path below `root`.
+/// Resolves `path` to the canonical path of a regular file below `root`.
 ///
 /// A relative `path` is taken below `root`. Links are followed, and the
 /// file they lead to must itself be below the root.
 ///
 /// The same file system calls are made, in the same order, whether or not
 /// the path exists and wherever it leads: the root is resolved, then the
-/// path. Only then is the answer chosen, so the work done does not depend
-/// on what was found. What remains is the cost of those calls themselves: resolving a path that exists walks all of
+/// path, then the path is examined. Only then is the answer chosen, so the
+/// work done does not depend on what was found. What remains is the cost
+/// of those calls themselves: resolving a path that exists walks all of
 /// it, and resolving one that does not stops at the first missing name.
 ///
 /// # Errors
 ///
-/// [`file_not_found`] when `path` is missing, leads outside the root or
-/// cannot be examined; the cases are deliberately not told apart. `Internal` when the root itself cannot be resolved.
+/// [`file_not_found`] when `path` is missing, is not a regular file, leads
+/// outside the root or cannot be examined; the cases are deliberately not
+/// told apart. `Internal` when the root itself cannot be resolved.
 pub fn resolve_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
     let root_canon = root
         .canonicalize()
@@ -529,8 +531,10 @@ pub fn resolve_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
     } else {
         root.join(path)
     };
-    match joined.canonicalize() {
-        Ok(canon) if canon.starts_with(&root_canon) => Ok(canon),
+    let canon = joined.canonicalize();
+    let is_file = std::fs::metadata(&joined).is_ok_and(|found| found.is_file());
+    match canon {
+        Ok(canon) if is_file && canon.starts_with(&root_canon) => Ok(canon),
         _ => Err(file_not_found()),
     }
 }
@@ -1140,12 +1144,22 @@ mod tests {
             PathBuf::from("../outside"),
             PathBuf::from(".."),
             PathBuf::from("nul\0.txt"),
+            // A directory is not a file to serve: the root, and one below it.
+            PathBuf::new(),
+            PathBuf::from("."),
             PathBuf::from("inside.txt/child"),
         ] {
             let err = resolve_path(&root, &probe).expect_err("must fail");
             assert_eq!(err.code(), missing.code(), "{probe:?}");
             assert_eq!(err.message(), missing.message(), "{probe:?}");
         }
+        std::fs::create_dir_all(root.join("sub")).expect("sub dir");
+        let err = resolve_path(&root, Path::new("sub")).expect_err("a directory");
+        assert_eq!(
+            (err.code(), err.message()),
+            (missing.code(), missing.message())
+        );
+
         std::fs::remove_dir_all(&base).expect("cleanup");
     }
 

@@ -40,7 +40,7 @@ GetFlightInfo notes.txt
 	not json
 	...^....
 GetFlightInfo sub
-    Internal: read sub: <os error>
+    NotFound: file not found
 GetFlightInfo missing.jsonl
     NotFound: file not found
 GetFlightInfo missing.jsonl?batch=1
@@ -104,7 +104,7 @@ DoGet notes.txt
 	not json
 	...^....
 DoGet sub
-    Internal: read sub: <os error>
+    NotFound: file not found
 DoGet missing.jsonl
     NotFound: file not found
 DoGet ../outside.jsonl
@@ -116,7 +116,7 @@ DoGet link.jsonl
 DoGet <base>/outside.jsonl
     NotFound: file not found
 DoGet 
-    Internal: read .: <os error>
+    NotFound: file not found
 DoGet �
     InvalidArgument: ticket must be utf-8 path
 DoPut without a bearer
@@ -156,9 +156,9 @@ GetFlightInfo ..%2fprobe-outside.jsonl
 GetFlightInfo probe\u{0}nul.jsonl
     NotFound: file not found
 GetFlightInfo probe-dir
-    Internal: read probe-dir: <os error>
+    NotFound: file not found
 GetFlightInfo 
-    Internal: read .: <os error>
+    NotFound: file not found
 DoGet <base>/probe-nope.jsonl
     NotFound: file not found
 DoGet <base>/probe-outside.jsonl
@@ -176,6 +176,6 @@ DoGet ..%2fprobe-outside.jsonl
 DoGet probe\u{0}nul.jsonl
     NotFound: file not found
 DoGet probe-dir
-    Internal: read probe-dir: <os error>
+    NotFound: file not found
 DoGet 
-    Internal: read .: <os error>
+    NotFound: file not found

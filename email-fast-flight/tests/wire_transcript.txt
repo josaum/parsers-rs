@@ -21,7 +21,7 @@ GetFlightInfo sub\Upper.EML
 GetFlightInfo notes.txt
     path=notes.txt tickets=["notes.txt"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
 GetFlightInfo sub
-    path=sub tickets=["sub"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+    NotFound: file not found
 GetFlightInfo missing.eml
     NotFound: file not found
 GetFlightInfo ../outside.eml
@@ -31,15 +31,15 @@ GetFlightInfo link.eml
 GetFlightInfo <base>/outside.eml
     NotFound: file not found
 GetFlightInfo 
-    path= tickets=[""] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+    NotFound: file not found
 GetFlightInfo parts ["sub", "Upper.EML"]
     path=sub/Upper.EML tickets=["sub/Upper.EML"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
 GetFlightInfo parts ["sub", "..", "mail.eml"]
     path=sub/../mail.eml tickets=["sub/../mail.eml"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
 GetFlightInfo cmd mail.eml
-    path=cmd:mail.eml tickets=[""] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+    NotFound: file not found
 GetFlightInfo cmd 
-    path=cmd: tickets=[""] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+    NotFound: file not found
 PollFlightInfo mail.eml without a bearer
     Unauthenticated: missing authorization metadata
 PollFlightInfo mail.eml
@@ -63,7 +63,7 @@ DoGet sub\Upper.EML
 DoGet notes.txt
     Internal: Failed to parse email: Cannot detect email format for: notes.txt
 DoGet sub
-    Internal: Failed to parse email: <os error>
+    NotFound: file not found
 DoGet missing.eml
     NotFound: file not found
 DoGet ../outside.eml
@@ -75,7 +75,7 @@ DoGet link.eml
 DoGet <base>/outside.eml
     NotFound: file not found
 DoGet 
-    Internal: Failed to parse email: <os error>
+    NotFound: file not found
 DoGet �
     InvalidArgument: Invalid ticket: invalid utf-8 sequence of 1 bytes from index 0
 DoPut without a bearer
@@ -115,9 +115,9 @@ GetFlightInfo ..%2fprobe-outside.eml
 GetFlightInfo probe\u{0}nul.eml
     NotFound: file not found
 GetFlightInfo probe-dir
-    path=probe-dir tickets=["probe-dir"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+    NotFound: file not found
 GetFlightInfo 
-    path= tickets=[""] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+    NotFound: file not found
 DoGet <base>/probe-nope.eml
     NotFound: file not found
 DoGet <base>/probe-outside.eml
@@ -135,6 +135,6 @@ DoGet ..%2fprobe-outside.eml
 DoGet probe\u{0}nul.eml
     NotFound: file not found
 DoGet probe-dir
-    Internal: Failed to parse email: <os error>
+    NotFound: file not found
 DoGet 
-    Internal: Failed to parse email: <os error>
+    NotFound: file not found

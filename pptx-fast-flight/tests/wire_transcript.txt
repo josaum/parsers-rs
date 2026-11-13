@@ -57,9 +57,9 @@ GetFlightInfo ..%2fprobe-outside.pptx
 GetFlightInfo probe\u{0}nul.pptx
     NotFound: file not found
 GetFlightInfo probe-dir
-    path=probe-dir tickets=["probe-dir"] total_bytes=64 total_records=-1 schema_len=320 schema_fnv=dfff7ba7a41c5408
+    NotFound: file not found
 GetFlightInfo 
-    path= tickets=[""] total_bytes=256 total_records=-1 schema_len=320 schema_fnv=dfff7ba7a41c5408
+    NotFound: file not found
 DoGet <base>/probe-nope.pptx
     NotFound: file not found
 DoGet <base>/probe-outside.pptx
@@ -77,6 +77,6 @@ DoGet ..%2fprobe-outside.pptx
 DoGet probe\u{0}nul.pptx
     NotFound: file not found
 DoGet probe-dir
-    Internal: External error: <os error>
+    NotFound: file not found
 DoGet 
-    Internal: External error: <os error>
+    NotFound: file not found
