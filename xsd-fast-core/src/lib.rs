@@ -11,6 +11,11 @@
 //!
 //! - Parses `xs:element`, `xs:complexType`, `xs:simpleType`, `xs:sequence`, `xs:choice`,
 //!   `xs:all`, `xs:extension`, `xs:restriction`, `xs:enumeration`, `xs:include`, `xs:import`
+//! - Follows chains of named simple types; `xs:list` keeps its item type and
+//!   `xs:union` the kind its members share (a string when they differ)
+//! - Resolves `xs:attribute ref` and `xs:attributeGroup ref`, nested groups
+//!   included
+//! - Models `xs:any` element wildcards for validation; they derive no column
 //! - Resolves multi-file schemas (relative `schemaLocation` paths)
 //! - Derives an Arrow `Schema` from a root element (for downstream Flight / IPC)
 //! - Validates XML byte slices against the parsed schema rules (enumeration, pattern,
@@ -20,7 +25,12 @@
 //! ## Out of scope (v1)
 //!
 //! - `xs:key` / `xs:keyref` / `xs:unique` identity constraints
-//! - `xs:union` member resolution beyond string fallback
+//! - Named model groups: `xs:group ref` is not expanded, so a group's
+//!   particles are not part of the types that reference it. The elements a
+//!   named group declares appear as top-level (global) elements instead.
+//! - Attribute values are not validated, and union values are not checked
+//!   against their members' facets
+//! - `xs:anyAttribute`
 //! - XPath-based assertions
 //!
 //! ## Quick Start

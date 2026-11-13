@@ -346,10 +346,10 @@ pub struct ComplexType {
     /// `<xs:complexType/>`, or the open-and-closed form of that.
     ///
     /// This is not the same as having no particles and no attributes. The
-    /// parser leaves out what it does not model (attribute references,
-    /// attribute groups, group references, wildcards, a derivation from a
-    /// base it cannot find), so a type built only from those has neither
-    /// and is not empty. `false` for a model that was deserialized without
+    /// parser leaves out what it does not model (references to named model
+    /// groups, an attribute reference or attribute group that names nothing
+    /// declared, an attribute wildcard, a derivation from a base it cannot
+    /// find), so a type built only from those has neither and is not empty. `false` for a model that was deserialized without
     /// this field or built by a caller that does not set it.
     #[serde(default)]
     pub empty_in_source: bool,
