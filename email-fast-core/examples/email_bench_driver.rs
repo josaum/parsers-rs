@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let Some(path) = std::env::args_os().nth(1) else {
-        eprintln!("usage: bench_driver <file>");
+        eprintln!("usage: email_bench_driver <file>");
         return ExitCode::from(2);
     };
     let options = email_fast_core::ParseOptions {

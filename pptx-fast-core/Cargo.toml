@@ -8,6 +8,9 @@ license.workspace = true
 keywords = ["pptx", "powerpoint", "ooxml", "parser", "office", "presentation"]
 categories = ["parser-implementations", "encoding"]
 rust-version.workspace = true
+# Benchmarks and the one-shot bench drivers are for this repository, not for
+# users of the crate: they stay out of the published package.
+exclude = ["benches/", "examples/"]
 
 [lib]
 name = "pptx_fast_core"

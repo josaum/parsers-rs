@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let Some(path) = std::env::args_os().nth(1) else {
-        eprintln!("usage: bench_driver <file>");
+        eprintln!("usage: pptx_bench_driver <file>");
         return ExitCode::from(2);
     };
     let json = pptx_fast_core::parse_pptx(&path, pptx_fast_core::ParseOptions::default())

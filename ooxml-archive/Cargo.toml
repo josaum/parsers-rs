@@ -8,6 +8,9 @@ license.workspace = true
 keywords = ["ooxml", "zip", "office", "parser"]
 categories = ["parser-implementations", "encoding"]
 rust-version.workspace = true
+# Benchmarks and the one-shot bench drivers are for this repository, not for
+# users of the crate: they stay out of the published package.
+exclude = ["benches/", "examples/"]
 
 [lib]
 name = "ooxml_archive"

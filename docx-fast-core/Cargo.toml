@@ -8,6 +8,9 @@ license.workspace = true
 keywords = ["docx", "word", "ooxml", "parser", "office"]
 categories = ["parser-implementations", "encoding"]
 rust-version.workspace = true
+# Benchmarks and the one-shot bench drivers are for this repository, not for
+# users of the crate: they stay out of the published package.
+exclude = ["benches/", "examples/"]
 
 [lib]
 name = "docx_fast_core"
