@@ -39,6 +39,9 @@
 //! | `function::type4::parse_procedure_inner` | [`MAX_PROGRAM_NESTING`] |
 //! | `function::type4::eval_inner` | the same: it recurses once per parsed procedure level |
 //! | array and dictionary `skip`/`read` in a content stream (one hop) | [`MAX_CONTENT_NESTING`] |
+//! | `font::cmap::CMapLexer::get_obj`, once per consecutive comment line in a font's `/Encoding` or `/ToUnicode` CMap | [`MAX_CMAP_COMMENT_RUN`] |
+//! | `function::type0::interpolate_inner`, one level per input of a sampled function and twice the work per input | [`MAX_SAMPLED_FUNCTION_INPUTS`] |
+//! | `function::type0::increment_index`, one level per input of a sampled function | the same |
 //!
 //! Bounded by the interpreter itself:
 //!
@@ -53,9 +56,6 @@
 //! | recursion | what drives it |
 //! |---|---|
 //! | array and dictionary `skip`/`read` on objects in the file itself | nesting in any object's text; it runs while the document is opened, before this module sees anything |
-//! | `font::cmap::CMapLexer::get_obj` | one level per consecutive comment line in a CMap |
-//! | `function::type0::interpolate_inner` | one level per input of a sampled function, and twice the work per input |
-//! | `function::type0::increment_index` | one level per input of a sampled function |
 //!
 //! Matched by the search but not recursion: `hayro` `renderer::draw_image`
 //! (calls a different method of the same name), `hayro-font`
@@ -66,12 +66,30 @@
 //!
 //! * **A page tree the two parsers read differently.** The page-tree bound
 //!   uses this crate's parser, not the interpreter's.
-//! * **`usecmap` chains and the image decoders** were not examined.
-//! * **Objects reached only through fonts.** Font dictionaries are not
-//!   followed by the object-depth check.
-//! * **Memory and time.** Every nested tiling cell and soft mask gets a
-//!   renderer the size of the page, the interpreter's saved-state stack is
-//!   unbounded, and a sampled function's cost doubles with each input.
+//! * **The image decoders** (`hayro-jpeg2000`, `hayro-jbig2`, `hayro-ccitt`
+//!   and JPEG) were not traced. Each may size its buffers from the
+//!   codestream's own header rather than the dictionary.
+//! * **Memory and time.** Every soft mask gets a renderer the size of the
+//!   one it is drawn in, and how many soft masks a page uses is not bounded.
+//!   Each saved graphics state copies the clip paths in force, and the
+//!   number of those is not bounded.
+//!
+//! Bounded beyond recursion: the pixels an image XObject, its soft mask or
+//! an inline image declares, and the pixels of the tiling cell renderers
+//! held at once along one path of nested patterns, each by
+//! [`image_pixel_budget`] (a cell is sized by `cell_pixels`, at the largest
+//! scale the interpreter allows, since the transform is not known before
+//! rendering); the interpreter's
+//! saved-state stack, by [`MAX_SAVED_STATES`]; a sampled function's table, by
+//! [`MAX_SAMPLED_FUNCTION_ENTRIES`], and its cost per evaluation, which
+//! doubles with each input, by [`MAX_SAMPLED_FUNCTION_INPUTS`]. Every font a
+//! stream selects, and every object it reaches, is held to
+//! [`MAX_OBJECT_DEPTH`] like the resources are, although no recursion over
+//! font objects is known in the interpreter.
+//!
+//! `/UseCMap` chains need no bound: `hayro-interpret` 0.5.0 logs the key
+//! and treats the `usecmap` operator as a no-op, so it never loads a second
+//! CMap, and a chain or a cycle costs it nothing.
 //!
 //! The search finds a function that names itself. A cycle through two or
 //! more other functions that was not already known would not appear here.
@@ -163,7 +181,8 @@ const MAX_VETTED_CONTEXTS: usize = 1_000_000;
 const MAX_VETTED_OBJECTS: usize = 2_000_000;
 
 /// Deepest array, dictionary and reference nesting accepted in a colour
-/// space, function, shading, pattern, graphics state or image dictionary.
+/// space, function, shading, pattern, graphics state, image dictionary or
+/// font (with its descendant fonts, descriptor, widths and encodings).
 ///
 /// The interpreter builds these by recursion: about 2.7 KB of stack per
 /// nested stitching function and 1.6 KB per nested colour space in the
@@ -184,6 +203,121 @@ const MAX_CONTENT_NESTING: usize = 4_096;
 /// function, whose parser recurses once per level at about 400 bytes
 /// optimized: under 1 MiB unoptimized at this depth.
 const MAX_PROGRAM_NESTING: usize = 256;
+
+/// Most graphics states the interpreter may hold saved at once along one
+/// path of nested content streams.
+///
+/// Every `q` clones the whole current state onto a stack that has no limit:
+/// a page of a million `q` reached a peak of 616 MB in a release build
+/// against 6 MB for a blank page, about 610 bytes a state, more when clip
+/// paths are in force, since each saved state copies the list of them. Real
+/// content nests `q` a few levels deep, rarely past a few dozen. This many
+/// cost about 2.5 MB without clips. Glyph procedures are bounded per stream
+/// only, so a glyph shown at the deepest point can hold as many again.
+const MAX_SAVED_STATES: usize = 4_096;
+
+/// Most samples a sampled (Type 0) function may hold: the product of its
+/// `/Size` entries times its outputs, and the samples its stream holds.
+///
+/// The interpreter keeps every sample point in a hash map keyed by its
+/// coordinates, about 80 bytes a point with four inputs or fewer, so this
+/// many cost under 100 MiB. Real functions are far smaller: a shading or
+/// tint transform over one input has 256 to 4,096 points with three or four
+/// outputs; a three-input table of 33 points per input with three outputs
+/// holds 107,811.
+const MAX_SAMPLED_FUNCTION_ENTRIES: u64 = 1 << 20;
+
+/// Most inputs a sampled (Type 0) function may take.
+///
+/// The interpreter interpolates between the two neighbouring samples on
+/// every input, by recursion, so one evaluation reads up to 2^inputs
+/// samples, and it evaluates once a pixel for shadings and images. Eight
+/// inputs is 256 reads an evaluation; a `/DeviceN` tint transform is the
+/// only common many-input function, and eight colorants is already rare.
+const MAX_SAMPLED_FUNCTION_INPUTS: usize = 8;
+
+/// Most consecutive comment lines accepted in a font's CMap.
+///
+/// The interpreter's CMap lexer calls itself once for every comment that
+/// follows another with only white space between them; a million such lines
+/// overflow the 64 MiB render stack. CMaps in real files open with a header
+/// of ten to twenty comment lines. At 2 KB a level, more than an
+/// unoptimized frame of that lexer needs, this many levels cost 8 MiB of
+/// [`RENDER_STACK_BYTES`] beyond [`STACK_BUDGET`].
+const MAX_CMAP_COMMENT_RUN: usize = 4_096;
+
+/// Fewest pixels an image may have whatever the render size: 256 megapixels.
+///
+/// The interpreter converts an image to 8-bit RGB, three bytes a pixel, in
+/// buffers sized from its `/Width` and `/Height`, plus the decoded samples.
+/// A 600 dpi scan of an A3 sheet is about 70 megapixels, so real scans sit
+/// well under this, even embedded in a page rendered small.
+const IMAGE_PIXEL_FLOOR: u64 = 256_000_000;
+
+/// How many times the page's own rendered pixel count an image may have,
+/// when that is more than [`IMAGE_PIXEL_FLOOR`]: an image four times the
+/// render's resolution on each axis.
+const IMAGE_PIXELS_PER_PAGE_PIXEL: u64 = 16;
+
+/// Most pixels one image may declare on a page rendered to `page_pixels`.
+pub(crate) fn image_pixel_budget(page_pixels: u64) -> u64 {
+    page_pixels
+        .saturating_mul(IMAGE_PIXELS_PER_PAGE_PIXEL)
+        .max(IMAGE_PIXEL_FLOOR)
+}
+
+/// Pixels an image dictionary declares, read as the interpreter reads them:
+/// `/W` or `/Width` times `/H` or `/Height`; zero when either is missing.
+fn declared_pixels(dict: &Dict<'_>) -> u64 {
+    let side = |short: &[u8], long: &[u8]| {
+        dict.get::<u32>(short)
+            .or_else(|| dict.get::<u32>(long))
+            .map_or(0, u64::from)
+    };
+    side(&b"W"[..], &b"Width"[..]).saturating_mul(side(&b"H"[..], &b"Height"[..]))
+}
+
+/// Largest renderer, in pixels, the interpreter can make for one tiling
+/// cell, whatever the transform it is drawn with.
+///
+/// Mirrors the cell sizing in `hayro` 0.5.0's renderer: the cell's scale on
+/// each axis is clamped to between 1 and 3,000 pixels across its `/BBox`,
+/// and the renderer is `/XStep` and `/YStep` at that scale, cast to `u16`.
+/// The transform in force is not known before rendering, so the largest
+/// scale is assumed: a cell whose step is its box size counts as 3,000 by
+/// 3,000 pixels however small it is drawn, and one whose step is k times
+/// its box as 3,000·k a side, up to 65,535.
+fn cell_pixels(dict: &Dict<'_>) -> u64 {
+    let side = |step: &[u8], low: usize, high: usize| -> u64 {
+        let step = f64::from(dict.get::<f32>(step).unwrap_or(0.0)).abs();
+        let extent = dict
+            .get::<[f32; 4]>(&b"BBox"[..])
+            .and_then(|bbox| Some(f64::from(*bbox.get(high)?) - f64::from(*bbox.get(low)?)))
+            .map_or(0.0, f64::abs);
+        let pixels = (step * 3000.0 / extent).round();
+        if pixels.is_nan() {
+            0
+        } else {
+            // A saturating cast, as the interpreter's own.
+            pixels.min(f64::from(u16::MAX)) as u64
+        }
+    };
+    side(&b"XStep"[..], 0, 2).saturating_mul(side(&b"YStep"[..], 1, 3))
+}
+
+/// A dictionary's keys in byte order.
+///
+/// `Dict::keys` follows a hash map whose order changes from process to
+/// process. Walking in a fixed order makes the walk, and so the reason given
+/// for a page that breaks two bounds, the same in every run.
+fn sorted_keys<'a>(dict: &Dict<'a>) -> Vec<Name<'a>> {
+    let mut keys: Vec<Name<'a>> = dict.keys().collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// What `vet_object` names in a refusal for objects reached from resources.
+const RESOURCE_OBJECTS: &str = "a colour space, function or shading";
 
 /// Identity of a stream: where its dictionary sits in the file.
 type StreamId = (usize, usize);
@@ -222,11 +356,17 @@ struct Scan {
     ext_g_states: Vec<Vec<u8>>,
     /// Font operands of `Tf`.
     fonts: Vec<Vec<u8>>,
+    /// Most pixels any inline image in this stream declares.
+    inline_pixels: u64,
+    /// Most graphics states this stream holds saved at once: the deepest
+    /// `q` nesting, with a `Q` past the first ignored.
+    saves: usize,
 }
 
 impl Scan {
     fn of(content: &[u8]) -> Self {
         let mut scan = Self::default();
+        let mut depth = 0usize;
         for instruction in TypedIter::new(content) {
             match instruction {
                 TypedInstruction::XObject(op) => {
@@ -248,6 +388,14 @@ impl Scan {
                 TypedInstruction::TextFont(op) => {
                     remember(&mut scan.seen, 3, &mut scan.fonts, &op.0);
                 }
+                TypedInstruction::InlineImage(op) => {
+                    scan.inline_pixels = scan.inline_pixels.max(declared_pixels(op.0.dict()));
+                }
+                TypedInstruction::SaveState(_) => {
+                    depth += 1;
+                    scan.saves = scan.saves.max(depth);
+                }
+                TypedInstruction::RestoreState(_) => depth = depth.saturating_sub(1),
                 _ => {}
             }
         }
@@ -325,6 +473,9 @@ struct Child<'a> {
     /// the child is entered, so a stream naming many children holds one
     /// chain, not one per child.
     own: Dict<'a>,
+    /// Pixels of every tiling cell renderer held while this stream runs,
+    /// its own included.
+    cells: u64,
 }
 
 /// One content stream in one context, part-way through being vetted.
@@ -345,6 +496,11 @@ struct Frame<'a> {
     /// Stack the deepest glyph procedure of a Type 3 font selected here
     /// needs, when one is selected.
     glyphs: Option<u32>,
+    /// Pixels of every tiling cell renderer held while this stream runs.
+    cells: u64,
+    /// Graphics states the interpreter may hold saved inside this stream:
+    /// its own deepest nesting on top of every stream's above it.
+    saves: usize,
 }
 
 impl Frame<'_> {
@@ -385,6 +541,8 @@ struct Walk<'a> {
     /// Decoded bytes scanned so far, and the most this render may scan.
     decoded: usize,
     decode_allowance: usize,
+    /// Most pixels one image may declare, from [`image_pixel_budget`].
+    image_pixels: u64,
     next_id: u32,
 }
 
@@ -431,7 +589,10 @@ impl<'a> Walk<'a> {
     fn scan_content(&mut self, content: &[u8]) -> Result<Scan> {
         self.spend(content.len())?;
         check_nesting(content, MAX_CONTENT_NESTING)?;
-        Ok(Scan::of(content))
+        let scan = Scan::of(content);
+        check_saves(scan.saves)?;
+        self.check_image_pixels(scan.inline_pixels)?;
+        Ok(scan)
     }
 
     /// Bounds the depth of every object the interpreter may build from one
@@ -445,7 +606,7 @@ impl<'a> Walk<'a> {
             &resources.patterns,
             &resources.x_objects,
         ] {
-            self.vet_object(Object::Dict(dict.clone()))?;
+            self.vet_object(Object::Dict(dict.clone()), RESOURCE_OBJECTS)?;
         }
         Ok(())
     }
@@ -460,10 +621,10 @@ impl<'a> Walk<'a> {
     /// render. An object that does hold a reference is followed again each
     /// time it is reached. It does not follow `/Resources`, `/Parent`
     /// or a soft mask's `/G`, which lead to content streams and are bounded
-    /// by the walk over those.
-    fn vet_object(&mut self, root: Object<'a>) -> Result<()> {
-        let too_deep =
-            || refused("a colour space, function or shading is nested deeper than can be built");
+    /// by the walk over those, nor `/UseCMap`, which the interpreter ignores.
+    /// `what` names the kind of object in the refusal.
+    fn vet_object(&mut self, root: Object<'a>, what: &str) -> Result<()> {
+        let too_deep = || refused(&format!("{what} is nested deeper than can be built"));
         // Each entry: the object's identity, the children still to visit,
         // and the tallest child seen so far.
         let mut path: Vec<(Option<StreamId>, Vec<Object<'a>>, usize)> = Vec::new();
@@ -517,23 +678,113 @@ impl<'a> Walk<'a> {
             Object::Array(array) => return Ok(array.iter::<Object<'a>>().filter(nested).collect()),
             Object::Dict(dict) => dict,
             Object::Stream(stream) => {
-                if stream.dict().get::<u8>(&b"FunctionType"[..]) == Some(4) {
-                    // The calculator parser recurses once per `{`.
-                    if let Ok(program) = stream.decoded() {
-                        self.spend(program.len())?;
-                        check_nesting(&program, MAX_PROGRAM_NESTING)?;
+                // An image XObject, or the soft mask of one.
+                if has_subtype(stream.dict(), b"Image") {
+                    self.check_image_pixels(declared_pixels(stream.dict()))?;
+                }
+                match stream.dict().get::<u8>(&b"FunctionType"[..]) {
+                    Some(4) => {
+                        // The calculator parser recurses once per `{`.
+                        if let Ok(program) = stream.decoded() {
+                            self.spend(program.len())?;
+                            check_nesting(&program, MAX_PROGRAM_NESTING)?;
+                        }
                     }
+                    Some(0) => self.vet_sampled_function(&stream)?,
+                    _ => {}
                 }
                 stream.dict().clone()
             }
             _ => return Ok(Vec::new()),
         };
-        Ok(dict
-            .keys()
-            .filter(|key| !matches!(&**key, b"Resources" | b"Parent" | b"G"))
+        Ok(sorted_keys(&dict)
+            .into_iter()
+            .filter(|key| !matches!(&**key, b"Resources" | b"Parent" | b"G" | b"UseCMap"))
             .filter_map(|key| dict.get::<Object<'a>>(key))
             .filter(nested)
             .collect())
+    }
+
+    /// Refuses a sampled (Type 0) function that would cost the interpreter
+    /// more than [`MAX_SAMPLED_FUNCTION_ENTRIES`] samples or more than
+    /// [`MAX_SAMPLED_FUNCTION_INPUTS`] inputs, or whose `/Size` overflows or
+    /// holds a zero.
+    ///
+    /// Mirrors `Type0::new`: it builds nothing without a valid
+    /// `/BitsPerSample`, a `/Size` or a non-empty `/Range`, so neither is
+    /// checked here. It reads every sample in the stream before cutting the
+    /// list to `/Size`, so the samples the stream holds are counted too.
+    fn vet_sampled_function(&mut self, stream: &Stream<'a>) -> Result<()> {
+        let dict = stream.dict();
+        let Some(bits) = dict.get::<u8>(&b"BitsPerSample"[..]) else {
+            return Ok(());
+        };
+        if !matches!(bits, 1 | 2 | 4 | 8 | 16 | 24 | 32) {
+            return Ok(());
+        }
+        let outputs = dict
+            .get::<Array<'_>>(&b"Range"[..])
+            .map_or(0, |range| range.iter::<f32>().count() / 2);
+        let Some(sizes) = dict.get::<Array<'_>>(&b"Size"[..]) else {
+            return Ok(());
+        };
+        if outputs == 0 {
+            return Ok(());
+        }
+        let over_budget =
+            || refused("a sampled function holds more samples than the interpreter may build");
+        let mut inputs = 0usize;
+        let mut entries = u64::try_from(outputs).map_err(|_| over_budget())?;
+        for size in sizes.iter::<u32>() {
+            inputs += 1;
+            if size == 0 {
+                return Err(refused("a sampled function has a /Size entry of zero"));
+            }
+            entries = entries
+                .checked_mul(u64::from(size))
+                .ok_or_else(|| refused("a sampled function's /Size overflows"))?;
+        }
+        if inputs > MAX_SAMPLED_FUNCTION_INPUTS {
+            return Err(refused(
+                "a sampled function has more inputs than the interpreter can evaluate in time",
+            ));
+        }
+        if entries > MAX_SAMPLED_FUNCTION_ENTRIES {
+            return Err(over_budget());
+        }
+        if let Ok(data) = stream.decoded() {
+            self.spend(data.len())?;
+            let held = u64::try_from(data.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(8)
+                / u64::from(bits);
+            if held > MAX_SAMPLED_FUNCTION_ENTRIES {
+                return Err(over_budget());
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses an image that declares more than [`image_pixel_budget`]
+    /// pixels for this render.
+    fn check_image_pixels(&self, pixels: u64) -> Result<()> {
+        if pixels > self.image_pixels {
+            return Err(refused(
+                "an image declares more pixels than this render may decode",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses tiling cell renderers, held at once along one path, that
+    /// together have more than [`image_pixel_budget`] pixels.
+    fn check_cell_pixels(&self, pixels: u64) -> Result<()> {
+        if pixels > self.image_pixels {
+            return Err(refused(
+                "a tiling pattern's cells need more pixels than this render may hold",
+            ));
+        }
+        Ok(())
     }
 
     fn count_object(&mut self) -> Result<()> {
@@ -546,19 +797,27 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
-    /// Counts `bytes` of decoded data against what the document's decode
-    /// budget still has. Nothing is taken from the budget itself.
+    /// Counts `bytes` of decoded data against the allowance this check was
+    /// given: the caller's configured decode limit (see [`vet_page`]).
     fn spend(&mut self, bytes: usize) -> Result<()> {
         self.decoded = self.decoded.saturating_add(bytes);
         if self.decoded > self.decode_allowance {
-            return Err(refused(
-                "checking the page would decode more than the document's decode budget has left",
-            ));
+            return Err(refused(&format!(
+                "checking the page would decode more than the configured decode limit of {} \
+                 bytes (stopped after decoding {} bytes)",
+                self.decode_allowance, self.decoded
+            )));
         }
         Ok(())
     }
 
-    fn push(&mut self, child: Child<'a>, resources: Resources<'a>, floor: u32) -> Result<()> {
+    fn push(
+        &mut self,
+        child: Child<'a>,
+        resources: Resources<'a>,
+        floor: u32,
+        saves_above: usize,
+    ) -> Result<()> {
         if floor > STACK_BUDGET {
             return Err(refused(
                 "content streams nest deeper than the interpreter's stack allows",
@@ -580,7 +839,10 @@ impl<'a> Walk<'a> {
             through_forms: 0,
             target: None,
             glyphs: None,
+            saves: saves_above.saturating_add(child.scan.saves),
+            cells: child.cells,
         };
+        check_saves(frame.saves)?;
         self.vet_resource_objects(&frame.resources)?;
         self.expand(&mut frame, &child.scan)?;
         self.stack.push(frame);
@@ -637,10 +899,19 @@ impl<'a> Walk<'a> {
     fn queue(&mut self, frame: &mut Frame<'a>, route: Route, stream: &Stream<'a>) -> Result<()> {
         // The stream's dictionary carries objects of its own, such as a
         // transparency group's colour space.
-        self.vet_object(Object::Dict(stream.dict().clone()))?;
+        self.vet_object(Object::Dict(stream.dict().clone()), RESOURCE_OBJECTS)?;
+        // A tiling cell renders into a renderer of its own, held while the
+        // cell's content runs, beneath every cell it is nested in.
+        let cells = match route {
+            Route::Pattern => frame.cells.saturating_add(cell_pixels(stream.dict())),
+            Route::Form | Route::SoftMask => frame.cells,
+        };
+        self.check_cell_pixels(cells)?;
         let Some(scan) = self.scan(stream)? else {
             return Ok(());
         };
+        // Its saved states sit on top of those of every stream above it.
+        check_saves(frame.saves.saturating_add(scan.saves))?;
         if scan.is_empty() {
             // This walk never enters it, so its own resources are checked
             // here: the interpreter still builds whatever they hold if the
@@ -655,6 +926,7 @@ impl<'a> Walk<'a> {
             stream: stream_id(stream),
             scan,
             own: own_resources(stream.dict()),
+            cells,
         });
         Ok(())
     }
@@ -682,10 +954,7 @@ impl<'a> Walk<'a> {
             level = resources.parent();
             above += 1;
         };
-        if !has_subtype(&font, b"Type3") {
-            return Ok(());
-        }
-        frame.glyphs = Some(frame.glyphs.unwrap_or(GLYPH_COST));
+        let type3 = has_subtype(&font, b"Type3");
         // The stack holds this frame's ancestors; `above` levels up is one of
         // them, or one of the page tree's own resource levels past the root.
         let ancestors = self.stack.len();
@@ -697,14 +966,22 @@ impl<'a> Walk<'a> {
         let beyond_root = u32::try_from(above.saturating_sub(ancestors)).unwrap_or(u32::MAX);
         let memo = (owner, beyond_root, name.to_vec());
         if let Some(known) = self.fonts.get(&memo) {
-            frame.glyphs = Some(frame.glyphs.unwrap_or(0).max(*known));
+            if type3 {
+                frame.glyphs = Some(frame.glyphs.unwrap_or(0).max(*known));
+            }
             return Ok(());
         }
+        self.vet_font_dict(&font)?;
+        if !type3 {
+            self.fonts.insert(memo, 0);
+            return Ok(());
+        }
+        frame.glyphs = Some(frame.glyphs.unwrap_or(GLYPH_COST));
 
         let font_resources = own_resources(&font);
         let procedures = font.get::<Dict<'_>>(&b"CharProcs"[..]).unwrap_or_default();
         let mut cost = GLYPH_COST;
-        for glyph in procedures.keys() {
+        for glyph in sorted_keys(&procedures) {
             self.count()?;
             let Some(procedure) = procedures.get::<Stream<'a>>(glyph) else {
                 continue;
@@ -716,6 +993,28 @@ impl<'a> Walk<'a> {
         }
         self.fonts.insert(memo, cost);
         frame.glyphs = Some(frame.glyphs.unwrap_or(0).max(cost));
+        Ok(())
+    }
+
+    /// Checks what the interpreter builds from a font dictionary as soon as
+    /// the font is selected: the objects it reaches, to [`MAX_OBJECT_DEPTH`],
+    /// and the CMaps of its `/Encoding` and `/ToUnicode`.
+    ///
+    /// `/UseCMap` and the `usecmap` operator are not followed: the
+    /// interpreter ignores both.
+    fn vet_font_dict(&mut self, font: &Dict<'a>) -> Result<()> {
+        // Descendant fonts, the descriptor, widths, encodings and glyph
+        // procedure dictionaries are held to the same depth as resources.
+        self.vet_object(Object::Dict(font.clone()), "a font")?;
+        for key in [&b"Encoding"[..], b"ToUnicode"] {
+            let Some(cmap) = font.get::<Stream<'a>>(key) else {
+                continue;
+            };
+            if let Ok(text) = cmap.decoded() {
+                self.spend(text.len())?;
+                check_cmap_comments(&text)?;
+            }
+        }
         Ok(())
     }
 
@@ -754,7 +1053,7 @@ impl<'a> Walk<'a> {
                     b"XObject",
                 ] {
                     if let Some(dict) = resources.get::<Dict<'a>>(category) {
-                        self.vet_object(Object::Dict(dict))?;
+                        self.vet_object(Object::Dict(dict), RESOURCE_OBJECTS)?;
                     }
                 }
             }
@@ -776,6 +1075,7 @@ impl<'a> Walk<'a> {
             for name in &scan.patterns {
                 let pattern = find(&chain, b"Pattern", name).ok_or_else(outside)?;
                 if let Some(cell) = pattern.into_stream() {
+                    self.check_cell_pixels(cell_pixels(cell.dict()))?;
                     let own = vec![own_resources(cell.dict())];
                     targets.push((cell, own, PATTERN_COST));
                 }
@@ -796,12 +1096,13 @@ impl<'a> Walk<'a> {
                 let font = find(&chain, b"Font", name)
                     .and_then(Object::into_dict)
                     .ok_or_else(outside)?;
+                self.vet_font_dict(&font)?;
                 if !has_subtype(&font, b"Type3") {
                     continue;
                 }
                 let font_resources = own_resources(&font);
                 let procedures = font.get::<Dict<'_>>(&b"CharProcs"[..]).unwrap_or_default();
-                for glyph in procedures.keys() {
+                for glyph in sorted_keys(&procedures) {
                     self.count()?;
                     if let Some(inner) = procedures.get::<Stream<'a>>(glyph) {
                         let own = vec![own_resources(inner.dict()), font_resources.clone()];
@@ -832,16 +1133,17 @@ impl<'a> Walk<'a> {
     /// Vets `root` and everything beneath it; `floor` is the stack already in
     /// use when `root` starts. Returns the stack needed beneath `root`.
     fn run(&mut self, root: Child<'a>, resources: Resources<'a>, floor: u32) -> Result<u32> {
-        self.push(root, resources, floor)?;
+        self.push(root, resources, floor, 0)?;
         loop {
             let Some(frame) = self.stack.last_mut() else {
                 return Ok(0);
             };
             if let Some(child) = frame.children.pop() {
                 let floor = frame.floor.saturating_add(child.route.cost());
+                let saves = frame.saves;
                 let resources = Resources::from_parent(child.own.clone(), frame.resources.clone());
                 self.count()?;
-                self.push(child, resources, floor)?;
+                self.push(child, resources, floor, saves)?;
                 continue;
             }
             let Some(done) = self.stack.pop() else {
@@ -982,6 +1284,51 @@ fn check_nesting(content: &[u8], limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a CMap with more consecutive comment lines than
+/// [`MAX_CMAP_COMMENT_RUN`].
+///
+/// The interpreter parses a CMap only when it is all ASCII, and its lexer
+/// calls itself once for each comment that follows another with only white
+/// space (as `char::is_whitespace` sees it) between them. This counts the
+/// same runs with no recursion. A `%` inside a string is counted as a
+/// comment too, which can only make a run look longer.
+fn check_cmap_comments(text: &[u8]) -> Result<()> {
+    if !text.is_ascii() {
+        return Ok(());
+    }
+    let mut run = 0usize;
+    let mut index = 0usize;
+    while let Some(&byte) = text.get(index) {
+        index += 1;
+        match byte {
+            b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' => {}
+            b'%' => {
+                run += 1;
+                if run > MAX_CMAP_COMMENT_RUN {
+                    return Err(refused(
+                        "a font's CMap holds more consecutive comment lines than its parser can safely follow",
+                    ));
+                }
+                while text.get(index).is_some_and(|&b| b != b'\n' && b != b'\r') {
+                    index += 1;
+                }
+            }
+            _ => run = 0,
+        }
+    }
+    Ok(())
+}
+
+/// Refuses more saved graphics states than [`MAX_SAVED_STATES`].
+fn check_saves(saves: usize) -> Result<()> {
+    if saves > MAX_SAVED_STATES {
+        return Err(refused(
+            "the page saves more graphics states at once than the interpreter may hold",
+        ));
+    }
+    Ok(())
+}
+
 /// Whether a stream decodes to the same bytes however it was reached.
 fn decode_is_fixed(stream: &Stream<'_>) -> bool {
     if !matches!(stream.raw_data(), std::borrow::Cow::Borrowed(_)) {
@@ -1004,8 +1351,12 @@ fn decode_is_fixed(stream: &Stream<'_>) -> bool {
 ///
 /// `page` must be the very object handed to the interpreter afterwards, and
 /// this must run on the thread that will render it. `decode_allowance` is
-/// how many decoded bytes the check may look at; nothing is taken from the
-/// document's budget.
+/// how many decoded bytes the check may look at: the caller's configured
+/// decode limit, not what is left of it, so the check never competes with
+/// the render for the budget and a caller who lowers the limit lowers the
+/// check's work too. Nothing is taken from the document's budget.
+/// `image_pixels` is the most pixels one image may declare, from
+/// [`image_pixel_budget`].
 ///
 /// # Errors
 ///
@@ -1013,7 +1364,7 @@ fn decode_is_fixed(stream: &Stream<'_>) -> bool {
 /// itself, when the streams nest deeper than the budget allows, when a Type 3
 /// glyph procedure could enter another content stream, or when checking
 /// would take more contexts or decoded bytes than its bounds allow.
-pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
+pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize, image_pixels: u64) -> Result<()> {
     let mut walk = Walk {
         scans: HashMap::new(),
         fonts: HashMap::new(),
@@ -1024,6 +1375,7 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
         root: page.resources().clone(),
         decoded: 0,
         decode_allowance,
+        image_pixels,
         next_id: 1,
     };
 
@@ -1051,6 +1403,7 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
                 stream: page_id,
                 scan: page_scan,
                 own: Dict::empty(),
+                cells: 0,
             },
             page.resources().clone(),
             PAGE_COST,
@@ -1074,7 +1427,7 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
         else {
             continue;
         };
-        walk.vet_object(Object::Dict(appearance.dict().clone()))?;
+        walk.vet_object(Object::Dict(appearance.dict().clone()), RESOURCE_OBJECTS)?;
         let own =
             Resources::from_parent(own_resources(appearance.dict()), page.resources().clone());
         let Some(scan) = walk.scan(&appearance)? else {
@@ -1090,6 +1443,7 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
                 stream: stream_id(&appearance),
                 scan,
                 own: Dict::empty(),
+                cells: 0,
             },
             own,
             PAGE_COST.saturating_add(FORM_COST),

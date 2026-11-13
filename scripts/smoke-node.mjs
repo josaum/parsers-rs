@@ -292,6 +292,19 @@ const checks = {
     const findings = m.validate(firstLine, schema);
     if (!findings.some((f) => f.severity === 'error' && typeof f.path === 'string' && typeof f.message === 'string')) throw new Error(`validate: ${JSON.stringify(findings)}`);
     mustThrow(() => m.validate(firstLine, '{'), 'malformed schema');
+    const remote = '{"$ref":"https://example.com/positive.json"}';
+    const supplied = { 'https://example.com/positive.json': '{"type":"integer","minimum":1}' };
+    if (m.validate('3', remote, supplied).some((f) => f.severity === 'error')) throw new Error('validate with resources refused a valid value');
+    if (!m.validate('0', remote, supplied).some((f) => f.severity === 'error')) throw new Error('validate with resources accepted an invalid value');
+    if (!m.validate('3', remote).some((f) => f.severity === 'error' && f.message.includes('does not resolve'))) throw new Error('unresolvable reference accepted');
+    for (const bad of [5, 'abc', ['{}'], new Map([['https://example.com/positive.json', '{"type":"integer"}']]), { 'https://example.com/positive.json': 5 }]) {
+      let typeError = false;
+      try { m.validate('3', remote, bad); } catch (err) { typeError = err instanceof TypeError; }
+      if (!typeError) throw new Error(`validate: resources ${Object.prototype.toString.call(bad)} did not throw a TypeError`);
+    }
+    let named = false;
+    try { m.validate('3', remote, { 'https://example.com/positive.json': '{' }); } catch (err) { named = err.message.includes('https://example.com/positive.json'); }
+    if (!named) throw new Error('validate: a malformed resource error does not name its URI');
     if (m.jsonRpcRequest('{"jsonrpc":"2.0","method":"ping","id":1}').method !== 'ping') throw new Error('json-rpc request');
     mustThrow(() => m.jsonRpcRequest('{"jsonrpc":"1.0","method":"ping"}'), 'json-rpc 1.0 request');
     if (m.jsonRpcResponse('{"jsonrpc":"2.0","result":7,"id":1}').result !== 7) throw new Error('json-rpc response');

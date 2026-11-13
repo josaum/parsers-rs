@@ -16,8 +16,18 @@ export interface SchemaFinding {
   message: string;
 }
 
-/** Validate a JSON document against a JSON Schema; returns an array of findings. */
-export declare function validate(s: string, schema: string): SchemaFinding[];
+/**
+ * Validate a JSON document against a JSON Schema; returns an array of findings.
+ * `resources` is a plain object mapping a URI to the JSON text of another
+ * schema document a `$ref` may name; anything else throws a `TypeError`.
+ * Nothing is fetched: a reference that resolves nowhere is an error. When two
+ * documents claim one URI (through `$id`), the first by URI order wins.
+ */
+export declare function validate(
+  s: string,
+  schema: string,
+  resources?: Record<string, string>,
+): SchemaFinding[];
 
 /** Parse and validate a JSON-RPC 2.0 request envelope. */
 export declare function jsonRpcRequest(s: string): any;
