@@ -77,21 +77,21 @@ fn js_error(err: impl std::fmt::Display) -> Error {
 }
 
 /// Parse an email file (EML or MSG, detected by content) and return it as a JSON value.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_email_js(path: String, options: Option<ParseOptionsJs>) -> Result<serde_json::Value> {
     let email = parse_email(path, to_parse_options(options)).map_err(js_error)?;
     serde_json::to_value(&email).map_err(js_error)
 }
 
 /// Parse an RFC 5322 EML file and return it as a JSON value.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_eml_js(path: String, options: Option<ParseOptionsJs>) -> Result<serde_json::Value> {
     let email = parse_eml(path, to_parse_options(options)).map_err(js_error)?;
     serde_json::to_value(&email).map_err(js_error)
 }
 
 /// Parse an email file and write each message as one NDJSON record to `out_path`.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_email_ndjson_js(
     path: String,
     out_path: String,
@@ -101,7 +101,7 @@ pub fn parse_email_ndjson_js(
 }
 
 /// Parse an mbox file into NDJSON at `out_path` and return the message count.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_mbox_ndjson_js(
     path: String,
     out_path: String,
@@ -113,7 +113,7 @@ pub fn parse_mbox_ndjson_js(
 }
 
 /// Parse an mbox file into an Arrow IPC file at `out_path` and return the message count.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_mbox_arrow_js(
     path: String,
     out_path: String,
@@ -134,7 +134,7 @@ pub fn parse_mbox_arrow_js(
 ///
 /// `max_attachment_size` overrides the per-attachment ceiling; content
 /// extraction is always on because the bytes are what gets written.
-#[napi]
+#[napi(catch_unwind)]
 pub fn extract_attachments_js(
     path: String,
     out_dir: String,
