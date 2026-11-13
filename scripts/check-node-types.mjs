@@ -40,10 +40,6 @@ function parenthesized(text, open) {
 
 const camel = (snake) => snake.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
 
-// Crates whose functions may still lack `catch_unwind`. json-fast-node is
-// under separate review; remove it from this list when that lands.
-const PANIC_CHECK_EXEMPT = new Set(['json-fast-node']);
-
 // Every `#[napi]` function, method and constructor in a crate: its parameter
 // count and whether it is built with `catch_unwind`. Free functions are keyed
 // by JavaScript name, methods by `Class.method`, constructors by
@@ -85,10 +81,8 @@ function check(crate) {
   const rust = rustItems(readFileSync(path.join(dir, 'src', 'lib.rs'), 'utf8'));
   // A panic that reaches Node-API unwinds out of an `extern "C"` function and
   // ends the process. `catch_unwind` turns it into a thrown error instead.
-  if (!PANIC_CHECK_EXEMPT.has(crate)) {
-    for (const item of rust.values()) {
-      if (!item.catchUnwind) problems.push(`${item.rustName}: #[napi] without catch_unwind, so a panic would end the process`);
-    }
+  for (const item of rust.values()) {
+    if (!item.catchUnwind) problems.push(`${item.rustName}: #[napi] without catch_unwind, so a panic would end the process`);
   }
   const mod = require(dir);
 
