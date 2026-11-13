@@ -35,7 +35,7 @@ fn particle_names(content: &ContentModel) -> Vec<String> {
         .filter_map(|particle| match &particle.element {
             ElementRef::Inline(decl) => Some(decl.name.local.clone()),
             ElementRef::Ref(qn) => Some(qn.local.clone()),
-            ElementRef::Group(_) => None,
+            _ => None,
         })
         .collect()
 }

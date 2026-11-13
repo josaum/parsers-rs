@@ -12,6 +12,12 @@ requires-python = ">=3.8"
 authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 keywords = ["excel", "xlsx", "writer", "spreadsheet", "office", "ooxml", "rust"]
 
+[project.urls]
+Homepage = "https://github.com/josaum/parsers-rs"
+Repository = "https://github.com/josaum/parsers-rs/tree/main/xlsx-fast-write-py"
+Documentation = "https://github.com/josaum/parsers-rs#readme"
+"Bug Tracker" = "https://github.com/josaum/parsers-rs/issues"
+
 [tool.maturin]
 module-name = "xlsx_fast_write._core"
 python-source = "."

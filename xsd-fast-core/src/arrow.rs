@@ -6,9 +6,19 @@
 //!
 //! ## Flattening strategy
 //!
-//! The produced Arrow schema is **flat**: each leaf element and attribute becomes
-//! one column. Multi-occurrence particles (`maxOccurs > 1` or unbounded) are
-//! emitted as `List<item>`. Nested paths use `"parent.child"` dot-separated names.
+//! Each leaf element and each attribute of the root element becomes one
+//! column, and a child element with more than one column becomes a struct of
+//! them. A child element with exactly one column is that column, named after
+//! the element. Multi-occurrence particles (`maxOccurs > 1` or unbounded) are
+//! emitted as `List<item>`. Wildcards (`xs:any`) derive no column.
+//!
+//! An attribute that reaches a type through `xs:attribute ref` or
+//! `xs:attributeGroup ref` is a column of the root element, and of a child
+//! element with no column or more than one column of its own. **By default
+//! it is left out of a child element whose other content derives exactly one
+//! column** (typically its text), so that column keeps the shape it had
+//! before references were resolved; [`ArrowShape::attributes_on_simple_children`]
+//! makes such a child a struct of its value and all its attributes.
 //!
 //! ## Example
 //!
@@ -33,7 +43,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use crate::parser::SchemaSet;
 use crate::schema::{
     ComplexType, ContentModel, ElementDecl, ElementRef, OccurrenceConstraint, Particle,
-    SchemaModel, SimpleTypeKind, XsdType,
+    SchemaModel, SimpleTypeDef, SimpleTypeKind, XsdType,
 };
 
 /// Deepest flattening performed, whatever [`ArrowOptions::max_depth`] asks for.
@@ -95,6 +105,42 @@ pub struct ArrowOptions {
     pub batch_size: usize,
 }
 
+/// How Arrow derivation shapes columns, beyond [`ArrowOptions`].
+///
+/// Kept apart from `ArrowOptions` so code that builds `ArrowOptions` field
+/// by field keeps compiling. Pass it to
+/// [`SchemaSet::to_arrow_schema_with_shape`] or
+/// [`SchemaSet::try_all_arrow_schemas_with_shape`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ArrowShape {
+    /// Whether a child element whose own content derives exactly one column
+    /// also gets the attributes that reach its type through
+    /// `xs:attribute ref` or `xs:attributeGroup ref`. Default: false.
+    ///
+    /// By default such a child is that one column, named after the element,
+    /// as it was before references were resolved, and those attributes are
+    /// left out: they are columns of the same type only where it is the
+    /// root element, or a child with no column or several of its own. When
+    /// true, the child becomes a struct of its value and all its
+    /// attributes, which changes the type of its column.
+    pub attributes_on_simple_children: bool,
+}
+
+impl ArrowShape {
+    /// The default shape: today's columns, unchanged.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`ArrowShape::attributes_on_simple_children`].
+    #[must_use]
+    pub fn with_attributes_on_simple_children(mut self, on: bool) -> Self {
+        self.attributes_on_simple_children = on;
+        self
+    }
+}
+
 impl Default for ArrowOptions {
     fn default() -> Self {
         Self {
@@ -118,8 +164,23 @@ impl SchemaSet {
     /// walk steps (types visited plus fields emitted, wrapped ones included)
     /// or its model groups nest too deeply to walk.
     pub fn to_arrow_schema(&self, root_element: &str, opts: ArrowOptions) -> Result<SchemaRef> {
+        self.to_arrow_schema_with_shape(root_element, opts, ArrowShape::default())
+    }
+
+    /// Derive an Arrow [`Schema`] for the named root element, shaped as
+    /// `shape` says; [`SchemaSet::to_arrow_schema`] uses the default shape.
+    ///
+    /// # Errors
+    ///
+    /// As [`SchemaSet::to_arrow_schema`].
+    pub fn to_arrow_schema_with_shape(
+        &self,
+        root_element: &str,
+        opts: ArrowOptions,
+        shape: ArrowShape,
+    ) -> Result<SchemaRef> {
         let mut steps = MAX_DERIVATION_STEPS;
-        self.derive_arrow_schema(root_element, &opts, &mut steps)
+        self.derive_arrow_schema(root_element, &opts, shape, &mut steps)
     }
 
     /// Derives one element's schema, taking its steps out of `steps_left`.
@@ -131,6 +192,7 @@ impl SchemaSet {
         &self,
         root_element: &str,
         opts: &ArrowOptions,
+        shape: ArrowShape,
         steps_left: &mut usize,
     ) -> Result<SchemaRef> {
         let decl = self
@@ -145,12 +207,17 @@ impl SchemaSet {
             model: &self.model,
             max_depth: opts.max_depth.min(MAX_FLATTEN_DEPTH),
             opts,
+            shape,
             steps_left: allowed,
             nesting: 0,
         };
         let walked = derivation.fields_from_type(&decl.type_def, 0, String::new(), &mut fields);
         *steps_left -= allowed - derivation.steps_left;
         walked?;
+        let fields = fields
+            .into_iter()
+            .map(unmark_referenced)
+            .collect::<Vec<_>>();
         Ok(Arc::new(Schema::new(fields)))
     }
 
@@ -236,7 +303,9 @@ impl SchemaSet {
             if steps_left == 0 {
                 break;
             }
-            if let Ok(schema) = self.derive_arrow_schema(name, &opts, &mut steps_left) {
+            if let Ok(schema) =
+                self.derive_arrow_schema(name, &opts, ArrowShape::default(), &mut steps_left)
+            {
                 derived.push((name.clone(), schema));
             }
         }
@@ -257,11 +326,24 @@ impl SchemaSet {
     /// the elements together take more than 4,000,000 walk steps, even if
     /// each is inside its own limit. No partial result is returned.
     pub fn try_all_arrow_schemas(&self, opts: ArrowOptions) -> Result<Vec<(String, SchemaRef)>> {
+        self.try_all_arrow_schemas_with_shape(opts, ArrowShape::default())
+    }
+
+    /// [`SchemaSet::try_all_arrow_schemas`], shaped as `shape` says.
+    ///
+    /// # Errors
+    ///
+    /// As [`SchemaSet::try_all_arrow_schemas`].
+    pub fn try_all_arrow_schemas_with_shape(
+        &self,
+        opts: ArrowOptions,
+        shape: ArrowShape,
+    ) -> Result<Vec<(String, SchemaRef)>> {
         let mut steps_left = MAX_TOTAL_DERIVATION_STEPS;
         let mut derived = Vec::with_capacity(self.model.global_elements.len());
         for name in self.model.global_elements.keys() {
             let before = steps_left;
-            match self.derive_arrow_schema(name, &opts, &mut steps_left) {
+            match self.derive_arrow_schema(name, &opts, shape, &mut steps_left) {
                 Ok(schema) => derived.push((name.clone(), schema)),
                 // The element ran out because the call did, not because it
                 // is too large on its own.
@@ -285,6 +367,7 @@ impl SchemaSet {
 struct Derivation<'a> {
     model: &'a SchemaModel,
     opts: &'a ArrowOptions,
+    shape: ArrowShape,
     /// [`ArrowOptions::max_depth`], capped at [`MAX_FLATTEN_DEPTH`].
     max_depth: usize,
     /// Steps that may still be taken before the derivation is refused.
@@ -331,7 +414,7 @@ impl Derivation<'_> {
 
         let model = self.model;
         match xsd {
-            XsdType::Simple(st) => self.emit_leaf(prefix, Some(&st.kind), fields),
+            XsdType::Simple(st) => self.emit_leaf(prefix, Some(st), fields),
             XsdType::Complex(ct) => self.fields_from_complex(ct, depth, &prefix, fields),
             XsdType::Ref(qn) => {
                 if let Some(ct) = model.complex_types.get(&qn.local) {
@@ -344,22 +427,22 @@ impl Derivation<'_> {
                     Ok(())
                 } else {
                     // A named simple type, or unresolved: fall back to Utf8.
-                    let kind = model.simple_types.get(&qn.local).map(|st| &st.kind);
-                    self.emit_leaf(prefix, kind, fields)
+                    let simple = model.simple_types.get(&qn.local);
+                    self.emit_leaf(prefix, simple, fields)
                 }
             }
         }
     }
 
-    /// Emits the single column of a leaf; `kind` is `None` for raw text.
+    /// Emits the single column of a leaf; `simple` is `None` for raw text.
     fn emit_leaf(
         &mut self,
         prefix: String,
-        kind: Option<&SimpleTypeKind>,
+        simple: Option<&SimpleTypeDef>,
         fields: &mut Vec<Field>,
     ) -> Result<()> {
-        let data_type = match kind {
-            Some(kind) => simple_kind_to_arrow(kind, self.opts),
+        let data_type = match simple {
+            Some(simple) => simple_type_to_arrow(simple, self.opts),
             None => DataType::Utf8,
         };
         self.emit(fields, Field::new(value_name(prefix), data_type, true))
@@ -393,13 +476,17 @@ impl Derivation<'_> {
         fields: &mut Vec<Field>,
     ) -> Result<()> {
         for attr in &ct.attributes {
-            let dt = simple_kind_to_arrow(&attr.type_def.kind, self.opts);
+            let dt = simple_type_to_arrow(&attr.type_def, self.opts);
             let name = if prefix.is_empty() {
                 format!("@{}", attr.name)
             } else {
                 format!("{prefix}.@{}", attr.name)
             };
-            self.emit(fields, Field::new(name, dt, !attr.required))?;
+            let mut field = Field::new(name, dt, !attr.required);
+            if attr.referenced {
+                field = mark_referenced(field);
+            }
+            self.emit(fields, field)?;
         }
         Ok(())
     }
@@ -422,7 +509,7 @@ impl Derivation<'_> {
         }
         let particles = match content {
             ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
-            ContentModel::SimpleContent(st) => return self.emit_text(&st.kind, prefix, fields),
+            ContentModel::SimpleContent(st) => return self.emit_text(st, prefix, fields),
             ContentModel::Empty => return Ok(()),
         };
         self.nesting += 1;
@@ -434,11 +521,11 @@ impl Derivation<'_> {
     /// Emits the `$text` column of a simple-content type.
     fn emit_text(
         &mut self,
-        kind: &SimpleTypeKind,
+        simple: &SimpleTypeDef,
         prefix: &str,
         fields: &mut Vec<Field>,
     ) -> Result<()> {
-        let dt = simple_kind_to_arrow(kind, self.opts);
+        let dt = simple_type_to_arrow(simple, self.opts);
         let name = if prefix.is_empty() {
             "$text".to_string()
         } else {
@@ -470,6 +557,8 @@ impl Derivation<'_> {
                 // branch into its own column at the current prefix; mark them
                 // nullable since at most one branch is selected per instance.
                 ElementRef::Group(group) => self.fields_from_group(group, depth, prefix, fields)?,
+                // A wildcard admits elements the schema does not declare.
+                ElementRef::Any(_) => {}
             }
         }
         Ok(())
@@ -513,9 +602,21 @@ impl Derivation<'_> {
     ) -> Result<()> {
         let col_path = column_path(prefix, &decl.name.local);
         let nillable = decl.nillable;
+        let own = inner_fields.iter().filter(|f| !is_referenced(f)).count();
+        if own == 1 && !self.shape.attributes_on_simple_children {
+            // A child whose other content derives one column keeps the shape
+            // it had before attribute references were resolved: that column,
+            // named after the child.
+            inner_fields.retain(|f| !is_referenced(f));
+        }
+        let mut inner_fields: Vec<Field> =
+            inner_fields.into_iter().map(unmark_referenced).collect();
+        // A repeated child with no column of its own was a list of empty
+        // structs; one referenced attribute keeps it a list of structs.
+        let keep_struct = own == 0 && occ.is_multi();
         if occ.is_multi() {
             // Wrap the inner type in a List.
-            let item_field = if inner_fields.len() == 1 {
+            let item_field = if inner_fields.len() == 1 && !keep_struct {
                 inner_fields
                     .remove(0)
                     .with_name("item")
@@ -529,19 +630,27 @@ impl Derivation<'_> {
             )
         } else {
             let nullable = occ.min == 0 || nillable;
+            // A child with no column of its own had no column at all before
+            // attribute references were resolved: its column is as new as
+            // the attributes that make it, to the parent too.
+            let new = |field: Field| {
+                if own == 0 {
+                    mark_referenced(field)
+                } else {
+                    field
+                }
+            };
             if inner_fields.len() == 1 {
                 let f = inner_fields
                     .remove(0)
                     .with_name(&col_path)
                     .with_nullable(nullable);
                 // Already charged when the inner walk emitted it.
-                fields.push(f);
+                fields.push(new(f));
                 Ok(())
             } else if !inner_fields.is_empty() {
-                self.emit(
-                    fields,
-                    Field::new(col_path, DataType::Struct(inner_fields.into()), nullable),
-                )
+                let f = Field::new(col_path, DataType::Struct(inner_fields.into()), nullable);
+                self.emit(fields, new(f))
             } else {
                 Ok(())
             }
@@ -579,6 +688,34 @@ fn declares_nothing(ct: &ComplexType) -> bool {
         && matches!(ct.content, ContentModel::Empty)
 }
 
+/// Metadata key marking, during one derivation, a column of a referenced
+/// attribute; see [`crate::schema::AttributeDecl::referenced`]. It never
+/// reaches the derived schema.
+const REFERENCED_MARK: &str = "xsd-fast-core.referenced";
+
+/// `field` marked as the column of a referenced attribute.
+fn mark_referenced(field: Field) -> Field {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(REFERENCED_MARK.to_owned(), String::new());
+    field.with_metadata(metadata)
+}
+
+/// Whether `field` is the column of a referenced attribute.
+fn is_referenced(field: &Field) -> bool {
+    field.metadata().contains_key(REFERENCED_MARK)
+}
+
+/// `field` without the referenced-attribute mark.
+fn unmark_referenced(field: Field) -> Field {
+    if is_referenced(&field) {
+        let mut metadata = field.metadata().clone();
+        metadata.remove(REFERENCED_MARK);
+        field.with_metadata(metadata)
+    } else {
+        field
+    }
+}
+
 /// Marks every field nullable: a choice selects at most one branch, so none
 /// of its columns are mandatory.
 fn force_nullable(fields: &mut [Field]) {
@@ -608,6 +745,19 @@ fn value_name(prefix: String) -> String {
 }
 
 // ── SimpleTypeKind → Arrow DataType ──────────────────────────────────────────
+
+/// The Arrow type of a simple type's value: a list of its items for an
+/// `xs:list`, and the type of its kind otherwise.
+fn simple_type_to_arrow(simple: &SimpleTypeDef, opts: &ArrowOptions) -> DataType {
+    match &simple.list_item {
+        Some(item) => DataType::List(Arc::new(Field::new(
+            "item",
+            simple_kind_to_arrow(&item.kind, opts),
+            true,
+        ))),
+        None => simple_kind_to_arrow(&simple.kind, opts),
+    }
+}
 
 pub(crate) fn simple_kind_to_arrow(kind: &SimpleTypeKind, opts: &ArrowOptions) -> DataType {
     match kind {

@@ -960,6 +960,13 @@ def assert_dependabot_contract(dependabot: str) -> None:
         cargo,
         re.MULTILINE,
     ), "tiny-skia 0.12 and later must be ignored until its rendering change is accepted"
+    # hayro 0.6 and later invalidates what the render guard mirrors; it waits
+    # for the guard to be ported and re-measured.
+    assert re.search(
+        r'^      - dependency-name: "hayro"\n        versions:\n          - ">=0\.6"$',
+        cargo,
+        re.MULTILINE,
+    ), "hayro 0.6 and later must be ignored until the render guard is ported to it"
     # mailparse 0.18 splits MIME parts differently, and email-fast-core's
     # nesting and header-cost guards replay 0.15's search; it waits for both.
     assert re.search(
@@ -1374,6 +1381,8 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_dependabot_contract, DEPENDABOT, '"napi-derive"\n        versions:\n          - ">=3"', '"napi-derive"\n        versions:\n          - ">=3.1"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "tiny-skia"\n', '      - dependency-name: "tiny-skia-path"\n'),
         (assert_dependabot_contract, DEPENDABOT, '          - ">=0.12"', '          - ">=0.13"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "hayro"\n', '      - dependency-name: "hayro-syntax"\n'),
+        (assert_dependabot_contract, DEPENDABOT, '          - ">=0.6"', '          - ">=0.10"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "mailparse"\n        versions:\n          - ">=0.16"\n', ""),
         (assert_dependabot_contract, DEPENDABOT, '"mailparse"\n        versions:\n          - ">=0.16"', '"mailparse"\n        versions:\n          - ">=0.19"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "arrow*"\n', '      - dependency-name: "arrow"\n'),
