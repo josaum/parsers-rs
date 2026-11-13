@@ -3845,8 +3845,107 @@ pub struct PdfDictionaryEntry {
     pub value: PdfValue,
 }
 
+/// An array or dictionary part-way through being copied by
+/// [`PdfValue::clone`].
+enum CopiedContainer<'a> {
+    Array {
+        rest: std::slice::Iter<'a, PdfValue>,
+        copied: Vec<PdfValue>,
+    },
+    Dictionary {
+        rest: std::slice::Iter<'a, PdfDictionaryEntry>,
+        copied: Vec<PdfDictionaryEntry>,
+        /// Key of the entry whose value is being copied.
+        key: &'a str,
+    },
+}
+
+/// Copies a value without recursing once per level of nesting.
+///
+/// The derived implementation calls itself for every array and dictionary
+/// level, and a value nested to the parser's limit then needs more stack to
+/// copy than to parse: page resources are copied on the way to every reader.
+/// Containers being copied are kept in a list instead.
+impl Clone for PdfValue {
+    fn clone(&self) -> Self {
+        let mut open: Vec<CopiedContainer<'_>> = Vec::new();
+        let mut source = self;
+        loop {
+            let mut finished = match source {
+                Self::Null => Some(Self::Null),
+                Self::Bool(value) => Some(Self::Bool(*value)),
+                Self::Integer(value) => Some(Self::Integer(*value)),
+                Self::Real(value) => Some(Self::Real(*value)),
+                Self::Name(value) => Some(Self::Name(value.clone())),
+                Self::String(value) => Some(Self::String(value.clone())),
+                Self::HexString(value) => Some(Self::HexString(value.clone())),
+                Self::Reference {
+                    object_number,
+                    generation,
+                } => Some(Self::Reference {
+                    object_number: *object_number,
+                    generation: *generation,
+                }),
+                Self::Raw(value) => Some(Self::Raw(value.clone())),
+                Self::Array(values) => {
+                    open.push(CopiedContainer::Array {
+                        rest: values.iter(),
+                        copied: Vec::with_capacity(values.len()),
+                    });
+                    None
+                }
+                Self::Dictionary(dictionary) => {
+                    open.push(CopiedContainer::Dictionary {
+                        rest: dictionary.entries.iter(),
+                        copied: Vec::with_capacity(dictionary.entries.len()),
+                        key: "",
+                    });
+                    None
+                }
+            };
+            // Hand a finished copy to the container it belongs in, and keep
+            // closing containers until one has another child to copy.
+            loop {
+                let Some(top) = open.last_mut() else {
+                    // Nothing is open, so the copy is the whole value: a
+                    // container that was just opened is still in the list.
+                    return finished.unwrap_or(Self::Null);
+                };
+                match top {
+                    CopiedContainer::Array { rest, copied } => {
+                        copied.extend(finished.take());
+                        if let Some(next) = rest.next() {
+                            source = next;
+                            break;
+                        }
+                    }
+                    CopiedContainer::Dictionary { rest, copied, key } => {
+                        if let Some(value) = finished.take() {
+                            copied.push(PdfDictionaryEntry {
+                                key: (*key).to_owned(),
+                                value,
+                            });
+                        }
+                        if let Some(entry) = rest.next() {
+                            *key = &entry.key;
+                            source = &entry.value;
+                            break;
+                        }
+                    }
+                }
+                finished = open.pop().map(|container| match container {
+                    CopiedContainer::Array { copied, .. } => Self::Array(copied),
+                    CopiedContainer::Dictionary { copied, .. } => {
+                        Self::Dictionary(PdfDictionary { entries: copied })
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// A PDF value as recovered from a dictionary or array.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[cfg_attr(feature = "serde", serde(tag = "type", content = "value"))]
 pub enum PdfValue {
@@ -7665,10 +7764,11 @@ fn is_delimiter(byte: u8) -> bool {
 /// Deepest array or dictionary nesting the object parser follows.
 ///
 /// Real documents nest a handful of levels; an input that nests deeper is
-/// malformed or hostile, and each level costs two recursive calls. The bound
-/// matches the 128-hop limit the `/Parent` walks use, and is small enough that
-/// the recursion fits a 256 KiB worker-thread stack in an unoptimized build.
-/// Raising it trades that stack headroom away.
+/// malformed or hostile and is refused. The parser keeps its open containers
+/// in a list on the heap, so this bound is not what protects the parser's
+/// own stack. It bounds the depth of the [`PdfValue`] tree the parser hands
+/// out, which later code walks and drops recursively: raising it deepens
+/// every one of those walks. Indirect references do not count toward it.
 const MAX_VALUE_NESTING: usize = 128;
 
 struct ValueParser<'a> {
@@ -7676,6 +7776,38 @@ struct ValueParser<'a> {
     pos: usize,
     /// Containers currently open, bounded by [`MAX_VALUE_NESTING`].
     depth: usize,
+}
+
+/// An array or dictionary the object parser has opened and not yet closed.
+enum OpenContainer {
+    Array {
+        values: Vec<PdfValue>,
+        /// Where the element being read began, to detect one that consumed
+        /// nothing.
+        element_start: usize,
+    },
+    Dictionary {
+        entries: Vec<PdfDictionaryEntry>,
+        /// Key of the entry whose value is being read.
+        key: String,
+    },
+}
+
+impl OpenContainer {
+    fn into_value(self) -> PdfValue {
+        match self {
+            Self::Array { values, .. } => PdfValue::Array(values),
+            Self::Dictionary { entries, .. } => PdfValue::Dictionary(PdfDictionary { entries }),
+        }
+    }
+}
+
+/// What the first token of a value turned out to be.
+enum ValueStart {
+    /// A value that holds no other values, read in full.
+    Scalar(PdfValue),
+    /// The opening delimiter of an array or dictionary, consumed.
+    Container(OpenContainer),
 }
 
 impl<'a> ValueParser<'a> {
@@ -7698,80 +7830,119 @@ impl<'a> ValueParser<'a> {
         Ok(())
     }
 
+    /// Parse one value, however deeply its arrays and dictionaries nest.
+    ///
+    /// Open containers are kept in a list rather than on the call stack, so
+    /// the stack this needs does not grow with the input's nesting.
     fn parse_value(&mut self) -> Result<PdfValue> {
+        let mut open: Vec<OpenContainer> = Vec::new();
+        loop {
+            let mut value = match self.parse_value_start()? {
+                ValueStart::Scalar(value) => Some(value),
+                ValueStart::Container(container) => {
+                    open.push(container);
+                    None
+                }
+            };
+            // Hand a finished value to the container that holds it, and keep
+            // closing containers until one asks for another child.
+            loop {
+                let Some(top) = open.last_mut() else {
+                    // No container is open, so `value` is the whole value: a
+                    // container that was just opened is still in the list.
+                    return value.ok_or_else(|| anyhow!("unexpected end of input"));
+                };
+                if let Some(value) = value.take() {
+                    match top {
+                        OpenContainer::Array {
+                            values,
+                            element_start,
+                        } => {
+                            if self.pos == *element_start {
+                                // A stray delimiter (`)`, `>`, `{`, `}`) parses
+                                // as an empty bareword without consuming it.
+                                // Pushing that value and looping would never
+                                // advance, so the array is refused.
+                                return Err(anyhow!("unexpected delimiter in PDF array"));
+                            }
+                            values.push(value);
+                        }
+                        OpenContainer::Dictionary { entries, key } => {
+                            entries.push(PdfDictionaryEntry {
+                                key: std::mem::take(key),
+                                value,
+                            });
+                        }
+                    }
+                }
+                skip_whitespace_and_comments(self.bytes, &mut self.pos);
+                match top {
+                    OpenContainer::Array { element_start, .. } => {
+                        if self.bytes.get(self.pos) != Some(&b']') {
+                            *element_start = self.pos;
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                    OpenContainer::Dictionary { key, .. } => {
+                        if self.bytes.get(self.pos..self.pos + 2) != Some(b">>") {
+                            // `parse_name` consumes at least the solidus, so
+                            // every pass makes progress even when the value
+                            // that follows is empty.
+                            *key = self.parse_name()?;
+                            break;
+                        }
+                        self.pos += 2;
+                    }
+                }
+                self.depth -= 1;
+                value = open.pop().map(OpenContainer::into_value);
+            }
+        }
+    }
+
+    /// Read a scalar in full, or consume a container's opening delimiter.
+    fn parse_value_start(&mut self) -> Result<ValueStart> {
         skip_whitespace_and_comments(self.bytes, &mut self.pos);
         let Some(byte) = self.bytes.get(self.pos).copied() else {
             return Err(anyhow!("unexpected end of input"));
         };
-        match byte {
-            b'<' if self.bytes.get(self.pos + 1) == Some(&b'<') => self.parse_dictionary(),
-            b'[' => self.parse_array(),
-            b'/' => self.parse_name().map(PdfValue::Name),
-            b'(' => self
-                .parse_literal_string()
-                .map(|bytes| PdfValue::String(decode_pdf_text(&bytes))),
-            b'<' => self
-                .parse_hex_string()
-                .map(|bytes| PdfValue::HexString(to_upper_hex(&bytes))),
+        let scalar = match byte {
+            b'<' if self.bytes.get(self.pos + 1) == Some(&b'<') => {
+                self.enter_container()?;
+                self.pos += 2;
+                return Ok(ValueStart::Container(OpenContainer::Dictionary {
+                    entries: Vec::new(),
+                    key: String::new(),
+                }));
+            }
+            b'[' => {
+                self.enter_container()?;
+                self.pos += 1;
+                return Ok(ValueStart::Container(OpenContainer::Array {
+                    values: Vec::new(),
+                    element_start: self.pos,
+                }));
+            }
+            b'/' => PdfValue::Name(self.parse_name()?),
+            b'(' => PdfValue::String(decode_pdf_text(&self.parse_literal_string()?)),
+            b'<' => PdfValue::HexString(to_upper_hex(&self.parse_hex_string()?)),
             b't' if self.bytes.get(self.pos..self.pos + 4) == Some(b"true") => {
                 self.pos += 4;
-                Ok(PdfValue::Bool(true))
+                PdfValue::Bool(true)
             }
             b'f' if self.bytes.get(self.pos..self.pos + 5) == Some(b"false") => {
                 self.pos += 5;
-                Ok(PdfValue::Bool(false))
+                PdfValue::Bool(false)
             }
             b'n' if self.bytes.get(self.pos..self.pos + 4) == Some(b"null") => {
                 self.pos += 4;
-                Ok(PdfValue::Null)
+                PdfValue::Null
             }
-            b'+' | b'-' | b'.' | b'0'..=b'9' => self.parse_number_or_reference(),
-            _ => Ok(PdfValue::Raw(self.parse_bareword())),
-        }
-    }
-
-    fn parse_dictionary(&mut self) -> Result<PdfValue> {
-        self.enter_container()?;
-        self.pos += 2;
-        let mut entries = Vec::new();
-        loop {
-            skip_whitespace_and_comments(self.bytes, &mut self.pos);
-            if self.bytes.get(self.pos..self.pos + 2) == Some(b">>") {
-                self.pos += 2;
-                break;
-            }
-            // `parse_name` consumes at least the solidus, so every pass makes
-            // progress even when the value that follows is empty.
-            let key = self.parse_name()?;
-            let value = self.parse_value()?;
-            entries.push(PdfDictionaryEntry { key, value });
-        }
-        self.depth -= 1;
-        Ok(PdfValue::Dictionary(PdfDictionary { entries }))
-    }
-
-    fn parse_array(&mut self) -> Result<PdfValue> {
-        self.enter_container()?;
-        self.pos += 1;
-        let mut values = Vec::new();
-        loop {
-            skip_whitespace_and_comments(self.bytes, &mut self.pos);
-            if self.bytes.get(self.pos) == Some(&b']') {
-                self.pos += 1;
-                break;
-            }
-            let before = self.pos;
-            let value = self.parse_value()?;
-            if self.pos == before {
-                // A stray delimiter (`)`, `>`, `{`, `}`) parses as an empty
-                // bareword without consuming it. Pushing that value and
-                // looping would never advance, so the array is refused.
-                return Err(anyhow!("unexpected delimiter in PDF array"));
-            }
-            values.push(value);
-        }
-        self.depth -= 1;
-        Ok(PdfValue::Array(values))
+            b'+' | b'-' | b'.' | b'0'..=b'9' => self.parse_number_or_reference()?,
+            _ => PdfValue::Raw(self.parse_bareword()),
+        };
+        Ok(ValueStart::Scalar(scalar))
     }
 
     fn parse_name(&mut self) -> Result<String> {
@@ -8690,25 +8861,56 @@ fn is_content_whitespace(byte: u8) -> bool {
 /// Deepest array nesting the content-stream tokenizer follows.
 ///
 /// A content stream only nests arrays one level (`TJ`, dash patterns), so
-/// anything deeper is malformed. Each level is one recursive call; the bound
-/// keeps that recursion inside a 256 KiB worker-thread stack.
+/// anything deeper is malformed. The arrays still open are kept in a list,
+/// not on the call stack, so the bound limits memory and nonsense, not
+/// stack: at one recursive call per level, 128 levels needed more than
+/// 192 KiB of a 256 KiB thread in an unoptimized build.
 const MAX_CONTENT_ARRAY_NESTING: usize = 128;
 
+/// Reads the next token of a content stream.
+///
+/// Returns `None`, the same answer as the end of the stream, when arrays
+/// nest past [`MAX_CONTENT_ARRAY_NESTING`] or an array is never closed, so a
+/// caller stops reading a stream it cannot make sense of.
 fn next_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> {
-    next_content_token_nested(bytes, cursor, 0)
+    skip_whitespace_and_comments(bytes, cursor);
+    if bytes.get(*cursor) != Some(&b'[') {
+        return next_scalar_content_token(bytes, cursor);
+    }
+    // The arrays opened and not yet closed, outermost first.
+    let mut open: Vec<Vec<ContentValue>> = Vec::new();
+    loop {
+        skip_whitespace_and_comments(bytes, cursor);
+        match bytes.get(*cursor) {
+            Some(b'[') => {
+                if open.len() >= MAX_CONTENT_ARRAY_NESTING {
+                    return None;
+                }
+                *cursor += 1;
+                open.push(Vec::new());
+            }
+            Some(b']') => {
+                *cursor += 1;
+                let finished = ContentValue::Array(open.pop()?);
+                match open.last_mut() {
+                    Some(parent) => parent.push(finished),
+                    None => return Some(ContentToken::Value(finished)),
+                }
+            }
+            _ => {
+                let item = match next_scalar_content_token(bytes, cursor)? {
+                    ContentToken::Value(value) => value,
+                    ContentToken::Operator(_) => ContentValue::Other,
+                };
+                open.last_mut()?.push(item);
+            }
+        }
+    }
 }
 
-/// [`next_content_token`] with the number of arrays already open.
-///
-/// Returns `None` — the same answer as the end of the stream — when arrays
-/// nest past [`MAX_CONTENT_ARRAY_NESTING`], so a caller stops reading a stream
-/// it cannot make sense of instead of recursing without bound.
-fn next_content_token_nested(
-    bytes: &[u8],
-    cursor: &mut usize,
-    depth: usize,
-) -> Option<ContentToken> {
-    skip_whitespace_and_comments(bytes, cursor);
+/// Reads one token that is not an array. The cursor must already be past
+/// any whitespace.
+fn next_scalar_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> {
     let byte = *bytes.get(*cursor)?;
     match byte {
         b'(' => {
@@ -8730,25 +8932,6 @@ fn next_content_token_nested(
             let value = parser.parse_hex_string().ok()?;
             *cursor = parser.pos;
             Some(ContentToken::Value(ContentValue::HexString(value)))
-        }
-        b'[' => {
-            if depth >= MAX_CONTENT_ARRAY_NESTING {
-                return None;
-            }
-            *cursor += 1;
-            let mut items = Vec::new();
-            loop {
-                skip_whitespace_and_comments(bytes, cursor);
-                if bytes.get(*cursor) == Some(&b']') {
-                    *cursor += 1;
-                    break;
-                }
-                match next_content_token_nested(bytes, cursor, depth + 1)? {
-                    ContentToken::Value(value) => items.push(value),
-                    ContentToken::Operator(_) => items.push(ContentValue::Other),
-                }
-            }
-            Some(ContentToken::Value(ContentValue::Array(items)))
         }
         b'/' => {
             let mut parser = ValueParser::new(bytes, *cursor);

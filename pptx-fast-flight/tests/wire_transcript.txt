@@ -1,0 +1,82 @@
+ListFlights without a bearer
+    Unauthenticated: missing authorization metadata
+ListFlights
+    2 flights
+    path=minimal.pptx tickets=["minimal.pptx"] total_bytes=3048 total_records=-1 schema_len=320 schema_fnv=dfff7ba7a41c5408
+    path=sub/Upper.PPTX tickets=["sub/Upper.PPTX"] total_bytes=3048 total_records=-1 schema_len=320 schema_fnv=dfff7ba7a41c5408
+GetFlightInfo minimal.pptx without a bearer
+    Unauthenticated: missing authorization metadata
+GetFlightInfo minimal.pptx
+    path=minimal.pptx tickets=["minimal.pptx"] total_bytes=3048 total_records=-1 schema_len=320 schema_fnv=dfff7ba7a41c5408
+GetFlightInfo minimal.pptx?table=paragraphs
+    path=minimal.pptx?table=paragraphs tickets=["minimal.pptx"] total_bytes=3048 total_records=-1 schema_len=384 schema_fnv=acc212ad9d8e4435
+GetFlightInfo minimal.pptx?table=no_such_table
+    InvalidArgument: unknown table
+GetFlightInfo sub/Upper.PPTX
+    path=sub/Upper.PPTX tickets=["sub/Upper.PPTX"] total_bytes=3048 total_records=-1 schema_len=320 schema_fnv=dfff7ba7a41c5408
+GetFlightInfo missing.pptx
+    NotFound: file not found
+GetFlightInfo ../minimal.pptx
+    NotFound: file not found
+DoGet minimal.pptx without a bearer
+    Unauthenticated: missing authorization metadata
+DoGet minimal.pptx
+    messages=2 bytes=760 fnv=9f1d4e0f9cfe412d batches=1 rows=1 columns=["slide_id", "name", "slide_index"]
+DoGet minimal.pptx?table=paragraphs
+    messages=2 bytes=1152 fnv=d3d32b4542cd2863 batches=1 rows=2 columns=["paragraph_id", "shape_id", "para_index", "level", "text"]
+DoGet minimal.pptx?table=paragraphs&batch=1
+    messages=3 bytes=1944 fnv=920edaa49a5652a1 batches=2 rows=2 columns=["paragraph_id", "shape_id", "para_index", "level", "text"]
+DoGet minimal.pptx?table=no_such_table
+    InvalidArgument: unknown table
+DoGet sub/Upper.PPTX
+    messages=2 bytes=760 fnv=9f1d4e0f9cfe412d batches=1 rows=1 columns=["slide_id", "name", "slide_index"]
+DoGet notes.txt
+    Internal: External error: open zip archive
+DoGet missing.pptx
+    NotFound: file not found
+DoGet ../minimal.pptx
+    NotFound: file not found
+DoPut without a bearer
+    Unauthenticated: missing authorization metadata
+DoPut
+    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
+GetFlightInfo <base>/probe-nope.pptx
+    NotFound: file not found
+GetFlightInfo <base>/probe-outside.pptx
+    NotFound: file not found
+GetFlightInfo ../probe-nope.pptx
+    NotFound: file not found
+GetFlightInfo ../probe-outside.pptx
+    NotFound: file not found
+GetFlightInfo probe-dangling.pptx
+    NotFound: file not found
+GetFlightInfo probe-link.pptx
+    NotFound: file not found
+GetFlightInfo ..%2fprobe-outside.pptx
+    NotFound: file not found
+GetFlightInfo probe\u{0}nul.pptx
+    NotFound: file not found
+GetFlightInfo probe-dir
+    NotFound: file not found
+GetFlightInfo 
+    NotFound: file not found
+DoGet <base>/probe-nope.pptx
+    NotFound: file not found
+DoGet <base>/probe-outside.pptx
+    NotFound: file not found
+DoGet ../probe-nope.pptx
+    NotFound: file not found
+DoGet ../probe-outside.pptx
+    NotFound: file not found
+DoGet probe-dangling.pptx
+    NotFound: file not found
+DoGet probe-link.pptx
+    NotFound: file not found
+DoGet ..%2fprobe-outside.pptx
+    NotFound: file not found
+DoGet probe\u{0}nul.pptx
+    NotFound: file not found
+DoGet probe-dir
+    NotFound: file not found
+DoGet 
+    NotFound: file not found
