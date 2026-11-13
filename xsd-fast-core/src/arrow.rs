@@ -335,8 +335,10 @@ impl Derivation<'_> {
             XsdType::Complex(ct) => self.fields_from_complex(ct, depth, &prefix, fields),
             XsdType::Ref(qn) => {
                 if let Some(ct) = model.complex_types.get(&qn.local) {
-                    // Avoid infinite recursion on self-referential types.
-                    if depth < self.max_depth {
+                    // Avoid infinite recursion on self-referential types. A
+                    // type that declares nothing has nowhere to recurse, and
+                    // keeps its marker column at the flattening limit too.
+                    if depth < self.max_depth || declares_nothing(ct) {
                         self.fields_from_complex(ct, depth, &prefix, fields)?;
                     }
                     Ok(())

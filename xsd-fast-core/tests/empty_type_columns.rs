@@ -111,3 +111,21 @@ fn a_parent_keeps_its_shape_beside_an_empty_child() {
     // An inline empty type is a marker as well.
     assert_eq!(column(REPEATED_PARENT, "inline"), (DataType::Utf8, true));
 }
+
+// The column is there at every flattening limit, as it is for an element of
+// a type that is not declared.
+#[test]
+fn the_marker_column_does_not_depend_on_the_flattening_limit() {
+    let schema = SchemaSet::load_bytes(SELF_CLOSING, ParseOptions::default()).expect("loads");
+    for max_depth in 0..4 {
+        let options = ArrowOptions {
+            max_depth,
+            ..ArrowOptions::default()
+        };
+        let arrow = schema
+            .to_arrow_schema("root", options)
+            .expect("schema derives");
+        let names: Vec<_> = arrow.fields().iter().map(|field| field.name()).collect();
+        assert_eq!(names, ["p", "s"], "max_depth {max_depth}");
+    }
+}
