@@ -68,6 +68,15 @@ jobs:
       - run: cargo clippy -p geo-fast-core --all-targets --locked --features http
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --locked --features ${{ env.ARROW_FEATURES }}
+      # Features that gate code but are neither on by default nor turned on
+      # by another crate: built and tested here, or not at all. The
+      # `reading-order` feature of pdf-fast-py and pdf-fast-node stays out,
+      # for the reason given above.
+      - run: cargo test -p geo-fast-core --locked --features http
+      - run: cargo clippy -p json-fast-core --all-targets --locked --features mmap
+      - run: cargo test -p json-fast-core --locked --features mmap
+      - run: cargo clippy -p pdf-fast-core --all-targets --locked --features glyph-catalog
+      - run: cargo test -p pdf-fast-core --locked --features glyph-catalog
 
   rust-platforms:
     # The same tests on the other two operating systems a release ships for.

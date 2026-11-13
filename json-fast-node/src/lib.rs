@@ -14,38 +14,38 @@ fn err(e: impl ToString) -> Error {
 }
 
 /// Crate / binding version string.
-#[napi]
+#[napi(catch_unwind)]
 pub fn version() -> &'static str {
     json_fast_core::VERSION
 }
 
 /// Parse a JSON document into a JS value (SIMD fast path).
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_json(s: String) -> Result<Value> {
     json_fast_core::parse::<Value>(&s).map_err(err)
 }
 
 /// Parse a JSONL document into an array of JS values (blank lines skipped).
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_jsonl(s: String) -> Result<Vec<Value>> {
     jsonl::parse_many::<Value>(&s).map_err(err)
 }
 
 /// Count non-blank lines in a JSONL document (fast streaming pass).
-#[napi]
+#[napi(catch_unwind)]
 pub fn count_lines(s: String) -> Result<u32> {
     Ok(jsonl::count_lines(&s) as u32)
 }
 
 /// Return the six-type classification of a JSON document's root value.
-#[napi]
+#[napi(catch_unwind)]
 pub fn json_type(s: String) -> Result<String> {
     let value: Value = json_fast_core::parse(&s).map_err(err)?;
     Ok(json_fast_core::value_type(&value).as_str().to_string())
 }
 
 /// Validate a JSON document against a JSON Schema; returns an array of findings.
-#[napi]
+#[napi(catch_unwind)]
 pub fn validate(s: String, schema: String) -> Result<Vec<Value>> {
     let doc: Value = json_fast_core::parse(&s).map_err(err)?;
     let sch: Value = json_fast_core::parse(&schema).map_err(err)?;
@@ -62,28 +62,28 @@ pub fn validate(s: String, schema: String) -> Result<Vec<Value>> {
 }
 
 /// Parse and validate a JSON-RPC 2.0 request envelope.
-#[napi]
+#[napi(catch_unwind)]
 pub fn json_rpc_request(s: String) -> Result<Value> {
     let request = json_fast_core::jsonrpc::JsonRpcRequest::parse(&s).map_err(err)?;
     serde_json::to_value(&request).map_err(err)
 }
 
 /// Parse and validate a JSON-RPC 2.0 response envelope.
-#[napi]
+#[napi(catch_unwind)]
 pub fn json_rpc_response(s: String) -> Result<Value> {
     let response = json_fast_core::jsonrpc::JsonRpcResponse::parse(&s).map_err(err)?;
     serde_json::to_value(&response).map_err(err)
 }
 
 /// Parse and validate a JSON:API document envelope.
-#[napi]
+#[napi(catch_unwind)]
 pub fn json_api_document(s: String) -> Result<Value> {
     let document = json_fast_core::jsonapi::JsonApiDocument::parse(&s).map_err(err)?;
     serde_json::to_value(&document).map_err(err)
 }
 
 /// Split a compact JWT into `{header, payload, signature}`.
-#[napi]
+#[napi(catch_unwind)]
 pub fn jwt_parts(s: String) -> Result<Value> {
     let parts = json_fast_core::jwt::split_jwt(&s).map_err(err)?;
     Ok(json!({
@@ -94,7 +94,7 @@ pub fn jwt_parts(s: String) -> Result<Value> {
 }
 
 /// Peek at a JSON-LD document's `@context` / `@graph` / `@type`.
-#[napi]
+#[napi(catch_unwind)]
 pub fn json_ld_meta(s: String) -> Result<Value> {
     let meta = json_fast_core::jsonld::peek(&s).map_err(err)?;
     serde_json::to_value(&meta).map_err(err)

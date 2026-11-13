@@ -63,6 +63,9 @@ pub mod types;
 mod xml_text;
 
 #[cfg(feature = "http")]
+mod http_body;
+
+#[cfg(feature = "http")]
 pub mod wms;
 
 #[cfg(feature = "http")]
