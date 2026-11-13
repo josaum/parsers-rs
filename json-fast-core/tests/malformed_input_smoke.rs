@@ -255,9 +255,9 @@ type NestedSchemaCase = (
 /// Stack of a process's main thread on Linux and macOS (8 MiB).
 const MAIN_THREAD_STACK_BYTES: usize = 8 << 20;
 
-/// Validates the deepest schema and document `validate_str` can be handed (64
-/// levels, the default nesting limit) on a thread with `stack_bytes` of stack.
-fn validate_schemas_nested_to_the_parse_limit(stack_bytes: usize) {
+/// The four nested schema shapes, each with its matching document, at the
+/// deepest nesting the parser accepts (64 levels, the default limit).
+fn schemas_nested_to_the_parse_limit() -> Vec<(String, String)> {
     let depth = json_fast_core::DEFAULT_MAX_NESTING_DEPTH;
     let cases: [NestedSchemaCase; 4] = [
         (b"{\"items\":", b"}", 1, b"[", b"]"),
@@ -265,19 +265,34 @@ fn validate_schemas_nested_to_the_parse_limit(stack_bytes: usize) {
         (b"{\"allOf\":[{\"anyOf\":[", b"]}]}", 4, b"[", b"]"),
         (b"{\"not\":", b"}", 1, b"[", b"]"),
     ];
-    for (open, close, levels, doc_open, doc_close) in cases {
-        let schema_text = smoke::nested(open, b"true", close, depth / levels - 1);
-        let document = smoke::nested(doc_open, b"1", doc_close, depth - 1);
-        std::thread::Builder::new()
-            .stack_size(stack_bytes)
-            .spawn(move || {
-                let schema_text = std::str::from_utf8(&schema_text).expect("ascii");
-                let document = std::str::from_utf8(&document).expect("ascii");
-                schema::validate_str(document, schema_text).expect("both parse within limits");
-            })
-            .expect("spawn validation thread")
-            .join()
-            .expect("validation panicked");
+    cases
+        .into_iter()
+        .map(|(open, close, levels, doc_open, doc_close)| {
+            let schema_text = smoke::nested(open, b"true", close, depth / levels - 1);
+            let document = smoke::nested(doc_open, b"1", doc_close, depth - 1);
+            (
+                String::from_utf8(document).expect("ascii"),
+                String::from_utf8(schema_text).expect("ascii"),
+            )
+        })
+        .collect()
+}
+
+fn on_stack<T: Send + 'static>(stack_bytes: usize, work: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(stack_bytes)
+        .spawn(work)
+        .expect("spawn thread")
+        .join()
+        .expect("thread panicked")
+}
+
+/// Parses and validates each shape on a thread with `stack_bytes` of stack.
+fn validate_schemas_nested_to_the_parse_limit(stack_bytes: usize) {
+    for (document, schema_text) in schemas_nested_to_the_parse_limit() {
+        on_stack(stack_bytes, move || {
+            schema::validate_str(&document, &schema_text).expect("both parse within limits");
+        });
     }
 }
 
@@ -286,15 +301,34 @@ fn schemas_nested_to_the_parse_limit_fit_a_main_thread_stack() {
     validate_schemas_nested_to_the_parse_limit(MAIN_THREAD_STACK_BYTES);
 }
 
-/// Still open. Measured separately at the 64-level limit in an unoptimized
-/// build: parsing 63 nested objects into a `Value` needs between 2 and 4 MiB
-/// (the recursion is in the JSON parser dependency), while validating the
-/// already-parsed values needs 256 KiB for two of the four cases and 512 KiB
-/// for `items` and `not` (4 to 8 KiB per level). `validate_str` parses on
-/// the calling thread, so this cannot pass on 256 KiB until the parse does.
-/// An optimized build fits 128 KiB.
+/// Validation alone, of values that are already parsed, at the 64-level
+/// limit. Measured in an unoptimized build: the `properties` and
+/// `allOf`/`anyOf` shapes fit 256 KiB, `items` and `not` need 512 KiB (4 to
+/// 8 KiB per level). Parsing and dropping the values happens on a large
+/// stack, because that recursion belongs to the parser, not the validator.
 #[test]
-#[ignore = "parsing 63 nested objects needs 2-4 MiB of stack in a debug build; validation alone needs up to 512 KiB"]
+fn validating_parsed_schemas_at_the_parse_limit_fits_512_kib() {
+    for (document, schema_text) in schemas_nested_to_the_parse_limit() {
+        let parsed = on_stack(MAIN_THREAD_STACK_BYTES * 4, move || {
+            let document = json_fast_core::parse_value(&document).expect("document parses");
+            let schema_value = json_fast_core::parse_value(&schema_text).expect("schema parses");
+            (document, schema_value)
+        });
+        let parsed = on_stack(512 * 1024, move || {
+            let findings = schema::validate(&parsed.0, &parsed.1);
+            assert!(findings.iter().all(|f| !f.message.contains("stopped")));
+            parsed
+        });
+        on_stack(MAIN_THREAD_STACK_BYTES * 4, move || drop(parsed));
+    }
+}
+
+/// Parse plus validation on the harness's 256 KiB stack. Still open, and the
+/// obstacle is the parse: measured in an unoptimized build, parsing 63 nested
+/// objects into a `Value` needs between 2 and 4 MiB (the recursion is in the
+/// JSON parser dependency). An optimized build fits 128 KiB.
+#[test]
+#[ignore = "parsing 63 nested objects needs 2-4 MiB of stack in a debug build (parser dependency); validation alone is covered by the 512 KiB test"]
 fn schemas_nested_to_the_parse_limit_fit_a_small_stack() {
     validate_schemas_nested_to_the_parse_limit(smoke::SMALL_STACK_BYTES);
 }
