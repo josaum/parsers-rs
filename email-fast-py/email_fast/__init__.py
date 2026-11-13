@@ -7,6 +7,7 @@ Supports .eml and .msg formats with attachment extraction and Arrow IPC output.
 import json
 
 from ._core import (
+    parse_mbox_bytes_json_py,
     parse_email_bytes_json_py,
     parse_email_json_py,
     parse_eml_json_py,
@@ -260,11 +261,39 @@ def parse_email_bytes(
             include_raw_headers=include_raw_headers,
             html_to_text=html_to_text,
             extract_attachment_content=extract_attachment_content,
+            max_total_attachment_bytes=max_total_attachment_bytes,
+        )
+    )
+
+
+def parse_mbox_bytes(
+    source,
+    *,
+    max_attachment_size=None,
+    include_raw_headers=False,
+    html_to_text=False,
+    extract_attachment_content=False,
+    max_total_attachment_bytes=None,
+):
+    """Parse an mbox mailbox held in memory; return a list of message dicts.
+
+    The byte form of the mbox entry points: an uploaded mailbox does not have
+    to be written to disk first. A message that does not parse is skipped.
+    """
+    return json.loads(
+        parse_mbox_bytes_json_py(
+            source,
+            max_attachment_size=max_attachment_size,
+            include_raw_headers=include_raw_headers,
+            html_to_text=html_to_text,
+            extract_attachment_content=extract_attachment_content,
+            max_total_attachment_bytes=max_total_attachment_bytes,
         )
     )
 
 __all__ = [
     "parse_email_bytes",
+    "parse_mbox_bytes",
     "parse_email",
     "parse_eml",
     "parse_email_json",

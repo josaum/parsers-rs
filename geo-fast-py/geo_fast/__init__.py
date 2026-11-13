@@ -7,9 +7,13 @@ geodesic bbox area/IoU, antimeridian split, and STRtree queries.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 from geo_fast._core import (
+    compute_ndvi_py,
+    geotiff_bands_py,
+    geotiff_metadata_json,
+    spectral_angle_py,
     bbox_area_km2_py,
     bbox_iou_geodesic_py,
     parse_geojson_to_records_json,
@@ -55,6 +59,39 @@ def strtree_query(
     return json.loads(strtree_query_json(json.dumps(boxes), query_bbox))
 
 
+def geotiff_metadata(path: str) -> dict[str, Any]:
+    """Read a GeoTIFF's georeferencing.
+
+    Keys: `width`, `height`, `band_count`, `bbox` (degrees; `None` for a
+    projected raster), `pixel_scale`, `tiepoints`, `transformation_matrix`,
+    `epsg_code`, `is_geographic`, `pixel_is_point`, `upper_left`,
+    `lower_right`, `geokeys` and `geokey_params` (`doubles` and `strings`,
+    keyed by GeoKey ID as text). Raises `RuntimeError` for a file that is
+    missing or is not a readable TIFF.
+    """
+    return json.loads(geotiff_metadata_json(path))
+
+
+def geotiff_bands(path: str, max_band_bytes: Optional[int] = None) -> list[list[float]]:
+    """Read every band of a GeoTIFF, one list of samples per band.
+
+    `max_band_bytes` is the most band data to return, in bytes (four per
+    sample, all bands together); without it the default limit applies.
+    Raises `RuntimeError` when the bands would exceed the limit.
+    """
+    return geotiff_bands_py(path, max_band_bytes=max_band_bytes)
+
+
+def compute_ndvi(nir_band: list[float], red_band: list[float]) -> list[float]:
+    """NDVI per sample; raises `RuntimeError` when the bands differ in length."""
+    return compute_ndvi_py(nir_band, red_band)
+
+
+def spectral_angle(pixel_spectrum: list[float], reference: list[float]) -> float:
+    """Spectral angle in radians; raises `RuntimeError` on a length mismatch."""
+    return float(spectral_angle_py(pixel_spectrum, reference))
+
+
 __all__ = [
     "__version__",
     "parse_geojson_records",
@@ -63,4 +100,8 @@ __all__ = [
     "bbox_area_km2",
     "split_bbox_antimeridian",
     "strtree_query",
+    "geotiff_metadata",
+    "geotiff_bands",
+    "compute_ndvi",
+    "spectral_angle",
 ]
