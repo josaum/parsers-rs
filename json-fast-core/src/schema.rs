@@ -397,14 +397,19 @@ struct SchemaShape {
     longest_chain: usize,
     /// `$ref`s that lead back into a schema still being applied.
     back_references: usize,
+    /// Edges walked: linear in the schema and the supplied documents.
+    edges: usize,
 }
 
 /// Finds the `$ref` cycles of a schema and its longest chain of subschemas.
 ///
 /// One depth-first walk over the schema's objects and arrays, with every
 /// place a `$ref` or `$dynamicRef` can lead as an extra edge (for a dynamic
-/// one: its own target and every same-named `$dynamicAnchor`), using
-/// Tarjan's strongly-connected-components algorithm on an explicit stack.
+/// one: its own target, and from there the ring of same-named
+/// `$dynamicAnchor`s, so every one is reachable without an edge per pair),
+/// using Tarjan's strongly-connected-components algorithm on an explicit
+/// stack. The ring may report anchors as cyclic that are not, which only
+/// costs remembering their results.
 /// Supplied documents are walked as far as references reach into them.
 fn schema_shape<'a>(root: &'a Value, registry: &Registry<'a>) -> SchemaShape {
     fn children<'a>(node: &'a Value, registry: &Registry<'a>) -> Vec<&'a Value> {
@@ -414,16 +419,19 @@ fn schema_shape<'a>(root: &'a Value, registry: &Registry<'a>) -> SchemaShape {
             Value::Object(map) => {
                 let mut out: Vec<&Value> = map.values().filter(nested).collect();
                 for dynamic in [false, true] {
-                    let Some(Some(target)) = registry.references.get(&(address(node), dynamic))
-                    else {
-                        continue;
-                    };
-                    out.extend(Some(target.node).filter(nested));
-                    if let Some(name) = target.dynamic {
-                        let anchors = registry.dynamic_targets.get(name);
-                        out.extend(anchors.into_iter().flatten().copied().filter(nested));
+                    if let Some(Some(target)) = registry.references.get(&(address(node), dynamic)) {
+                        out.extend(Some(target.node).filter(nested));
                     }
                 }
+                // A dynamic target is itself a same-named anchor; the ring
+                // reaches every other one from it in linearly many edges.
+                out.extend(
+                    registry
+                        .dynamic_ring
+                        .get(&address(node))
+                        .copied()
+                        .filter(nested),
+                );
                 out
             }
             _ => Vec::new(),
@@ -439,6 +447,7 @@ fn schema_shape<'a>(root: &'a Value, registry: &Registry<'a>) -> SchemaShape {
         cyclic: HashSet::new(),
         longest_chain: 1,
         back_references: 0,
+        edges: 0,
     };
     let mut indexes: HashMap<usize, usize> = HashMap::new();
     let mut low: Vec<usize> = Vec::new();
@@ -473,6 +482,7 @@ fn schema_shape<'a>(root: &'a Value, registry: &Registry<'a>) -> SchemaShape {
     while let Some(frame) = frames.last_mut() {
         if let Some(child) = frame.children.get(frame.next).copied() {
             frame.next += 1;
+            shape.edges += 1;
             let own = usize::from(frame.node.is_object());
             match indexes.get(&address(child)).copied() {
                 Some(seen) if open[seen] => {
@@ -977,8 +987,7 @@ pub fn validate(document: &Value, schema: &Value) -> Vec<Finding> {
     run(document, schema, None).findings
 }
 
-/// Validate a JSON document against a schema that refers to other schema
-/// documents, which the caller supplies.
+/// Validate a document against a schema plus caller-supplied schema documents.
 ///
 /// Each entry of `resources` is `(retrieval URI, schema document)`. A
 /// `$ref` to that URI, or to the document's own `$id`, resolves inside it,
@@ -2370,6 +2379,9 @@ struct Registry<'s> {
     /// Every subschema declaring a `$dynamicAnchor`, by name: the places a
     /// `$dynamicRef` to that name can lead.
     dynamic_targets: HashMap<&'s str, Vec<&'s Value>>,
+    /// For each name a dynamic `$dynamicRef` uses: anchor address -> the
+    /// next anchor of that name, closing a ring through all of them.
+    dynamic_ring: HashMap<usize, &'s Value>,
     /// Whether any `$dynamicRef` consults the dynamic scope.
     dynamic: bool,
 }
@@ -2387,12 +2399,32 @@ impl<'s> Registry<'s> {
         for (uri, document) in documents {
             registry.register(document, uri, &mut sites);
         }
+        let mut live: HashSet<&'s str> = HashSet::new();
         for site in sites {
             let target = registry.resolve(site.reference, site.resource, site.dynamic);
-            registry.dynamic |= target.is_some_and(|target| target.dynamic.is_some());
+            live.extend(target.and_then(|target| target.dynamic));
             registry
                 .references
                 .insert((site.address, site.dynamic), target);
+        }
+        registry.dynamic = !live.is_empty();
+        for name in live {
+            let Some(anchors) = registry.dynamic_targets.get(name) else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            let distinct: Vec<&'s Value> = anchors
+                .iter()
+                .copied()
+                .filter(|anchor| seen.insert(address(anchor)))
+                .collect();
+            if distinct.len() < 2 {
+                continue;
+            }
+            let next = distinct.iter().cycle().skip(1);
+            for (anchor, following) in distinct.iter().zip(next) {
+                registry.dynamic_ring.insert(address(anchor), following);
+            }
         }
         registry
     }
@@ -4060,6 +4092,31 @@ mod tests {
         assert!(passes(r#"["a", ["b"]]"#, &schema));
         assert!(fails(r#"[1, ["b"]]"#, &schema));
         assert!(fails("[true]", &schema));
+    }
+
+    #[test]
+    fn the_shape_of_dynamic_references_is_linear() {
+        // 200 `$dynamicRef`s, each able to reach any of 201 anchors.
+        let mut defs = Map::new();
+        for i in 0..200 {
+            defs.insert(
+                format!("r{i}"),
+                json!({"$id": format!("r{i}"), "$dynamicAnchor": "x"}),
+            );
+        }
+        let sites: Vec<Value> = (0..200).map(|_| json!({"$dynamicRef": "#x"})).collect();
+        let schema = json!({"$id": "https://example.com/root", "$dynamicAnchor": "x",
+            "allOf": sites, "$defs": defs});
+        let registry = Registry::build(&schema, &[]);
+        let shape = schema_shape(&schema, &registry);
+        let (values, _) = measure(&schema);
+        assert!(
+            shape.edges < 2 * values as usize,
+            "{} edges for {values} values",
+            shape.edges
+        );
+        // Every anchor is still reachable from a `$dynamicRef`.
+        assert!(shape.cyclic.len() > 200);
     }
 
     #[test]
