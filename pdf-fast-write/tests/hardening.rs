@@ -683,3 +683,25 @@ fn page_content_only_leaves_out_annotations_actions_and_metadata() {
     }
     assert_eq!(output, extract(&kept, &[1]).expect("extracts"));
 }
+
+/// WHY: an entry whose value never closes cannot be cut out, and a lenient
+/// reader still runs it. Asked for the page content alone, the extraction
+/// must refuse such a page instead of handing the entry on.
+#[test]
+fn page_content_only_refuses_an_entry_it_cannot_remove() {
+    let pdf = build(&[revision(
+        vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_vec()),
+            (3, page(2, 4, "/AA << /O << /S /JavaScript /JS (KEPTJS)")),
+            (4, text_stream("Kept")),
+        ],
+        1,
+    )]);
+    let options = pdf_fast_write::ExtractOptions::new().page_content_only(true);
+    let result = PdfWriter::extract_pages_from_bytes_with(&pdf, &[1], &options);
+    let error = result
+        .map(|output| String::from_utf8_lossy(&output).contains("KEPTJS"))
+        .expect_err("the entry was not removed");
+    assert!(format!("{error:#}").contains("/AA"), "{error:#}");
+}

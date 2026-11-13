@@ -177,6 +177,9 @@ impl ExtractOptions {
     /// `/Thumb`. Content streams and `/Resources` are copied unchanged, so
     /// metadata attached to an image or a form inside the resources stays.
     ///
+    /// A page with one of these entries so malformed that it cannot be cut
+    /// out is refused.
+    ///
     /// A page whose annotations point at an unselected page is refused by
     /// default; with this option it is extracted, since the annotations are
     /// not copied.
@@ -292,7 +295,7 @@ impl Pdf {
                     slot.insert(if options.page_content_only {
                         // Left out before anything is followed, so what only
                         // these entries refer to is never collected.
-                        without_page_extras(&body)
+                        without_page_extras(&body)?
                     } else {
                         body
                     })
@@ -1528,7 +1531,10 @@ fn top_level_value_range(dict: &[u8], key: &[u8]) -> Option<std::ops::Range<usiz
 const PAGE_EXTRA_KEYS: &[&[u8]] = &[b"/Annots", b"/AA", b"/Metadata", b"/PieceInfo", b"/Thumb"];
 
 /// Returns the page dictionary without the entries in [`PAGE_EXTRA_KEYS`].
-fn without_page_extras(page: &[u8]) -> Vec<u8> {
+///
+/// Fails when one of them is still named afterwards: an entry whose value
+/// never closes cannot be cut out, and a lenient reader would still use it.
+fn without_page_extras(page: &[u8]) -> Result<Vec<u8>> {
     let mut page = page.to_vec();
     for &key in PAGE_EXTRA_KEYS {
         // A key can be given more than once; readers differ on which one
@@ -1546,7 +1552,15 @@ fn without_page_extras(page: &[u8]) -> Vec<u8> {
             page.splice(key_start..end, *b" ");
         }
     }
-    page
+    for token in syntax_tokens(&page) {
+        if let Some(key) = PAGE_EXTRA_KEYS.iter().find(|key| name_is(token.bytes, key)) {
+            return Err(anyhow!(
+                "the page's {} entry is malformed and cannot be left out",
+                String::from_utf8_lossy(key)
+            ));
+        }
+    }
+    Ok(page)
 }
 
 /// Returns where a top-level `key` starts and the range of its value.
