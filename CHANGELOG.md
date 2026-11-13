@@ -100,6 +100,17 @@ request.
   what validation reads. Validation of 12 instance documents found beside 7
   of the schemas gives the same findings before and after.
 
+### Fixed
+
+- **email:** a message nested 100,000 multipart levels deep took 8 s to
+  refuse in an optimized build, because the scan that bounds header
+  decoding compared every body line that begins with `--` with every
+  boundary declared before it. The same work let a message one level deep
+  that declares many boundaries take seconds to accept. The scan now does
+  one comparison per such line; that message is refused in about 0.4 s,
+  mostly the nesting walk. What is refused and what is accepted, and with
+  what result, is unchanged.
+
 ## v2026.11.13.2
 
 v2026.11.13.1 was tagged but never released: its Linux x86_64 wheels did

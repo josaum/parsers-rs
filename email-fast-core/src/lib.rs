@@ -53,9 +53,10 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use memmap2::Mmap;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "arrow")]
@@ -1068,15 +1069,27 @@ const MAX_BOUNDARY_LEN: usize = 200;
 /// before `mailparse` sees the message, because it decodes the `Content-*`
 /// headers of every part on its own.
 ///
+/// The scan itself takes time close to linear in the size of `raw`, however
+/// many boundaries the message declares ([`Delimiters`]).
+///
 /// # Errors
 ///
 /// Returns an error once the cost passes `limit`, or if a multipart
 /// `Content-Type` declares a boundary longer than [`MAX_BOUNDARY_LEN`].
 fn header_decode_cost(raw: &[u8], limit: u64) -> Result<u64> {
+    scan_headers(raw, limit).map(|scan| scan.cost)
+}
+
+/// Runs the scan of [`header_decode_cost`] and returns its final state.
+///
+/// # Errors
+///
+/// As [`header_decode_cost`].
+fn scan_headers(raw: &[u8], limit: u64) -> Result<HeaderScan> {
     let mut scan = HeaderScan {
         cost: 0,
         limit,
-        delimiters: Vec::new(),
+        delimiters: Delimiters::default(),
         block_has_content_type: false,
     };
     let mut in_headers = true;
@@ -1104,11 +1117,7 @@ fn header_decode_cost(raw: &[u8], limit: u64) -> Result<u64> {
                 }
             }
         } else {
-            in_headers = line.starts_with(b"--")
-                && scan
-                    .delimiters
-                    .iter()
-                    .any(|delimiter| line.starts_with(delimiter));
+            in_headers = line.starts_with(b"--") && scan.delimiters.begin(line);
             scan.block_has_content_type = false;
         }
         pos = line_end + 1;
@@ -1116,7 +1125,66 @@ fn header_decode_cost(raw: &[u8], limit: u64) -> Result<u64> {
     if let Some(start) = header_start {
         scan.header(&raw[start..])?;
     }
-    Ok(scan.cost)
+    Ok(scan)
+}
+
+/// The delimiters a message has declared, each `--` and a boundary.
+///
+/// A body line is a delimiter line when some declared delimiter is a prefix
+/// of it. Comparing the line with every delimiter in turn costs the number
+/// of delimiters for each line that begins with `--`: a message nested
+/// 100,000 levels deep declares 100,000 boundaries and has as many such
+/// lines, and took 8 s to scan in an optimized build.
+///
+/// The set is kept free of prefixes instead. A delimiter that begins with
+/// another one matches only lines the shorter one matches already, so it is
+/// not kept (or is dropped when the shorter one arrives later). In a set
+/// where no member begins another, the only member that can be a prefix of
+/// a line is the greatest member not above the line: any member between
+/// that prefix and the line would begin with the prefix. So a line costs
+/// one ordered lookup and one comparison, and a message costs time close to
+/// linear in its size, as many boundaries as it declares.
+#[derive(Default)]
+struct Delimiters {
+    /// The declared delimiters, none of which begins another. Boxed, so
+    /// each costs no more than its bytes and a pointer and length.
+    kept: BTreeSet<Box<[u8]>>,
+    /// Delimiters compared with a line so far; the work tests bound.
+    compared: u64,
+}
+
+impl Delimiters {
+    /// Records one more declared delimiter.
+    fn declare(&mut self, delimiter: Vec<u8>) {
+        if self.covers(&delimiter) {
+            return;
+        }
+        // The members that begin with the new delimiter sort right after it.
+        while let Some(longer) = self
+            .kept
+            .range::<[u8], _>((Bound::Included(delimiter.as_slice()), Bound::Unbounded))
+            .next()
+            .filter(|member| member.starts_with(&delimiter))
+            .cloned()
+        {
+            self.kept.remove(&longer);
+        }
+        self.kept.insert(delimiter.into_boxed_slice());
+    }
+
+    /// Reports whether some declared delimiter is a prefix of `line`.
+    fn begin(&mut self, line: &[u8]) -> bool {
+        self.compared += 1;
+        self.covers(line)
+    }
+
+    /// Reports whether a kept delimiter is a prefix of `bytes`.
+    fn covers(&self, bytes: &[u8]) -> bool {
+        self.kept
+            .range::<[u8], _>((Bound::Unbounded, Bound::Included(bytes)))
+            .next_back()
+            .is_some_and(|member| bytes.starts_with(member))
+    }
 }
 
 /// The running state of [`header_decode_cost`].
@@ -1126,7 +1194,7 @@ struct HeaderScan {
     /// The cost at which the scan gives up.
     limit: u64,
     /// `--` and each boundary a `Content-Type` header has declared so far.
-    delimiters: Vec<Vec<u8>>,
+    delimiters: Delimiters,
     /// Whether the header block being read already had a `Content-Type`.
     /// `mailparse` uses the first one of a block, so only that one can
     /// declare a boundary.
@@ -1190,7 +1258,8 @@ impl HeaderScan {
                     "multipart boundary longer than {MAX_BOUNDARY_LEN} bytes"
                 ));
             }
-            self.delimiters.push(format!("--{boundary}").into_bytes());
+            self.delimiters
+                .declare(format!("--{boundary}").into_bytes());
         }
         Ok(())
     }
@@ -3161,17 +3230,154 @@ mod malformed_input_unit_tests {
 
     /// A message whose one leaf is nested `depth` multipart levels deep.
     fn nested(depth: usize) -> Vec<u8> {
+        nested_with_digits(depth, 4)
+    }
+
+    /// As [`nested`], with each level's boundary numbered in `digits` digits.
+    ///
+    /// Past `10^digits` levels one boundary begins another (`b1000` begins
+    /// `b10000`), so a delimiter line matches an earlier boundary; with
+    /// enough digits none does.
+    fn nested_with_digits(depth: usize, digits: usize) -> Vec<u8> {
         let mut out = b"Subject: deep\r\n".to_vec();
         for level in 0..depth {
             out.extend_from_slice(
                 format!(
-                    "Content-Type: multipart/mixed; boundary=b{level:04}\r\n\r\n--b{level:04}\r\n"
+                    "Content-Type: multipart/mixed; boundary=b{level:0digits$}\r\n\r\n\
+                     --b{level:0digits$}\r\n"
                 )
                 .as_bytes(),
             );
         }
         out.extend_from_slice(b"Content-Type: text/plain\r\n\r\nleaf\r\n");
         out
+    }
+
+    /// A message one level deep whose `parts` parts each declare a boundary
+    /// of their own on a text type, then hold a `--` line that is no
+    /// delimiter.
+    fn shallow_with_boundaries(parts: usize) -> Vec<u8> {
+        let mut out = b"Subject: s\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n".to_vec();
+        for part in 0..parts {
+            out.extend_from_slice(
+                format!("--x\r\nContent-Type: text/plain; boundary=y{part:06}\r\n\r\n--z\r\n")
+                    .as_bytes(),
+            );
+        }
+        out.extend_from_slice(b"--x--\r\n");
+        out
+    }
+
+    /// The set of declared delimiters answers as comparing a line with every
+    /// declared delimiter did, whatever the order they are declared in.
+    #[test]
+    fn delimiters_match_a_line_exactly_when_a_declared_one_begins_it() {
+        let mut rng = smoke::Rng::new(0x0DE1_1A17);
+        // Few distinct bytes, so delimiters often begin one another or repeat.
+        let alphabet = b"-ab\xff\r ";
+        let random_bytes = |rng: &mut smoke::Rng, most: usize| -> Vec<u8> {
+            (0..rng.below(most + 1))
+                .map(|_| alphabet[rng.below(alphabet.len())])
+                .collect()
+        };
+        for _ in 0..300 {
+            let mut set = Delimiters::default();
+            let mut declared: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..1 + rng.below(12) {
+                // An empty boundary declares `--` alone; some are far longer
+                // than a multipart boundary may be, as a text type allows.
+                let mut delimiter = b"--".to_vec();
+                if rng.below(8) == 0 {
+                    delimiter.extend(std::iter::repeat_n(b'a', 300));
+                }
+                delimiter.extend(random_bytes(&mut rng, 4));
+                set.declare(delimiter.clone());
+                declared.push(delimiter);
+                let mut lines: Vec<Vec<u8>> = (0..20)
+                    .map(|_| {
+                        let mut line = b"--".to_vec();
+                        line.extend(random_bytes(&mut rng, 6));
+                        line
+                    })
+                    .collect();
+                for known in &declared {
+                    let mut longer = known.clone();
+                    longer.extend(random_bytes(&mut rng, 3));
+                    lines.push(longer);
+                    lines.push(known[..known.len() - rng.below(known.len() + 1)].to_vec());
+                }
+                for line in lines {
+                    let expected = declared.iter().any(|known| line.starts_with(known));
+                    assert_eq!(
+                        set.begin(&line),
+                        expected,
+                        "line {:?} with {:?}",
+                        String::from_utf8_lossy(&line),
+                        declared
+                            .iter()
+                            .map(|known| String::from_utf8_lossy(known))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The header scan compares a body line with one declared delimiter,
+    /// however many the message declares. Compared with each in turn, a
+    /// message nested 100,000 levels deep took 8 s to refuse.
+    #[test]
+    fn the_header_scan_compares_one_delimiter_per_dash_line() {
+        const LEVELS: usize = 2_000;
+        for message in [
+            nested_with_digits(LEVELS, 6),
+            shallow_with_boundaries(LEVELS),
+        ] {
+            let dash_lines = message
+                .split(|byte| *byte == b'\n')
+                .filter(|line| line.starts_with(b"--"))
+                .count() as u64;
+            let scan = scan_headers(&message, MAX_HEADER_DECODE_COST).expect("no encoded-words");
+            assert!(dash_lines >= LEVELS as u64, "{dash_lines}");
+            assert!(
+                scan.delimiters.compared <= dash_lines,
+                "{} delimiters compared for {dash_lines} lines that begin with `--`",
+                scan.delimiters.compared
+            );
+        }
+        let error = parse_eml_bytes(&nested_with_digits(LEVELS, 6), ParseOptions::default())
+            .expect_err("nested past the limit");
+        assert!(error.to_string().contains("nesting"), "{error}");
+        parse_eml_bytes(&shallow_with_boundaries(LEVELS), ParseOptions::default())
+            .expect("one level deep");
+    }
+
+    /// A message nested 100,000 levels deep is refused in well under a
+    /// second. It took 8 s while the header scan compared every line that
+    /// begins with `--` with every boundary declared before it. What is left
+    /// is mostly the depth walk, which searches the rest of the message once
+    /// per level up to the limit: about 0.4 s in all on an Apple M4 Max.
+    #[test]
+    #[ignore = "times an optimized build; run with --release -- --ignored"]
+    fn a_nesting_bomb_is_refused_in_well_under_a_second() {
+        let message = nested_with_digits(100_000, 6);
+        let started = std::time::Instant::now();
+        let scan = header_decode_cost(&message, MAX_HEADER_DECODE_COST);
+        let scanned = started.elapsed();
+        let walked_from = std::time::Instant::now();
+        let exceeds = mime_nesting_exceeds(&message, MAX_MIME_DEPTH);
+        let walked = walked_from.elapsed();
+        let refused_from = std::time::Instant::now();
+        let error =
+            parse_eml_bytes(&message, ParseOptions::default()).expect_err("nested past the limit");
+        let refused = refused_from.elapsed();
+        eprintln!("header scan {scanned:?}, depth walk {walked:?}, whole refusal {refused:?}");
+        assert!(scan.is_ok() && exceeds, "{scan:?} {exceeds}");
+        assert!(error.to_string().contains("nesting"), "{error}");
+        assert!(
+            refused < std::time::Duration::from_millis(600),
+            "refusal took {refused:?}"
+        );
     }
 
     /// `mailparse` refuses a part nested more than 100 levels deep. Given
