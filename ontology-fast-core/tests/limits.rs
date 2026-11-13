@@ -137,3 +137,27 @@ fn max_statements_does_not_apply_to_the_prefix_table() {
         "the prefix table retains no statement"
     );
 }
+
+#[test]
+fn rendering_does_not_test_every_prefix_against_every_term() {
+    // Forty thousand prefixes and one hundred and twenty thousand distinct
+    // terms: testing each term against each prefix is billions of string
+    // comparisons, where a sorted lookup is a few million.
+    let count = 40_000;
+    let mut text = String::new();
+    for n in 0..count {
+        text.push_str(&format!("@prefix p{n}: <urn:n:{n}/> .\n"));
+    }
+    for n in 0..count {
+        text.push_str(&format!("p{n}:s <urn:n:{n}/p> <urn:q:{n}> .\n"));
+    }
+    let started = std::time::Instant::now();
+    let ontology = parse_turtle(text.as_bytes(), OntologyLimits::default()).expect("parses");
+    let elapsed = started.elapsed();
+    assert_eq!(ontology.triples().len(), count);
+    assert_eq!(ontology.triples()[7].to_line(), "p7:s\tp7:p\t<urn:q:7>");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "rendering took {elapsed:?}"
+    );
+}

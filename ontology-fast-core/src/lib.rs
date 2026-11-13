@@ -34,7 +34,7 @@
 //! Nothing here reads a source system, signs data, or promotes a fact: parsing
 //! preserves structure and provenance, and the output is unsigned.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
 use oxttl::TurtleParser;
@@ -325,34 +325,34 @@ pub fn parse_turtle(
     limits: OntologyLimits,
 ) -> Result<ParsedOntology, OntologyError> {
     // Rendering needs the document's final prefix table, which exists only
-    // once the parser has reached the end, so full-IRI rows are staged first.
-    // The stage is deduplicated and held to the statement budget, which keeps
-    // retained memory bounded by the same ceiling as the result.
-    let mut staged: Vec<StagedTriple> = Vec::new();
-    let mut staged_seen: BTreeSet<StagedTriple> = BTreeSet::new();
+    // once the parser has reached the end, so rows are staged first. A staged
+    // row is three term numbers: each distinct term is held once, however many
+    // statements repeat it. The stage is deduplicated and held to the
+    // statement budget, which keeps retained memory bounded by the same
+    // ceiling as the result.
+    let mut terms = StagedTerms::default();
+    let mut staged: Vec<[u32; 3]> = Vec::new();
+    let mut staged_seen: HashSet<[u32; 3]> = HashSet::new();
     let prefixes = read_default_graph(source, limits, |quad, blank_labels| {
         // Subject before object: blank nodes are numbered by first appearance,
         // and both views must meet them in the same order.
         let subject = match &quad.subject {
-            NamedOrBlankNode::NamedNode(node) => StagedTerm::Iri(node.as_str().to_owned()),
+            NamedOrBlankNode::NamedNode(node) => terms.number(TermKind::Iri, node.as_str())?,
             NamedOrBlankNode::BlankNode(node) => {
-                StagedTerm::Verbatim(blank_labels.label(node.as_str()).to_owned())
+                terms.number(TermKind::Verbatim, blank_labels.label(node.as_str()))?
             }
         };
         let object = match &quad.object {
-            Term::NamedNode(node) => StagedTerm::Iri(node.as_str().to_owned()),
-            Term::Literal(literal) => StagedTerm::Verbatim(literal.value().to_owned()),
+            Term::NamedNode(node) => terms.number(TermKind::Iri, node.as_str())?,
+            Term::Literal(literal) => terms.number(TermKind::Verbatim, literal.value())?,
             Term::BlankNode(node) => {
-                StagedTerm::Verbatim(blank_labels.label(node.as_str()).to_owned())
+                terms.number(TermKind::Verbatim, blank_labels.label(node.as_str()))?
             }
             Term::Triple(_) => return Err(OntologyError::TripleTerm { position: "object" }),
         };
-        let candidate = StagedTriple {
-            subject,
-            predicate: quad.predicate.as_str().to_owned(),
-            object,
-        };
-        if staged_seen.insert(candidate.clone()) {
+        let predicate = terms.number(TermKind::Predicate, quad.predicate.as_str())?;
+        let candidate = [subject, predicate, object];
+        if staged_seen.insert(candidate) {
             enforce_statement_budget(staged_seen.len(), limits)?;
             staged.push(candidate);
         }
@@ -360,28 +360,50 @@ pub fn parse_turtle(
     })?;
     drop(staged_seen);
 
-    // Two staged rows can render to one text row (a literal whose lexical form
-    // equals an abbreviated IRI), so the text set is deduplicated on its own.
-    let mut triples: Vec<TripleText> = Vec::with_capacity(staged.len());
-    let mut seen: BTreeSet<TripleText> = BTreeSet::new();
-    for row in staged {
-        let candidate = TripleText {
-            subject: row.subject.render(&prefixes),
-            predicate: predicate_text(&row.predicate, &prefixes),
-            object: row.object.render(&prefixes),
-        };
-        if seen.insert(candidate.clone()) {
-            triples.push(candidate);
-        }
+    // Each distinct term is rendered once. Two staged terms can render to one
+    // text (a literal whose lexical form equals an abbreviated IRI), so every
+    // term is mapped to the first term with its text, and the rows are
+    // deduplicated again only when such a pair exists.
+    let abbreviator = Abbreviator::new(&prefixes);
+    let rendered = terms.render(&abbreviator);
+    let mut first_with_text: HashMap<&str, u32> = HashMap::with_capacity(rendered.len());
+    let mut folded = false;
+    let canonical: Vec<u32> = (0_u32..)
+        .zip(&rendered)
+        .map(|(number, text)| {
+            let first = *first_with_text.entry(text.as_str()).or_insert(number);
+            folded |= first != number;
+            first
+        })
+        .collect();
+    drop(first_with_text);
+    let mut rows = staged;
+    if folded {
+        let mut seen: HashSet<[u32; 3]> = HashSet::with_capacity(rows.len());
+        rows.retain_mut(|row| {
+            *row = row.map(|number| canonical[number as usize]);
+            seen.insert(*row)
+        });
     }
+    drop(canonical);
 
-    let mut index = OntologyIndex::default();
-    for (ordinal, triple) in triples.iter().enumerate() {
-        let ordinal = u32::try_from(ordinal).map_err(|_| OntologyError::ResourceLimit {
+    if u32::try_from(rows.len()).is_err() {
+        return Err(OntologyError::ResourceLimit {
             resource: "index_ordinals",
             limit: u32::MAX as usize,
-            observed: triples.len(),
-        })?;
+            observed: rows.len(),
+        });
+    }
+    let triples: Vec<TripleText> = rows
+        .iter()
+        .map(|[subject, predicate, object]| TripleText {
+            subject: rendered[*subject as usize].clone(),
+            predicate: rendered[*predicate as usize].clone(),
+            object: rendered[*object as usize].clone(),
+        })
+        .collect();
+    let mut index = OntologyIndex::default();
+    for (ordinal, triple) in (0_u32..).zip(&triples) {
         index.insert(ordinal, triple);
     }
 
@@ -541,30 +563,62 @@ fn enforce_statement_budget(observed: usize, limits: OntologyLimits) -> Result<(
     Ok(())
 }
 
-/// A term held until the document's prefix table is complete.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum StagedTerm {
-    /// A full IRI, abbreviated at render time.
-    Iri(String),
+/// How a staged term renders once the prefix table is complete.
+///
+/// Two terms are one term only when both the kind and the text agree: the IRI
+/// `urn:x` and the literal `"urn:x"` are different terms.
+#[derive(Clone, Copy, Debug)]
+enum TermKind {
+    /// A full IRI in subject or object position, abbreviated at render time.
+    Iri = 0,
     /// Text that renders as it stands: a literal's lexical form or a blank label.
-    Verbatim(String),
+    Verbatim = 1,
+    /// A full IRI in predicate position: `rdf:type` renders as `a`.
+    Predicate = 2,
 }
 
-impl StagedTerm {
-    fn render(self, prefixes: &BTreeMap<String, String>) -> String {
-        match self {
-            Self::Iri(iri) => abbreviate(&iri, prefixes),
-            Self::Verbatim(text) => text,
+/// The distinct terms of one document, numbered by first appearance.
+#[derive(Debug, Default)]
+struct StagedTerms {
+    /// One table per [`TermKind`]; the numbers are unique across all three.
+    by_kind: [HashMap<String, u32>; 3],
+    count: u32,
+}
+
+impl StagedTerms {
+    /// The number of the term `text` of kind `kind`, assigning the next on first sight.
+    fn number(&mut self, kind: TermKind, text: &str) -> Result<u32, OntologyError> {
+        let table = &mut self.by_kind[kind as usize];
+        if let Some(number) = table.get(text) {
+            return Ok(*number);
         }
+        let number = self.count;
+        self.count = next_number(number)?;
+        table.insert(text.to_owned(), number);
+        Ok(number)
     }
-}
 
-/// One text-view triple before abbreviation.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct StagedTriple {
-    subject: StagedTerm,
-    predicate: String,
-    object: StagedTerm,
+    /// The text form of every term, at the index of its number.
+    fn render(self, abbreviator: &Abbreviator<'_>) -> Vec<String> {
+        let mut rendered = vec![String::new(); self.count as usize];
+        let [iris, verbatim, predicates] = self.by_kind;
+        // The tables are walked in hash order, but every text lands in the
+        // slot of its own number, so the result does not depend on that order.
+        for (iri, number) in iris {
+            rendered[number as usize] = abbreviator.abbreviate(&iri);
+        }
+        for (text, number) in verbatim {
+            rendered[number as usize] = text;
+        }
+        for (iri, number) in predicates {
+            rendered[number as usize] = if iri == RDF_TYPE {
+                "a".to_owned()
+            } else {
+                abbreviator.abbreviate(&iri)
+            };
+        }
+        rendered
+    }
 }
 
 /// Distinct strings numbered by first appearance, for the term view's deduplication.
@@ -601,6 +655,66 @@ fn next_number(number: u32) -> Result<u32, OntologyError> {
         limit: u32::MAX as usize,
         observed: u32::MAX as usize + 1,
     })
+}
+
+/// A prefix table arranged for longest-namespace lookup.
+///
+/// [`abbreviate`] tests every declared prefix against one IRI. Rendering a
+/// document asks the same question once per distinct IRI, so the namespaces
+/// are sorted once and each IRI is answered by binary search instead.
+#[derive(Debug)]
+struct Abbreviator<'a> {
+    /// `(namespace, prefix)`, ascending by namespace, one entry per namespace:
+    /// the prefix that sorts first, as in [`abbreviate`].
+    namespaces: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> Abbreviator<'a> {
+    fn new(prefixes: &'a BTreeMap<String, String>) -> Self {
+        let mut namespaces: Vec<(&str, &str)> = prefixes
+            .iter()
+            .map(|(prefix, namespace)| (namespace.as_str(), prefix.as_str()))
+            .collect();
+        // Stable, and the map iterates in prefix order, so the first entry of
+        // each run of equal namespaces carries the prefix that sorts first.
+        namespaces.sort_by_key(|(namespace, _)| *namespace);
+        namespaces.dedup_by_key(|(namespace, _)| *namespace);
+        Self { namespaces }
+    }
+
+    /// The longest declared namespace that starts `iri`, with its prefix.
+    fn longest_namespace(&self, iri: &str) -> Option<(&'a str, &'a str)> {
+        // Every namespace that starts `iri` also starts `probe`, which begins
+        // as the whole IRI. Such a namespace sorts at or before `probe`, and so
+        // does the greatest namespace at or before `probe`, `nearest`, which
+        // sits between the two and therefore starts with it as well. So if
+        // `nearest` starts `probe` it is the longest answer; if it does not,
+        // every answer starts both, and `probe` shrinks to what they share.
+        let mut probe = iri.as_bytes();
+        loop {
+            let after = self
+                .namespaces
+                .partition_point(|(namespace, _)| namespace.as_bytes() <= probe);
+            let (namespace, prefix) = *self.namespaces.get(after.checked_sub(1)?)?;
+            if probe.starts_with(namespace.as_bytes()) {
+                return Some((namespace, prefix));
+            }
+            let shared = namespace
+                .bytes()
+                .zip(probe)
+                .take_while(|(left, right)| left == *right)
+                .count();
+            probe = &probe[..shared];
+        }
+    }
+
+    /// As [`abbreviate`], for this table.
+    fn abbreviate(&self, iri: &str) -> String {
+        match self.longest_namespace(iri) {
+            Some((namespace, prefix)) => format!("{prefix}:{}", &iri[namespace.len()..]),
+            None => format!("<{iri}>"),
+        }
+    }
 }
 
 /// Render an object-position term, refusing what the view cannot carry.
@@ -954,5 +1068,46 @@ mod tests {
             matches!(error, OntologyError::BaseDirection { position: "object" }),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn the_sorted_namespace_lookup_agrees_with_the_linear_scan() {
+        // Nested namespaces, shared namespaces, the empty namespace and
+        // multi-byte text, probed with IRIs built from the same alphabet.
+        let pieces = [
+            "", "a", "ab", "a/", "a/b", "a/b/", "b", "é", "éa", "a/é", "ab/c",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize % bound
+        };
+        for round in 0..2_000 {
+            let mut prefixes = BTreeMap::new();
+            for slot in 0..next(8) {
+                let namespace = format!(
+                    "{}{}",
+                    pieces[next(pieces.len())],
+                    pieces[next(pieces.len())]
+                );
+                prefixes.insert(format!("p{}", (slot * 7 + round) % 10), namespace);
+            }
+            let abbreviator = Abbreviator::new(&prefixes);
+            for _ in 0..20 {
+                let iri = format!(
+                    "{}{}{}",
+                    pieces[next(pieces.len())],
+                    pieces[next(pieces.len())],
+                    pieces[next(pieces.len())]
+                );
+                assert_eq!(
+                    abbreviator.abbreviate(&iri),
+                    abbreviate(&iri, &prefixes),
+                    "iri {iri:?} under {prefixes:?}"
+                );
+            }
+        }
     }
 }
