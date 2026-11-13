@@ -1,6 +1,6 @@
 //! Throughput of page extraction, in source bytes per second.
 //!
-//! Run with `cargo bench -p pdf-fast-write`.
+//! Run with `cargo bench -p pdf-fast-write --bench extract`.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use pdf_fast_write::PdfWriter;

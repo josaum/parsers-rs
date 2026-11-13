@@ -1,6 +1,6 @@
 //! Throughput of the workbook writer, in cells per second.
 //!
-//! Run with `cargo bench -p xlsx-fast-write`.
+//! Run with `cargo bench -p xlsx-fast-write --bench write`.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::hint::black_box;
