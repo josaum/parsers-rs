@@ -7,6 +7,7 @@ description = "Canonical Turtle reader and indexed triple view"
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+exclude = ["benches/", "examples/"]
 keywords = ["turtle", "rdf", "ontology", "parser"]
 categories = ["parser-implementations"]
 
