@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{fs, path::Path};
+use yaml_rust2::{Yaml, YamlLoader};
 const NAMES: &[&str] = &[
     "parsers-clippy-gate",
     "parsers-arrow-ipc",
@@ -25,6 +26,14 @@ struct Request {
 fn text(root: &Path, path: &str) -> Result<String> {
     fs::read_to_string(root.join(path)).with_context(|| path.to_owned())
 }
+/// The first document of a YAML file, as a generic value. Indexing a key that
+/// is absent yields a value every `as_*` accessor answers `None` for.
+fn yaml_file(root: &Path, path: &str) -> Result<Yaml> {
+    YamlLoader::load_from_str(&text(root, path)?)?
+        .into_iter()
+        .next()
+        .with_context(|| format!("{path} holds no YAML document"))
+}
 fn toml_file(root: &Path, path: &str) -> Result<toml::Value> {
     Ok(toml::from_str(&text(root, path)?)?)
 }
@@ -41,9 +50,9 @@ fn check(root: &Path, name: &str) -> Value {
         match name {
             "parsers-clippy-gate" => {
                 let path = ".github/workflows/ci.yml";
-                let ci: serde_yaml::Value = serde_yaml::from_str(&text(root, path)?)?;
+                let ci = yaml_file(root, path)?;
                 let commands: Vec<_> = ci["jobs"]["rust"]["steps"]
-                    .as_sequence()
+                    .as_vec()
                     .context("CI rust steps missing")?
                     .iter()
                     .filter_map(|s| s["run"].as_str())
@@ -318,13 +327,12 @@ mod regression {
     #[test]
     fn repository_ci_covers_every_declared_arrow_feature() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let workflow: serde_yaml::Value =
-            serde_yaml::from_str(&text(&root, ".github/workflows/ci.yml").unwrap()).unwrap();
+        let workflow = yaml_file(&root, ".github/workflows/ci.yml").unwrap();
         assert!(
             workflow["on"]
-                .as_mapping()
+                .as_hash()
                 .unwrap()
-                .contains_key(serde_yaml::Value::String("workflow_call".to_owned()))
+                .contains_key(&Yaml::String("workflow_call".to_owned()))
         );
         let result = check(&root, "parsers-clippy-gate");
         assert_eq!(result["warnings"], json!([]), "{result}");
