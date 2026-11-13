@@ -180,6 +180,51 @@ def test_two_threads_parse_at_once() -> None:
     assert first == second and "threaded" in json.dumps(first["slides"])
 
 
+SNAPSHOT_TYPES = {
+    "Utf8": "string", "LargeUtf8": "large_string", "Boolean": "bool", "Binary": "binary",
+    "UInt8": "uint8", "UInt16": "uint16", "UInt32": "uint32", "UInt64": "uint64",
+    "Int8": "int8", "Int16": "int16", "Int32": "int32", "Int64": "int64",
+    "Float32": "float", "Float64": "double", "Date32": "date32[day]",
+    "Timestamp(Microsecond, None)": "timestamp[us]",
+    "Timestamp(Millisecond, None)": "timestamp[ms]",
+    "List(Field { data_type: Int32, nullable: true })": "list<item: int32>",
+}
+
+
+def assert_matches_schema_snapshot(schema, core_crate: str, snapshot: str) -> None:
+    """The schema pyarrow read is the one the core crate's snapshot freezes."""
+    import re
+
+    path = Path(__file__).resolve().parents[2] / core_crate / "tests" / "schema_snapshots" / snapshot
+    if not path.is_file():
+        pytest.skip(f"no schema snapshot at {path} (tests run outside the repository)")
+    expected = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(r"(.+?): (.+)\(nullable=(true|false)\)", line.strip())
+        if match:
+            expected.append((match.group(1), match.group(2), match.group(3) == "true"))
+    assert expected, f"{path} holds no fields"
+    assert schema.names == [name for name, _, _ in expected]
+    for field, (name, rust_type, nullable) in zip(schema, expected):
+        assert rust_type in SNAPSHOT_TYPES, f"{name}: no pyarrow spelling known for {rust_type}"
+        assert str(field.type) == SNAPSHOT_TYPES[rust_type], name
+        assert field.nullable is nullable, name
+
+
+def test_pptx_arrow_tables_match_the_core_schema_snapshots(pptx_path: Path, tmp_path: Path) -> None:
+    ipc = pytest.importorskip("pyarrow.ipc")
+    written = MODULE.parse_pptx_arrow_dataset(pptx_path, tmp_path / "dataset")
+    assert written
+    for table_path in written:
+        with open(table_path, "rb") as handle:
+            try:
+                schema = ipc.open_file(handle).schema
+            except Exception:
+                handle.seek(0)
+                schema = ipc.open_stream(handle).schema
+        assert_matches_schema_snapshot(schema, "pptx-fast-core", Path(table_path).stem + ".snap")
+
+
 def test_the_wheel_ships_type_information_that_matches_the_module() -> None:
     package_dir = Path(MODULE.__file__).parent
     assert (package_dir / "py.typed").is_file()
