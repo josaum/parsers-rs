@@ -25,6 +25,21 @@ const REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
 /// inside the merged span then counts as repaired if it holds U+FFFD.
 const MAX_SPANS: usize = 4096;
 
+/// The output limit for input of `len` bytes whose own limit is not known.
+///
+/// Input up to [`crate::DEFAULT_MAX_INFLATE`] may not grow past it by being
+/// repaired. Larger input was held to a larger limit, or none, that is not
+/// known here, so it is not capped: a few repaired bytes must not refuse a
+/// part that was accepted at its size.
+#[must_use]
+pub fn unknown_limit(len: usize) -> usize {
+    if len <= crate::DEFAULT_MAX_INFLATE {
+        crate::DEFAULT_MAX_INFLATE
+    } else {
+        usize::MAX
+    }
+}
+
 /// Returns `bytes` as UTF-8, each ill-formed sequence replaced by U+FFFD.
 ///
 /// Valid input is borrowed unchanged.
@@ -383,6 +398,14 @@ mod tests {
             .read_to_end(&mut out)
             .expect("valid input at the limit");
         assert_eq!(out, b"abcd");
+    }
+
+    #[test]
+    fn input_larger_than_the_default_limit_is_not_capped() {
+        let default = crate::DEFAULT_MAX_INFLATE;
+        assert_eq!(unknown_limit(0), default);
+        assert_eq!(unknown_limit(default), default);
+        assert_eq!(unknown_limit(default + 1), usize::MAX);
     }
 
     #[test]

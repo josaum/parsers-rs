@@ -222,7 +222,10 @@ impl<'m> ValidationContext<'m> {
         // Bytes that are not UTF-8 are read as U+FFFD. A name, text or value
         // in which one was replaced is treated as not UTF-8, as it was when
         // the reader handed over raw bytes (see `Repairs`).
-        let mut reader = Reader::from_reader(schema_input(xml, ooxml_archive::DEFAULT_MAX_INFLATE));
+        let mut reader = Reader::from_reader(schema_input(
+            xml,
+            ooxml_archive::utf8::unknown_limit(xml.len()),
+        ));
         // Text is not trimmed as it is read. An element's value can arrive in
         // several pieces (text, a CDATA section, more text), and trimming each
         // piece would delete the spaces between them. The whole value is

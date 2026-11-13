@@ -563,10 +563,10 @@ fn attr_text<'a, R: BufRead>(
 
 /// Reads `xml` as UTF-8, each ill-formed sequence replaced by U+FFFD.
 ///
-/// The repaired part may not outgrow [`DEFAULT_MAX_INFLATE`], or `xml`'s own
-/// length when that is larger: only a part that repair would triple can.
+/// The repaired part is held to [`utf8::unknown_limit`]: the caller's limit
+/// for the raw part is not known here.
 fn repairing_reader(xml: &[u8]) -> utf8::LossyUtf8<Cursor<&[u8]>> {
-    let limit = xml.len().max(DEFAULT_MAX_INFLATE);
+    let limit = utf8::unknown_limit(xml.len());
     utf8::LossyUtf8::with_limit(Cursor::new(xml), limit as u64)
 }
 

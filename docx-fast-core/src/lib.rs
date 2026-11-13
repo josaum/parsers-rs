@@ -2295,13 +2295,13 @@ fn utf8_xml(xml: &[u8]) -> Cow<'_, [u8]> {
 /// A UTF-16 part is transcoded, and a byte that is not UTF-8 reads as
 /// U+FFFD, so one bad character costs that character rather than the part.
 /// A UTF-8 part is read in place, never copied. Repair may not grow the part
-/// past [`DEFAULT_MAX_INFLATE`], or past its own length when that is larger:
-/// a part that only outgrows that by being repaired fails to read.
+/// past [`ooxml_archive::utf8::unknown_limit`]: a part that only outgrows
+/// that by being repaired fails to read.
 fn part_xml_reader(xml: &[u8]) -> Reader<LossyUtf8<Cursor<Cow<'_, [u8]>>>> {
     // The limit is taken after UTF-16 is transcoded, so valid text is never
     // refused for growing in transcoding.
     let xml = utf8_xml(xml);
-    let limit = u64::try_from(DEFAULT_MAX_INFLATE.max(xml.len())).unwrap_or(u64::MAX);
+    let limit = u64::try_from(ooxml_archive::utf8::unknown_limit(xml.len())).unwrap_or(u64::MAX);
     xml_reader(LossyUtf8::with_limit(Cursor::new(xml), limit))
 }
 

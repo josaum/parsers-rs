@@ -28,10 +28,9 @@ fn configure<R>(reader: &mut quick_xml::Reader<R>) {
 /// A value that held such a sequence is still unreadable, as it was when the
 /// reader handed over raw bytes; [`LossyUtf8::repaired_in`] tells it from a
 /// value holding a U+FFFD the document really has. The repaired document may
-/// not outgrow [`ooxml_archive::DEFAULT_MAX_INFLATE`], or `xml`'s own length
-/// when that is larger: only a document that repair would triple can.
+/// not outgrow [`ooxml_archive::utf8::unknown_limit`].
 fn repairing_input(xml: &[u8]) -> LossyUtf8<&[u8]> {
-    let limit = xml.len().max(ooxml_archive::DEFAULT_MAX_INFLATE);
+    let limit = ooxml_archive::utf8::unknown_limit(xml.len());
     LossyUtf8::with_limit(xml, limit as u64)
 }
 

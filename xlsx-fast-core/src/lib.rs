@@ -180,7 +180,7 @@ fn repairing<R: BufRead>(input: R, limit: usize) -> LossyUtf8<R> {
 
 /// The repair limit for a part read whole, with no part limit in scope.
 fn buffer_limit(xml: &[u8]) -> usize {
-    ooxml_archive::DEFAULT_MAX_INFLATE.max(xml.len())
+    ooxml_archive::utf8::unknown_limit(xml.len())
 }
 
 /// Byte length of one `ST_Xstring` escape, `_xHHHH_`.

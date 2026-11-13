@@ -1707,7 +1707,7 @@ fn attr_text<'a, R: BufRead>(
 
 /// The repair limit for a part read whole, with no part limit in scope.
 fn buffer_limit(xml: &[u8]) -> usize {
-    ooxml_archive::DEFAULT_MAX_INFLATE.max(xml.len())
+    ooxml_archive::utf8::unknown_limit(xml.len())
 }
 
 fn local_name(name: &[u8]) -> &[u8] {
