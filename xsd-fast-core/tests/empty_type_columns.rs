@@ -131,10 +131,11 @@ fn the_marker_column_does_not_depend_on_the_flattening_limit() {
 }
 
 // A type is a marker only when nothing is written in it but an annotation.
-// The parser does not model attribute references, attribute groups, group
-// references or wildcards, and it cannot fill in a derivation from a base
-// it does not know: a type made of those has no particles and no attributes
-// in the model, and is not empty. It derives what it always did, nothing.
+// The parser does not model attribute references or wildcards, and it
+// cannot fill in a derivation from a base it does not know: a type made of
+// those has no particles and no attributes in the model, and is not empty.
+// It derives what it always did, nothing. A type made of an attribute group
+// reference has the group's attributes.
 const NOT_EMPTY_IN_SOURCE: &[u8] = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
 <xs:attributeGroup name="AG"><xs:attribute name="g" type="xs:string"/></xs:attributeGroup>
 <xs:attribute name="ga" type="xs:string"/>
@@ -190,6 +191,7 @@ fn a_type_holding_a_construct_that_is_not_modelled_is_not_a_marker() {
         [
             "anchor",
             "annotated",
+            "attribute_group_ref",
             "mixed",
             "inline_annotated",
             "inline_open"

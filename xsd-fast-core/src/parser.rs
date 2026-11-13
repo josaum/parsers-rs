@@ -153,6 +153,9 @@ struct Loader {
     max_schema_location_bytes: usize,
     /// Files currently being parsed, the root included.
     include_nesting: usize,
+    /// The named attribute groups, by local name, as written: references
+    /// to other groups are still placeholders.
+    attribute_groups: HashMap<String, Vec<AttributeDecl>>,
 }
 
 impl Loader {
@@ -168,6 +171,7 @@ impl Loader {
             schema_bytes: 0,
             max_schema_location_bytes: options.max_schema_location_bytes,
             include_nesting: 0,
+            attribute_groups: HashMap::new(),
         }
     }
 
@@ -387,6 +391,13 @@ impl Loader {
                     self.model.simple_types.insert(n.clone(), st);
                 }
             }
+            "attributeGroup" if file.in_schema => {
+                let attrs = collect_attrs(e);
+                let attributes = parse_attribute_group(reader, &file.ns_map)?;
+                if let Some(name) = attrs.get("name") {
+                    self.attribute_groups.insert(name.clone(), attributes);
+                }
+            }
             "include" | "import" => return self.include_target(e),
             _ => {}
         }
@@ -409,6 +420,11 @@ impl Loader {
             "complexType" if file.in_schema => {
                 if let Some(name) = collect_attrs(e).remove("name") {
                     self.model.complex_types.insert(name, empty_complex_type());
+                }
+            }
+            "attributeGroup" if file.in_schema => {
+                if let Some(name) = collect_attrs(e).remove("name") {
+                    self.attribute_groups.insert(name, Vec::new());
                 }
             }
             "simpleType" if file.in_schema => {
@@ -448,6 +464,11 @@ impl Loader {
 
     /// The loaded model, with every type reference settled.
     fn finish(mut self) -> SchemaModel {
+        let mut expansion = Expansion {
+            attribute_groups: &self.attribute_groups,
+            remaining: MAX_EXPANDED_NODES,
+        };
+        expansion.expand_model(&mut self.model);
         settle_unprefixed_builtin_names(&mut self.model);
         self.model
     }
@@ -700,6 +721,11 @@ fn parse_complex_type_into(
                         skip_element(reader, "annotation")?;
                         depth -= 1;
                     }
+                    "attributeGroup" => {
+                        push_attribute_group_ref(&attrs, &mut complex_type.attributes);
+                        skip_element(reader, "attributeGroup")?;
+                        depth -= 1;
+                    }
                     _ => {}
                 }
             }
@@ -709,6 +735,8 @@ fn parse_complex_type_into(
                 }
                 if local == "attribute" {
                     push_attribute_decl(&attrs, None, ns_map, &mut complex_type.attributes);
+                } else if local == "attributeGroup" {
+                    push_attribute_group_ref(&attrs, &mut complex_type.attributes);
                 }
             }
             Tag::End { .. } => {
@@ -1461,11 +1489,17 @@ fn parse_derivation_children(
                         push_attribute_decl(&attrs, inline_type, ns_map, attributes);
                     }
                 }
+                "attributeGroup" => {
+                    push_attribute_group_ref(&attrs, attributes);
+                    skip_element(reader, "attributeGroup")?;
+                }
                 other => skip_element(reader, other)?,
             },
             Tag::Empty { local, attrs } => {
                 if local == "attribute" && !push_prohibited(&attrs, prohibited.as_deref_mut()) {
                     push_attribute_decl(&attrs, None, ns_map, attributes);
+                } else if local == "attributeGroup" {
+                    push_attribute_group_ref(&attrs, attributes);
                 }
             }
             // Every nested element is read to its end above, so the first
@@ -1758,6 +1792,201 @@ fn parse_facets(reader: &mut Reader<&[u8]>, facets: &mut SimpleFacets) -> Result
 }
 
 // ── Attribute declaration parser ─────────────────────────────────────────────
+
+/// Marks an attribute, while files are loading, as a reference to the named
+/// attribute group that follows it.
+///
+/// It starts with a NUL, which no attribute name read from XML can hold, and
+/// no attribute keeps it once [`Expansion::expand_model`] has run: it is
+/// replaced by the group's attributes, or removed.
+const ATTRIBUTE_GROUP_REF: &str = "\0attribute-group:";
+
+/// Appends a placeholder for `<xs:attributeGroup ref="...">`, if it has a `ref`.
+fn push_attribute_group_ref(attrs: &HashMap<String, String>, attributes: &mut Vec<AttributeDecl>) {
+    let Some(reference) = attrs.get("ref") else {
+        return;
+    };
+    attributes.push(AttributeDecl {
+        name: format!("{ATTRIBUTE_GROUP_REF}{}", split_prefix(reference).1),
+        type_def: SimpleTypeDef::string_unbounded(),
+        required: false,
+        default: None,
+        fixed: None,
+    });
+}
+
+/// The attribute group an attribute placeholder names, if it is one.
+fn attribute_group_ref(attribute: &AttributeDecl) -> Option<&str> {
+    attribute.name.strip_prefix(ATTRIBUTE_GROUP_REF)
+}
+
+/// Reads the children of a named `<xs:attributeGroup>` up to and including
+/// its end tag: its attributes, and placeholders for the groups it names.
+///
+/// Wildcards and annotations are skipped.
+fn parse_attribute_group(
+    reader: &mut Reader<&[u8]>,
+    ns_map: &HashMap<String, String>,
+) -> Result<Vec<AttributeDecl>> {
+    let mut attributes = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        match next_tag(reader, &mut buf, "attributeGroup")? {
+            Tag::Start { local, attrs } => match local.as_str() {
+                "attribute" => {
+                    let inline_type = parse_attribute_children(reader, ns_map)?;
+                    push_attribute_decl(&attrs, inline_type, ns_map, &mut attributes);
+                }
+                "attributeGroup" => {
+                    push_attribute_group_ref(&attrs, &mut attributes);
+                    skip_element(reader, "attributeGroup")?;
+                }
+                other => skip_element(reader, other)?,
+            },
+            Tag::Empty { local, attrs } => {
+                if local == "attribute" {
+                    push_attribute_decl(&attrs, None, ns_map, &mut attributes);
+                } else if local == "attributeGroup" {
+                    push_attribute_group_ref(&attrs, &mut attributes);
+                }
+            }
+            // Every nested element is read to its end above, so the first
+            // end tag met here closes the group itself.
+            Tag::End { .. } | Tag::Eof => break,
+        }
+    }
+    Ok(attributes)
+}
+
+/// Most attributes and particles that expanding group references may copy
+/// in one schema set.
+///
+/// Every reference receives its own copy of the group, and a group can
+/// name other groups, so a small schema can ask for many copies. The bound
+/// is the size of each of the inheritance budgets
+/// ([`crate::schema::SchemaModel::resolve_inheritance`]), so a fully used
+/// expansion holds about as much as one of them. Past it, the references
+/// not yet expanded add nothing, without an error: the type keeps what it
+/// declares itself, as every type did before groups were expanded.
+const MAX_EXPANDED_NODES: usize = 1 << 18;
+
+/// Deepest chain of attribute groups, each naming the next, that is
+/// followed. A group met again on the chain adds nothing more.
+const MAX_ATTRIBUTE_GROUP_NESTING: usize = 32;
+
+/// Replaces group references with what the groups hold.
+struct Expansion<'a> {
+    /// Named attribute groups, as written.
+    attribute_groups: &'a HashMap<String, Vec<AttributeDecl>>,
+    /// Attributes and particles that may still be copied.
+    remaining: usize,
+}
+
+impl<'a> Expansion<'a> {
+    /// Expands every group reference in the model.
+    fn expand_model(&mut self, model: &mut SchemaModel) {
+        for complex_type in model.complex_types.values_mut() {
+            self.expand_complex_type(complex_type);
+        }
+        for element in model.global_elements.values_mut() {
+            if let XsdType::Complex(complex_type) = &mut element.type_def {
+                self.expand_complex_type(complex_type);
+            }
+        }
+    }
+
+    /// Expands the references in one complex type and in the inline types
+    /// it holds. The recursion follows the nesting of the model, which the
+    /// parser bounds.
+    fn expand_complex_type(&mut self, complex_type: &mut ComplexType) {
+        if complex_type
+            .attributes
+            .iter()
+            .any(|attribute| attribute_group_ref(attribute).is_some())
+        {
+            let attributes = std::mem::take(&mut complex_type.attributes);
+            complex_type.attributes = self.expand_attributes(attributes);
+        }
+        self.expand_content(&mut complex_type.content);
+    }
+
+    /// Expands the inline types of the elements in one content model.
+    fn expand_content(&mut self, content: &mut ContentModel) {
+        let (ContentModel::Sequence(particles)
+        | ContentModel::All(particles)
+        | ContentModel::Choice(particles)) = content
+        else {
+            return;
+        };
+        for particle in particles {
+            match &mut particle.element {
+                ElementRef::Inline(element) => {
+                    if let XsdType::Complex(complex_type) = &mut element.type_def {
+                        self.expand_complex_type(complex_type);
+                    }
+                }
+                ElementRef::Group(group) => self.expand_content(group),
+                ElementRef::Ref(_) => {}
+            }
+        }
+    }
+
+    /// `attributes` with each group reference replaced by the group's
+    /// attributes, nested groups included.
+    ///
+    /// An attribute whose name the list already has, written in the type
+    /// itself or brought in by an earlier group, is not added again.
+    fn expand_attributes(&mut self, attributes: Vec<AttributeDecl>) -> Vec<AttributeDecl> {
+        let mut seen: HashSet<String> = attributes
+            .iter()
+            .filter(|attribute| attribute_group_ref(attribute).is_none())
+            .map(|attribute| attribute.name.clone())
+            .collect();
+        let mut expanded = Vec::with_capacity(attributes.len());
+        let mut chain = Vec::new();
+        for attribute in attributes {
+            match attribute_group_ref(&attribute) {
+                Some(group) => {
+                    self.append_attribute_group(group, &mut chain, &mut seen, &mut expanded);
+                }
+                None => expanded.push(attribute),
+            }
+        }
+        expanded
+    }
+
+    /// Appends the attributes of the group `name` that `seen` does not hold.
+    fn append_attribute_group(
+        &mut self,
+        name: &str,
+        chain: &mut Vec<&'a str>,
+        seen: &mut HashSet<String>,
+        expanded: &mut Vec<AttributeDecl>,
+    ) {
+        if chain.len() >= MAX_ATTRIBUTE_GROUP_NESTING || chain.contains(&name) {
+            return;
+        }
+        let groups = self.attribute_groups;
+        let Some((name, attributes)) = groups.get_key_value(name) else {
+            return;
+        };
+        chain.push(name.as_str());
+        for attribute in attributes {
+            match attribute_group_ref(attribute) {
+                Some(inner) => self.append_attribute_group(inner, chain, seen, expanded),
+                None => {
+                    if self.remaining == 0 || seen.contains(&attribute.name) {
+                        continue;
+                    }
+                    self.remaining -= 1;
+                    seen.insert(attribute.name.clone());
+                    expanded.push(attribute.clone());
+                }
+            }
+        }
+        chain.pop();
+    }
+}
 
 /// The declaration an `<xs:attribute>` makes, or `None` without a `name`.
 ///
