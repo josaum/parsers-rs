@@ -705,3 +705,24 @@ fn page_content_only_refuses_an_entry_it_cannot_remove() {
         .expect_err("the entry was not removed");
     assert!(format!("{error:#}").contains("/AA"), "{error:#}");
 }
+
+/// WHY: the refusal of too many repeats is read by callers; its text had a
+/// run of spaces in it from a string continued without a backslash.
+#[test]
+fn the_repeat_limit_error_reads_as_one_sentence() {
+    let big = format!("/Big ({})", "a".repeat(100_000));
+    let pdf = build(&[revision(
+        vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_vec()),
+            (3, page(2, 4, &big)),
+            (4, text_stream("Big")),
+        ],
+        1,
+    )]);
+    assert_eq!(
+        extract(&pdf, &[1; 1000]).expect_err("over the limit"),
+        "the repeated pages need more than 16777216 bytes of page dictionary copies; \
+         select fewer repeats"
+    );
+}

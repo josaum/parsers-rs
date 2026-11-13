@@ -395,7 +395,8 @@ impl Pdf {
                     repeated_bytes.saturating_add(out.objects[(kid - 1) as usize].len());
                 if repeated_bytes > MAX_REPEATED_PAGE_BYTES {
                     return Err(anyhow!(
-                        "the repeated pages need more than {} bytes of page dictionary                          copies; select fewer repeats",
+                        "the repeated pages need more than {} bytes of page dictionary \
+                         copies; select fewer repeats",
                         MAX_REPEATED_PAGE_BYTES
                     ));
                 }
