@@ -180,9 +180,11 @@ fn letters_are_mapped_only_when_the_font_applies_to_them() {
 }
 
 #[test]
-fn symbol_font_text_still_maps_only_its_private_use_characters() {
-    let body = run(r#"w:ascii="Symbol" w:hAnsi="Symbol""#, "a\u{F061}");
-    assert_eq!(paragraphs(&parse(&body, "")), ["a\u{3B1}"]);
+fn symbol_font_text_above_ascii_maps_only_its_private_use_characters() {
+    // U+00B3 stays SUPERSCRIPT THREE; the Private Use Area form of the same
+    // code is GREATER-THAN OR EQUAL TO.
+    let body = run(r#"w:ascii="Symbol" w:hAnsi="Symbol""#, "\u{B3}\u{F0B3}");
+    assert_eq!(paragraphs(&parse(&body, "")), ["\u{B3}\u{2265}"]);
 }
 
 /// A style named `id` whose run properties are `run_properties`.
@@ -417,4 +419,45 @@ fn a_revision_recorded_inside_old_properties_is_still_listed() {
     assert_eq!(paragraph.runs[0].text, "kept");
     assert!(paragraph.runs[0].revision.is_none());
     assert!(!paragraph.runs[0].bold);
+}
+
+// Word shows text typed in the Symbol font as the font's glyphs whether the
+// file stores the Private Use Area form or the plain key: "abg" is alpha,
+// beta, gamma.
+#[test]
+fn plain_letters_in_a_symbol_font_run_read_as_the_symbol_characters() {
+    let symbol = r#"w:ascii="Symbol" w:hAnsi="Symbol""#;
+    let body = [
+        run(symbol, "abg"),
+        run(symbol, "a\u{F062}G &lt; 2\"x"),
+        // Only the ASCII font decides for an ASCII character.
+        run(r#"w:hAnsi="Symbol" w:cs="Symbol""#, "abg"),
+        run(r#"w:ascii="Arial" w:hAnsi="Symbol""#, "abg"),
+        // A character outside ASCII is left as stored.
+        run(symbol, "a\u{e9}\u{3b2}"),
+        sym("Symbol", "0061"),
+        sym("Symbol", "F061"),
+        sym("symbol", "0022"),
+    ]
+    .concat();
+    assert_eq!(
+        paragraphs(&parse(&body, "")),
+        [
+            "\u{3b1}\u{3b2}\u{3b3}",
+            "\u{3b1}\u{3b2}\u{393} < 2\u{2200}\u{3be}",
+            "abg",
+            "abg",
+            "\u{3b1}\u{e9}\u{3b2}",
+            "\u{3b1}",
+            "\u{3b1}",
+            "\u{2200}",
+        ]
+    );
+}
+
+#[test]
+fn a_symbol_font_from_a_style_maps_plain_letters_too() {
+    let styles = r#"<w:style w:type="character" w:styleId="Greek"><w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol"/></w:rPr></w:style>"#;
+    let body = r#"<w:p><w:r><w:rPr><w:rStyle w:val="Greek"/></w:rPr><w:t>p</w:t></w:r><w:r><w:t>p</w:t></w:r></w:p>"#;
+    assert_eq!(paragraphs(&parse(body, styles)), ["\u{3c0}p"]);
 }
