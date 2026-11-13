@@ -267,11 +267,14 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
     reader.config_mut().allow_dangling_amp = true;
     let mut run = TextRun::default();
 
-    // One slot per `<Layer>`, taken when it opens and filled when it closes,
-    // so that a parent comes before the children that close before it.
-    let mut layers: Vec<Option<OpenLayer>> = Vec::new();
+    // One record per `<Layer>`, in the order they open, so that a parent
+    // comes before the children that close before it.
+    let mut layers: Vec<LayerRecord> = Vec::new();
     // The layers still open, outermost first.
     let mut open: Vec<OpenLayer> = Vec::new();
+    // The `EX_GeographicBoundingBox` elements still open, likewise. Kept
+    // apart from the layers: a layer is in one only for a moment.
+    let mut boxes: Vec<OpenBox> = Vec::new();
     let mut capture = Capture::Nothing;
     let mut depth: usize = 0;
 
@@ -296,13 +299,21 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
         }
 
         // Any other event ends the character data collected so far.
-        if let (Some(text), Some(layer)) = (run.take(), open.last_mut()) {
+        if let (Some(text), Some(layer)) = (run.take(), open.last()) {
             match std::mem::take(&mut capture) {
-                Capture::Name => layer.name = text,
-                Capture::Title => layer.title = text,
+                Capture::Name => declare(&mut layers, layer.record, |own| own.name = text),
+                Capture::Title => declare(&mut layers, layer.record, |own| own.title = text),
                 // Repeats are dropped once, when the document has been read.
-                Capture::Crs => layer.crs_list.push(text),
-                Capture::Edge(edge) => layer.edges[edge] = text.trim().parse().ok(),
+                Capture::Crs => declare(&mut layers, layer.record, |own| own.crs_list.push(text)),
+                Capture::Edge(edge) => {
+                    let place = boxes
+                        .last_mut()
+                        .filter(|open_box| open_box.layer_depth == layer.depth)
+                        .and_then(|open_box| open_box.edges.get_mut(edge));
+                    if let Some(place) = place {
+                        *place = text.trim().parse().ok();
+                    }
+                }
                 Capture::Nothing => {}
             }
         }
@@ -312,25 +323,34 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                 depth += 1;
                 let name = e.local_name();
                 if name.as_ref() == b"Layer" {
-                    let slot = layers.len();
-                    layers.push(None);
-                    let layer = OpenLayer::inside(open.last(), depth, slot);
-                    open.push(layer);
+                    let record = layers.len();
+                    layers.push(LayerRecord {
+                        parent: open.last().map(|parent| parent.record),
+                        declared: None,
+                    });
+                    open.push(OpenLayer { depth, record });
                     capture = Capture::Nothing;
-                } else if let Some(layer) = open.last_mut() {
+                } else if let Some(layer) = open.last() {
                     // Only the layer's own children describe it.
                     let own_child = depth == layer.depth + 1;
+                    let in_geographic_box = boxes
+                        .last()
+                        .is_some_and(|open_box| open_box.layer_depth == layer.depth);
                     match name.as_ref() {
                         b"Name" if own_child => capture = Capture::Name,
                         b"Title" if own_child => capture = Capture::Title,
                         b"CRS" | b"SRS" if own_child => capture = Capture::Crs,
                         b"EX_GeographicBoundingBox" if own_child => {
-                            layer.edges = [None; 4];
-                            layer.in_geographic_box = true;
-                            layer.read_box(e);
+                            boxes.push(OpenBox {
+                                layer_depth: layer.depth,
+                                edges: [None; 4],
+                            });
+                            read_box(&mut layers, layer.record, e);
                         }
-                        b"LatLonBoundingBox" | b"BoundingBox" if own_child => layer.read_box(e),
-                        edge if layer.in_geographic_box && depth == layer.depth + 2 => {
+                        b"LatLonBoundingBox" | b"BoundingBox" if own_child => {
+                            read_box(&mut layers, layer.record, e);
+                        }
+                        edge if in_geographic_box && depth == layer.depth + 2 => {
                             capture = match edge {
                                 b"westBoundLongitude" => Capture::Edge(WEST),
                                 b"southBoundLatitude" => Capture::Edge(SOUTH),
@@ -344,30 +364,31 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                 }
             }
             Event::Empty(ref e) => {
-                if let Some(layer) = open.last_mut() {
+                if let Some(layer) = open.last() {
                     let is_box = matches!(
                         e.local_name().as_ref(),
                         b"EX_GeographicBoundingBox" | b"LatLonBoundingBox" | b"BoundingBox"
                     );
                     // An empty element does not change `depth`.
                     if is_box && depth == layer.depth {
-                        layer.read_box(e);
+                        read_box(&mut layers, layer.record, e);
                     }
                 }
             }
             Event::End(ref e) => {
                 let name = e.local_name();
-                if let Some(layer) = open.last_mut() {
+                if let Some(layer) = open.last() {
+                    let in_geographic_box = boxes
+                        .last()
+                        .is_some_and(|open_box| open_box.layer_depth == layer.depth);
                     if name.as_ref() == b"Layer" && depth == layer.depth {
-                        if let Some(closed) = open.pop() {
-                            if let Some(place) = layers.get_mut(closed.slot) {
-                                *place = Some(closed);
-                            }
-                        }
-                    } else if layer.in_geographic_box && depth == layer.depth + 1 {
-                        layer.in_geographic_box = false;
-                        if let [Some(west), Some(south), Some(east), Some(north)] = layer.edges {
-                            layer.geographic = Some(BBox::new(west, south, east, north));
+                        open.pop();
+                    } else if in_geographic_box && depth == layer.depth + 1 {
+                        let edges = boxes.pop().map(|open_box| open_box.edges);
+                        if let Some([Some(west), Some(south), Some(east), Some(north)]) = edges {
+                            declare(&mut layers, layer.record, |own| {
+                                own.geographic = Some(BBox::new(west, south, east, north));
+                            });
                         }
                     }
                 }
@@ -381,10 +402,12 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
 
     // A layer the document ends inside of is not returned, but the layers
     // that closed in it still inherit what it declared.
-    for mut unclosed in open {
-        unclosed.name.clear();
-        if let Some(place) = layers.get_mut(unclosed.slot) {
-            *place = Some(unclosed);
+    for unclosed in open {
+        let declared = layers
+            .get_mut(unclosed.record)
+            .and_then(|record| record.declared.as_deref_mut());
+        if let Some(declared) = declared {
+            declared.name.clear();
         }
     }
 
@@ -416,23 +439,39 @@ pub const MAX_INHERITED_CRS_BYTES: usize = 64 * 1024 * 1024;
 
 /// Gives every layer what its ancestors declare and returns the named ones.
 ///
-/// `declared` holds each `<Layer>` in the order they opened, so a parent is
+/// `layers` holds each `<Layer>` in the order they opened, so a parent is
 /// always before its children and one pass in that order is enough. It is
 /// done once the whole document is read because a parent may declare a
 /// reference system or a box after a child has closed.
-fn resolve_inheritance(declared: Vec<Option<OpenLayer>>) -> Vec<WmsLayer> {
-    let mut resolved: Vec<Option<OpenLayer>> = Vec::with_capacity(declared.len());
+///
+/// The records are resolved where they are: a second list of them would
+/// double what a document of many small layers costs.
+fn resolve_inheritance(mut layers: Vec<LayerRecord>) -> Vec<WmsLayer> {
     let mut budget = MAX_INHERITED_CRS_BYTES;
-    for layer in declared {
-        let Some(mut layer) = layer else {
-            resolved.push(None);
+    for at in 0..layers.len() {
+        let (before, rest) = layers.split_at_mut(at);
+        let Some(layer) = rest.first_mut() else {
+            break;
+        };
+        // The nearest layer above this one that declares anything. A layer
+        // that declares nothing has already been pointed past itself, so
+        // this is one step however long the chain of such layers is.
+        layer.parent = layer.parent.and_then(|parent| {
+            let above = before.get(parent)?;
+            if above.declared.is_some() {
+                Some(parent)
+            } else {
+                above.parent
+            }
+        });
+        let Some(declared) = layer.declared.as_deref_mut() else {
             continue;
         };
         let parent = layer
             .parent
-            .and_then(|slot| resolved.get(slot))
-            .and_then(Option::as_ref);
-        let own = std::mem::take(&mut layer.crs_list);
+            .and_then(|parent| before.get(parent))
+            .and_then(|above| above.declared.as_deref());
+        let own = std::mem::take(&mut declared.crs_list);
         if let Some(parent) = parent {
             // Charged before the copy is made. A list that does not fit is
             // not copied, and not looked at either.
@@ -443,20 +482,28 @@ fn resolve_inheritance(declared: Vec<Option<OpenLayer>>) -> Vec<WmsLayer> {
                 }
                 None => &[],
             };
-            layer.crs_list = merge_crs(inherited, own);
-            layer.geographic = layer.geographic.or(parent.geographic);
-            layer.bounding = layer.bounding.or(parent.bounding);
+            declared.crs_list = merge_crs(inherited, own);
+            declared.geographic = declared.geographic.or(parent.geographic);
+            declared.bounding = declared.bounding.or(parent.bounding);
         } else {
-            layer.crs_list = merge_crs(&[], own);
+            declared.crs_list = merge_crs(&[], own);
         }
-        layer.crs_bytes = copy_cost(&layer.crs_list);
-        resolved.push(Some(layer));
+        declared.crs_bytes = copy_cost(&declared.crs_list);
     }
-    resolved
-        .into_iter()
-        .flatten()
-        .filter_map(OpenLayer::into_layer)
-        .collect()
+    // Counted first: a list grown as it is filled is for a while held twice.
+    let named = layers
+        .iter()
+        .filter_map(|record| record.declared.as_deref())
+        .filter(|declared| !declared.name.is_empty())
+        .count();
+    let mut returned = Vec::with_capacity(named);
+    returned.extend(
+        layers
+            .into_iter()
+            .filter_map(|record| record.declared)
+            .filter_map(|declared| declared.into_layer()),
+    );
+    returned
 }
 
 #[cfg(test)]
@@ -494,6 +541,9 @@ fn merge_crs(inherited: &[String], own: Vec<String>) -> Vec<String> {
     if own.is_empty() {
         return inherited.to_vec();
     }
+    if inherited.is_empty() && own.len() == 1 {
+        return own;
+    }
     let mut seen: HashSet<Seen<'_>> = HashSet::with_capacity(inherited.len() + own.len());
     seen.extend(inherited.iter().map(|crs| Seen(crs)));
     let is_new: Vec<bool> = own.iter().map(|crs| seen.insert(Seen(crs))).collect();
@@ -517,7 +567,7 @@ fn copy_cost(crs_list: &[String]) -> usize {
     })
 }
 
-/// Positions of the four edges in [`OpenLayer::edges`].
+/// Positions of the four edges in [`OpenBox::edges`].
 const WEST: usize = 0;
 const SOUTH: usize = 1;
 const EAST: usize = 2;
@@ -536,19 +586,26 @@ enum Capture {
     /// One of the layer's reference systems.
     Crs,
     /// An edge of the layer's geographic box, by its position in
-    /// [`OpenLayer::edges`].
+    /// [`OpenBox::edges`].
     Edge(usize),
 }
 
-/// A `<Layer>` as the document declares it: what it inherits is added by
-/// [`resolve_inheritance`].
-struct OpenLayer {
-    /// Depth of the `<Layer>` element in the document.
-    depth: usize,
-    /// Where the layer goes in the list of all layers.
-    slot: usize,
-    /// The slot of the layer this one is in.
+/// A `<Layer>` of the document, one per element.
+///
+/// Kept to two words for a layer that declares nothing: a document can be
+/// little more than `<Layer></Layer>` repeated, 15 bytes each.
+struct LayerRecord {
+    /// The record of the layer this one is in; once resolved, of the
+    /// nearest layer above it that declares anything.
     parent: Option<usize>,
+    /// What the layer declares, from the first thing it declares.
+    declared: Option<Box<Declared>>,
+}
+
+/// What a `<Layer>` declares: what it inherits is added by
+/// [`resolve_inheritance`].
+#[derive(Default)]
+struct Declared {
     name: String,
     title: String,
     /// Reference systems: the layer's own as they are written, and once
@@ -562,65 +619,9 @@ struct OpenLayer {
     geographic: Option<BBox>,
     /// Box in another reference system, likewise.
     bounding: Option<BBox>,
-    /// West, south, east and north of an `EX_GeographicBoundingBox` whose
-    /// children are being read.
-    edges: [Option<f64>; 4],
-    /// Whether the reader is inside the layer's `EX_GeographicBoundingBox`.
-    in_geographic_box: bool,
 }
 
-impl OpenLayer {
-    /// A layer opening at `depth` inside `parent`, with nothing declared.
-    fn inside(parent: Option<&OpenLayer>, depth: usize, slot: usize) -> Self {
-        OpenLayer {
-            depth,
-            slot,
-            name: String::new(),
-            title: String::new(),
-            parent: parent.map(|p| p.slot),
-            crs_list: Vec::new(),
-            crs_bytes: 0,
-            geographic: None,
-            bounding: None,
-            edges: [None; 4],
-            in_geographic_box: false,
-        }
-    }
-
-    /// Reads a bounding box written as attributes of `element`.
-    ///
-    /// The box replaces the one read before it, of its kind:
-    /// geographic for every element but `BoundingBox`. An element without
-    /// all four edges as numbers changes nothing.
-    fn read_box(&mut self, element: &BytesStart<'_>) {
-        let mut min_x: Option<f64> = None;
-        let mut min_y: Option<f64> = None;
-        let mut max_x: Option<f64> = None;
-        let mut max_y: Option<f64> = None;
-        for attr in element.attributes().with_checks(false).flatten() {
-            let key = attr.key.local_name();
-            let val = attr
-                .normalized_value(XmlVersion::Implicit1_0)
-                .unwrap_or_default();
-            let f = val.parse::<f64>().ok();
-            match key.as_ref() {
-                b"minx" | b"westBoundLongitude" => min_x = f,
-                b"miny" | b"southBoundLatitude" => min_y = f,
-                b"maxx" | b"eastBoundLongitude" => max_x = f,
-                b"maxy" | b"northBoundLatitude" => max_y = f,
-                _ => {}
-            }
-        }
-        if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (min_x, min_y, max_x, max_y) {
-            let bbox = Some(BBox::new(x0, y0, x1, y1));
-            if element.local_name().as_ref() == b"BoundingBox" {
-                self.bounding = bbox;
-            } else {
-                self.geographic = bbox;
-            }
-        }
-    }
-
+impl Declared {
     /// The layer as it is returned; `None` for a group without a name.
     fn into_layer(self) -> Option<WmsLayer> {
         (!self.name.is_empty()).then(|| WmsLayer {
@@ -629,6 +630,72 @@ impl OpenLayer {
             crs_list: self.crs_list,
             bbox: self.geographic.or(self.bounding),
         })
+    }
+}
+
+/// A `<Layer>` the reader is inside of.
+#[derive(Clone, Copy)]
+struct OpenLayer {
+    /// Depth of the `<Layer>` element in the document.
+    depth: usize,
+    /// Where the layer is in the list of all layers.
+    record: usize,
+}
+
+/// An `EX_GeographicBoundingBox` whose children are being read.
+struct OpenBox {
+    /// Depth of the `<Layer>` the box is a child of.
+    layer_depth: usize,
+    /// West, south, east and north, as far as they have been read.
+    edges: [Option<f64>; 4],
+}
+
+/// Adds to what the layer at `record` declares, making room for it if this
+/// is the first thing the layer declares.
+///
+/// `record` is always one the reader has pushed; for any other nothing
+/// is done.
+fn declare(layers: &mut [LayerRecord], record: usize, add: impl FnOnce(&mut Declared)) {
+    if let Some(layer) = layers.get_mut(record) {
+        add(layer.declared.get_or_insert_with(Box::default));
+    }
+}
+
+/// Reads a bounding box written as attributes of `element` into the layer
+/// at `record`.
+///
+/// The box replaces the one read before it, of its kind:
+/// geographic for every element but `BoundingBox`. An element without
+/// all four edges as numbers changes nothing.
+fn read_box(layers: &mut [LayerRecord], record: usize, element: &BytesStart<'_>) {
+    let mut min_x: Option<f64> = None;
+    let mut min_y: Option<f64> = None;
+    let mut max_x: Option<f64> = None;
+    let mut max_y: Option<f64> = None;
+    for attr in element.attributes().with_checks(false).flatten() {
+        let key = attr.key.local_name();
+        let val = attr
+            .normalized_value(XmlVersion::Implicit1_0)
+            .unwrap_or_default();
+        let f = val.parse::<f64>().ok();
+        match key.as_ref() {
+            b"minx" | b"westBoundLongitude" => min_x = f,
+            b"miny" | b"southBoundLatitude" => min_y = f,
+            b"maxx" | b"eastBoundLongitude" => max_x = f,
+            b"maxy" | b"northBoundLatitude" => max_y = f,
+            _ => {}
+        }
+    }
+    if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (min_x, min_y, max_x, max_y) {
+        let bbox = Some(BBox::new(x0, y0, x1, y1));
+        let projected = element.local_name().as_ref() == b"BoundingBox";
+        declare(layers, record, |own| {
+            if projected {
+                own.bounding = bbox;
+            } else {
+                own.geographic = bbox;
+            }
+        });
     }
 }
 
@@ -1141,6 +1208,33 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// A layer that declares nothing costs its record and no more: a list
+    /// of 260-byte records, held twice while it was resolved, made 525 MB
+    /// of 1,000,000 empty layers in 15 MB.
+    #[test]
+    fn layer_that_declares_nothing_costs_three_words() {
+        assert!(std::mem::size_of::<LayerRecord>() <= 3 * std::mem::size_of::<usize>());
+        let layers = parse_capabilities_xml(&"<Layer></Layer>".repeat(10_000)).expect("layers");
+        assert!(layers.is_empty());
+    }
+
+    /// Layers come back in the order they open, wherever a layer writes
+    /// its name: here the outer one after the inner one has closed.
+    #[test]
+    fn layers_are_returned_in_the_order_they_open() {
+        let layers = parse_capabilities_xml(
+            "<C><Layer><Layer><Name>b</Name></Layer><Layer><Layer><Name>c</Name></Layer></Layer>\
+             <Name>a</Name><CRS>X</CRS></Layer></C>",
+        )
+        .expect("capabilities");
+        let summary: Vec<_> = layers
+            .iter()
+            .map(|layer| (layer.name.as_str(), layer.crs_list.clone()))
+            .collect();
+        let x = vec!["X".to_string()];
+        assert_eq!(summary, vec![("a", x.clone()), ("b", x.clone()), ("c", x)]);
     }
 
     /// A document cut short: a layer that closed inside one that did not is
