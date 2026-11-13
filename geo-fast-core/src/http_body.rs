@@ -1,3 +1,4 @@
+// Rust guideline compliant 2026-02-21
 //! Reading an HTTP response body under a size limit.
 //!
 //! Every response the WMS and WFS clients read goes through

@@ -155,11 +155,10 @@ impl WmsClient {
         parse_capabilities_xml(&self.capabilities_document().await?)
     }
 
-    /// Fetch and parse `GetCapabilities` as
-    /// [`get_capabilities`](Self::get_capabilities) does, and say which
-    /// layers had their inherited reference systems cut.
+    /// Fetch `GetCapabilities` and report layers whose inherited list was cut.
     ///
-    /// See [`parse_capabilities_xml_with_report`].
+    /// The layers are those [`get_capabilities`](Self::get_capabilities)
+    /// returns. See [`parse_capabilities_xml_with_report`].
     ///
     /// # Errors
     ///
@@ -314,8 +313,7 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
     read_capabilities(xml, false).map(|capabilities| capabilities.layers)
 }
 
-/// Reads a WMS `GetCapabilities` document as [`parse_capabilities_xml`]
-/// does, and says which layers had their inherited reference systems cut.
+/// Reads a capabilities document and reports layers whose inherited list was cut.
 ///
 /// [`WmsCapabilities::layers`] is what [`parse_capabilities_xml`] returns
 /// for the same document. [`WmsCapabilities::inherited_crs_cut`] lists,
@@ -331,8 +329,7 @@ pub fn parse_capabilities_xml_with_report(xml: &str) -> Result<WmsCapabilities, 
     read_capabilities(xml, true)
 }
 
-/// The layers of a WMS `GetCapabilities` document, and the layers whose
-/// inherited reference systems were cut.
+/// The layers of a capabilities document, with those whose inheritance was cut.
 ///
 /// Returned by [`parse_capabilities_xml_with_report`] and
 /// [`WmsClient::get_capabilities_with_report`].
@@ -347,9 +344,12 @@ pub struct WmsCapabilities {
     pub inherited_crs_cut: Vec<LayerRef>,
 }
 
-/// A `<Layer>` of a capabilities document, as
-/// [`WmsCapabilities::inherited_crs_cut`] names it.
+/// A `<Layer>` of a capabilities document, by name or by position.
+///
+/// [`WmsCapabilities::inherited_crs_cut`] names layers this way. More
+/// ways may be added, such as one that tells apart layers sharing a name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum LayerRef {
     /// A layer with a name: the one in [`WmsCapabilities::layers`] with
     /// this [`WmsLayer::name`]. A document may give two layers the same
