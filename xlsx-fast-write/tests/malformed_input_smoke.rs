@@ -113,8 +113,15 @@ fn arbitrary_builder_calls_never_panic() {
     });
 }
 
-/// Deep nesting in a cell value and a very wide or tall spec must be
-/// rejected or written within the small stack and the allocation cap.
+/// Deep nesting in a cell value or in the spec itself must be refused on
+/// the small stack, and a very tall or many-sheet spec must be written
+/// within the allocation cap.
+///
+/// Only the deep specs run on the small stack: their cost must not follow
+/// the input. Writing a workbook has a fixed stack cost that an unoptimized
+/// Windows build does not fit in 256 KiB, whatever the spec, so the two
+/// large specs run on 1 MiB, the smallest default thread stack among the
+/// platforms this is built for.
 #[test]
 fn deep_and_large_specs_are_bounded_on_a_small_stack() {
     let deep_value = smoke::nested(b"[", b"1", b"]", 100_000);
@@ -131,17 +138,21 @@ fn deep_and_large_specs_are_bounded_on_a_small_stack() {
         r#"{{"sheets":[{}{{"name":"x"}}]}}"#,
         r#"{"name":"x"},"#.repeat(20_000)
     );
-    for spec in [
-        deep,
-        deep_sheets,
-        empty_rows.into_bytes(),
-        many_sheets.into_bytes(),
-    ] {
+    for spec in [deep, deep_sheets] {
         smoke::run_on_small_stack(move || {
-            if let Ok(text) = std::str::from_utf8(&spec) {
-                let _ = Workbook::write_json_spec_to_bytes(text);
-            }
+            let text = std::str::from_utf8(&spec).expect("the spec is ascii");
+            assert!(Workbook::write_json_spec_to_bytes(text).is_err());
         });
+    }
+    for spec in [empty_rows, many_sheets] {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let _ = Workbook::write_json_spec_to_bytes(&spec);
+            })
+            .expect("spawn the writer thread")
+            .join()
+            .expect("the writer panicked");
     }
 }
 
