@@ -1018,6 +1018,17 @@ impl PdfDocument {
         self.decoded_byte_budget
             .charge_resource_bytes(reserved_before_render)?;
 
+        // The interpreter builds its page list by recursing over `/Kids`
+        // as soon as the document is opened, before anything can look at
+        // the tree through its object model. Bound the tree on this crate's
+        // reading of it first.
+        if self.page_tree_depth_exceeds(render_guard::MAX_PAGE_TREE_DEPTH) {
+            return Err(anyhow!(
+                "interpreted render refused: the page tree is nested deeper than {} levels",
+                render_guard::MAX_PAGE_TREE_DEPTH
+            ));
+        }
+
         // The interpreter recurses, and a stack overflow aborts the process
         // rather than unwinding. Run it on a thread whose stack size is
         // known, so the guard's budget does not depend on how much stack the
@@ -1042,6 +1053,75 @@ impl PdfDocument {
                 Err(panic) => std::panic::resume_unwind(panic),
             }
         })
+    }
+
+    /// Whether any chain of `/Kids` is longer than `limit`, on this crate's
+    /// own reading of the objects. Iterative; a cycle counts as too deep.
+    #[cfg(feature = "rasterize")]
+    fn page_tree_depth_exceeds(&self, limit: usize) -> bool {
+        let kids_of = |id: (u32, u16)| -> Vec<(u32, u16)> {
+            let Some(kids) = self
+                .object_by_id(id.0, id.1)
+                .and_then(|object| object.dictionary.as_ref())
+                .and_then(|dictionary| dictionary.get("Kids"))
+                .and_then(|kids| self.resolve_array(kids))
+            else {
+                return Vec::new();
+            };
+            kids.iter()
+                .filter_map(|kid| match kid {
+                    PdfValue::Reference {
+                        object_number,
+                        generation,
+                    } => Some((*object_number, *generation)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Height of each node once known; a node still on the path has none.
+        let mut heights: HashMap<(u32, u16), usize> = HashMap::new();
+        let mut on_path: HashSet<(u32, u16)> = HashSet::new();
+        for object in &self.objects {
+            let root = (object.object_number, object.generation);
+            if heights.contains_key(&root)
+                || object
+                    .dictionary
+                    .as_ref()
+                    .is_none_or(|dictionary| dictionary.get("Kids").is_none())
+            {
+                continue;
+            }
+            let mut path = vec![(root, kids_of(root), 0usize)];
+            on_path.insert(root);
+            while let Some((id, kids, tallest)) = path.last_mut() {
+                if let Some(kid) = kids.pop() {
+                    if let Some(height) = heights.get(&kid) {
+                        *tallest = (*tallest).max(*height);
+                    } else if on_path.contains(&kid) {
+                        return true;
+                    } else {
+                        on_path.insert(kid);
+                        let next = kids_of(kid);
+                        path.push((kid, next, 0));
+                        if path.len() > limit {
+                            return true;
+                        }
+                    }
+                    continue;
+                }
+                let (id, height) = (*id, *tallest + 1);
+                if height > limit {
+                    return true;
+                }
+                on_path.remove(&id);
+                heights.insert(id, height);
+                path.pop();
+                if let Some((_, _, tallest)) = path.last_mut() {
+                    *tallest = (*tallest).max(height);
+                }
+            }
+        }
+        false
     }
 
     /// Opens the document with the full interpreter, vets the page and

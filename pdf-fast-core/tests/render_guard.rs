@@ -391,8 +391,31 @@ fn many_names(count: usize) -> Vec<u8> {
     one_page("", &content, Vec::new())
 }
 
+/// A page under `depth` nested `/Pages` nodes.
+fn deep_page_tree(depth: usize) -> Vec<u8> {
+    let mut objects = vec![(1u32, b"<< /Type /Catalog /Pages 10 0 R >>".to_vec())];
+    let depth = u32::try_from(depth).expect("small depth");
+    for level in 0..depth {
+        objects.push((
+            10 + level,
+            format!("<< /Type /Pages /Kids [{} 0 R] /Count 1 >>", 11 + level).into_bytes(),
+        ));
+    }
+    objects.push((
+        10 + depth,
+        format!(
+            "<< /Type /Page /Parent {} 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+            9 + depth
+        )
+        .into_bytes(),
+    ));
+    objects.push((4, stream("", "0 0 10 10 re f")));
+    pdf(&objects)
+}
+
 fn fixture(route: &str, depth: usize) -> Vec<u8> {
     match route {
+        "pagetree" => deep_page_tree(depth),
         "decodepath" => form_that_decodes_by_path(),
         "form" => form_chain(depth),
         "annotation" => annotation_appearance(depth),
@@ -533,6 +556,12 @@ fn a_hundred_thousand_distinct_names_are_scanned_quickly() {
         "scanning took {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn a_page_tree_nested_100_000_deep_is_refused() {
+    assert_refused("deep page tree", &deep_page_tree(100_000));
+    assert_renders("page tree 20 deep", &deep_page_tree(20));
 }
 
 #[test]

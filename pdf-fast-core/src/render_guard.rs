@@ -39,6 +39,14 @@ use std::rc::Rc;
 /// it is first touched, so a shallow page touches a few hundred kilobytes.
 pub(crate) const RENDER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
+/// Deepest `/Kids` nesting accepted in the page tree.
+///
+/// The interpreter builds its page list by recursion with no limit, as soon
+/// as it opens the document. A balanced tree over a million pages is about
+/// twenty levels deep. The recursion costs roughly 1.3 KB a level, so this
+/// is under 100 KB of [`RENDER_STACK_BYTES`].
+pub(crate) const MAX_PAGE_TREE_DEPTH: usize = 64;
+
 /// Stack the interpreter may need for one page's nested content streams.
 ///
 /// One eighth of [`RENDER_STACK_BYTES`]. The rest is margin for the
