@@ -967,8 +967,10 @@ mod tests {
         xml
     }
 
-    /// A document without nesting reads as it did before layers inherited:
-    /// the numbers below were taken from the parser as it was.
+    /// A document without nesting has nothing to inherit and must read the
+    /// same whatever is done to inheritance: the numbers below were taken
+    /// from the parser at `f3bd49a`, before reference systems went through
+    /// a hash set and layers became records.
     #[test]
     fn flat_document_reads_as_before() {
         let layers = parse_capabilities_xml(&flat_capabilities()).expect("capabilities");
