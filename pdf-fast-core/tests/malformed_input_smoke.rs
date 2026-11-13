@@ -1269,6 +1269,7 @@ fn a_page_of_composite_type3_glyphs_keeps_every_outline() {
 /// Composite glyphs whose part is a megabyte long spend the nested procedure
 /// cap before the honest glyphs after them are reached. The checked reader
 /// reports the limit; it does not hand back a page with glyphs missing.
+/// The unchecked reader returns the glyphs it reached.
 #[test]
 fn a_spent_glyph_procedure_cap_is_an_error_not_missing_glyphs() {
     let _serial = serial();
@@ -1287,6 +1288,12 @@ fn a_spent_glyph_procedure_cap_is_an_error_not_missing_glyphs() {
         format!("{error:#}").contains("glyph procedures nested"),
         "{error:#}"
     );
+    // The reader that reports nothing keeps what it read before the cap,
+    // as it did when there was no cap; it does not hand back an empty page.
+    let pages = document.pages();
+    let page = pages.first().expect("the document has a page");
+    let kept = pdf_fast_core::extract_page_vector_text_runs(&document, page);
+    assert!(!kept.is_empty(), "the unchecked reader dropped the page");
 }
 
 /// What the glyph reader finds in `document`: the semantic text, and how many

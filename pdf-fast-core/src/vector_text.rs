@@ -1467,8 +1467,13 @@ pub fn check_first_cm_matches(stream: &[u8], target: Matrix) -> bool {
 /// Extract vector glyph runs for a single PDF page, sorted top-to-bottom and
 /// left-to-right (4-unit row buckets, x within bucket). Empty if no content
 /// streams or no glyph geometry was emitted.
+///
+/// A page that spends the glyph procedure cap keeps the runs read up to
+/// that point; [`extract_page_vector_text_runs_checked`] reports it instead.
 pub fn extract_page_vector_text_runs(doc: &PdfDocument, page: &PdfPage) -> Vec<GlyphRun> {
-    extract_page_vector_text_runs_checked(doc, page).unwrap_or_default()
+    page_vector_text_runs(doc, page)
+        .map(|(runs, _)| runs)
+        .unwrap_or_default()
 }
 
 /// Checked page-level vector extraction. Unlike
@@ -1478,12 +1483,23 @@ pub fn extract_page_vector_text_runs_checked(
     doc: &PdfDocument,
     page: &PdfPage,
 ) -> Result<Vec<GlyphRun>> {
+    let (runs, glyph_budget_spent) = page_vector_text_runs(doc, page)?;
+    if glyph_budget_spent {
+        return Err(anyhow::anyhow!(GlyphProcedureBudgetExceeded));
+    }
+    Ok(runs)
+}
+
+/// Reads a page's runs, and whether any content stream spent the glyph
+/// procedure cap (its later nested glyph text is then missing).
+fn page_vector_text_runs(doc: &PdfDocument, page: &PdfPage) -> Result<(Vec<GlyphRun>, bool)> {
     let mut all_runs = Vec::new();
+    let mut glyph_budget_spent = false;
 
     // Re-implemented to fetch streams similar to page_content_streams_for_raster
     let streams = doc.page_content_streams_for_raster(page)?;
     if streams.is_empty() {
-        return Ok(all_runs);
+        return Ok((all_runs, glyph_budget_spent));
     }
 
     let page_ctm = detect_page_ctm(&streams[0]);
@@ -1508,9 +1524,7 @@ pub fn extract_page_vector_text_runs_checked(
             depth: 0,
         };
         extractor.parse_stream_ctx(&stream, Some(&ctx))?;
-        if extractor.glyph_budget_spent {
-            return Err(anyhow::anyhow!(GlyphProcedureBudgetExceeded));
-        }
+        glyph_budget_spent |= extractor.glyph_budget_spent;
         all_runs.extend(extractor.runs);
     }
 
@@ -1525,7 +1539,7 @@ pub fn extract_page_vector_text_runs_checked(
             .then_with(|| a.page_x.total_cmp(&b.page_x))
     });
 
-    Ok(all_runs)
+    Ok((all_runs, glyph_budget_spent))
 }
 
 /// Resolve a glyph through the shape catalog, or `None` when the catalog is not
