@@ -288,6 +288,10 @@ impl Pdf {
         // The dictionary of each selected page as it will be copied.
         let mut page_bodies: HashMap<u32, Vec<u8>> = HashMap::new();
         for &page in &selected {
+            // A page selected again needs nothing collected a second time.
+            if inherited.contains_key(&page) {
+                continue;
+            }
             let body = match page_bodies.entry(page) {
                 std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
                 std::collections::hash_map::Entry::Vacant(slot) => {
@@ -393,15 +397,17 @@ impl Pdf {
         // order they were asked for. A page tree may not list one object
         // twice, so a page selected again gets its own copy of the page
         // dictionary; the copies share content streams and resources.
+        //
+        // What the repeats add is known now that every selected page is in
+        // its final form, so a selection over the limit is refused here,
+        // before any copy is made: a refusal costs each distinct page once
+        // and one pass over the selection.
         let mut listed = std::collections::HashSet::new();
-        let mut kids = String::new();
         let mut repeated_bytes: usize = 0;
         for &page in &selected {
-            let mut kid = id_map[&page];
             if !listed.insert(page) {
-                // Checked before the copy is made, so a refusal costs nothing.
-                repeated_bytes =
-                    repeated_bytes.saturating_add(out.objects[(kid - 1) as usize].len());
+                let size = out.objects[(id_map[&page] - 1) as usize].len();
+                repeated_bytes = repeated_bytes.saturating_add(size);
                 if repeated_bytes > MAX_REPEATED_PAGE_BYTES {
                     return Err(anyhow!(
                         "the repeated pages need more than {} bytes of page dictionary \
@@ -409,6 +415,13 @@ impl Pdf {
                         MAX_REPEATED_PAGE_BYTES
                     ));
                 }
+            }
+        }
+        listed.clear();
+        let mut kids = String::new();
+        for &page in &selected {
+            let mut kid = id_map[&page];
+            if !listed.insert(page) {
                 let copy = out.objects[(kid - 1) as usize].clone();
                 out.objects.push(copy);
                 kid = u32::try_from(out.objects.len())
@@ -585,6 +598,8 @@ mod work {
     thread_local! {
         /// Bytes handed to the header check while building an [`super::Xref`].
         pub(super) static HEADER_BYTES: Cell<usize> = const { Cell::new(0) };
+        /// Calls of [`super::effective_page_attributes`].
+        pub(super) static ATTRIBUTE_WALKS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn add(counter: &'static LocalKey<Cell<usize>>, amount: usize) {
@@ -1507,6 +1522,8 @@ fn effective_page_attributes(
     page_obj: u32,
     pages_root: u32,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    #[cfg(test)]
+    work::add(&work::ATTRIBUTE_WALKS, 1);
     let mut attributes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut current = page_obj;
     let mut seen = std::collections::HashSet::new();
@@ -2377,6 +2394,35 @@ mod tests {
         assert!(!looks_like_compressed_xref(b"xref\n0 1\n"));
     }
 
+    /// A page with a 100 KB entry and one content stream.
+    fn make_pdf_with_large_page() -> Vec<u8> {
+        let page = format!(
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Big ({}) >>\nendobj\n",
+            "a".repeat(100_000)
+        );
+        make_classic_pdf(
+            vec![
+                (
+                    1,
+                    0,
+                    b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+                ),
+                (
+                    2,
+                    0,
+                    b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+                ),
+                (3, 0, page.into_bytes()),
+                (
+                    4,
+                    0,
+                    b"4 0 obj\n<< /Length 2 >>\nstream\nBT\nendstream\nendobj\n".to_vec(),
+                ),
+            ],
+            (1, 0),
+        )
+    }
+
     /// WHY: every xref entry is checked for an object header. The check reads
     /// a bounded window, so a table whose entries all point into one long
     /// token costs the size of the table, not the table times the file.
@@ -2417,5 +2463,27 @@ mod tests {
         assert!(delimiters_balance(b"<< /A [1 2 (]) <5d> ] /B << >> >>"));
         assert!(!delimiters_balance(b"<< /A [1 2 >>"));
         assert!(!delimiters_balance(b"<< /A 1 >> >>"));
+    }
+
+    /// WHY: a selection over the repeat limit used to be refused only after
+    /// the inherited attributes were collected once per repeat (29 s for
+    /// 20,000 repeats of a page under 141 KB of inherited resources).
+    #[test]
+    fn repeats_are_refused_or_accepted_after_one_walk_per_distinct_page() {
+        let data = make_pdf_with_large_page();
+        work::take(&work::ATTRIBUTE_WALKS);
+        let error = PdfWriter::extract_pages_from_bytes(&data, &[1; 20_000])
+            .expect_err("two gigabytes of copies");
+        assert_eq!(
+            error.to_string(),
+            "the repeated pages need more than 16777216 bytes of page dictionary copies; \
+             select fewer repeats"
+        );
+        assert_eq!(work::take(&work::ATTRIBUTE_WALKS), 1);
+
+        let small = make_minimal_pdf();
+        let selection: Vec<usize> = (0..5_000).map(|index| 1 + index % 2).collect();
+        PdfWriter::extract_pages_from_bytes(&small, &selection).expect("extracts");
+        assert_eq!(work::take(&work::ATTRIBUTE_WALKS), 2);
     }
 }
