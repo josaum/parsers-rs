@@ -1353,12 +1353,18 @@ struct StyleFonts {
     /// The fonts of the default paragraph style, which a paragraph without a
     /// `w:pStyle` uses.
     default_paragraph: symbol::FontChoice,
+    /// The fonts of the default table style, which a table without a
+    /// `w:tblStyle` uses.
+    default_table: symbol::FontChoice,
+    /// The fonts of `w:docDefaults` (`w:rPrDefault`), behind every style.
+    defaults: symbol::FontChoice,
 }
 
 impl StyleFonts {
-    /// Whether no style names a font, so only a run's own font matters.
+    /// Whether neither a style nor the document defaults name a font, so
+    /// only a run's own font matters.
     fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.by_id.is_empty() && self.defaults.is_inherit()
     }
 
     fn of(&self, style_id: &str) -> symbol::FontChoice {
@@ -1366,19 +1372,30 @@ impl StyleFonts {
     }
 
     /// The fonts in effect for a run, nearest formatting first: the run's
-    /// own, its character style, then the paragraph's style.
+    /// own, its character style, the paragraph's style, the style of the
+    /// table the run is in, then the document defaults (ECMA-376 part 1,
+    /// 17.7.2).
+    ///
+    /// `table_style` is `None` outside a table, and inside one the table's
+    /// `w:tblStyle`, itself `None` for a table that names no style.
     fn effective(
         &self,
         run: symbol::FontChoice,
         run_style: Option<&str>,
         paragraph_style: Option<&str>,
+        table_style: Option<Option<&str>>,
     ) -> symbol::FontChoice {
         let character = run_style.map(|id| self.of(id)).unwrap_or_default();
         let paragraph = match paragraph_style {
             Some(id) => self.of(id),
             None => self.default_paragraph,
         };
-        run.or(character).or(paragraph)
+        let table = match table_style {
+            Some(Some(id)) => self.of(id),
+            Some(None) => self.default_table,
+            None => symbol::FontChoice::default(),
+        };
+        run.or(character).or(paragraph).or(table).or(self.defaults)
     }
 }
 
@@ -1418,6 +1435,9 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
     let mut buf = Vec::new();
     let mut declared: HashMap<String, Declared> = HashMap::new();
     let mut default_paragraph: Option<String> = None;
+    let mut default_table: Option<String> = None;
+    let mut defaults = symbol::FontChoice::default();
+    let mut in_doc_defaults = false;
     let mut current: Option<(String, Declared)> = None;
     let mut in_rpr = false;
     // Inside `w:tblStylePr`: formatting for part of a table, not the style's.
@@ -1433,10 +1453,14 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
                         let id = attr_value(&reader, e, b"styleId")?.unwrap_or_default();
                         let is_default = attr_value(&reader, e, b"default")?
                             .is_some_and(|val| val == "1" || val.eq_ignore_ascii_case("true"));
-                        let is_paragraph = attr_value(&reader, e, b"type")?
-                            .is_some_and(|kind| kind == "paragraph");
+                        let kind = attr_value(&reader, e, b"type")?;
+                        let is_paragraph = kind.as_deref() == Some("paragraph");
                         if is_default && is_paragraph && default_paragraph.is_none() {
                             default_paragraph = Some(id.clone());
+                        }
+                        if is_default && kind.as_deref() == Some("table") && default_table.is_none()
+                        {
+                            default_table = Some(id.clone());
                         }
                         let style = Declared {
                             based_on: None,
@@ -1457,9 +1481,12 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
                     }
                     b"rPr" if is_start => in_rpr = true,
                     b"tblStylePr" if is_start => in_table_part = true,
+                    b"docDefaults" if is_start => in_doc_defaults = true,
                     b"rFonts" if in_rpr && !in_table_part => {
                         if let Some((_, style)) = current.as_mut() {
                             style.fonts = font_choice(&reader, e)?;
+                        } else if in_doc_defaults {
+                            defaults = font_choice(&reader, e)?;
                         }
                     }
                     _ => {}
@@ -1475,6 +1502,7 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
                     }
                     b"rPr" => in_rpr = false,
                     b"tblStylePr" => in_table_part = false,
+                    b"docDefaults" => in_doc_defaults = false,
                     _ => {}
                 }
             }
@@ -1508,9 +1536,15 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
         .as_deref()
         .map(|id| by_id.get(id).copied().unwrap_or_default())
         .unwrap_or_default();
+    let default_table = default_table
+        .as_deref()
+        .map(|id| by_id.get(id).copied().unwrap_or_default())
+        .unwrap_or_default();
     Ok(StyleFonts {
         by_id,
         default_paragraph,
+        default_table,
+        defaults,
     })
 }
 
@@ -2282,6 +2316,9 @@ struct DocxBodyParser<'a> {
     /// Table containers currently on `containers`, kept under
     /// [`MAX_TABLE_DEPTH`].
     open_tables: usize,
+    /// The `w:tblStyle` of each open table, innermost last; `None` for a
+    /// table that names no style.
+    table_styles: Vec<Option<String>>,
     in_ppr: bool,
     in_rpr: bool,
     in_numpr: bool,
@@ -2398,6 +2435,7 @@ impl<'a> DocxBodyParser<'a> {
             pending_comment_refs: Vec::new(),
             current_revision_stack: Vec::new(),
             open_tables: 0,
+            table_styles: Vec::new(),
             in_ppr: false,
             in_rpr: false,
             in_numpr: false,
@@ -2416,6 +2454,7 @@ impl<'a> DocxBodyParser<'a> {
         self.pending_comment_refs.clear();
         self.current_revision_stack.clear();
         self.open_tables = 0;
+        self.table_styles.clear();
         self.in_ppr = false;
         self.in_rpr = false;
         self.in_numpr = false;
@@ -2471,7 +2510,7 @@ impl<'a> DocxBodyParser<'a> {
         e: &quick_xml::events::BytesStart<'_>,
         name: &[u8],
     ) -> Result<()> {
-        if matches!(name, b"rPrChange" | b"pPrChange") {
+        if matches!(name, b"rPrChange" | b"pPrChange" | b"tblPrChange") {
             self.old_properties_depth += 1;
             return Ok(());
         }
@@ -2710,8 +2749,14 @@ impl<'a> DocxBodyParser<'a> {
                     ));
                 }
                 self.open_tables += 1;
+                self.table_styles.push(None);
                 self.containers
                     .push(Container::Table(TableBuilder::default()));
+            }
+            b"tblStyle" => {
+                if let Some(style) = self.table_styles.last_mut() {
+                    *style = attr_value(reader, e, b"val")?;
+                }
             }
             b"tr" => {
                 self.containers
@@ -2782,8 +2827,14 @@ impl<'a> DocxBodyParser<'a> {
                 .current_paragraph
                 .as_ref()
                 .and_then(|paragraph| paragraph.style_id.as_deref());
+            let table_style = self.table_styles.last().map(Option::as_deref);
             self.style_fonts
-                .effective(run.fonts, run.style_id.as_deref(), paragraph_style)
+                .effective(
+                    run.fonts,
+                    run.style_id.as_deref(),
+                    paragraph_style,
+                    table_style,
+                )
                 .symbol_fonts()
         };
         run.symbol_fonts = Some(fonts);
@@ -2791,7 +2842,7 @@ impl<'a> DocxBodyParser<'a> {
     }
 
     fn handle_end(&mut self, name: &[u8]) -> Result<()> {
-        if matches!(name, b"rPrChange" | b"pPrChange") {
+        if matches!(name, b"rPrChange" | b"pPrChange" | b"tblPrChange") {
             self.old_properties_depth = self.old_properties_depth.saturating_sub(1);
             return Ok(());
         }
@@ -2847,6 +2898,7 @@ impl<'a> DocxBodyParser<'a> {
                 }
             }
             b"tbl" => {
+                self.table_styles.pop();
                 if let Some(Container::Table(table)) = self.pop_container() {
                     let block = Block::Table(Table { rows: table.rows });
                     self.push_block(block);

@@ -471,3 +471,127 @@ fn a_symbol_font_from_a_style_maps_plain_letters_too() {
     let body = r#"<w:p><w:r><w:rPr><w:rStyle w:val="Greek"/></w:rPr><w:t>p</w:t></w:r><w:r><w:t>p</w:t></w:r></w:p>"#;
     assert_eq!(paragraphs(&parse(body, styles)), ["\u{3c0}p"]);
 }
+
+/// Every paragraph of the document in order, those inside tables included.
+fn all_paragraphs(blocks: &[Block], out: &mut Vec<String>) {
+    for block in blocks {
+        match block {
+            Block::Paragraph(paragraph) => out.push(paragraph.text.clone()),
+            Block::Table(table) => {
+                for cell in table.rows.iter().flat_map(|row| &row.cells) {
+                    all_paragraphs(&cell.blocks, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn doc_defaults(fonts: &str) -> String {
+    format!(
+        "<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts {fonts}/></w:rPr></w:rPrDefault></w:docDefaults>"
+    )
+}
+
+// ECMA-376 part 1, 17.7.2: document defaults are the outermost level of
+// formatting, behind every style.
+#[test]
+fn a_symbol_font_from_the_document_defaults_is_applied() {
+    let styles = [
+        doc_defaults(WINGDINGS),
+        style(
+            "paragraph",
+            "Text",
+            "",
+            None,
+            r#"w:ascii="Arial" w:hAnsi="Arial""#,
+        ),
+        style("paragraph", "Bare", "", None, ""),
+    ]
+    .concat();
+    let body = [
+        "<w:p><w:r><w:t>J</w:t></w:r></w:p>".to_string(),
+        // A style that names no font leaves the defaults in effect.
+        r#"<w:p><w:pPr><w:pStyle w:val="Bare"/></w:pPr><w:r><w:t>J</w:t></w:r></w:p>"#.to_string(),
+        // A style or a run that names a font is nearer than the defaults.
+        r#"<w:p><w:pPr><w:pStyle w:val="Text"/></w:pPr><w:r><w:t>J</w:t></w:r></w:p>"#.to_string(),
+        run(r#"w:ascii="Arial" w:hAnsi="Arial""#, "J"),
+    ]
+    .concat();
+    assert_eq!(
+        paragraphs(&parse(&body, &styles)),
+        ["\u{263A}", "\u{263A}", "J", "J"]
+    );
+}
+
+#[test]
+fn a_theme_font_in_the_document_defaults_is_an_ordinary_font() {
+    let styles = doc_defaults(
+        r#"w:ascii="Wingdings" w:asciiTheme="minorHAnsi" w:hAnsi="Wingdings" w:hAnsiTheme="minorHAnsi""#,
+    );
+    let body = "<w:p><w:r><w:t>J</w:t></w:r></w:p>";
+    assert_eq!(paragraphs(&parse(body, &styles)), ["J"]);
+}
+
+fn table(properties: &str, cell: &str) -> String {
+    format!("<w:tbl><w:tblPr>{properties}</w:tblPr><w:tr><w:tc>{cell}</w:tc></w:tr></w:tbl>")
+}
+
+// A table style formats the runs of the table it is applied to, behind the
+// paragraph and character styles and ahead of the document defaults.
+#[test]
+fn a_symbol_font_from_the_table_style_is_applied() {
+    let styles = [
+        style("table", "Marks", "", None, WINGDINGS),
+        style("table", "Derived", "", Some("Marks"), ""),
+        style(
+            "paragraph",
+            "Text",
+            "",
+            None,
+            r#"w:ascii="Arial" w:hAnsi="Arial""#,
+        ),
+    ]
+    .concat();
+    let plain = "<w:p><w:r><w:t>J</w:t></w:r></w:p>";
+    let styled = r#"<w:p><w:pPr><w:pStyle w:val="Text"/></w:pPr><w:r><w:t>J</w:t></w:r></w:p>"#;
+    let body = [
+        table(r#"<w:tblStyle w:val="Marks"/>"#, &[plain, styled].concat()),
+        table(r#"<w:tblStyle w:val="Derived"/>"#, plain),
+        // The style of the table the run is in counts, not that of a table
+        // around it; and the former style in a tracked change does not.
+        table(
+            r#"<w:tblStyle w:val="Marks"/>"#,
+            &[&table("", plain), plain].concat(),
+        ),
+        table(
+            r#"<w:tblPrChange w:id="1" w:author="a"><w:tblPr><w:tblStyle w:val="Marks"/></w:tblPr></w:tblPrChange>"#,
+            plain,
+        ),
+        // Outside any table.
+        plain.to_string(),
+    ]
+    .concat();
+    let mut texts = Vec::new();
+    all_paragraphs(&parse(&body, &styles).blocks, &mut texts);
+    assert_eq!(
+        texts,
+        ["\u{263A}", "J", "\u{263A}", "J", "\u{263A}", "J", "J"]
+    );
+}
+
+#[test]
+fn the_default_table_style_and_the_defaults_are_ordered() {
+    let styles = [
+        doc_defaults(SYMBOL),
+        style("table", "Normal", r#" w:default="1""#, None, WINGDINGS),
+    ]
+    .concat();
+    let plain = "<w:p><w:r><w:t>J</w:t></w:r></w:p>";
+    let body = [table("", plain), plain.to_string()].concat();
+    let mut texts = Vec::new();
+    all_paragraphs(&parse(&body, &styles).blocks, &mut texts);
+    // In the table the default table style is nearer than the document
+    // defaults; outside it only the defaults apply (Symbol: J is theta).
+    assert_eq!(texts, ["\u{263A}", "\u{3D1}"]);
+}
