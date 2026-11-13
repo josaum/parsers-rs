@@ -1,13 +1,14 @@
 //! Malformed HTML must be parsed within its limits or rejected with an error.
 //!
-//! Covers `parse_html` and `parse_html_bytes`, with and without a base URL and
+//! Covers `parse_html`, `parse_html_bytes` and `parse_html_file`, with and without a base URL and
 //! with odd encoding labels, plus the Arrow output behind the `arrow` feature.
 
 #[path = "../../tools/mutation_smoke.rs"]
 mod smoke;
 
 use web_fast_core::{
-    parse_html, parse_html_bytes, ParseOptions, WebDocument, WebParseError, MAX_NESTING_DEPTH,
+    parse_html, parse_html_bytes, parse_html_file, ParseOptions, WebDocument, WebParseError,
+    MAX_NESTING_DEPTH,
 };
 
 #[global_allocator]
@@ -90,6 +91,49 @@ fn mutated_html_never_panics() {
     // 20,000 iterations ran clean once but take over a minute in a debug
     // build; this count keeps the test near 15 seconds.
     smoke::assert_no_panics("web-fast-core html", &[seed()], 4_000, exercise);
+}
+
+/// `parse_html_file` reads the file and must then behave exactly like
+/// `parse_html_bytes`: same success or failure, same document.
+#[test]
+fn mutated_html_files_never_panic_and_match_the_bytes_parse() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("input.html");
+    smoke::assert_no_panics("web-fast-core html file", &[seed()], 400, |bytes| {
+        std::fs::write(&path, bytes).expect("write input");
+        let from_file = parse_html_file(&path, None, ParseOptions::default());
+        let from_bytes = parse_html_bytes(bytes, None, ParseOptions::default());
+        match (from_file, from_bytes) {
+            (Ok(file), Ok(bytes)) => {
+                assert_eq!(file.source_sha256, bytes.source_sha256);
+                assert_eq!(file.blocks, bytes.blocks);
+                assert_eq!(file.tables, bytes.tables);
+            }
+            (Err(_), Err(_)) => {}
+            (file, bytes) => panic!("file ok={} bytes ok={}", file.is_ok(), bytes.is_ok()),
+        }
+    });
+
+    std::fs::write(&path, seed()).expect("write seed");
+    let tiny = ParseOptions {
+        max_input_bytes: 16,
+        ..ParseOptions::default()
+    };
+    assert!(matches!(
+        parse_html_file(&path, None, tiny),
+        Err(WebParseError::InputTooLarge)
+    ));
+    for missing in [
+        directory.path().join("absent.html"),
+        directory.path().to_owned(),
+    ] {
+        assert!(matches!(
+            parse_html_file(&missing, None, ParseOptions::default()),
+            Err(WebParseError::Io(_))
+        ));
+    }
+    std::fs::write(&path, b"").expect("write empty");
+    assert!(parse_html_file(&path, None, ParseOptions::default()).is_ok());
 }
 
 #[test]
