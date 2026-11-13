@@ -20,6 +20,10 @@ yanked = "deny"
 # Said out loud, though it is the default: an unmaintained crate fails wherever
 # it sits in the graph, not only as a direct dependency.
 unmaintained = "all"
+# Likewise an unsound crate. Without this cargo-deny reads unsoundness
+# advisories for the workspace's direct dependencies only, and an unsound
+# crate deeper in the graph passes.
+unsound = "all"
 
 [licenses]
 # The workspace is distributed as `MIT OR Apache-2.0`. A dependency passes when

@@ -602,12 +602,13 @@ def assert_deny_policy(policy: str) -> None:
     assert config["graph"] == {"all-features": True}, "optional dependencies must be checked too"
 
     advisories = config["advisories"]
-    # No advisory is waved through, and neither a yanked nor an unmaintained
-    # crate is, wherever it sits in the graph.
+    # No advisory is waved through, and neither a yanked, an unmaintained nor
+    # an unsound crate is, wherever it sits in the graph.
     assert advisories.get("ignore", []) == [], "deny.toml ignores an advisory"
     assert advisories.get("yanked") == "deny"
     assert advisories.get("unmaintained") == "all"
-    assert set(advisories) <= {"ignore", "yanked", "unmaintained"}, "an advisory setting nobody reviewed"
+    assert advisories.get("unsound") == "all"
+    assert set(advisories) <= {"ignore", "yanked", "unmaintained", "unsound"}, "an advisory setting nobody reviewed"
 
     sources = config["sources"]
     assert sources.get("unknown-registry") == "deny"
@@ -1301,6 +1302,8 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_deny_policy, ROOT / DENY_CONFIG, 'yanked = "deny"', 'yanked = "warn"'),
         (assert_deny_policy, ROOT / DENY_CONFIG, 'unmaintained = "all"', 'unmaintained = "none"'),
         (assert_deny_policy, ROOT / DENY_CONFIG, 'unmaintained = "all"\n', ""),
+        (assert_deny_policy, ROOT / DENY_CONFIG, 'unsound = "all"', 'unsound = "workspace"'),
+        (assert_deny_policy, ROOT / DENY_CONFIG, 'unsound = "all"\n', ""),
         (assert_deny_policy, ROOT / DENY_CONFIG, "all-features = true", "all-features = false"),
         (assert_deny_policy, ROOT / DENY_CONFIG, 'multiple-versions = "warn"', 'multiple-versions = "allow"'),
         (assert_deny_policy, ROOT / DENY_CONFIG, 'wildcards = "warn"', 'wildcards = "allow"'),
