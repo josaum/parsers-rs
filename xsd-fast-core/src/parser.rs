@@ -599,7 +599,11 @@ fn unbounded_string_type() -> Box<XsdType> {
     Box::new(XsdType::Simple(SimpleTypeDef::string_unbounded()))
 }
 
-/// A complex type with no content, no attributes and no base.
+/// A complex type with no content, no attributes and no base, as
+/// `<xs:complexType/>` declares it.
+///
+/// It is marked empty in the source; [`parse_complex_type_into`] takes the
+/// mark away at the first child that is not an annotation.
 fn empty_complex_type() -> ComplexType {
     ComplexType {
         name: None,
@@ -608,6 +612,7 @@ fn empty_complex_type() -> ComplexType {
         base: None,
         derivation: Derivation::default(),
         prohibited_attributes: Vec::new(),
+        empty_in_source: true,
         content_occurrence: OccurrenceConstraint::default(),
     }
 }
@@ -643,6 +648,10 @@ fn parse_complex_type_into(
         match next_tag(reader, &mut buf, "complexType")? {
             Tag::Start { local, attrs } => {
                 depth += 1;
+                // Anything but an annotation is content, modelled or not.
+                if local != "annotation" {
+                    complex_type.empty_in_source = false;
+                }
                 match local.as_str() {
                     "sequence" => {
                         complex_type.content_occurrence = parse_occurrence(&attrs);
@@ -695,6 +704,9 @@ fn parse_complex_type_into(
                 }
             }
             Tag::Empty { local, attrs } => {
+                if local != "annotation" {
+                    complex_type.empty_in_source = false;
+                }
                 if local == "attribute" {
                     push_attribute_decl(&attrs, None, ns_map, &mut complex_type.attributes);
                 }

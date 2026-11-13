@@ -566,18 +566,17 @@ impl Derivation<'_> {
     }
 }
 
-/// Whether a complex type has no attributes and no particles.
+/// Whether a complex type is empty as written, and has stayed so.
 ///
-/// True for `<xs:complexType/>`, for the open-and-closed form with nothing
-/// inside, and for a model group that holds no particle. A type with simple
-/// content has a text value and is not empty in this sense.
+/// True for `<xs:complexType/>` and for the open-and-closed form with
+/// nothing inside but annotations. Having no particles and no attributes is
+/// not enough: the parser leaves out the constructs it does not model, so a
+/// type built only from those has neither, and derives no column.
 fn declares_nothing(ct: &ComplexType) -> bool {
-    let no_particles = match &ct.content {
-        ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p.is_empty(),
-        ContentModel::SimpleContent(_) => false,
-        ContentModel::Empty => true,
-    };
-    no_particles && ct.attributes.is_empty()
+    ct.empty_in_source
+        && ct.base.is_none()
+        && ct.attributes.is_empty()
+        && matches!(ct.content, ContentModel::Empty)
 }
 
 /// Marks every field nullable: a choice selects at most one branch, so none

@@ -314,6 +314,17 @@ pub struct ComplexType {
     /// base's attributes of those names are left out when it is folded in.
     #[serde(default)]
     pub prohibited_attributes: Vec<String>,
+    /// Whether the type was written with nothing in it but annotations:
+    /// `<xs:complexType/>`, or the open-and-closed form of that.
+    ///
+    /// This is not the same as having no particles and no attributes. The
+    /// parser leaves out what it does not model (attribute references,
+    /// attribute groups, group references, wildcards, a derivation from a
+    /// base it cannot find), so a type built only from those has neither
+    /// and is not empty. `false` for a model that was deserialized without
+    /// this field or built by a caller that does not set it.
+    #[serde(default)]
+    pub empty_in_source: bool,
     /// Occurrence bounds of the model group that is the type's content: the
     /// `minOccurs` / `maxOccurs` written on its `xs:sequence`, `xs:all` or
     /// `xs:choice`. With a minimum of zero the whole content may be left out,
