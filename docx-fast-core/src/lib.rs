@@ -524,8 +524,8 @@ fn parse_header_footer_refs<R: BufRead>(reader: R) -> Result<Vec<HeaderFooterRef
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if name == b"headerReference" || name == b"footerReference" {
                     let mut rel_id = None;
                     let mut ref_type = None;
@@ -1076,8 +1076,8 @@ fn parse_settings(archive: &DocxArchive, max_inflate: usize) -> Result<HashMap<S
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if name == b"settings" {
                     continue;
                 }
@@ -1258,8 +1258,8 @@ fn parse_styles(xml: &[u8]) -> Result<Vec<Style>> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if name == b"style" {
                     let mut style = Style {
                         id: String::new(),
@@ -1530,8 +1530,8 @@ fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if name == b"abstractNum" {
                     let mut id = 0u32;
                     if let Some(val) = attr_value(&reader, &e, b"abstractNumId")? {
@@ -1584,8 +1584,8 @@ fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
                 }
             }
             Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if name == b"lvl" {
                     if let Some(level) = current_level.take() {
                         if let Some(abs) = current_abs.as_mut() {
@@ -1629,8 +1629,8 @@ fn parse_notes(
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if name == tag {
                     let note_type = attr_value(&reader, &e, b"type")?;
                     let is_user_note = note_type.as_deref().is_none_or(|value| value == "normal");
@@ -1647,15 +1647,15 @@ fn parse_notes(
                 }
             }
             Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if current_id.is_some() {
                     parser.handle_empty(&reader, &e, name)?;
                 }
             }
             Ok(Event::Text(e)) => {
                 if current_id.is_some() {
-                    parser.handle_text(text_event_string(&e).as_bytes());
+                    parser.handle_text(&e);
                 }
             }
             Ok(Event::GeneralRef(e)) => {
@@ -1669,8 +1669,8 @@ fn parse_notes(
                 }
             }
             Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if name == tag {
                     if let Some(id) = current_id {
                         let blocks = parser.finish();
@@ -1703,8 +1703,8 @@ fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Res
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if name == b"comment" {
                     let mut comment = Comment {
                         id: 0,
@@ -1765,15 +1765,15 @@ fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Res
                 }
             }
             Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if current.is_some() {
                     parser.handle_empty(&reader, &e, name)?;
                 }
             }
             Ok(Event::Text(e)) => {
                 if current.is_some() {
-                    parser.handle_text(text_event_string(&e).as_bytes());
+                    parser.handle_text(&e);
                 }
             }
             Ok(Event::GeneralRef(e)) => {
@@ -1787,8 +1787,8 @@ fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Res
                 }
             }
             Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if name == b"comment" {
                     if let Some(mut comment) = current.take() {
                         comment.blocks = parser.finish();
@@ -1973,8 +1973,8 @@ fn parse_content_types(
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 if name == b"Default" {
                     let mut ext = None;
                     let mut ct = None;
@@ -2423,17 +2423,17 @@ impl<'a> DocxBodyParser<'a> {
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
-                    let raw = e.name().as_ref().to_vec();
-                    let name = local_name(&raw);
+                    let qname = e.name();
+                    let name = local_name(qname.as_ref());
                     self.handle_start(&reader, &e, name)?;
                 }
                 Ok(Event::Empty(e)) => {
-                    let raw = e.name().as_ref().to_vec();
-                    let name = local_name(&raw);
+                    let qname = e.name();
+                    let name = local_name(qname.as_ref());
                     self.handle_empty(&reader, &e, name)?;
                 }
                 Ok(Event::Text(e)) => {
-                    self.handle_text(text_event_string(&e).as_bytes());
+                    self.handle_text(&e);
                 }
                 // A reference arrives on its own, between the pieces of text
                 // around it, and is text like them.
@@ -2445,8 +2445,8 @@ impl<'a> DocxBodyParser<'a> {
                     self.handle_text(&e);
                 }
                 Ok(Event::End(e)) => {
-                    let raw = e.name().as_ref().to_vec();
-                    let name = local_name(&raw);
+                    let qname = e.name();
+                    let name = local_name(qname.as_ref());
                     self.handle_end(name)?;
                 }
                 Ok(Event::Eof) => break,
