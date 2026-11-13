@@ -1,27 +1,59 @@
-//! Decides whether the full interpreter can render a page without running
-//! out of stack.
+//! Bounds what the full interpreter is asked to render, so that it does not
+//! run out of stack.
 //!
-//! The interpreter (`hayro`) enters another content stream in five places and
-//! guards none of them: a Form XObject drawn with `Do`, an annotation's normal
-//! appearance, the cell of a tiling pattern, a Type 3 glyph procedure, and the
-//! group of a soft mask. A stream that reaches itself recurses until the stack
-//! overflows, and so does a long enough chain of distinct streams. Either one
-//! aborts the process, so [`vet_page`] walks everything a page can reach
-//! before the interpreter is allowed near it.
+//! The interpreter (`hayro`) recurses with no limit in many places, and a
+//! stack overflow aborts the process. It therefore runs on a thread of its
+//! own with a stack of [`RENDER_STACK_BYTES`], and [`vet_page`] runs there
+//! first, on the very page object about to be rendered.
 //!
-//! The walk uses the interpreter's own object model: the same page object,
+//! The check uses the interpreter's own object model: the same page object,
 //! the same `Resources` chain with its fallback to the enclosing stream's
 //! resources, the same content tokenizer. Two details of that model decide
 //! what recurses, and a second parser would get both wrong: a name missing
 //! from a stream's own resources is looked up in every enclosing stream's,
 //! and a reference back into an object the lookup is already inside comes
-//! back empty.
+//! back empty. The second means the same stream can resolve, and even
+//! decode, differently on different paths, so the walk follows contexts,
+//! not streams.
 //!
-//! What a stream reaches therefore depends on the streams around it, so the
-//! walk follows contexts, not streams: one visit per distinct name a stream
-//! uses, however many times it uses it. Each stream is decoded and tokenized
-//! once per render. A stream that reappears beneath itself is refused, and so
-//! is anything that would need more stack than [`STACK_BUDGET`].
+//! # What is bounded, and by what
+//!
+//! Recursive functions in hayro 0.5.0 that hostile input can drive:
+//!
+//! | recursion | bounded by |
+//! |---|---|
+//! | `interpret` through `draw_form_xobject` (`Do`, annotation `/AP /N`) | [`STACK_BUDGET`]; a stream beneath itself is refused |
+//! | `interpret` through `TilingPattern::interpret` | the same |
+//! | `interpret` through `SoftMask::interpret` | the same |
+//! | `interpret` through `Type3::render_glyph` | a glyph procedure that could enter another content stream is refused |
+//! | `Resources::clone`, `Resources` lookups and drop, one frame per level | the same budget, since the chain is as long as the nesting |
+//! | `page::resolve_pages` over `/Kids` | `MAX_PAGE_TREE_DEPTH`, checked on this crate's own reading of the file before the interpreter opens it |
+//! | `Function::new` through stitching functions | [`MAX_OBJECT_DEPTH`] |
+//! | `ColorSpace::new` through `/Indexed`, `/Separation`, `/DeviceN`, `/ICCBased` | [`MAX_OBJECT_DEPTH`] |
+//! | `function::type4::parse_procedure_inner` | [`MAX_PROGRAM_OPENINGS`] |
+//! | the content tokenizer's `skip` and `read` of nested arrays and dictionaries | [`MAX_CONTENT_OPENINGS`] |
+//!
+//! # What is not bounded
+//!
+//! * **Nesting in the file's own object syntax.** Reading any object whose
+//!   text holds deeply nested arrays or dictionaries recurses in the
+//!   interpreter's parser, and that happens while it opens the document,
+//!   before this module sees anything. Only the size of the render stack
+//!   stands against it.
+//! * **A page tree the two parsers read differently.** The page-tree bound
+//!   uses this crate's parser, not the interpreter's.
+//! * **Objects this module does not follow.** Font dictionaries, CMaps
+//!   (`usecmap` chains), embedded font programs, ICC profiles, image
+//!   decoders (JPEG 2000, JBIG2, CCITT) and optional-content dictionaries
+//!   were not audited for recursion.
+//! * **Memory.** Every nested tiling cell and soft mask gets a renderer the
+//!   size of the page, and the interpreter's saved-state stack is unbounded.
+//!   The stack budget limits their depth, not what they allocate.
+//!
+//! The table above was drawn from reading the content-stream entry points
+//! and the functions a review found to overflow. It is not the result of an
+//! exhaustive search of `hayro-syntax`, `hayro-interpret`, `hayro` and
+//! `hayro-font` for every self-recursive function.
 
 use anyhow::{anyhow, Result};
 use hayro::hayro_syntax::content::ops::TypedInstruction;
