@@ -130,7 +130,15 @@ impl SpatialIndex {
         let Some(root) = self.root else {
             return;
         };
-        self.query_node(root, query, out);
+        // A node's box is tested once, here for the root and by its parent
+        // for every other node.
+        if self
+            .nodes
+            .get(root)
+            .is_some_and(|node| node.bbox.intersects(query))
+        {
+            self.query_node(root, query, out);
+        }
     }
 
     /// Query that also matches antimeridian-split query boxes.
@@ -151,13 +159,11 @@ impl SpatialIndex {
         out
     }
 
+    /// Collects the matches under a node whose own box intersects `query`.
     fn query_node(&self, node_id: usize, query: &BBox, out: &mut Vec<usize>) {
         let Some(node) = self.nodes.get(node_id) else {
             return;
         };
-        if !node.bbox.intersects(query) {
-            return;
-        }
         if node.is_leaf {
             for child in &node.children {
                 if child.bbox.intersects(query) {
