@@ -1,0 +1,38 @@
+[package]
+name = "geo-fast-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+geo-fast-core = { path = ".." }
+
+[[bin]]
+name = "shapefile"
+path = "fuzz_targets/shapefile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "geotiff"
+path = "fuzz_targets/geotiff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "geojson"
+path = "fuzz_targets/geojson.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone fuzz crate: intentionally outside the office-parsers-rs
+# workspace (members are explicit) and outside any parent workspace, so the
+# workspace lockfile and build never see libFuzzer.
+[workspace]

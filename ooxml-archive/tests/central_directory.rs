@@ -99,3 +99,15 @@ fn an_archive_at_the_classic_entry_limit_opens() {
         assert_eq!(archive.part_names().count(), count);
     }
 }
+
+#[test]
+fn part_names_are_sorted_byte_by_byte_whatever_the_archive_order() {
+    let archive =
+        OoxmlArchive::from_bytes(package(&["z.xml", "a/b.xml", "A.xml", "m.xml", "a.xml"]))
+            .unwrap();
+    let names: Vec<&str> = archive.part_names().collect();
+    assert_eq!(names, ["A.xml", "a.xml", "a/b.xml", "m.xml", "z.xml"]);
+    // The same on every call, and nothing is lost to the ordering.
+    assert_eq!(archive.part_names().collect::<Vec<_>>(), names);
+    assert!(names.iter().all(|name| archive.has_part(name)));
+}

@@ -3,8 +3,8 @@
 //! Gated behind the `arrow` feature. Parses a JSONL/NDJSON stream of objects
 //! into [`RecordBatch`]es with a columnar schema, and optionally writes Arrow
 //! IPC (Feather v2). This is the transport seam for the rest of the stack:
-//! [`xlsx-fast-flight`] shows the flight-server pattern this feature feeds,
-//! and [`json-fast-zerobus`] shows the Databricks Arrow-Flight ingest pattern.
+//! `xlsx-fast-flight` shows the flight-server pattern this feature feeds,
+//! and `json-fast-zerobus` shows the Databricks Arrow-Flight ingest pattern.
 //!
 //! # Schema model
 //!

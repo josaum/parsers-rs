@@ -88,15 +88,37 @@ pub fn write_msg_cfb_fixture_streams(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
     msg::write_fixture_streams(streams)
 }
 
+/// Serializes the raw headers with their names in order.
+///
+/// A `HashMap` iterates in an order that changes from one process to the
+/// next; the same message must give the same bytes every time.
+fn serialize_sorted_headers<S>(
+    headers: &Option<HashMap<String, Vec<String>>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match headers {
+        Some(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            serializer.collect_map(entries)
+        }
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Configuration options for email parsing.
 #[derive(Debug, Clone, Copy)]
 pub struct ParseOptions {
-    /// Max uncompressed part size to load into memory (bytes).
+    /// Has no effect today: nothing in this crate reads it.
     ///
-    /// Parts larger than this threshold are streamed rather than
-    /// loaded entirely into memory. Default: 128 MiB.
-    /// Mirrors the `max_inflate` field in the OOXML parsers for API
-    /// consistency across all `*-fast-core` crates.
+    /// The field mirrors `max_inflate` in the OOXML parsers so that every
+    /// `*-fast-core` crate takes the same options, but an email is not a
+    /// compressed container and this crate inflates nothing. The sizes that
+    /// are enforced are `max_attachment_size` and
+    /// `max_total_attachment_bytes`. Default: 128 MiB.
     pub max_inflate: usize,
     /// Maximum size of attachments to process in bytes (default: 100 MB)
     pub max_attachment_size: usize,
@@ -267,7 +289,10 @@ pub struct Email {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
     /// All headers (if include_raw_headers is enabled)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_sorted_headers"
+    )]
     pub headers: Option<HashMap<String, Vec<String>>>,
 }
 

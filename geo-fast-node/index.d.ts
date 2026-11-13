@@ -13,3 +13,40 @@ export declare function bboxIouGeodesic(a: string, b: string): number;
 export declare function bboxAreaKm2(bbox: string): number;
 export declare function splitBboxAntimeridianJson(bbox: string): string;
 export declare function strtreeQueryJson(boxesJson: string, queryBBox: string): string;
+
+/** Georeferencing of a GeoTIFF, as `JSON.parse(geotiffMetadataJson(path))` returns it. */
+export interface GeoTiffMetadata {
+  width: number;
+  height: number;
+  band_count: number;
+  /** `[min_lon, min_lat, max_lon, max_lat]` in degrees; `null` for a projected raster. */
+  bbox: [number, number, number, number] | null;
+  pixel_scale: [number, number] | null;
+  tiepoints: number[][];
+  transformation_matrix: number[] | null;
+  epsg_code: number | null;
+  is_geographic: boolean;
+  /** True when the raster type is PixelIsPoint: a tiepoint ties a pixel centre. */
+  pixel_is_point: boolean;
+  upper_left: [number, number] | null;
+  lower_right: [number, number] | null;
+  /** GeoKey directory, by GeoKey ID. */
+  geokeys: Record<string, number>;
+  /** GeoKey values stored in the double and ASCII parameter tags, by GeoKey ID. */
+  geokey_params: { doubles: Record<string, number[]>; strings: Record<string, string> };
+}
+
+/** Read a GeoTIFF's georeferencing as a JSON string (see `GeoTiffMetadata`). Throws on an unreadable file. */
+export declare function geotiffMetadataJson(path: string): string;
+/** Samples as a typed array (what `geotiffBands` returns) or an array of numbers. */
+export type Samples = Float32Array | Float64Array | number[];
+
+/**
+ * Read every band, one `Float32Array` per band. `maxBandBytes` must be a
+ * non-negative whole number; throws when it is not, or when the bands exceed it.
+ */
+export declare function geotiffBands(path: string, maxBandBytes?: number | null): Float32Array[];
+/** NDVI per sample. Throws when the bands differ in length. */
+export declare function computeNdvi(nirBand: Samples, redBand: Samples): Float32Array;
+/** Spectral angle in radians. Throws when the spectra differ in length. */
+export declare function spectralAngle(pixelSpectrum: Samples, reference: Samples): number;

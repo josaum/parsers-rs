@@ -26,3 +26,16 @@ cargo test -p xsd-fast-py
 ```
 
 Licensed under either of MIT ([LICENSE](LICENSE)) or Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your option.
+## Every element's Arrow schema in one call
+
+```python
+import xsd_fast
+
+schemas = xsd_fast.all_arrow_schemas("schema.xsd")
+for element, fields in schemas.items():
+    print(element, [(f["path"], f["arrow_type"], f["nullable"]) for f in fields])
+```
+
+Each value has the shape `describe_element` returns for one element. If any
+element's schema cannot be derived the call raises `RuntimeError` instead of
+leaving that element out.

@@ -180,8 +180,10 @@ jobs:
           python3 -m pip install --no-index --no-deps dist/*.whl
           python3 -I -c "import importlib, os; [importlib.import_module(crate.removesuffix('-py').replace('-', '_')) for crate in os.environ['BINDINGS'].split()]"
           python3 -I -m pytest --import-mode=importlib -q \
-            email-fast-py/tests json-fast-py/tests ontology-fast-py/tests \
-            pdf-fast-py/tests xsd-fast-py/tests
+            docx-fast-py/tests email-fast-py/tests geo-fast-py/tests \
+            json-fast-py/tests ontology-fast-py/tests pdf-fast-py/tests \
+            pdf-fast-write-py/tests pptx-fast-py/tests xlsx-fast-py/tests \
+            xlsx-fast-write-py/tests xsd-fast-py/tests
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-${{ matrix.target }}
@@ -222,6 +224,8 @@ jobs:
           scripts/build-node.sh "${node_bindings[@]}"
       - name: Load and parse a generated fixture through each binding
         run: node scripts/smoke-node.mjs
+      - name: Check that every declared type is a real export
+        run: node scripts/check-node-types.mjs
       - name: Pack one tarball per binding
         shell: bash
         run: |

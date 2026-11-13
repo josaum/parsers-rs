@@ -12,7 +12,7 @@
 //! - Parses `xs:element`, `xs:complexType`, `xs:simpleType`, `xs:sequence`, `xs:choice`,
 //!   `xs:all`, `xs:extension`, `xs:restriction`, `xs:enumeration`, `xs:include`, `xs:import`
 //! - Resolves multi-file schemas (relative `schemaLocation` paths)
-//! - Derives an Arrow [`Schema`] from a root element (for downstream Flight / IPC)
+//! - Derives an Arrow `Schema` from a root element (for downstream Flight / IPC)
 //! - Validates XML byte slices against the parsed schema rules (enumeration, pattern,
 //!   minLength/maxLength, minInclusive/maxInclusive for simple types)
 //! - Produces structured [`ValidationError`] values — never panics on bad input

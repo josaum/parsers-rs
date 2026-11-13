@@ -3,7 +3,7 @@
 //! Validates simple-type constraints: enumerations, string length, numeric range.
 //! Complex structure checks (required children, cardinality) are also included.
 //!
-//! Each [`TypeFrame`] on the stack borrows its type from the schema model, so
+//! Each `TypeFrame` on the stack borrows its type from the schema model, so
 //! the cost of an open element does not depend on the size of its type.
 
 use std::collections::{HashMap, HashSet};
