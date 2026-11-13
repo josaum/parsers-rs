@@ -1,35 +1,45 @@
 //! Lossy UTF-8 input for the XML reader.
 //!
-//! quick-xml 0.42 validates every event as UTF-8 and fails the whole document
-//! on the first byte that is not. The parsers built on it read such a byte as
-//! U+FFFD and carry on, as they did when quick-xml handed them raw bytes, so
-//! their input passes through [`LossyUtf8`] (streams) or [`lossy_utf8`]
-//! (buffers) first. Both replace exactly what [`String::from_utf8_lossy`]
-//! replaces: each maximal ill-formed subsequence becomes one U+FFFD.
+//! The XML reader accepts only UTF-8 and fails a whole document on its first
+//! byte that is not. The parsers built on it read such a byte as U+FFFD and
+//! carry on, so their input passes through [`LossyUtf8`] first. It replaces
+//! exactly what [`String::from_utf8_lossy`] replaces: each maximal
+//! ill-formed subsequence becomes one U+FFFD.
+//!
+//! [`LossyUtf8`] also remembers where it put each replacement, so a parser
+//! that used to reject a value that was not UTF-8 can tell a replacement in
+//! that value from a U+FFFD the document really holds, or from a
+//! replacement elsewhere in the part ([`LossyUtf8::repaired_in`]).
 
 use std::borrow::Cow;
 use std::io::{self, BufRead, Read};
+use std::ops::RangeInclusive;
 
 /// U+FFFD REPLACEMENT CHARACTER encoded as UTF-8.
 const REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
 
+/// Most separate repaired spans remembered per stream.
+///
+/// Past this many, the spans are merged into one that covers them all, so
+/// memory stays bounded however many stray bytes a part holds. A value
+/// inside the merged span then counts as repaired if it holds U+FFFD.
+const MAX_SPANS: usize = 4096;
+
 /// Returns `bytes` as UTF-8, each ill-formed sequence replaced by U+FFFD.
 ///
-/// Valid input is borrowed unchanged. The result is `Cow::Owned` exactly when
-/// a replacement was made.
+/// Valid input is borrowed unchanged.
 #[must_use]
-pub fn lossy_utf8(bytes: &[u8]) -> Cow<'_, [u8]> {
-    match String::from_utf8_lossy(bytes) {
-        Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
-        Cow::Owned(text) => Cow::Owned(text.into_bytes()),
-    }
+pub fn lossy_utf8(bytes: &[u8]) -> Cow<'_, str> {
+    String::from_utf8_lossy(bytes)
 }
 
 /// A [`BufRead`] that yields its input as UTF-8, replacing ill-formed bytes.
 ///
 /// Valid input is passed through from the inner reader's buffer without a
-/// copy. A sequence split across two of the inner reader's buffers is joined
-/// first, so a character is never replaced for straddling a boundary.
+/// copy, and each byte is validated once. A sequence split across two of the
+/// inner reader's buffers is joined first, so a character is never replaced
+/// for straddling a boundary, and an [`io::ErrorKind::Interrupted`] from the
+/// inner reader in the middle of one loses nothing.
 #[derive(Debug)]
 pub struct LossyUtf8<R> {
     inner: R,
@@ -38,29 +48,111 @@ pub struct LossyUtf8<R> {
     pending: [u8; 4],
     pending_start: usize,
     pending_end: usize,
-    /// Bytes at the front of the inner buffer already checked as UTF-8, so
-    /// each byte is validated once however often the buffer is refilled.
+    /// The start of a character consumed from `inner` whose remaining bytes
+    /// have not been read yet.
+    carry: [u8; 4],
+    carry_len: usize,
+    /// Bytes at the front of the inner buffer already checked as UTF-8.
     validated: usize,
-    repaired: bool,
+    /// Output bytes consumed so far.
+    position: u64,
+    /// Most output bytes this stream may produce.
+    limit: u64,
+    /// Output ranges holding a replacement, ascending and disjoint.
+    spans: Vec<(u64, u64)>,
+    replacements: u64,
 }
 
 impl<R: BufRead> LossyUtf8<R> {
-    /// Wraps `inner`.
+    /// Wraps `inner`, with no limit on the output.
     pub fn new(inner: R) -> Self {
+        Self::with_limit(inner, u64::MAX)
+    }
+
+    /// Wraps `inner`, refusing to produce more than `limit` bytes.
+    ///
+    /// Replacing one byte with U+FFFD takes three, so repaired output can be
+    /// three times its input. Pass the limit the input was held to, and a
+    /// part that only grows past it by being repaired is refused instead of
+    /// being read at up to three times the size its limit allowed. Valid
+    /// UTF-8 is never longer than its input.
+    pub fn with_limit(inner: R, limit: u64) -> Self {
         Self {
             inner,
             pending: [0; 4],
             pending_start: 0,
             pending_end: 0,
+            carry: [0; 4],
+            carry_len: 0,
             validated: 0,
-            repaired: false,
+            position: 0,
+            limit,
+            spans: Vec::new(),
+            replacements: 0,
         }
     }
 
     /// Whether a byte that is not UTF-8 has been replaced so far.
     #[must_use]
     pub fn repaired(&self) -> bool {
-        self.repaired
+        self.replacements > 0
+    }
+
+    /// Output bytes consumed so far.
+    #[must_use]
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Whether `value` holds a U+FFFD this reader put there.
+    ///
+    /// `event` is the content of the event the XML reader returned last
+    /// (what a `BytesStart`, `BytesText`, `BytesCData` or `BytesRef`
+    /// dereferences to) and `value` a slice of it: an attribute's raw value,
+    /// a name, or the text itself. `after` is how many bytes the reader
+    /// consumed after the event's content: `1..=2` for a start or empty tag
+    /// (`>` or `/>`), `1..=1` for an end tag or a reference (`>`, `;`),
+    /// `3..=3` for CDATA (`]]>`), and `0..=0` for text the reader does not
+    /// trim. A range covers both cases at once; that is exact for values
+    /// and names, whose neighbors (a quote, `<`, `>`, `/` or white space)
+    /// are never a replacement.
+    ///
+    /// A U+FFFD the input itself held, or a replacement outside `value`,
+    /// does not count. A `value` that is not a slice of `event` counts as
+    /// repaired when any byte of `event` was.
+    #[must_use]
+    pub fn repaired_in(&self, event: &[u8], after: RangeInclusive<u64>, value: &[u8]) -> bool {
+        if self.replacements == 0 || !contains_replacement(value) {
+            return false;
+        }
+        let event_start = event.as_ptr() as usize;
+        let event_end = event_start + event.len();
+        let value_start = value.as_ptr() as usize;
+        let value = if value_start >= event_start && value_start + value.len() <= event_end {
+            value
+        } else {
+            event
+        };
+        let value_start = value.as_ptr() as usize;
+        let to_value_start = (event_end - value_start) as u64;
+        let to_value_end = (event_end - value_start - value.len()) as u64;
+        let start = self
+            .position
+            .saturating_sub(after.end().saturating_add(to_value_start));
+        let end = self
+            .position
+            .saturating_sub(after.start().saturating_add(to_value_end));
+        self.repaired_between(start, end)
+    }
+
+    /// Whether a replacement overlaps output bytes `start..end`.
+    fn repaired_between(&self, start: u64, end: u64) -> bool {
+        let first = self
+            .spans
+            .partition_point(|&(_, span_end)| span_end <= start);
+        self.spans
+            .get(first)
+            .is_some_and(|&(span_start, _)| span_start < end)
     }
 
     fn set_pending(&mut self, bytes: &[u8]) {
@@ -69,42 +161,88 @@ impl<R: BufRead> LossyUtf8<R> {
         self.pending_end = bytes.len();
     }
 
+    /// Queues one U+FFFD and records where it lands in the output.
     fn replace(&mut self) {
-        self.repaired = true;
+        self.replacements += 1;
+        let start = self.position;
+        let end = start + REPLACEMENT.len() as u64;
+        match self.spans.last_mut() {
+            Some(last) if last.1 == start => last.1 = end,
+            _ => self.spans.push((start, end)),
+        }
+        if self.spans.len() > MAX_SPANS {
+            let merged = (self.spans[0].0, end);
+            self.spans.clear();
+            self.spans.push(merged);
+        }
         self.set_pending(REPLACEMENT);
     }
 
-    /// Completes the character whose first `carry_len` bytes, held in
-    /// `carry`, ended an inner buffer, peeking at the next bytes one at a
-    /// time and consuming only those that belong to it.
-    fn join_split_sequence(&mut self, mut carry: [u8; 4], mut carry_len: usize) -> io::Result<()> {
-        loop {
-            let next = self.inner.fill_buf()?;
-            let Some(&byte) = next.first() else {
-                // Input ends inside a character.
+    /// Continues the character held in `carry` with the next input byte.
+    ///
+    /// Returns `true` once the character is complete or replaced (queued in
+    /// `pending`), `false` when it needs another byte. Only bytes that
+    /// belong to the character are consumed.
+    fn continue_carry(&mut self) -> io::Result<bool> {
+        let next = self.inner.fill_buf()?;
+        let Some(&byte) = next.first() else {
+            // Input ends inside a character.
+            self.carry_len = 0;
+            self.replace();
+            return Ok(true);
+        };
+        let length = self.carry_len;
+        self.carry[length] = byte;
+        match std::str::from_utf8(&self.carry[..=length]) {
+            Ok(_) => {
+                self.inner.consume(1);
+                let carry = self.carry;
+                self.set_pending(&carry[..=length]);
+                self.carry_len = 0;
+                Ok(true)
+            }
+            Err(error) if error.error_len().is_none() && length + 1 < 4 => {
+                self.inner.consume(1);
+                self.carry_len += 1;
+                Ok(false)
+            }
+            Err(_) => {
+                // `byte` cannot continue the character: the bytes before it
+                // are one ill-formed sequence and `byte` is read next.
+                self.carry_len = 0;
                 self.replace();
-                return Ok(());
-            };
-            carry[carry_len] = byte;
-            match std::str::from_utf8(&carry[..=carry_len]) {
-                Ok(_) => {
-                    self.inner.consume(1);
-                    self.set_pending(&carry[..=carry_len]);
-                    return Ok(());
-                }
-                Err(error) if error.error_len().is_none() && carry_len + 1 < 4 => {
-                    self.inner.consume(1);
-                    carry_len += 1;
-                }
-                Err(_) => {
-                    // `byte` cannot continue the character: the bytes before
-                    // it are one ill-formed sequence and `byte` is read next.
-                    self.replace();
-                    return Ok(());
-                }
+                Ok(true)
             }
         }
     }
+}
+
+/// Whether `bytes` holds the UTF-8 encoding of U+FFFD.
+fn contains_replacement(bytes: &[u8]) -> bool {
+    bytes
+        .windows(REPLACEMENT.len())
+        .any(|window| window == REPLACEMENT)
+}
+
+/// The part of `available` that fits under `limit` at `position`.
+///
+/// # Errors
+///
+/// Fails with [`io::ErrorKind::InvalidData`] when output remains but the
+/// limit is reached.
+fn within_limit(available: &[u8], position: u64, limit: u64) -> io::Result<&[u8]> {
+    if available.is_empty() {
+        return Ok(available);
+    }
+    let room = limit.saturating_sub(position);
+    if room == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("part is larger than {limit} bytes once repaired to UTF-8"),
+        ));
+    }
+    let length = usize::try_from(room).map_or(available.len(), |room| room.min(available.len()));
+    Ok(&available[..length])
 }
 
 impl<R: BufRead> Read for LossyUtf8<R> {
@@ -119,24 +257,29 @@ impl<R: BufRead> Read for LossyUtf8<R> {
 
 impl<R: BufRead> BufRead for LossyUtf8<R> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if self.pending_start == self.pending_end {
+        while self.pending_start == self.pending_end {
+            if self.carry_len > 0 {
+                self.continue_carry()?;
+                continue;
+            }
             if self.validated > 0 {
                 let buf = self.inner.fill_buf()?;
-                return Ok(&buf[..self.validated.min(buf.len())]);
+                let valid = self.validated.min(buf.len());
+                return within_limit(&buf[..valid], self.position, self.limit);
             }
             // What to do is decided first and the inner buffer re-borrowed
             // after, so that the passthrough can return it.
             let (valid, invalid, split) = {
                 let buf = self.inner.fill_buf()?;
                 match std::str::from_utf8(buf) {
-                    Ok(_) => (buf.len(), 0, None),
-                    Err(error) if error.valid_up_to() > 0 => (error.valid_up_to(), 0, None),
+                    Ok(_) => (buf.len(), 0, 0),
+                    Err(error) if error.valid_up_to() > 0 => (error.valid_up_to(), 0, 0),
                     Err(error) => match error.error_len() {
-                        Some(length) => (0, length, None),
+                        Some(length) => (0, length, 0),
                         None => {
-                            let mut carry = [0u8; 4];
-                            carry[..buf.len()].copy_from_slice(buf);
-                            (0, 0, Some((carry, buf.len())))
+                            // An incomplete character ends the buffer.
+                            self.carry[..buf.len()].copy_from_slice(buf);
+                            (0, 0, buf.len())
                         }
                     },
                 }
@@ -144,23 +287,33 @@ impl<R: BufRead> BufRead for LossyUtf8<R> {
             if invalid > 0 {
                 self.inner.consume(invalid);
                 self.replace();
-            } else if let Some((carry, carry_len)) = split {
-                self.inner.consume(carry_len);
-                self.join_split_sequence(carry, carry_len)?;
+            } else if split > 0 {
+                self.inner.consume(split);
+                self.carry_len = split;
             } else {
                 self.validated = valid;
-                return Ok(&self.inner.fill_buf()?[..valid]);
+                let buf = self.inner.fill_buf()?;
+                let valid = valid.min(buf.len());
+                return within_limit(&buf[..valid], self.position, self.limit);
             }
         }
-        Ok(&self.pending[self.pending_start..self.pending_end])
+        within_limit(
+            &self.pending[self.pending_start..self.pending_end],
+            self.position,
+            self.limit,
+        )
     }
 
     fn consume(&mut self, amount: usize) {
         if self.pending_start < self.pending_end {
-            self.pending_start = (self.pending_start + amount).min(self.pending_end);
+            let amount = amount.min(self.pending_end - self.pending_start);
+            self.pending_start += amount;
+            self.position += amount as u64;
         } else {
-            self.validated = self.validated.saturating_sub(amount);
+            let amount = amount.min(self.validated);
+            self.validated -= amount;
             self.inner.consume(amount);
+            self.position += amount as u64;
         }
     }
 }
@@ -203,7 +356,7 @@ mod tests {
                     "case {case:?}"
                 );
             }
-            assert_eq!(lossy_utf8(case).as_ref(), expected.as_slice());
+            assert_eq!(lossy_utf8(case).as_bytes(), expected.as_slice());
         }
     }
 
@@ -214,5 +367,47 @@ mod tests {
             Cow::Borrowed(_)
         ));
         assert!(matches!(lossy_utf8(b"caf\xe9"), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn repaired_output_past_the_limit_is_refused() {
+        let mut reader = LossyUtf8::with_limit(&b"ab\xff\xff"[..], 4);
+        let mut out = Vec::new();
+        let error = reader
+            .read_to_end(&mut out)
+            .expect_err("8 bytes once repaired");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let mut reader = LossyUtf8::with_limit(&b"abcd"[..], 4);
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .expect("valid input at the limit");
+        assert_eq!(out, b"abcd");
+    }
+
+    #[test]
+    fn replacements_are_told_apart_from_a_real_replacement_character() {
+        // Text holding a real U+FFFD, then a replacement: the reader has
+        // consumed the whole text, so it ends where the stream does.
+        let input = b"\xef\xbf\xbd \xff";
+        let mut reader = LossyUtf8::new(&input[..]);
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).expect("read from a slice");
+        assert_eq!(out, "\u{FFFD} \u{FFFD}".as_bytes());
+        assert!(!reader.repaired_in(&out, 0..=0, &out[..3]));
+        assert!(reader.repaired_in(&out, 0..=0, &out[4..]));
+        assert!(reader.repaired_in(&out, 0..=0, &out));
+        // An empty tag: its content ends two bytes before the stream does.
+        let input = b"<a x=\"\xef\xbf\xbd\" y=\"\xff\"/>";
+        let mut reader = LossyUtf8::new(&input[..]);
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).expect("read from a slice");
+        let tag = &out[1..out.len() - 2];
+        let x = &tag[5..8];
+        let y = &tag[13..16];
+        assert_eq!(x, "\u{FFFD}".as_bytes());
+        assert_eq!(y, "\u{FFFD}".as_bytes());
+        assert!(!reader.repaired_in(tag, 1..=2, x));
+        assert!(reader.repaired_in(tag, 1..=2, y));
     }
 }

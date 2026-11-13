@@ -30,8 +30,18 @@ fn latin_1(text: &str) -> Vec<u8> {
 /// Builds a one-sheet workbook from its sheet name, the inner XML of `<sst>`
 /// and the whole sheet part, with `@` read as in [`latin_1`].
 fn workbook(sheet_name: &str, shared_strings: &str, sheet: &[u8]) -> Vec<u8> {
+    workbook_with_prologue("", sheet_name, shared_strings, sheet)
+}
+
+/// Like [`workbook`], with `prologue` before the workbook part's root.
+fn workbook_with_prologue(
+    prologue: &str,
+    sheet_name: &str,
+    shared_strings: &str,
+    sheet: &[u8],
+) -> Vec<u8> {
     let workbook = latin_1(&format!(
-        r#"<workbook xmlns="{NS}" xmlns:r="{REL_NS}"><sheets><sheet name="{sheet_name}" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+        r#"{prologue}<workbook xmlns="{NS}" xmlns:r="{REL_NS}"><sheets><sheet name="{sheet_name}" sheetId="1" r:id="rId1"/></sheets></workbook>"#
     ));
     let shared_strings = latin_1(&format!(r#"<sst xmlns="{NS}">{shared_strings}</sst>"#));
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
@@ -199,4 +209,95 @@ fn a_utf16_sheet_part_reads_as_a_sheet_without_cells() {
     // recognised, so the sheet is there and holds no cells.
     assert_eq!(json, r#"{"sheets":[{"id":1,"name":"Sheet1","cells":[]}]}"#);
     assert_eq!(arrow, "776 bytes, sum 31046");
+}
+
+// A U+FFFD the part really holds is a character like any other. Only a
+// value whose own bytes are not UTF-8 fails, as on quick-xml 0.41; a stray
+// byte elsewhere in the part, before the value or in the same tag, does not
+// make a real U+FFFD fail.
+
+#[test]
+fn a_real_replacement_character_in_the_sheet_name_survives_a_stray_byte_before_it() {
+    let (json, arrow) = both(workbook_with_prologue(
+        "<!-- @ -->",
+        "Sheet1\u{FFFD}",
+        "<si><t>plain</t></si>",
+        &two_cells("", "", "text"),
+    ));
+    assert_eq!(
+        json,
+        concat!(
+            r#"{"sheets":[{"id":1,"name":"Sheet1"#,
+            "\u{FFFD}",
+            r#"","cells":[{"row":1,"col":1,"#,
+            r#""value":{"type":"string","v":"plain"}},{"row":1,"col":2,"#,
+            r#""value":{"type":"string","v":"text"}}]}]}"#
+        )
+    );
+    assert_eq!(arrow, PINNED_ARROW_REAL_REPLACEMENT_IN_NAME);
+}
+
+/// What 0.41 gave on the Arrow path for the workbook above.
+const PINNED_ARROW_REAL_REPLACEMENT_IN_NAME: &str = "2824 bytes, sum 38957";
+
+#[test]
+fn a_stray_byte_in_the_sheet_name_beside_a_real_replacement_character_still_fails() {
+    let (json, arrow) = both(workbook_with_prologue(
+        "",
+        "Sheet1\u{FFFD}@",
+        "<si><t>plain</t></si>",
+        &two_cells("", "", "text"),
+    ));
+    assert_eq!(json, "<parse error>");
+    assert_eq!(arrow, "<parse error>");
+}
+
+#[test]
+fn a_real_replacement_character_in_a_cell_reference_survives_a_stray_byte_in_its_tag() {
+    // `r` holds a real U+FFFD, so it is no cell reference and the cell takes
+    // the next column; `foo` holds a stray byte nobody reads.
+    let (json, arrow) = both(workbook(
+        "Sheet1",
+        "<si><t>plain</t></si>",
+        &sheet(
+            "<!-- @ -->",
+            "",
+            "<row r=\"1\"><c r=\"A1\u{FFFD}\" foo=\"@\" t=\"inlineStr\"><is><t>x</t></is></c></row>",
+        ),
+    ));
+    assert_eq!(json, PINNED_JSON_REAL_REPLACEMENT_IN_REF);
+    assert_eq!(arrow, PINNED_ARROW_REAL_REPLACEMENT_IN_REF);
+}
+
+/// What 0.41 gave for the workbook above.
+const PINNED_JSON_REAL_REPLACEMENT_IN_REF: &str =
+    r#"{"sheets":[{"id":1,"name":"Sheet1","cells":[]}]}"#;
+const PINNED_ARROW_REAL_REPLACEMENT_IN_REF: &str = "776 bytes, sum 31046";
+
+/// New refusal: a part whose raw bytes fit `max_inflate` but which repair
+/// grows past it (each stray byte becomes three) is refused, not read at up
+/// to three times the size the limit allowed. quick-xml 0.41 read it.
+#[test]
+fn a_part_that_repair_grows_past_its_limit_is_refused() {
+    let text = "@".repeat(1000);
+    let bytes = workbook(
+        "Sheet1",
+        &format!("<si><t>{text}</t></si>"),
+        &two_cells("", "", "x"),
+    );
+    let options = ParseOptions {
+        max_inflate: 2200,
+        ..ParseOptions::default()
+    };
+    let error = parse_xlsx_bytes(bytes.clone(), options).expect_err("refused");
+    assert!(
+        format!("{error:#}").contains("once repaired to UTF-8"),
+        "{error:#}"
+    );
+    // The same part within its limit once repaired still reads.
+    let options = ParseOptions {
+        max_inflate: 5000,
+        ..ParseOptions::default()
+    };
+    assert!(parse_xlsx_bytes(bytes, options).is_ok());
 }

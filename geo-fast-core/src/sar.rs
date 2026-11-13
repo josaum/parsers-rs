@@ -5,7 +5,7 @@
 //!
 //! Extracts: metadata, bounding box, polarization, GCP grid.
 
-use std::borrow::Cow;
+use ooxml_archive::utf8::LossyUtf8;
 
 use crate::error::GeoError;
 use crate::types::{BBox, Coordinate};
@@ -17,10 +17,29 @@ use crate::xml_text::TextRun;
 /// [`TextRun`]), and trimming each piece would close up `a &amp; b` to `a&b`.
 /// A `&` that starts no reference is reported as text, not as an error, so
 /// one unescaped ampersand does not cost the whole document.
-fn configure(reader: &mut quick_xml::Reader<&[u8]>) {
+fn configure<R>(reader: &mut quick_xml::Reader<R>) {
     let config = reader.config_mut();
     config.trim_text(false);
     config.allow_dangling_amp = true;
+}
+
+/// Reads `xml` as UTF-8, each ill-formed sequence replaced by U+FFFD.
+///
+/// A value that held such a sequence is still unreadable, as it was when the
+/// reader handed over raw bytes; [`LossyUtf8::repaired_in`] tells it from a
+/// value holding a U+FFFD the document really has. The repaired document may
+/// not outgrow [`ooxml_archive::DEFAULT_MAX_INFLATE`], or `xml`'s own length
+/// when that is larger: only a document that repair would triple can.
+fn repairing_input(xml: &[u8]) -> LossyUtf8<&[u8]> {
+    let limit = xml.len().max(ooxml_archive::DEFAULT_MAX_INFLATE);
+    LossyUtf8::with_limit(xml, limit as u64)
+}
+
+/// Whether the reader replaced bytes that are not UTF-8 in `piece`, the
+/// text, CDATA or reference it read last; `after` is how many bytes of
+/// markup it read past the piece (none, `]]>` or `;`).
+fn text_repaired(input: &LossyUtf8<&[u8]>, piece: &str, after: u64) -> bool {
+    input.repaired_in(piece.as_bytes(), after..=after, piece.as_bytes())
 }
 
 /// Metadata extracted from a SAR product.
@@ -116,13 +135,10 @@ impl SarParser {
         use quick_xml::events::Event;
         use quick_xml::Reader;
 
-        // Bytes that are not UTF-8 read as U+FFFD; see `TextRun::new`.
-        let xml = String::from_utf8_lossy(xml_bytes);
-        let repaired = matches!(xml, Cow::Owned(_));
-        let mut reader = Reader::from_reader(xml.as_bytes());
+        let mut reader = Reader::from_reader(repairing_input(xml_bytes));
         configure(&mut reader);
         let mut buf = Vec::with_capacity(4096);
-        let mut run = TextRun::new(repaired);
+        let mut run = TextRun::default();
 
         let mut sensor = String::new();
         let mut acquisition_date = String::new();
@@ -153,17 +169,20 @@ impl SarParser {
             })?;
             match &event {
                 Event::Text(piece) => {
-                    run.push_text(piece);
+                    let undecodable = text_repaired(reader.get_ref(), piece, 0);
+                    run.push_text(piece, undecodable);
                     buf.clear();
                     continue;
                 }
                 Event::CData(section) => {
-                    run.push_cdata(section);
+                    let undecodable = text_repaired(reader.get_ref(), section, 3);
+                    run.push_cdata(section, undecodable);
                     buf.clear();
                     continue;
                 }
                 Event::GeneralRef(reference) => {
-                    run.push_reference(reference);
+                    let undecodable = text_repaired(reader.get_ref(), reference, 1);
+                    run.push_reference(reference, undecodable);
                     buf.clear();
                     continue;
                 }
@@ -255,13 +274,17 @@ impl SarParser {
                                 .with_checks(false)
                                 .flatten()
                                 .find(|attr| attr.key.local_name().as_ref() == "abbreviation")
+                                // A value that was not UTF-8 is unreadable.
+                                .filter(|attr| {
+                                    !reader.get_ref().repaired_in(
+                                        e.as_bytes(),
+                                        1..=2,
+                                        attr.value.as_bytes(),
+                                    )
+                                })
                                 .and_then(|attr| {
                                     attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                         .ok()
-                                })
-                                // A value that was not UTF-8 is unreadable.
-                                .filter(|value| {
-                                    !(repaired && value.contains(char::REPLACEMENT_CHARACTER))
                                 })
                                 .map(|value| value.trim().to_string())
                                 .filter(|value| !value.is_empty());
@@ -437,12 +460,10 @@ impl SarParser {
         use quick_xml::events::Event;
         use quick_xml::Reader;
 
-        // Bytes that are not UTF-8 read as U+FFFD; see `TextRun::new`.
-        let xml = String::from_utf8_lossy(annotation_xml);
-        let mut reader = Reader::from_reader(xml.as_bytes());
+        let mut reader = Reader::from_reader(repairing_input(annotation_xml));
         configure(&mut reader);
         let mut buf = Vec::with_capacity(2048);
-        let mut run = TextRun::new(matches!(xml, Cow::Owned(_)));
+        let mut run = TextRun::default();
 
         let mut gcps: Vec<GroundControlPoint> = Vec::new();
 
@@ -464,17 +485,20 @@ impl SarParser {
             })?;
             match &event {
                 Event::Text(piece) => {
-                    run.push_text(piece);
+                    let undecodable = text_repaired(reader.get_ref(), piece, 0);
+                    run.push_text(piece, undecodable);
                     buf.clear();
                     continue;
                 }
                 Event::CData(section) => {
-                    run.push_cdata(section);
+                    let undecodable = text_repaired(reader.get_ref(), section, 3);
+                    run.push_cdata(section, undecodable);
                     buf.clear();
                     continue;
                 }
                 Event::GeneralRef(reference) => {
-                    run.push_reference(reference);
+                    let undecodable = text_repaired(reader.get_ref(), reference, 1);
+                    run.push_reference(reference, undecodable);
                     buf.clear();
                     continue;
                 }

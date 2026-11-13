@@ -21,6 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 mod properties;
+#[doc(hidden)]
 pub mod utf8;
 
 pub use properties::parse_simple_props;
@@ -378,9 +379,7 @@ pub struct RelEntry {
 
 /// Parse a `.rels` XML part into Id/Type maps and an entry list.
 pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
-    let xml = utf8::lossy_utf8(xml);
-    let repaired = matches!(xml, Cow::Owned(_));
-    let mut reader = xml_reader(Cursor::new(xml.as_ref()));
+    let mut reader = xml_reader(repairing_reader(xml));
     let mut buf = Vec::new();
     let mut rels = Relationships::default();
     loop {
@@ -396,11 +395,11 @@ pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
                 for attr in e.attributes().with_checks(false).flatten() {
                     let key = local_name(attr.key.as_ref().as_bytes());
                     if key == b"Id" {
-                        id = Some(attr_text(&attr, repaired)?.to_string());
+                        id = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                     } else if key == b"Type" {
-                        rel_type = Some(attr_text(&attr, repaired)?.to_string());
+                        rel_type = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                     } else if key == b"Target" {
-                        target = Some(attr_text(&attr, repaired)?.to_string());
+                        target = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                     }
                 }
                 if let (Some(id), Some(rel_type), Some(target)) = (id, rel_type, target) {
@@ -547,15 +546,28 @@ fn xml_reader<R: BufRead>(input: R) -> Reader<R> {
 /// carriage return becomes a space, while one written as a character
 /// reference (`&#9;`) is kept.
 ///
-/// `repaired` says the part had bytes that are not UTF-8 and was read with
-/// U+FFFD in their place. A value holding one is then an error, as a value
-/// that is not UTF-8 always was.
-fn attr_text<'a>(attr: &Attribute<'a>, repaired: bool) -> Result<Cow<'a, str>> {
-    let value = attr.normalized_value(XmlVersion::Implicit1_0)?;
-    if repaired && value.contains(char::REPLACEMENT_CHARACTER) {
+/// A value in which `input` replaced bytes that are not UTF-8 is an error,
+/// as such a value always was; `tag` is the start or empty tag the
+/// attribute was read from. A U+FFFD the part really holds, or a
+/// replacement elsewhere in the part, is not.
+fn attr_text<'a, R: BufRead>(
+    attr: &Attribute<'a>,
+    input: &utf8::LossyUtf8<R>,
+    tag: &str,
+) -> Result<Cow<'a, str>> {
+    if input.repaired_in(tag.as_bytes(), 1..=2, attr.value.as_bytes()) {
         return Err(anyhow!("attribute value is not UTF-8"));
     }
-    Ok(value)
+    Ok(attr.normalized_value(XmlVersion::Implicit1_0)?)
+}
+
+/// Reads `xml` as UTF-8, each ill-formed sequence replaced by U+FFFD.
+///
+/// The repaired part may not outgrow [`DEFAULT_MAX_INFLATE`], or `xml`'s own
+/// length when that is larger: only a part that repair would triple can.
+fn repairing_reader(xml: &[u8]) -> utf8::LossyUtf8<Cursor<&[u8]>> {
+    let limit = xml.len().max(DEFAULT_MAX_INFLATE);
+    utf8::LossyUtf8::with_limit(Cursor::new(xml), limit as u64)
 }
 
 fn local_name(name: &[u8]) -> &[u8] {

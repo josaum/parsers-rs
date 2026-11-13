@@ -60,11 +60,11 @@
 
 use anyhow::{anyhow, Context, Result};
 use chrono::DateTime;
-use ooxml_archive::utf8::{lossy_utf8, LossyUtf8};
+use ooxml_archive::utf8::LossyUtf8;
 use ooxml_archive::{
     parse_relationships, parse_simple_props, part_dir, relationship_matches, relationship_target,
     rels_path_for_part, resolve_part, source_part_from_rels, OoxmlArchive, PartReader, RelEntry,
-    Relationships,
+    Relationships, DEFAULT_MAX_INFLATE,
 };
 use quick_xml::events::{BytesRef, BytesText, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -603,9 +603,9 @@ fn header_footer_ref(
 /// The usual route collects them while the body is parsed
 /// ([`parse_document_blocks_with_refs`]). This pass is what that route falls
 /// back to, and its error is the one a malformed document reports.
-fn parse_header_footer_refs<R: BufRead>(reader: R) -> Result<Vec<HeaderFooterRef>> {
+fn parse_header_footer_refs<R: BufRead>(reader: R, limit: usize) -> Result<Vec<HeaderFooterRef>> {
     PASS_COUNTS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
-    let mut reader = xml_reader(utf8_stream(reader)?);
+    let mut reader = xml_reader(utf8_stream(reader, limit)?);
     let mut buf = Vec::new();
     let mut refs = Vec::new();
     loop {
@@ -817,6 +817,7 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         let mut body_revisions = Vec::new();
         match parse_document_blocks_with_refs(
             Cursor::new(&*document_xml),
+            options.max_inflate,
             &styles,
             &style_fonts,
             &mut body_fields,
@@ -829,7 +830,7 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
             Err(BodyFailure::ReferenceSearch(error)) => return Err(error),
             Err(BodyFailure::Body(error)) => {
                 body_error = Some(error);
-                parse_header_footer_refs(Cursor::new(&*document_xml))?
+                parse_header_footer_refs(Cursor::new(&*document_xml), options.max_inflate)?
             }
         }
     } else {
@@ -843,6 +844,7 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
             if let Some(reader) = open_optional_part_reader(&archive, &part, options.max_inflate)? {
                 let blocks = parse_document_blocks(
                     reader,
+                    options.max_inflate,
                     &styles,
                     &style_fonts,
                     &mut fields,
@@ -883,6 +885,7 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         }
         None => parse_document_blocks(
             Cursor::new(&*document_xml),
+            options.max_inflate,
             &styles,
             &style_fonts,
             &mut fields,
@@ -1181,7 +1184,7 @@ fn parse_settings(archive: &DocxArchive, max_inflate: usize) -> Result<HashMap<S
     let Some(xml) = read_optional_part_bytes(archive, "word/settings.xml", max_inflate)? else {
         return Ok(HashMap::new());
     };
-    let mut reader = xml_reader(Cursor::new(reader_xml(&xml)));
+    let mut reader = part_xml_reader(&xml);
     let mut buf = Vec::new();
     let mut settings = HashMap::new();
     loop {
@@ -1258,7 +1261,7 @@ fn store_property(
 /// A property is a `property` element; its name is the `name` attribute and
 /// its value the text of the value element inside it.
 fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let mut reader = xml_reader(Cursor::new(reader_xml(xml)));
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut out = HashMap::new();
     let mut current_name: Option<String> = None;
@@ -1309,7 +1312,7 @@ fn normalize_datetime(value: &str) -> String {
 }
 
 fn parse_styles(xml: &[u8]) -> Result<Vec<Style>> {
-    let mut reader = xml_reader(Cursor::new(reader_xml(xml)));
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut styles = Vec::new();
     let mut current: Option<Style> = None;
@@ -1473,7 +1476,7 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
         fonts: symbol::FontChoice,
     }
 
-    let mut reader = xml_reader(Cursor::new(reader_xml(xml)));
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut declared: HashMap<String, Declared> = HashMap::new();
     let mut default_paragraph: Option<String> = None;
@@ -1591,7 +1594,7 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
 }
 
 fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
-    let mut reader = xml_reader(Cursor::new(reader_xml(xml)));
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut numbering = Numbering::default();
     let mut current_abs: Option<AbstractNum> = None;
@@ -1689,7 +1692,7 @@ fn parse_notes(
     styles: &[Style],
     style_fonts: &StyleFonts,
 ) -> Result<Vec<Note>> {
-    let mut reader = xml_reader(Cursor::new(reader_xml(xml)));
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut notes = Vec::new();
     let mut current_id: Option<i32> = None;
@@ -1763,7 +1766,7 @@ fn parse_notes(
 }
 
 fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Result<Vec<Comment>> {
-    let mut reader = xml_reader(Cursor::new(reader_xml(xml)));
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut comments = Vec::new();
     let mut current: Option<Comment> = None;
@@ -1850,7 +1853,7 @@ fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Res
 }
 
 fn apply_extended_comments(comments: &mut [Comment], xml: &[u8]) -> Result<()> {
-    let mut reader = xml_reader(Cursor::new(reader_xml(xml)));
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1886,15 +1889,19 @@ fn apply_extended_comments(comments: &mut [Comment], xml: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Parses the blocks of a document, header or footer part.
+///
+/// `limit` is the size limit the part was read under; see [`utf8_stream`].
 fn parse_document_blocks<R: BufRead>(
     reader: R,
+    limit: usize,
     styles: &[Style],
     style_fonts: &StyleFonts,
     fields_out: &mut Vec<Field>,
     revisions_out: &mut Vec<Revision>,
 ) -> Result<Vec<Block>> {
     let mut parser = DocxBodyParser::new(styles, style_fonts, fields_out, revisions_out);
-    parser.parse(reader)
+    parser.parse(reader, limit)
 }
 
 /// Adds `by` to the field number of every run in `blocks`, tables included.
@@ -1936,6 +1943,7 @@ fn shift_field_ids(blocks: &mut [Block], by: u32) {
 /// Says which of the two jobs failed; see [`BodyFailure`].
 fn parse_document_blocks_with_refs<R: BufRead>(
     reader: R,
+    limit: usize,
     styles: &[Style],
     style_fonts: &StyleFonts,
     fields_out: &mut Vec<Field>,
@@ -1943,7 +1951,7 @@ fn parse_document_blocks_with_refs<R: BufRead>(
 ) -> std::result::Result<(Vec<Block>, Vec<HeaderFooterRef>), BodyFailure> {
     let mut parser = DocxBodyParser::new(styles, style_fonts, fields_out, revisions_out);
     parser.section_refs = Some(Vec::new());
-    match parser.parse(reader) {
+    match parser.parse(reader, limit) {
         Ok(blocks) => Ok((blocks, parser.section_refs.take().unwrap_or_default())),
         Err(error) => Err(match parser.reference_search_error.take() {
             Some(search_error) => BodyFailure::ReferenceSearch(search_error),
@@ -2073,7 +2081,7 @@ fn parse_content_types(
     let Some(xml) = read_optional_part_bytes(archive, "[Content_Types].xml", max_inflate)? else {
         return Ok(HashMap::new());
     };
-    let mut reader = xml_reader(Cursor::new(reader_xml(&xml)));
+    let mut reader = part_xml_reader(&xml);
     let mut buf = Vec::new();
     let mut map = HashMap::new();
     let mut defaults: HashMap<String, String> = HashMap::new();
@@ -2282,16 +2290,19 @@ fn utf8_xml(xml: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
-/// Returns a part as UTF-8 for the XML reader.
+/// Makes the XML reader for a part held in memory.
 ///
 /// A UTF-16 part is transcoded, and a byte that is not UTF-8 reads as
 /// U+FFFD, so one bad character costs that character rather than the part.
-fn reader_xml(xml: &[u8]) -> Cow<'_, [u8]> {
-    match utf8_xml(xml) {
-        Cow::Borrowed(stored) => lossy_utf8(stored),
-        // The UTF-16 transcoder writes nothing but UTF-8.
-        Cow::Owned(transcoded) => Cow::Owned(transcoded),
-    }
+/// A UTF-8 part is read in place, never copied. Repair may not grow the part
+/// past [`DEFAULT_MAX_INFLATE`], or past its own length when that is larger:
+/// a part that only outgrows that by being repaired fails to read.
+fn part_xml_reader(xml: &[u8]) -> Reader<LossyUtf8<Cursor<Cow<'_, [u8]>>>> {
+    // The limit is taken after UTF-16 is transcoded, so valid text is never
+    // refused for growing in transcoding.
+    let xml = utf8_xml(xml);
+    let limit = u64::try_from(DEFAULT_MAX_INFLATE.max(xml.len())).unwrap_or(u64::MAX);
+    xml_reader(LossyUtf8::with_limit(Cursor::new(xml), limit))
 }
 
 /// A part being read: as stored, with each byte that is not UTF-8 read as
@@ -2333,9 +2344,14 @@ impl<R: BufRead> BufRead for Utf8Stream<R> {
 /// keeps streaming, with each byte that is not UTF-8 read as U+FFFD. A
 /// UTF-16 part is read whole, within whatever size limit `reader` enforces,
 /// and transcoded.
-fn utf8_stream<R: BufRead>(mut reader: R) -> Result<Utf8Stream<R>> {
+///
+/// `limit` is the size limit the part was read under: a UTF-8 part that only
+/// outgrows it by being repaired fails to read, instead of being read at up
+/// to three times the size the limit allows.
+fn utf8_stream<R: BufRead>(mut reader: R, limit: usize) -> Result<Utf8Stream<R>> {
     let Some(big_endian) = utf16_big_endian(reader.fill_buf()?) else {
-        return Ok(Utf8Stream::Stored(LossyUtf8::new(reader)));
+        let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+        return Ok(Utf8Stream::Stored(LossyUtf8::with_limit(reader, limit)));
     };
     let mut xml = Vec::new();
     reader.read_to_end(&mut xml)?;
@@ -2590,9 +2606,9 @@ impl<'a> DocxBodyParser<'a> {
         self.in_instr = false;
     }
 
-    fn parse<R: BufRead>(&mut self, reader: R) -> Result<Vec<Block>> {
+    fn parse<R: BufRead>(&mut self, reader: R, limit: usize) -> Result<Vec<Block>> {
         PASS_COUNTS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
-        let mut reader = xml_reader(utf8_stream(reader)?);
+        let mut reader = xml_reader(utf8_stream(reader, limit)?);
         let mut buf = Vec::new();
         loop {
             match reader.read_event_into(&mut buf) {
@@ -3247,6 +3263,7 @@ mod tests {
         let mut revisions = Vec::new();
         parse_document_blocks(
             Cursor::new(xml),
+            DEFAULT_MAX_INFLATE,
             &[],
             &StyleFonts::default(),
             &mut fields,

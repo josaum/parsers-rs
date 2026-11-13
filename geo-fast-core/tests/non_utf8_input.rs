@@ -62,3 +62,28 @@ const EXPECTED_MANIFEST: &str = "Ok(SarMetadata { sensor: \"SENTINEL-1A\", acqui
 const EXPECTED_ANNOTATION: &str = "Ok([GroundControlPoint { geo: Coordinate { lon: 4.0, lat: 0.0 }, line: 1.0, sample: 2.0, height: 5.0 }])";
 #[cfg(feature = "http")]
 const EXPECTED_CAPABILITIES: &str = "Ok([WmsLayer { name: \"café\", title: \"Café à la carte\", crs_list: [\"EPSG:4326\"], bbox: None }])";
+
+/// A U+FFFD a manifest really holds is read as text even when a stray byte
+/// sits elsewhere in the document; a stray byte in the value itself still
+/// makes it unreadable.
+#[test]
+fn replacement_character_beside_a_stray_byte_is_kept() {
+    let manifest = "<xfdu:XFDU xmlns:xfdu=\"urn:ccsds:schema:xfdu:1\" xmlns:safe=\"http://www.esa.int/safe/sentinel-1.0\">\
+        <!-- ~ -->\
+        <safe:platform><safe:familyName>SENTINEL-1</safe:familyName><safe:number>A</safe:number>\
+        <safe:instrument><safe:familyName abbreviation=\"S\u{FFFD}R\">Radar \u{FFFD}</safe:familyName></safe:instrument>\
+        </safe:platform>\
+        <s1sarl1:productType xmlns:s1sarl1=\"x\">GR\u{FFFD}D</s1sarl1:productType>\
+        <s1:pass xmlns:s1=\"y\">ASC~NDING</s1:pass>\
+        </xfdu:XFDU>";
+    let bytes: Vec<u8> = manifest
+        .bytes()
+        .map(|b| if b == b'~' { 0xFF } else { b })
+        .collect();
+    let metadata = format!("{:?}", SarParser::parse_safe_manifest(&bytes));
+    let platform = format!("{:?}", SarParser::parse_safe_platform(&bytes));
+    let output = format!("{metadata}\n{platform}");
+    assert_eq!(output, EXPECTED_REPLACEMENT_KEPT);
+}
+
+const EXPECTED_REPLACEMENT_KEPT: &str = "Ok(SarMetadata { sensor: \"SENTINEL-1A\", acquisition_date: \"\", polarization: [], bbox: BBox { min_lon: 0.0, max_lon: 0.0, min_lat: 0.0, max_lat: 0.0 }, resolution_m: 0.0, width: 0, height: 0, orbit_direction: \"\", incidence_angle_deg: 0.0, product_type: \"GR\u{FFFD}D\" })\nOk(SafePlatform { platform: \"SENTINEL-1A\", instrument: Some(\"Radar \u{FFFD}\"), instrument_abbreviation: Some(\"S\u{FFFD}R\") })";

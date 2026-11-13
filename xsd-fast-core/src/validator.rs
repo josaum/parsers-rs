@@ -15,7 +15,7 @@ use quick_xml::events::{BytesRef, BytesStart, BytesText, Event};
 use quick_xml::{Reader, XmlVersion};
 use serde::{Deserialize, Serialize};
 
-use crate::parser::{not_utf8, SchemaSet};
+use crate::parser::{schema_input, Repairs, SchemaInput, SchemaSet};
 use crate::schema::{
     ComplexType, ContentModel, ElementRef, Particle, SchemaModel, SimpleTypeDef, XsdType,
 };
@@ -120,7 +120,6 @@ impl SchemaSet {
             outside_text_reported: false,
             namespaces: Vec::new(),
             unclaimed: Vec::new(),
-            repaired: false,
         };
         ctx.validate_document(xml)?;
         Ok(ctx.errors)
@@ -174,10 +173,6 @@ struct ValidationContext<'m> {
     outside_text_reported: bool,
     /// Prefix declarations of the open elements, innermost last.
     namespaces: Vec<PrefixBinding>,
-    /// Whether the document had bytes that are not UTF-8 and is read with
-    /// U+FFFD in their place. A name, text or value holding U+FFFD is then
-    /// treated as not UTF-8, as it was when the reader handed over raw bytes.
-    repaired: bool,
     /// Children of the element being checked that no named particle of its
     /// type claims, by namespace, for its wildcards.
     unclaimed: Vec<(Option<String>, usize)>,
@@ -224,9 +219,10 @@ struct ContentIndex<'m> {
 
 impl<'m> ValidationContext<'m> {
     fn validate_document(&mut self, xml: &[u8]) -> Result<()> {
-        let xml = String::from_utf8_lossy(xml);
-        self.repaired = matches!(xml, std::borrow::Cow::Owned(_));
-        let mut reader = Reader::from_reader(xml.as_bytes());
+        // Bytes that are not UTF-8 are read as U+FFFD. A name, text or value
+        // in which one was replaced is treated as not UTF-8, as it was when
+        // the reader handed over raw bytes (see `Repairs`).
+        let mut reader = Reader::from_reader(schema_input(xml, ooxml_archive::DEFAULT_MAX_INFLATE));
         // Text is not trimmed as it is read. An element's value can arrive in
         // several pieces (text, a CDATA section, more text), and trimming each
         // piece would delete the spaces between them. The whole value is
@@ -245,12 +241,16 @@ impl<'m> ValidationContext<'m> {
                 Ok(Event::Start(ref e)) => {
                     let local = {
                         let name_bytes = e.name();
-                        strip_prefix(self.name_text(name_bytes.as_ref())).to_owned()
+                        strip_prefix(Self::name_text(
+                            name_bytes.as_ref(),
+                            Repairs::tag(reader.get_ref(), e),
+                        ))
+                        .to_owned()
                     };
                     self.path.push(local.clone());
                     self.count_root();
                     self.report_undeclared_root(&local);
-                    self.check_attribute_references(e);
+                    self.check_attribute_references(e, Repairs::tag(reader.get_ref(), e));
                     self.open_namespaces(e);
 
                     let xsd_type = self.resolve_child_type(&local);
@@ -276,12 +276,16 @@ impl<'m> ValidationContext<'m> {
                 Ok(Event::Empty(ref e)) => {
                     let local = {
                         let name_bytes = e.name();
-                        strip_prefix(self.name_text(name_bytes.as_ref())).to_owned()
+                        strip_prefix(Self::name_text(
+                            name_bytes.as_ref(),
+                            Repairs::tag(reader.get_ref(), e),
+                        ))
+                        .to_owned()
                     };
                     self.path.push(local.clone());
                     self.count_root();
                     self.report_undeclared_root(&local);
-                    self.check_attribute_references(e);
+                    self.check_attribute_references(e, Repairs::tag(reader.get_ref(), e));
                     self.open_namespaces(e);
 
                     let xsd_type = self.resolve_child_type(&local);
@@ -321,7 +325,7 @@ impl<'m> ValidationContext<'m> {
                     self.check_text_references(t);
                     self.check_outside_text(t);
                     let text: &str = t;
-                    if !not_utf8(self.repaired, text) {
+                    if !Repairs::text(reader.get_ref(), t).not_utf8(text) {
                         if let Some(frame) = self.type_stack.last_mut() {
                             frame.text.push_str(text);
                         }
@@ -339,7 +343,7 @@ impl<'m> ValidationContext<'m> {
                 }
                 Ok(Event::DocType(ref doctype)) => {
                     let text: &str = doctype;
-                    if !not_utf8(self.repaired, text) {
+                    if !Repairs::end(reader.get_ref(), doctype).not_utf8(text) {
                         self.entities = internal_entities(text);
                     }
                 }
@@ -391,8 +395,8 @@ impl<'m> ValidationContext<'m> {
     }
 
     /// An element name as written; `?` when the name is not UTF-8.
-    fn name_text<'n>(&self, raw: &'n str) -> &'n str {
-        if not_utf8(self.repaired, raw) {
+    fn name_text<'n>(raw: &'n str, repairs: Repairs<'_>) -> &'n str {
+        if repairs.not_utf8(raw) {
             "?"
         } else {
             raw
@@ -462,22 +466,30 @@ impl<'m> ValidationContext<'m> {
     /// Nothing more is checked against the schema, but a parse error must be
     /// reported whatever the limit, so if the reader raises one it is
     /// recorded. The element path is kept up to date for it.
-    fn report_ill_formed_rest(&mut self, reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>) {
+    fn report_ill_formed_rest(&mut self, reader: &mut Reader<SchemaInput<'_>>, buf: &mut Vec<u8>) {
         loop {
             match reader.read_event_into(buf) {
                 Ok(Event::Start(ref e)) => {
                     let name_bytes = e.name();
-                    let local = strip_prefix(self.name_text(name_bytes.as_ref())).to_owned();
+                    let local = strip_prefix(Self::name_text(
+                        name_bytes.as_ref(),
+                        Repairs::tag(reader.get_ref(), e),
+                    ))
+                    .to_owned();
                     self.path.push(local);
                     self.count_root();
-                    self.check_attribute_references(e);
+                    self.check_attribute_references(e, Repairs::tag(reader.get_ref(), e));
                 }
                 Ok(Event::Empty(ref e)) => {
                     let name_bytes = e.name();
-                    let local = strip_prefix(self.name_text(name_bytes.as_ref())).to_owned();
+                    let local = strip_prefix(Self::name_text(
+                        name_bytes.as_ref(),
+                        Repairs::tag(reader.get_ref(), e),
+                    ))
+                    .to_owned();
                     self.path.push(local);
                     self.count_root();
-                    self.check_attribute_references(e);
+                    self.check_attribute_references(e, Repairs::tag(reader.get_ref(), e));
                     self.path.pop();
                 }
                 Ok(Event::Text(ref t)) => {
@@ -525,12 +537,11 @@ impl<'m> ValidationContext<'m> {
     /// reference to no character or an entity the document does not declare
     /// makes the document ill-formed wherever it is written. Duplicate
     /// checking is skipped: it is quadratic in the number of attributes.
-    fn check_attribute_references(&mut self, start: &BytesStart<'_>) {
+    fn check_attribute_references(&mut self, start: &BytesStart<'_>, repairs: Repairs<'_>) {
         if self.reference_reported {
             return;
         }
         let entities = &self.entities;
-        let repaired = self.repaired;
         let ill_formed = start
             .attributes()
             .with_checks(false)
@@ -540,7 +551,7 @@ impl<'m> ValidationContext<'m> {
                 // Declared replacement text holds no reference, so one level
                 // of expansion is all there is. A value that is not UTF-8
                 // cannot be read, as before.
-                not_utf8(repaired, &attribute.value)
+                repairs.not_utf8(&attribute.value)
                     || attribute
                         .normalized_value_with(XmlVersion::Implicit1_0, 1, |name| {
                             resolve_predefined_entity(name)

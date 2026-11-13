@@ -132,3 +132,43 @@ fn utf16le_part_is_transcoded() {
     let doc = parse(zip(&[("word/document.xml", document)]));
     assert_eq!(first_paragraph_text(&doc), "caf\u{e9} \u{65E5}\u{672C}");
 }
+
+/// A document part holding `filler` bytes in a comment, plus one paragraph.
+fn document_with_comment(filler: u8, length: usize) -> Vec<u8> {
+    let mut document = format!(r#"<w:document xmlns:w="{W}"><!-- "#).into_bytes();
+    document.extend(std::iter::repeat_n(filler, length));
+    document.extend_from_slice(
+        b" --><w:body><w:p><w:r><w:t>after</w:t></w:r></w:p></w:body></w:document>",
+    );
+    zip(&[
+        (
+            "_rels/.rels",
+            format!(
+                r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="word/document.xml"/></Relationships>"#
+            )
+            .into_bytes(),
+        ),
+        ("word/document.xml", document),
+    ])
+}
+
+/// WHY: replacing one stray byte with U+FFFD takes three bytes, so a part
+/// read within `max_inflate` could be read at three times that size. A part
+/// that only outgrows the limit by being repaired is refused instead; the
+/// same part with valid bytes in their place still reads.
+#[test]
+fn a_part_that_outgrows_max_inflate_once_repaired_is_refused() {
+    let options = || ParseOptions {
+        max_inflate: 64 * 1024,
+        ..ParseOptions::default()
+    };
+    let valid = parse_docx_bytes(document_with_comment(b'a', 40 * 1024), options())
+        .expect("40 KiB of valid bytes fit a 64 KiB limit");
+    assert_eq!(first_paragraph_text(&valid), "after");
+    let error = parse_docx_bytes(document_with_comment(0xFF, 40 * 1024), options())
+        .expect_err("40 KiB of stray bytes repair to 120 KiB");
+    assert!(
+        format!("{error:#}").contains("once repaired to UTF-8"),
+        "unexpected error: {error:#}"
+    );
+}

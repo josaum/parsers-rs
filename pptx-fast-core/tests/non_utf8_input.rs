@@ -134,3 +134,94 @@ fn a_utf16_slide_part_reads_as_a_slide_without_text() {
     }
     assert_eq!(outcome(&utf16), "name=None text=None");
 }
+
+/// Parses a deck and renders its slide's name and its first shape's name,
+/// or `<parse error>`.
+fn names(slide: &[u8]) -> String {
+    match parse_pptx_bytes(deck(slide), ParseOptions::default()) {
+        Ok(doc) => {
+            let Some(slide) = doc.slides.first() else {
+                return "<no slide>".to_string();
+            };
+            let shape = slide.shapes.first().and_then(|shape| shape.name.clone());
+            format!("slide={:?} shape={:?}", slide.name, shape)
+        }
+        Err(_) => "<parse error>".to_string(),
+    }
+}
+
+/// A slide whose `cSld` and first shape carry the names given, after
+/// `prologue`; every `@` becomes the ISO-8859-1 byte 0xE9.
+fn named_slide(prologue: &str, slide_name: &str, shape_attrs: &str) -> Vec<u8> {
+    format!(
+        r#"{prologue}<p:sld xmlns:p="{P}" xmlns:a="{A}"><p:cSld name="{slide_name}"><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" {shape_attrs}/></p:nvSpPr><p:txBody><a:bodyPr/><a:p><a:r><a:t>plain</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+    )
+    .bytes()
+    .map(|byte| if byte == b'@' { 0xE9 } else { byte })
+    .collect()
+}
+
+// A U+FFFD the part really holds is a character like any other. Only a
+// value whose own bytes are not UTF-8 fails, as on quick-xml 0.41; a stray
+// byte elsewhere in the part, before the value or in the same tag, does not
+// make a real U+FFFD fail.
+
+#[test]
+fn real_replacement_characters_in_names_survive_a_stray_byte_before_them() {
+    assert_eq!(
+        names(&named_slide(
+            "<!-- @ -->",
+            "Deck\u{FFFD}",
+            "name=\"Title\u{FFFD}\""
+        )),
+        "slide=Some(\"Deck\u{FFFD}\") shape=Some(\"Title\u{FFFD}\")"
+    );
+}
+
+#[test]
+fn a_real_replacement_character_in_a_shape_name_survives_a_stray_byte_in_its_tag() {
+    assert_eq!(
+        names(&named_slide(
+            "",
+            "Deck",
+            "name=\"Title\u{FFFD}\" descr=\"x@y\""
+        )),
+        "slide=Some(\"Deck\") shape=Some(\"Title\u{FFFD}\")"
+    );
+}
+
+#[test]
+fn a_stray_byte_in_a_name_beside_a_real_replacement_character_still_fails() {
+    assert_eq!(
+        names(&named_slide("", "Deck\u{FFFD}@", "name=\"Title\"")),
+        "<parse error>"
+    );
+    assert_eq!(
+        names(&named_slide("", "Deck", "name=\"Title\u{FFFD}@\"")),
+        "<parse error>"
+    );
+}
+
+/// New refusal: a part whose raw bytes fit `max_inflate` but which repair
+/// grows past it (each stray byte becomes three) is refused, not read at up
+/// to three times the size the limit allowed. quick-xml 0.41 read it.
+#[test]
+fn a_part_that_repair_grows_past_its_limit_is_refused() {
+    let text = "@".repeat(1000);
+    let bytes = deck(&slide("", "", &text));
+    let options = ParseOptions {
+        max_inflate: 3000,
+        ..ParseOptions::default()
+    };
+    let error = parse_pptx_bytes(bytes.clone(), options).expect_err("refused");
+    assert!(
+        format!("{error:#}").contains("once repaired to UTF-8"),
+        "{error:#}"
+    );
+    // The same part within its limit once repaired still reads.
+    let options = ParseOptions {
+        max_inflate: 6000,
+        ..ParseOptions::default()
+    };
+    assert!(parse_pptx_bytes(bytes, options).is_ok());
+}

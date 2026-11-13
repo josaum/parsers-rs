@@ -87,3 +87,30 @@ fn utf16_property_part_reads_as_before() {
     )];
     assert_eq!(outcome.expect("main read this part"), expected);
 }
+
+#[test]
+fn real_replacement_character_in_a_target_survives_a_stray_byte_elsewhere() {
+    // A U+FFFD the part really holds is a character like any other; a byte
+    // that is not UTF-8 in a comment before or after it changes nothing.
+    let rel = "<Relationship Id=\"rId1\" Type=\"urn:t\" \
+        Target=\"http://e.com/a\u{FFFD}b\" TargetMode=\"External\"/>";
+    for (before, after) in [("", ""), ("<!-- X -->", ""), ("", "<!-- X -->")] {
+        let mut xml =
+            format!("<Relationships xmlns=\"urn:r\">{before}{rel}{after}</Relationships>")
+                .into_bytes();
+        if let Some(at) = xml.iter().position(|&b| b == b'X') {
+            xml[at] = 0xFF;
+        }
+        let rels = parse_relationships(&xml).expect("main read this part");
+        assert_eq!(rels.entries.len(), 1);
+        assert_eq!(rels.entries[0].target, "http://e.com/a\u{FFFD}b");
+    }
+}
+
+#[test]
+fn stray_byte_beside_a_real_replacement_character_in_one_target_is_an_error() {
+    let xml = b"<Relationships xmlns=\"urn:r\">\
+        <Relationship Id=\"rId1\" Type=\"urn:t\" Target=\"a\xef\xbf\xbd\xff\"/>\
+        </Relationships>";
+    assert!(parse_relationships(xml).is_err());
+}

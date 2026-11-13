@@ -391,15 +391,15 @@ fn read_capabilities(xml: &str, report: bool) -> Result<WmsCapabilities, GeoErro
             .map_err(|e| GeoError::Xml(e.to_string()))?;
         match &event {
             Event::Text(piece) => {
-                run.push_text(piece);
+                run.push_text(piece, false);
                 continue;
             }
             Event::CData(section) => {
-                run.push_cdata(section);
+                run.push_cdata(section, false);
                 continue;
             }
             Event::GeneralRef(reference) => {
-                run.push_reference(reference);
+                run.push_reference(reference, false);
                 continue;
             }
             _ => {}

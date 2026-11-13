@@ -149,20 +149,38 @@ fn configure_reader<R>(reader: &mut Reader<R>) {
 /// carriage return becomes a space (and a CR LF pair one space), while the
 /// same characters written as character references (`&#10;`) are kept.
 ///
-/// `repaired` says the part had bytes that are not UTF-8, read as U+FFFD (see
-/// [`LossyUtf8`]). A value holding one is then an error, as a value that is
-/// not UTF-8 always was.
+/// `tag` is the start or empty tag the attribute was read from, through
+/// `input`. A value in which `input` replaced bytes that are not UTF-8 with
+/// U+FFFD (see [`LossyUtf8`]) is an error, as a value that is not UTF-8
+/// always was. A U+FFFD the part really holds, or a replacement elsewhere in
+/// the part, is not.
 ///
 /// # Errors
 ///
-/// Fails when the value is not valid in the document's encoding, or holds a
-/// reference that cannot be resolved.
-fn attribute_value<'a>(attribute: &Attribute<'a>, repaired: bool) -> Result<Cow<'a, str>> {
-    let value = attribute.normalized_value(XmlVersion::Implicit1_0)?;
-    if repaired && value.contains(char::REPLACEMENT_CHARACTER) {
+/// Fails when the value is not UTF-8, or holds a reference that cannot be
+/// resolved.
+fn attribute_value<'a, R: BufRead>(
+    attribute: &Attribute<'a>,
+    input: &LossyUtf8<R>,
+    tag: &str,
+) -> Result<Cow<'a, str>> {
+    if input.repaired_in(tag.as_bytes(), 1..=2, attribute.value.as_bytes()) {
         return Err(anyhow!("attribute value is not UTF-8"));
     }
-    Ok(value)
+    Ok(attribute.normalized_value(XmlVersion::Implicit1_0)?)
+}
+
+/// Reads a part as UTF-8, each ill-formed sequence replaced by U+FFFD.
+///
+/// `limit` is the size the part's raw bytes were held to; the repaired part
+/// may not outgrow it, since repair can triple a part's size.
+fn repairing<R: BufRead>(input: R, limit: usize) -> LossyUtf8<R> {
+    LossyUtf8::with_limit(input, limit as u64)
+}
+
+/// The repair limit for a part read whole, with no part limit in scope.
+fn buffer_limit(xml: &[u8]) -> usize {
+    ooxml_archive::DEFAULT_MAX_INFLATE.max(xml.len())
 }
 
 /// Byte length of one `ST_Xstring` escape, `_xHHHH_`.
@@ -489,7 +507,7 @@ pub mod bench_support {
 
         let shared_strings = if let Some(path) = shared_strings_path.as_deref() {
             if let Some(reader) = open_optional_part_reader(&archive, path, options.max_inflate)? {
-                parse_shared_strings_reader(reader)?
+                parse_shared_strings_reader(reader, options.max_inflate)?
             } else {
                 StringTable::default()
             }
@@ -521,7 +539,7 @@ pub mod bench_support {
             let sheet_path = resolve_part(&workbook_dir, target);
             let reader = open_part_reader(&archive, &sheet_path, options.max_inflate)
                 .with_context(|| format!("read sheet: {sheet_path}"))?;
-            let xml_reader = Reader::from_reader(LossyUtf8::new(reader));
+            let xml_reader = Reader::from_reader(repairing(reader, options.max_inflate));
             parse_sheet_reader_with(
                 xml_reader,
                 &shared_strings,
@@ -751,7 +769,7 @@ fn parse_xlsx_from_archive(archive: XlsxArchive, options: ParseOptions) -> Resul
 
     let shared_strings = if let Some(path) = shared_strings_path.as_deref() {
         if let Some(reader) = open_optional_part_reader(&archive, path, options.max_inflate)? {
-            parse_shared_strings_reader(reader)?
+            parse_shared_strings_reader(reader, options.max_inflate)?
         } else {
             StringTable::default()
         }
@@ -789,7 +807,7 @@ fn parse_xlsx_from_archive(archive: XlsxArchive, options: ParseOptions) -> Resul
         let reader = open_part_reader(&archive, &sheet_path, options.max_inflate)
             .with_context(|| format!("read sheet: {sheet_path}"))?;
         let mut cells = Vec::new();
-        let xml_reader = Reader::from_reader(LossyUtf8::new(reader));
+        let xml_reader = Reader::from_reader(repairing(reader, options.max_inflate));
         parse_sheet_reader_with(
             xml_reader,
             &shared_strings,
@@ -882,7 +900,7 @@ pub fn parse_xlsx_to_writer<W: std::io::Write>(
 
     let shared_strings = if let Some(path) = shared_strings_path.as_deref() {
         if let Ok(reader) = open_part_reader(&archive, path, options.max_inflate) {
-            parse_shared_strings_reader(reader)?
+            parse_shared_strings_reader(reader, options.max_inflate)?
         } else {
             StringTable::default()
         }
@@ -921,7 +939,7 @@ pub fn parse_xlsx_to_writer<W: std::io::Write>(
 
         let reader = open_part_reader(&archive, &sheet_path, options.max_inflate)
             .with_context(|| format!("read sheet: {sheet_path}"))?;
-        let xml_reader = Reader::from_reader(LossyUtf8::new(reader));
+        let xml_reader = Reader::from_reader(repairing(reader, options.max_inflate));
         parse_sheet_reader_with(
             xml_reader,
             &shared_strings,
@@ -950,7 +968,7 @@ pub fn parse_xlsx_to_writer<W: std::io::Write>(
 }
 
 fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
-    let mut reader = Reader::from_reader(LossyUtf8::new(Cursor::new(xml)));
+    let mut reader = Reader::from_reader(repairing(Cursor::new(xml), buffer_limit(xml)));
     configure_reader(&mut reader);
     let mut buf = Vec::new();
     let mut info = WorkbookInfo::default();
@@ -962,8 +980,7 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
                 if name == b"workbookPr" {
                     for attr in e.attributes().with_checks(false).flatten() {
                         if local_name(attr.key.as_ref().as_bytes()) == b"date1904" {
-                            let value =
-                                attribute_value(&attr, reader.get_ref().repaired())?.to_string();
+                            let value = attribute_value(&attr, reader.get_ref(), &e)?.to_string();
                             info.date_1904 = value == "1" || value.eq_ignore_ascii_case("true");
                         }
                     }
@@ -973,15 +990,14 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
                         let key_raw = attr.key;
                         let key = local_name(key_raw.as_ref().as_bytes());
                         if key == b"name" {
-                            sheet.name =
-                                attribute_value(&attr, reader.get_ref().repaired())?.to_string();
+                            sheet.name = attribute_value(&attr, reader.get_ref(), &e)?.to_string();
                         } else if key == b"sheetId" {
-                            let value = attribute_value(&attr, reader.get_ref().repaired())?;
+                            let value = attribute_value(&attr, reader.get_ref(), &e)?;
                             sheet.sheet_id =
                                 lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0);
                         } else if key == b"r:id" || key == b"id" {
                             sheet.rel_id =
-                                attribute_value(&attr, reader.get_ref().repaired())?.to_string();
+                                attribute_value(&attr, reader.get_ref(), &e)?.to_string();
                         }
                     }
                     if !sheet.rel_id.is_empty() {
@@ -998,8 +1014,8 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
     Ok(info)
 }
 
-fn parse_shared_strings_reader<R: BufRead>(reader: R) -> Result<StringTable> {
-    let mut reader = Reader::from_reader(LossyUtf8::new(reader));
+fn parse_shared_strings_reader<R: BufRead>(reader: R, limit: usize) -> Result<StringTable> {
+    let mut reader = Reader::from_reader(repairing(reader, limit));
     configure_reader(&mut reader);
     let mut buf = Vec::new();
     let mut strings = StringTable::default();
@@ -1069,7 +1085,7 @@ fn parse_shared_strings_reader<R: BufRead>(reader: R) -> Result<StringTable> {
 }
 
 fn parse_styles(xml: &[u8]) -> Result<Styles> {
-    let mut reader = Reader::from_reader(LossyUtf8::new(Cursor::new(xml)));
+    let mut reader = Reader::from_reader(repairing(Cursor::new(xml), buffer_limit(xml)));
     configure_reader(&mut reader);
     let mut buf = Vec::new();
 
@@ -1090,12 +1106,10 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
                         let key_raw = attr.key;
                         let key = local_name(key_raw.as_ref().as_bytes());
                         if key == b"numFmtId" {
-                            let value = attribute_value(&attr, reader.get_ref().repaired())?;
+                            let value = attribute_value(&attr, reader.get_ref(), &e)?;
                             id = lexical_core::parse::<u32>(value.as_bytes()).ok();
                         } else if key == b"formatCode" {
-                            code = Some(
-                                attribute_value(&attr, reader.get_ref().repaired())?.to_string(),
-                            );
+                            code = Some(attribute_value(&attr, reader.get_ref(), &e)?.to_string());
                         }
                     }
                     if let (Some(id), Some(code)) = (id, code) {
@@ -1107,7 +1121,7 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
                     let mut num_fmt_id = None;
                     for attr in e.attributes().with_checks(false).flatten() {
                         if local_name(attr.key.as_ref().as_bytes()) == b"numFmtId" {
-                            let value = attribute_value(&attr, reader.get_ref().repaired())?;
+                            let value = attribute_value(&attr, reader.get_ref(), &e)?;
                             num_fmt_id = lexical_core::parse::<u32>(value.as_bytes()).ok();
                         }
                     }
@@ -1258,7 +1272,7 @@ where
                 match name {
                     b"sheetData" => in_sheet_data = true,
                     b"row" if in_sheet_data => {
-                        current_row = row_index(&e, reader.get_ref().repaired(), last_row)?;
+                        current_row = row_index(&e, reader.get_ref(), last_row)?;
                         col_cursor = 0;
                         if !EXCEL_ROWS.contains(&current_row) {
                             row_outside = true;
@@ -1295,7 +1309,7 @@ where
                             let key_raw = attr.key;
                             let key = local_name(key_raw.as_ref().as_bytes());
                             if key == b"r" {
-                                let value = attribute_value(&attr, reader.get_ref().repaired())?;
+                                let value = attribute_value(&attr, reader.get_ref(), &e)?;
                                 if let Some((row, col)) = parse_cell_ref(value.as_ref()) {
                                     cell_ref_row = row;
                                     cell_ref_col = col;
@@ -1304,7 +1318,7 @@ where
                                     invalid_cell_ref = true;
                                 }
                             } else if key == b"t" {
-                                let value = attribute_value(&attr, reader.get_ref().repaired())?;
+                                let value = attribute_value(&attr, reader.get_ref(), &e)?;
                                 cell_type = match value.as_ref() {
                                     "s" => CellType::SharedString,
                                     "b" => CellType::Bool,
@@ -1314,7 +1328,7 @@ where
                                     _ => CellType::Number,
                                 };
                             } else if key == b"s" {
-                                let value = attribute_value(&attr, reader.get_ref().repaired())?;
+                                let value = attribute_value(&attr, reader.get_ref(), &e)?;
                                 cell_style = lexical_core::parse::<u32>(value.as_bytes()).ok();
                             }
                         }
@@ -1391,7 +1405,7 @@ where
                         // An empty row still takes its number, so a following
                         // `<row>` without `r` is counted from it.
                         b"row" => {
-                            let row = row_index(&e, reader.get_ref().repaired(), last_row)?;
+                            let row = row_index(&e, reader.get_ref(), last_row)?;
                             if EXCEL_ROWS.contains(&row) {
                                 last_row = row;
                             }
@@ -1400,8 +1414,7 @@ where
                         // its column, so a following cell without `r` lands
                         // in the right place.
                         b"c" if !in_cell => {
-                            col_cursor =
-                                empty_cell_column(&e, reader.get_ref().repaired(), col_cursor)?;
+                            col_cursor = empty_cell_column(&e, reader.get_ref(), col_cursor)?;
                         }
                         _ => {}
                     }
@@ -1541,10 +1554,14 @@ const EXCEL_ROWS: std::ops::RangeInclusive<u32> = 1..=1_048_576;
 ///
 /// `r` is optional: without it the row is the one after `previous`. A present
 /// but unreadable `r` yields 0, which no worksheet row has.
-fn row_index(element: &BytesStart<'_>, repaired: bool, previous: u32) -> Result<u32> {
+fn row_index<R: BufRead>(
+    element: &BytesStart<'_>,
+    input: &LossyUtf8<R>,
+    previous: u32,
+) -> Result<u32> {
     for attr in element.attributes().with_checks(false).flatten() {
         if attr.key.as_ref().as_bytes() == b"r" {
-            let value = attribute_value(&attr, repaired)?;
+            let value = attribute_value(&attr, input, element)?;
             return Ok(lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0));
         }
     }
@@ -1555,10 +1572,14 @@ fn row_index(element: &BytesStart<'_>, repaired: bool, previous: u32) -> Result<
 ///
 /// Mirrors how a cell with content moves the cursor: to its `r` column, to 0
 /// when `r` is unreadable, and one to the right when `r` is absent.
-fn empty_cell_column(element: &BytesStart<'_>, repaired: bool, col_cursor: u32) -> Result<u32> {
+fn empty_cell_column<R: BufRead>(
+    element: &BytesStart<'_>,
+    input: &LossyUtf8<R>,
+    col_cursor: u32,
+) -> Result<u32> {
     for attr in element.attributes().with_checks(false).flatten() {
         if local_name(attr.key.as_ref().as_bytes()) == b"r" {
-            let value = attribute_value(&attr, repaired)?;
+            let value = attribute_value(&attr, input, element)?;
             return Ok(parse_cell_ref(value.as_ref()).map_or(0, |(_, col)| col));
         }
     }

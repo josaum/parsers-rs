@@ -8,9 +8,8 @@ use anyhow::{anyhow, Result};
 use chrono::DateTime;
 use quick_xml::events::{BytesRef, Event};
 use std::collections::HashMap;
-use std::io::Cursor;
 
-use crate::{local_name, xml_reader};
+use crate::{local_name, repairing_reader, xml_reader};
 
 /// Reads `docProps/core.xml` or `docProps/app.xml`.
 ///
@@ -51,8 +50,7 @@ use crate::{local_name, xml_reader};
 /// Returns an error when `xml` is not well-formed enough to read, for
 /// example when an end tag does not match its start tag.
 pub fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let xml = crate::utf8::lossy_utf8(xml);
-    let mut reader = xml_reader(Cursor::new(xml.as_ref()));
+    let mut reader = xml_reader(repairing_reader(xml));
     let mut buf = Vec::new();
     let mut out: HashMap<String, String> = HashMap::new();
     let mut current_key: Option<String> = None;
