@@ -598,6 +598,15 @@ const MAX_OPTIONAL_NODES_PER_TYPE: usize = 1 << 14;
 /// `Drop`).
 const REQUIRED_FOLD_DEPTH: usize = 16;
 
+/// How many of a type's nearest bases are always folded into it.
+///
+/// A chain of bases used to be followed this far and no further. These
+/// links are paid from the required budget, so their cost can refuse a
+/// schema, exactly as it always could. Bases further away are a fold the
+/// schema can do without: they are folded while [`MAX_OPTIONAL_NODES`] and
+/// [`MAX_OPTIONAL_NODES_PER_TYPE`] last, and left out after that.
+const REQUIRED_CHAIN_LINKS: usize = 16;
+
 /// The two budgets inheritance folding draws on.
 struct FoldBudget {
     /// For the folds a schema is wrong without; running out is an error.
@@ -610,37 +619,26 @@ struct FoldBudget {
 }
 
 impl FoldBudget {
-    /// Collects a base for a fold the schema can do without.
+    /// Charges `cost` to the budget for folds a schema can do without.
     ///
-    /// Returns `None`, with nothing spent and `folding` as it was, when the
-    /// pool or the type's allowance cannot pay for it; the type then has no
+    /// Returns `false`, with nothing spent, when the pool or the allowance
+    /// of the type being resolved cannot pay for it; the type then has no
     /// allowance left.
-    fn collect_optional<'a>(
-        &mut self,
-        base_local: &str,
-        originals: &'a IndexMap<String, ComplexType>,
-        folding: &mut Vec<&'a str>,
-    ) -> Option<Inherited> {
-        let outer = folding.len();
+    fn charge_optional(&mut self, cost: CopyCost) -> bool {
         let available = self.optional.remaining.min(self.allowance);
         let mut budget = InheritanceBudget {
             remaining: available,
             uncharged_text_bytes: self.optional.uncharged_text_bytes,
         };
-        match collect_base(base_local, None, originals, folding, &mut budget) {
-            Ok(inherited) => {
-                let spent = available - budget.remaining;
-                self.optional.remaining -= spent;
-                self.optional.uncharged_text_bytes = budget.uncharged_text_bytes;
-                self.allowance -= spent;
-                inherited
-            }
-            Err(_) => {
-                folding.truncate(outer);
-                self.allowance = 0;
-                None
-            }
+        if budget.charge(cost).is_err() {
+            self.allowance = 0;
+            return false;
         }
+        let spent = available - budget.remaining;
+        self.optional.remaining -= spent;
+        self.optional.uncharged_text_bytes = budget.uncharged_text_bytes;
+        self.allowance -= spent;
+        true
     }
 }
 
@@ -691,15 +689,6 @@ struct CopyCost {
 }
 
 impl CopyCost {
-    /// Cost of copying `particles`, nested inline types included.
-    ///
-    /// The recursion follows the nesting of the model.
-    fn of_particles(particles: &[Particle]) -> Self {
-        let mut cost = Self::default();
-        cost.add_particles(particles);
-        cost
-    }
-
     /// Cost of copying `attributes`.
     fn of_attributes(attributes: &[AttributeDecl]) -> Self {
         let mut cost = Self::default();
@@ -848,9 +837,17 @@ fn resolve_complex_type<'a>(
     if let Some(base) = ct.base.clone() {
         let recursive = folding.contains(&base.local.as_str());
         let inherited = if depth < REQUIRED_FOLD_DEPTH && !recursive {
-            collect_base(&base.local, owner, originals, folding, &mut budget.required)?
+            collect_base(
+                &base.local,
+                owner,
+                originals,
+                folding,
+                budget,
+                REQUIRED_CHAIN_LINKS,
+            )?
         } else if depth < REQUIRED_FOLD_DEPTH || !recursive {
-            budget.collect_optional(&base.local, originals, folding)
+            // Nothing of this fold is required, so it cannot fail.
+            collect_base(&base.local, owner, originals, folding, budget, 0)?
         } else {
             None
         };
@@ -955,24 +952,31 @@ type Inherited = (
 );
 
 /// Collect a base type's effective particles and attributes, oldest ancestor
-/// first, following the whole chain of bases. Returns `None` if the base is
-/// unknown or is `owner`, the type being resolved.
+/// first, following the chain of bases. Returns `None` if the base is
+/// unknown or is `owner`, the type being resolved, or if nothing of the
+/// chain can be paid for.
 ///
 /// The chain ends at a type with no base, at a base that is not a known
 /// complex type, or at a name already met (a cycle, which is broken there).
-/// It is as long as the schema makes it: nothing is left out for being far
-/// from the derived type. Each type on the chain costs `budget` one unit, so
-/// that the walk itself is bounded, and everything copied is charged at its
-/// [`CopyCost`] before the copy is made. A chain the budget cannot pay for is
-/// an error, never a partly inherited type.
+/// Each type on it costs one unit and the [`CopyCost`] of what is copied
+/// from it, charged before anything is copied, nearest base first.
 ///
-/// The name of every type on the chain is appended to `folding`.
+/// The nearest `required_links` types are paid from the required budget,
+/// and a chain that budget cannot pay for is an error. The types beyond
+/// them are paid from the budget for folds a schema can do without; the
+/// chain is cut, without an error, at the first one that budget cannot pay
+/// for, and the derived type then lacks what its furthest ancestors
+/// declare. The walk stops there too, so its length is bounded by what was
+/// paid.
+///
+/// The name of every type kept on the chain is appended to `folding`.
 fn collect_base<'a>(
     base_local: &str,
     owner: Option<&str>,
     originals: &'a IndexMap<String, ComplexType>,
     folding: &mut Vec<&'a str>,
-    budget: &mut InheritanceBudget,
+    budget: &mut FoldBudget,
+    required_links: usize,
 ) -> anyhow::Result<Option<Inherited>> {
     // Nearest base first.
     let mut chain: Vec<&ComplexType> = Vec::new();
@@ -987,10 +991,16 @@ fn collect_base<'a>(
         };
         // `seen` holds the map's own key from here on, which outlives `next`.
         seen.insert(name.as_str());
-        budget.charge(CopyCost {
-            nodes: 1,
-            text_bytes: 0,
-        })?;
+        let mut cost = CopyCost::of_attributes(&base.attributes);
+        cost.add_node();
+        if let ContentModel::Sequence(p) = &base.content {
+            cost.add_particles(p);
+        }
+        if chain.len() < required_links {
+            budget.required.charge(cost)?;
+        } else if !budget.charge_optional(cost) {
+            break;
+        }
         chain.push(base);
         folding.push(name.as_str());
         next = base.base.as_ref().map(|base| base.local.as_str());
@@ -1014,10 +1024,8 @@ fn collect_base<'a>(
             particles.clear();
         }
         if let ContentModel::Sequence(p) = &base.content {
-            budget.charge(CopyCost::of_particles(p))?;
             particles.extend(p.iter().cloned());
         }
-        budget.charge(CopyCost::of_attributes(&base.attributes))?;
         if restricts {
             restrict_attributes(
                 &mut attrs,
@@ -1033,8 +1041,13 @@ fn collect_base<'a>(
             let mut cost = CopyCost::default();
             cost.add_node();
             cost.add_simple_type(simple);
-            budget.charge(cost)?;
-            Some(Box::new(simple.clone()))
+            let paid = if required_links > 0 {
+                budget.required.charge(cost)?;
+                true
+            } else {
+                budget.charge_optional(cost)
+            };
+            paid.then(|| Box::new(simple.clone()))
         }
         None => None,
     };

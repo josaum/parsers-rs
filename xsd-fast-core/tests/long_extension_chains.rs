@@ -97,3 +97,64 @@ fn an_inline_extension_nested_deep_is_folded() {
     };
     assert_eq!(particle_names(&innermost.content), ["inherited", "own"]);
 }
+
+/// `length` types of `width` elements each, every one extending the one
+/// before it; `root` is of the last type.
+fn wide_chain(length: usize, width: usize) -> String {
+    let elements = |index: usize| -> String {
+        (0..width)
+            .map(|element| format!(r#"<xs:element name="e{index}_{element}" type="xs:string"/>"#))
+            .collect()
+    };
+    let mut xsd = String::from(r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">"#);
+    xsd.push_str(&format!(
+        r#"<xs:complexType name="C0"><xs:sequence>{}</xs:sequence></xs:complexType>"#,
+        elements(0)
+    ));
+    for index in 1..length {
+        xsd.push_str(&format!(
+            r#"<xs:complexType name="C{index}"><xs:complexContent><xs:extension base="C{}"><xs:sequence>{}</xs:sequence></xs:extension></xs:complexContent></xs:complexType>"#,
+            index - 1,
+            elements(index)
+        ));
+    }
+    xsd.push_str(&format!(
+        r#"<xs:element name="root" type="C{}"/></xs:schema>"#,
+        length - 1
+    ));
+    xsd
+}
+
+// The nearest sixteen bases are always folded, and their cost can refuse a
+// schema. Bases further away are folded while the budget for them lasts and
+// are left out after that, without an error: a chain is never the reason a
+// schema that used to load is refused.
+#[test]
+fn a_chain_too_long_to_fold_whole_loads_with_its_nearest_bases() {
+    for length in [700, 5000] {
+        let schema =
+            SchemaSet::load_bytes(wide_chain(length, 1).as_bytes(), ParseOptions::default())
+                .unwrap_or_else(|error| panic!("{length} types: {error}"));
+        let types = &schema.model().complex_types;
+        assert_eq!(types.len(), length);
+        // Every type has its own element and those of its sixteen nearest
+        // bases, in order, at the end of what it inherits.
+        for index in [16, length / 2, length - 1] {
+            let names = particle_names(&types[&format!("C{index}")].content);
+            let nearest: Vec<String> = (index - 16..=index).map(|i| format!("e{i}_0")).collect();
+            assert!(names.len() >= 17, "C{index} has {}", names.len());
+            assert_eq!(names[names.len() - 17..], nearest[..], "C{index}");
+        }
+        // An early type is folded whole.
+        assert_eq!(particle_names(&types["C40"].content).len(), 41);
+    }
+}
+
+// What the nearest sixteen bases cost is still charged in full.
+#[test]
+fn a_chain_whose_nearest_bases_cost_too_much_is_refused() {
+    let error = SchemaSet::load_bytes(wide_chain(700, 50).as_bytes(), ParseOptions::default())
+        .err()
+        .expect("the schema is refused");
+    assert!(error.to_string().contains("inherited_nodes"), "{error}");
+}
