@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "json-fast-core"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "base64",
  "regex",

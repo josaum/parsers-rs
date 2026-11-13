@@ -4,7 +4,21 @@ Changes a consumer of the wheels, Node packages, crates or Flight servers
 can observe. Each release also has generated notes listing every pull
 request.
 
-## Unreleased
+## v2026.11.13.3
+
+Every crate's patch version moves; `mcts-fast-core` and `mcts-fast-py` are
+released for the first time, at 0.2.0. cargo-semver-checks against
+v2026.11.13.2 finds no change to a public Rust API. Two outputs change on
+purpose and need a look before upgrading a pipeline that stores them: email
+bodies and attachments (mailparse 0.18), and the default xsd Arrow shape
+(one column per sibling name, and nullability under a choice).
+
+### Added
+
+- **mcts (new):** `mcts-fast-core`, an arena-based PUCT Monte Carlo Tree
+  Search with embedding-guided (cosine) simulation over a caller-built tree,
+  and its Python binding `mcts-fast-py` (#101). They join the release
+  wheels; there is no Node package.
 
 ### Changed output
 
