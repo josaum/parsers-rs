@@ -41,6 +41,21 @@ request.
   `unevaluatedItems` see through `$dynamicRef`. The JSON Schema Test Suite's
   2020-12 core cases go from 1,239 to 1,299 of 1,300. This closes the json
   known gap listed under v2026.11.13.
+- **geo:** `parse_geotiff_bands` (and `geotiff_bands` in Python and Node)
+  returned wrong pixels for two kinds of raster instead of an error. For
+  samples of 1, 2 or 4 bits it returned the packed bytes as values. For an
+  uncompressed strip or tile storing fewer bytes than its pixels take,
+  including a sparse block (offset and length zero), it filled the pixels
+  from whatever followed in the file, for a sparse block the file's own
+  header. Both are now refused (see "New refusals"). On GDAL's 237 test
+  TIFFs, 3 rasters that returned such values are refused, and no other
+  result changes.
+
+### New refusals
+
+- **geo:** a GeoTIFF raster whose samples are not a whole number of bytes
+  (1, 2, 4, 10 or 12 bits), and an uncompressed raster with a strip or tile
+  shorter than its pixels, including a sparse one.
 
 ## v2026.11.13
 

@@ -104,6 +104,24 @@ updates:
       - dependency-name: "mailparse"
         versions:
           - ">=0.16"
+      # tiff 0.10 and later reads a raster differently, and geo-fast-core's
+      # bands follow 0.9. On 2026-11-13, 0.11.3 against GDAL's 237 test
+      # TIFFs (autotest/gcore/data) gave:
+      # - an RGB raster whose fourth sample is an unspecified extra sample
+      #   lost that band, which is how RGB+NIR imagery is stored, and the
+      #   decoder has no option to keep it;
+      # - 11 JPEG-compressed rasters changed pixels (jpeg-decoder became
+      #   zune-jpeg): 8 by at most 1 of 255, and the 3 in YCbCr by a mean
+      #   of 11 to 66 of 255, with no reference yet for which is right;
+      # - a `fax` (Group 4) codec is on by default.
+      # It also decoded 9 rasters 0.9 refuses and words its errors
+      # differently. Unblocked by keeping every sample of such a raster (or
+      # reading its chunks directly), settling the YCbCr colours against
+      # GDAL, and a before-and-after band comparison in the upgrade's pull
+      # request.
+      - dependency-name: "tiff"
+        versions:
+          - ">=0.10"
 
   - package-ecosystem: cargo
     # The repository doctors: a package outside the workspace, with its own
