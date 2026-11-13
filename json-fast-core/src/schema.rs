@@ -89,16 +89,16 @@ pub const MAX_APPLICATION_DEPTH: usize = 128;
 /// reference hop and exhausts the budget instead.
 pub const VALIDATION_STEPS_PER_PAIR: u64 = 64;
 
-/// Most distinct regular expressions one validation may compile.
+/// Most bytes of regular-expression text one validation may compile.
 ///
 /// Counts `pattern`, `patternProperties` keys and, because `format: "regex"`
 /// compiles a string taken from the document, every distinct document
-/// string checked against that format. Each compiled expression is kept for
-/// the whole validation, so the count bounds both the compile time and the
-/// memory an input can demand. Beyond it validation stops with an error.
-pub const MAX_PATTERNS_PER_VALIDATION: usize = 4_096;
-
-/// Most bytes of regular-expression text one validation may compile.
+/// string checked against that format. Each expression is compiled once and
+/// kept for the whole validation, so the bytes of pattern text bound both
+/// the compile time and the memory an input can demand. The number of
+/// expressions is deliberately not limited: a schema with 5,000 short
+/// patterns is ordinary. Beyond this many bytes validation stops with an
+/// error.
 pub const MAX_PATTERN_BYTES_PER_VALIDATION: usize = 1 << 20;
 
 /// Severity of a schema [`Finding`].
@@ -287,7 +287,7 @@ const BUDGET_EXHAUSTED: &str = "validation stopped: the schema needs more subsch
 
 /// Why validation stopped at the pattern budget.
 const PATTERN_BUDGET_EXHAUSTED: &str = "validation stopped: the schema and document ask for \
-     more than 4096 distinct regular expressions or more than 1 MiB of pattern text; \
+     more than 1 MiB of regular-expression text; \
      the document was not fully validated";
 
 /// Why validation stopped at the application depth.
@@ -373,9 +373,7 @@ impl Ctx<'_> {
             return Some(hit);
         }
         self.pattern_bytes = self.pattern_bytes.saturating_add(pattern.len());
-        if self.patterns.len() >= MAX_PATTERNS_PER_VALIDATION
-            || self.pattern_bytes > MAX_PATTERN_BYTES_PER_VALIDATION
-        {
+        if self.pattern_bytes > MAX_PATTERN_BYTES_PER_VALIDATION {
             self.halted = Some(PATTERN_BUDGET_EXHAUSTED);
             return None;
         }
@@ -2154,21 +2152,18 @@ mod tests {
         let repeated = Value::Array(vec![json!("^a+$"); 50_000]);
         assert_eq!(validate(&repeated, &schema), []);
 
-        // Distinct document strings each need a compilation: capped by count.
+        // Distinct document strings each need a compilation: capped by bytes.
         let distinct = |count: usize| {
             Value::Array(
                 (0..count)
-                    .map(|i| Value::String(format!("^x{i}$")))
+                    .map(|i| Value::String(format!("^{i:0>1000}$")))
                     .collect(),
             )
         };
-        assert_eq!(
-            validate(&distinct(MAX_PATTERNS_PER_VALIDATION), &schema),
-            []
-        );
-        let findings = validate(&distinct(MAX_PATTERNS_PER_VALIDATION + 1), &schema);
+        assert_eq!(validate(&distinct(1_000), &schema), []);
+        let findings = validate(&distinct(1_100), &schema);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.contains("regular expressions"));
+        assert!(findings[0].message.contains("regular-expression text"));
 
         // Capped by total pattern bytes, for schema patterns as well.
         let long = "a".repeat(MAX_PATTERN_BYTES_PER_VALIDATION / 2);
@@ -2176,6 +2171,102 @@ mod tests {
         let findings = validate(&json!({"k": 1}), &schema);
         assert_eq!(findings.len(), 1);
         assert!(has_errors(&findings));
+    }
+
+    fn stopped(findings: &[Finding]) -> bool {
+        findings
+            .iter()
+            .any(|f| f.message.contains("validation stopped"))
+    }
+
+    /// `node = oneOf[v0..v7]`, each variant an object whose `child` is a node.
+    fn union_schema(variants: usize) -> Value {
+        let alternatives = (0..variants)
+            .map(|i| {
+                json!({
+                    "type": "object",
+                    "properties": {"kind": {"const": format!("k{i}")}, "child": {"$ref": "#/$defs/node"}},
+                    "required": ["kind"]
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({"$ref": "#/$defs/node", "$defs": {"node": {"oneOf": alternatives}}})
+    }
+
+    fn union_chain(depth: usize, last_kind: &str) -> Value {
+        let mut chain = json!({ "kind": last_kind });
+        for level in 1..depth {
+            chain = json!({"kind": format!("k{}", level % 8), "child": chain});
+        }
+        chain
+    }
+
+    #[test]
+    #[ignore = "fails until the following commit"]
+    fn recursive_discriminated_unions_validate_in_polynomial_work() {
+        let schema = union_schema(8);
+        let (findings, steps) = run(&union_chain(40, "k3"), &schema, MAX_REF_DEPTH, None);
+        assert_eq!(findings, []);
+        assert!(steps < 10_000, "{steps} applications");
+        let findings = validate(&union_chain(40, "nope"), &schema);
+        assert!(has_errors(&findings));
+        assert!(!stopped(&findings));
+    }
+
+    #[test]
+    #[ignore = "fails until the following commit"]
+    fn linked_lists_deeper_than_32_are_fully_validated() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"v": {"type": "integer"}, "next": {"$ref": "#"}}
+        });
+        let list = |last: Value| {
+            (0..60).fold(
+                json!({ "v": last }),
+                |next, _| json!({"v": 1, "next": next}),
+            )
+        };
+        assert_eq!(validate(&list(json!(1)), &schema), []);
+        let findings = validate(&list(json!("x")), &schema);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(findings[0].path.ends_with("/next/v"));
+    }
+
+    #[test]
+    #[ignore = "fails until the following commit"]
+    fn wrapped_recursive_schemas_validate_to_the_nesting_limit() {
+        let schema = json!({
+            "$ref": "#/$defs/node",
+            "$defs": {
+                "base": {"type": "object"},
+                "node": {"allOf": [
+                    {"$ref": "#/$defs/base"},
+                    {"properties": {"children": {"type": "array", "items": {
+                        "anyOf": [{"$ref": "#/$defs/node"}, {"type": "null"}]
+                    }}}}
+                ]}
+            }
+        });
+        // 31 tree levels are 62 levels of nesting and 155 nested applications.
+        let tree = (0..30).fold(
+            json!({"children": [null]}),
+            |inner, _| json!({"children": [inner]}),
+        );
+        assert_eq!(measure(&tree).1, 62);
+        assert_eq!(validate(&tree, &schema), []);
+    }
+
+    #[test]
+    fn many_pattern_properties_are_not_a_limit() {
+        let mut properties = Map::new();
+        let mut document = Map::new();
+        for i in 0..5_000 {
+            properties.insert(format!("p{i}"), json!({"pattern": format!("^v{i}$")}));
+            document.insert(format!("p{i}"), json!(format!("v{i}")));
+        }
+        let schema = json!({ "properties": properties });
+        assert_eq!(validate(&Value::Object(document), &schema), []);
     }
 
     #[test]
