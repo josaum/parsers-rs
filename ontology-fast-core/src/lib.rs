@@ -845,12 +845,15 @@ fn next_number(number: u32) -> Result<u32, OntologyError> {
 ///
 /// [`abbreviate`] tests every declared prefix against one IRI. Rendering a
 /// document asks the same question once per distinct IRI, so the namespaces
-/// are sorted once and each IRI is answered by binary search instead.
+/// are sorted once and each IRI is answered by one binary search.
 #[derive(Debug)]
 struct Abbreviator<'a> {
     /// `(namespace, prefix)`, ascending by namespace, one entry per namespace:
     /// the prefix that sorts first, as in [`abbreviate`].
     namespaces: Vec<(&'a str, &'a str)>,
+    /// `parents[i]` is the index of the longest other namespace that starts
+    /// namespace `i`, when there is one.
+    parents: Vec<Option<usize>>,
 }
 
 impl<'a> Abbreviator<'a> {
@@ -863,32 +866,55 @@ impl<'a> Abbreviator<'a> {
         // each run of equal namespaces carries the prefix that sorts first.
         namespaces.sort_by_key(|(namespace, _)| *namespace);
         namespaces.dedup_by_key(|(namespace, _)| *namespace);
-        Self { namespaces }
+        // In sorted order every namespace follows the namespaces that start
+        // it, so one pass with a stack of the still-open ones finds each
+        // parent: whatever does not start the current entry starts no later
+        // entry either.
+        let mut parents = Vec::with_capacity(namespaces.len());
+        let mut open: Vec<usize> = Vec::new();
+        for (index, (namespace, _)) in namespaces.iter().enumerate() {
+            while let Some(top) = open.last().copied() {
+                if namespaces
+                    .get(top)
+                    .is_some_and(|(outer, _)| namespace.starts_with(outer))
+                {
+                    break;
+                }
+                open.pop();
+            }
+            parents.push(open.last().copied());
+            open.push(index);
+        }
+        Self {
+            namespaces,
+            parents,
+        }
     }
 
     /// The longest declared namespace that starts `iri`, with its prefix.
     fn longest_namespace(&self, iri: &str) -> Option<(&'a str, &'a str)> {
-        // Every namespace that starts `iri` also starts `probe`, which begins
-        // as the whole IRI. Such a namespace sorts at or before `probe`, and so
-        // does the greatest namespace at or before `probe`, `nearest`, which
-        // sits between the two and therefore starts with it as well. So if
-        // `nearest` starts `probe` it is the longest answer; if it does not,
-        // every answer starts both, and `probe` shrinks to what they share.
-        let mut probe = iri.as_bytes();
+        // Every namespace that starts `iri` sorts at or before it, and so does
+        // `nearest`, the greatest namespace at or before `iri`. `nearest` sits
+        // between the two, so every answer starts `nearest` as well: the
+        // answer is `nearest` itself or one of its parents, and a parent
+        // starts `iri` exactly when it is no longer than what `nearest` and
+        // `iri` share. One search, then lengths only.
+        let after = self
+            .namespaces
+            .partition_point(|(namespace, _)| *namespace <= iri);
+        let mut at = after.checked_sub(1)?;
+        let (nearest, _) = *self.namespaces.get(at)?;
+        let shared = nearest
+            .bytes()
+            .zip(iri.bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
         loop {
-            let after = self
-                .namespaces
-                .partition_point(|(namespace, _)| namespace.as_bytes() <= probe);
-            let (namespace, prefix) = *self.namespaces.get(after.checked_sub(1)?)?;
-            if probe.starts_with(namespace.as_bytes()) {
+            let (namespace, prefix) = *self.namespaces.get(at)?;
+            if namespace.len() <= shared {
                 return Some((namespace, prefix));
             }
-            let shared = namespace
-                .bytes()
-                .zip(probe)
-                .take_while(|(left, right)| left == *right)
-                .count();
-            probe = &probe[..shared];
+            at = (*self.parents.get(at)?)?;
         }
     }
 

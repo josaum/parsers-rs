@@ -164,6 +164,36 @@ fn rendering_does_not_test_every_prefix_against_every_term() {
 }
 
 #[test]
+fn rendering_does_not_search_once_per_namespace_that_nearly_matches() {
+    // A thousand namespaces that each share one byte more with every IRI than
+    // the one before, and none of which starts any IRI. A lookup that drops
+    // one candidate per search makes a thousand searches per term; one search
+    // and a comparison of lengths is enough.
+    let prefixes = 1_000;
+    let rows = 5_000;
+    let mut text = String::new();
+    for k in 0..prefixes {
+        text.push_str(&format!("@prefix p{k}: <a:{}a> .\n", "b".repeat(k)));
+    }
+    text.push_str(&format!("@base <a:{}/> .\n", "b".repeat(prefixes + 1)));
+    for n in 0..rows {
+        text.push_str(&format!("<x{n}> <p> <o> .\n"));
+    }
+    let started = std::time::Instant::now();
+    let ontology = parse_turtle(text.as_bytes(), OntologyLimits::default()).expect("parses");
+    let elapsed = started.elapsed();
+    assert_eq!(ontology.triples().len(), rows);
+    assert_eq!(
+        ontology.triples()[7].subject,
+        format!("<a:{}/x7>", "b".repeat(prefixes + 1))
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "rendering took {elapsed:?}"
+    );
+}
+
+#[test]
 fn nesting_passes_at_the_limit_and_refuses_one_level_more() {
     let nested = |open: &str, close: &str, depth: usize| {
         format!(
