@@ -59,6 +59,19 @@ updates:
       - dependency-name: "tiny-skia"
         versions:
           - ">=0.12"
+      # Arrow is pinned to the version the consumers use (Cargo.toml says
+      # why), and flight-ipc-config reports it to them as
+      # CAPABILITY_ARROW_VERSION, so a new major is the consumers' move first.
+      # A trial of 60.1.0 on 2026-11-13 (`cargo check` with the CI Arrow
+      # features) compiles everywhere; pdf-fast-py's
+      # `ArrowArrayStreamReader` is deprecated, which `-D warnings` turns
+      # into an error. Unblocked when the consumers take the new major: move
+      # the five pins, CAPABILITY_ARROW_VERSION and README.md together, rename
+      # that reader, and show the schema snapshots and pyarrow interop pass.
+      # The `arrow-major` group above stays, so that upgrade arrives whole.
+      - dependency-name: "arrow*"
+        versions:
+          - ">=59"
 
   - package-ecosystem: cargo
     # The repository doctors: a package outside the workspace, with its own
