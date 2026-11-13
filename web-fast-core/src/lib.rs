@@ -43,6 +43,9 @@ pub enum WebParseError {
     /// Elements were nested deeper than [`MAX_NESTING_DEPTH`].
     #[error("HTML element nesting exceeds the supported depth")]
     NestingLimitExceeded,
+    /// `rowspan`/`colspan` covered more than [`MAX_TABLE_SPAN_CELLS`] cells.
+    #[error("HTML table spans cover more cells than the supported limit")]
+    TableSpanLimitExceeded,
     /// Reading a local source failed.
     #[error("failed to read HTML source: {0}")]
     Io(#[from] std::io::Error),
@@ -62,6 +65,21 @@ pub enum WebParseError {
 /// truncated. 512 is the depth at which browsers stop nesting elements, so
 /// a document a browser renders faithfully stays within it.
 pub const MAX_NESTING_DEPTH: usize = 512;
+
+/// Most empty cells `rowspan` and `colspan` may add across one document.
+///
+/// A spanning cell's text is emitted once, at its top-left position; every
+/// other position it covers is emitted as an empty cell so columns line up.
+/// A 17-byte `<td colspan=1000>` adds 999 such cells, so without a bound a
+/// 32 MiB document could ask for tens of gigabytes. Beyond this many the
+/// parse fails with [`WebParseError::TableSpanLimitExceeded`].
+pub const MAX_TABLE_SPAN_CELLS: usize = 1_000_000;
+
+/// Largest `colspan` honored: the maximum the HTML standard allows.
+const MAX_COLSPAN: usize = 1_000;
+
+/// Largest `rowspan` honored: the maximum the HTML standard allows.
+const MAX_ROWSPAN: usize = 65_534;
 
 /// Resource limits and decoding policy for one parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +193,11 @@ pub struct WebTable {
     /// Optional normalized caption.
     pub caption: Option<String>,
     /// Row-major normalized cells.
+    ///
+    /// A cell with `rowspan`/`colspan` appears once, at its top-left
+    /// position; the other positions it covers are empty strings. Cells
+    /// without text are kept as empty strings, so a column index means the
+    /// same column in every row. Rows may still differ in length.
     pub rows: Vec<Vec<String>>,
 }
 
@@ -439,6 +462,7 @@ fn parse_html_inner(
 
     let table_selector = selector("table")?;
     let mut tables = Vec::new();
+    let mut ignored_spans = 0usize;
     for table in document.select(&table_selector) {
         budget.add_node()?;
         let parts = own_table_parts(table);
@@ -449,22 +473,7 @@ fn parse_html_inner(
         if let Some(value) = &caption {
             budget.add_text(value)?;
         }
-        let mut rows = Vec::new();
-        for row in parts.rows {
-            let cells = row
-                .children()
-                .filter_map(ElementRef::wrap)
-                .filter(|cell| matches!(cell.value().name(), "th" | "td"))
-                .map(normalized_text)
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>();
-            for cell in &cells {
-                budget.add_text(cell)?;
-            }
-            if !cells.is_empty() {
-                rows.push(cells);
-            }
-        }
+        let rows = table_rows(&parts.rows, &mut budget, &mut ignored_spans)?;
         tables.push(WebTable {
             ordinal: ordinal(tables.len())?,
             dom_path: structural_path(table),
@@ -500,11 +509,13 @@ fn parse_html_inner(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let diagnostics = if invalid_json_ld == 0 {
-        Vec::new()
-    } else {
-        vec![format!("invalid_json_ld:{invalid_json_ld}")]
-    };
+    let mut diagnostics = Vec::new();
+    if invalid_json_ld != 0 {
+        diagnostics.push(format!("invalid_json_ld:{invalid_json_ld}"));
+    }
+    if ignored_spans != 0 {
+        diagnostics.push(format!("ignored_table_spans:{ignored_spans}"));
+    }
 
     Ok(WebDocument {
         source_sha256: format!("{:x}", Sha256::digest(source_bytes)),
@@ -534,6 +545,121 @@ fn check_tree_depth(document: &Html) -> Result<(), WebParseError> {
         }
         pending.extend(node.children().map(|child| (child, depth)));
     }
+    Ok(())
+}
+
+/// A cell from an earlier row that still covers columns of the current one.
+struct RowSpan {
+    column: usize,
+    width: usize,
+    rows_left: usize,
+}
+
+/// Reads a `rowspan`/`colspan` attribute.
+///
+/// A missing attribute is 1. A value that is not a number from 1 to
+/// `maximum` is treated as 1 and counted in `ignored`, so a hostile span
+/// neither expands the table nor passes unnoticed. `rowspan="0"` (to the end
+/// of the table, per HTML) is returned as `usize::MAX`.
+fn span_attr(cell: ElementRef<'_>, name: &str, maximum: usize, ignored: &mut usize) -> usize {
+    let Some(raw) = cell.value().attr(name) else {
+        return 1;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(0) if name == "rowspan" => usize::MAX,
+        Ok(value) if (1..=maximum).contains(&value) => value,
+        _ => {
+            *ignored += 1;
+            1
+        }
+    }
+}
+
+/// Lays a table's rows out on a grid, honoring `rowspan` and `colspan`.
+///
+/// `rowspan` only ever covers rows that exist: a span that outlives the
+/// table's last row is dropped, so it cannot create rows. Every empty cell a
+/// span adds is charged to the document-wide [`MAX_TABLE_SPAN_CELLS`].
+fn table_rows(
+    rows: &[ElementRef<'_>],
+    budget: &mut Budget,
+    ignored_spans: &mut usize,
+) -> Result<Vec<Vec<String>>, WebParseError> {
+    // Spans carried down from earlier rows: sorted by column, never overlapping.
+    let mut active: Vec<RowSpan> = Vec::new();
+    let mut grid = Vec::new();
+    for row in rows {
+        let mut out: Vec<String> = Vec::new();
+        let mut carried: Vec<RowSpan> = Vec::new();
+        let mut next_active = 0usize;
+        let cells = row
+            .children()
+            .filter_map(ElementRef::wrap)
+            .filter(|cell| matches!(cell.value().name(), "th" | "td"));
+        for cell in cells {
+            // Columns covered from above come before the next real cell.
+            while let Some(span) = active.get(next_active).filter(|s| s.column <= out.len()) {
+                cover(span, &mut out, &mut carried, budget)?;
+                next_active += 1;
+            }
+            let text = normalized_text(cell);
+            budget.add_text(&text)?;
+            let mut width = span_attr(cell, "colspan", MAX_COLSPAN, ignored_spans);
+            let height = span_attr(cell, "rowspan", MAX_ROWSPAN, ignored_spans);
+            if let Some(span) = active.get(next_active) {
+                // A cell may not run into a column covered from above.
+                width = width.min(span.column - out.len());
+            }
+            let column = out.len();
+            out.push(text);
+            add_empty_cells(&mut out, width - 1, budget)?;
+            if height > 1 {
+                carried.push(RowSpan {
+                    column,
+                    width,
+                    rows_left: height - 1,
+                });
+            }
+        }
+        for span in &active[next_active..] {
+            let gap = span.column.saturating_sub(out.len());
+            add_empty_cells(&mut out, gap, budget)?;
+            cover(span, &mut out, &mut carried, budget)?;
+        }
+        active = carried;
+        if !out.is_empty() {
+            grid.push(out);
+        }
+    }
+    Ok(grid)
+}
+
+/// Emits the empty cells of one span carried into the current row.
+fn cover(
+    span: &RowSpan,
+    out: &mut Vec<String>,
+    carried: &mut Vec<RowSpan>,
+    budget: &mut Budget,
+) -> Result<(), WebParseError> {
+    let column = out.len();
+    add_empty_cells(out, span.width, budget)?;
+    if span.rows_left > 1 {
+        carried.push(RowSpan {
+            column,
+            width: span.width,
+            rows_left: span.rows_left - 1,
+        });
+    }
+    Ok(())
+}
+
+fn add_empty_cells(
+    out: &mut Vec<String>,
+    count: usize,
+    budget: &mut Budget,
+) -> Result<(), WebParseError> {
+    budget.add_span_cells(count)?;
+    out.extend(std::iter::repeat_with(String::new).take(count));
     Ok(())
 }
 
@@ -704,6 +830,7 @@ fn ordinal(value: usize) -> Result<u32, WebParseError> {
 }
 
 struct Budget {
+    span_cells: usize,
     nodes: usize,
     text_bytes: usize,
     max_nodes: usize,
@@ -713,6 +840,7 @@ struct Budget {
 impl Budget {
     fn new(max_nodes: usize, max_text_bytes: usize) -> Self {
         Self {
+            span_cells: 0,
             nodes: 0,
             text_bytes: 0,
             max_nodes,
@@ -727,6 +855,14 @@ impl Budget {
             .ok_or(WebParseError::NodeLimitExceeded)?;
         if self.nodes > self.max_nodes {
             return Err(WebParseError::NodeLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn add_span_cells(&mut self, count: usize) -> Result<(), WebParseError> {
+        self.span_cells = self.span_cells.saturating_add(count);
+        if self.span_cells > MAX_TABLE_SPAN_CELLS {
+            return Err(WebParseError::TableSpanLimitExceeded);
         }
         Ok(())
     }

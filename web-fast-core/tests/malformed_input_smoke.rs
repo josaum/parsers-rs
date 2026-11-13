@@ -144,6 +144,62 @@ fn huge_spans_do_not_expand_tables() {
     emit(&document);
 }
 
+/// A spanning cell's text appears once, at its top-left position, and the
+/// positions it covers are empty cells, so a column index means one column.
+#[test]
+fn spanning_cells_keep_columns_aligned() {
+    let html = "<table>\
+        <tr><th colspan=2>name</th><th rowspan=2>age</th><th>x</th></tr>\
+        <tr><td>first</td><td>last</td><td></td></tr>\
+        <tr><td rowspan=9>ana</td><td>b</td><td>7</td><td>y</td></tr>\
+        <tr><td colspan=3>c</td></tr>\
+        <tr></tr>\
+        </table>";
+    let document = parse_html(html, None, ParseOptions::default()).expect("parses");
+    assert_eq!(
+        document.tables[0].rows,
+        [
+            vec!["name", "", "age", "x"],
+            vec!["first", "last", "", ""],
+            vec!["ana", "b", "7", "y"],
+            vec!["", "c", "", ""],
+            // `rowspan=9` covers the empty last row but creates no rows.
+            vec![""],
+        ]
+    );
+    assert!(document.diagnostics.is_empty());
+}
+
+/// Spans are bounded: a million-row `rowspan` adds no rows, and the empty
+/// cells that spans add are capped for the whole document, as an error.
+#[test]
+fn span_created_cells_are_capped_as_an_error() {
+    let tall = "<table><tr><td rowspan=65534>a</td><td>b</td></tr><tr><td>c</td></tr></table>";
+    let document = parse_html(tall, None, ParseOptions::default()).expect("parses");
+    assert_eq!(document.tables[0].rows, [["a", "b"], ["", "c"]]);
+
+    let over = "<table><tr><td rowspan=1000000>a</td></tr></table>";
+    let document = parse_html(over, None, ParseOptions::default()).expect("parses");
+    assert_eq!(document.tables[0].rows, [["a"]]);
+    assert_eq!(document.diagnostics, ["ignored_table_spans:1"]);
+
+    // 1,100 cells of colspan=1000 ask for 1,098,900 empty cells.
+    let wide = format!(
+        "<table><tr>{}</tr></table>",
+        "<td colspan=1000>a".repeat(1_100)
+    );
+    assert!(matches!(
+        parse_html(&wide, None, ParseOptions::default()),
+        Err(WebParseError::TableSpanLimitExceeded)
+    ));
+    let within = format!(
+        "<table><tr>{}</tr></table>",
+        "<td colspan=1000>a".repeat(1_000)
+    );
+    let document = parse_html(&within, None, ParseOptions::default()).expect("parses");
+    assert_eq!(document.tables[0].rows[0].len(), 1_000_000);
+}
+
 #[test]
 fn deeply_nested_divs_are_bounded_on_a_small_stack() {
     for (open, close) in [
