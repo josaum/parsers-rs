@@ -1148,14 +1148,19 @@ fn hash_value(value: &Value) -> u64 {
             }
             Value::Object(map) => {
                 mix_u64(h, 0x06);
+                // Members are hashed one by one and summed, so two objects
+                // that differ only in key order hash alike, as they compare.
+                let mut members = 0u64;
                 for (key, entry) in map {
+                    let mut member = FNV_OFFSET;
                     for &b in key.as_bytes() {
-                        mix_u64(h, b);
+                        mix_u64(&mut member, b);
                     }
-                    mix_u64(h, 0xfd);
-                    walk(h, entry);
-                    mix_u64(h, 0xfc);
+                    mix_u64(&mut member, 0xfd);
+                    walk(&mut member, entry);
+                    members = members.wrapping_add(member);
                 }
+                mix(h, members);
             }
         }
     }
@@ -1626,19 +1631,26 @@ fn json_equal(a: &Value, b: &Value) -> bool {
 }
 
 fn numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
-    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
-        return x == y;
+    // Integers, and floats that hold an integer, are compared exactly:
+    // 2^53 + 1 and 2^53 are different numbers that share one f64.
+    match (exact_integer(a), exact_integer(b)) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => a.as_f64() == b.as_f64(),
+        _ => false,
     }
-    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
-        return x == y;
+}
+
+/// The value of `n` as an integer, when it is one.
+fn exact_integer(n: &serde_json::Number) -> Option<i128> {
+    if let Some(value) = n.as_i64() {
+        return Some(i128::from(value));
     }
-    if let (Some(x), Some(y)) = (a.as_i64(), b.as_u64()) {
-        return x >= 0 && x as u64 == y;
+    if let Some(value) = n.as_u64() {
+        return Some(i128::from(value));
     }
-    if let (Some(x), Some(y)) = (a.as_u64(), b.as_i64()) {
-        return y >= 0 && x == y as u64;
-    }
-    a.as_f64() == b.as_f64()
+    let float = n.as_f64()?;
+    // Every f64 of this magnitude with no fraction converts exactly.
+    (float.is_finite() && float.fract() == 0.0 && float.abs() < 1e38).then_some(float as i128)
 }
 
 fn type_matches(value: &Value, type_name: &str) -> bool {
@@ -2417,6 +2429,22 @@ mod tests {
         }
         let schema = json!({ "properties": properties });
         assert_eq!(validate(&Value::Object(document), &schema), []);
+    }
+
+    #[test]
+    fn unique_items_ignores_key_order_and_compares_integers_exactly() {
+        let unique = json!({"uniqueItems": true});
+        assert!(fails(r#"[{"a":1,"b":2},{"b":2,"a":1}]"#, &unique));
+        assert!(fails(
+            r#"[{"a":{"x":1,"y":[2]}},{"a":{"y":[2],"x":1.0}}]"#,
+            &unique
+        ));
+        assert!(passes(r#"[{"a":1,"b":2},{"b":1,"a":2}]"#, &unique));
+        // 2^53 + 1 is not 2^53, although both round to the same f64.
+        assert!(passes("[9007199254740993, 9007199254740992.0]", &unique));
+        assert!(passes("[9007199254740993, 9007199254740992]", &unique));
+        assert!(fails("[9007199254740992, 9007199254740992.0]", &unique));
+        assert!(fails("[-3, -3.0]", &unique));
     }
 
     #[test]
