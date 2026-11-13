@@ -960,6 +960,13 @@ def assert_dependabot_contract(dependabot: str) -> None:
         cargo,
         re.MULTILINE,
     ), "tiny-skia 0.12 and later must be ignored until its rendering change is accepted"
+    # mailparse 0.18 splits MIME parts differently, and email-fast-core's
+    # nesting and header-cost guards replay 0.15's search; it waits for both.
+    assert re.search(
+        r'^      - dependency-name: "mailparse"\n        versions:\n          - ">=0\.16"$',
+        cargo,
+        re.MULTILINE,
+    ), "mailparse 0.16 and later must be ignored until email-fast-core's guards follow it"
     # The Arrow pin follows the consumers; every Arrow crate past it is held,
     # by one pattern, so the crates cannot drift apart.
     assert re.search(
@@ -1367,6 +1374,8 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_dependabot_contract, DEPENDABOT, '"napi-derive"\n        versions:\n          - ">=3"', '"napi-derive"\n        versions:\n          - ">=3.1"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "tiny-skia"\n', '      - dependency-name: "tiny-skia-path"\n'),
         (assert_dependabot_contract, DEPENDABOT, '          - ">=0.12"', '          - ">=0.13"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "mailparse"\n        versions:\n          - ">=0.16"\n', ""),
+        (assert_dependabot_contract, DEPENDABOT, '"mailparse"\n        versions:\n          - ">=0.16"', '"mailparse"\n        versions:\n          - ">=0.19"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "arrow*"\n', '      - dependency-name: "arrow"\n'),
         (assert_dependabot_contract, DEPENDABOT, '          - ">=59"', '          - ">=61"'),
         (assert_dependabot_contract, DEPENDABOT, "        update-types:\n", "        exclude-patterns:\n          - arrow-*\n        update-types:\n"),
