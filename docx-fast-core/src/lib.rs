@@ -2468,7 +2468,12 @@ impl<'a> DocxBodyParser<'a> {
             self.old_properties_depth += 1;
             return Ok(());
         }
-        if self.old_properties_depth > 0 {
+        // Old properties are skipped, except for the mark that a paragraph
+        // mark was itself inserted or deleted: that is a tracked change and
+        // stays in the list of revisions.
+        if self.old_properties_depth > 0
+            && !matches!(name, b"ins" | b"del" | b"moveFrom" | b"moveTo")
+        {
             return Ok(());
         }
         match name {
@@ -2806,7 +2811,12 @@ impl<'a> DocxBodyParser<'a> {
             self.old_properties_depth = self.old_properties_depth.saturating_sub(1);
             return Ok(());
         }
-        if self.old_properties_depth > 0 {
+        // Old properties are skipped, except for the mark that a paragraph
+        // mark was itself inserted or deleted: that is a tracked change and
+        // stays in the list of revisions.
+        if self.old_properties_depth > 0
+            && !matches!(name, b"ins" | b"del" | b"moveFrom" | b"moveTo")
+        {
             return Ok(());
         }
         match name {

@@ -393,3 +393,28 @@ fn a_theme_font_is_an_ordinary_font() {
         ["Hello \u{F04A}", "Hello", "Hello", "J\u{2713}"]
     );
 }
+
+#[test]
+fn a_revision_recorded_inside_old_properties_is_still_listed() {
+    // The old properties of a paragraph mark can say that the mark itself
+    // was inserted or deleted. That is a tracked change like any other.
+    let body = concat!(
+        r#"<w:p><w:pPr><w:rPr><w:rPrChange w:id="1" w:author="a"><w:rPr><w:ins w:id="7" w:author="Ada"/><w:b/></w:rPr></w:rPrChange></w:rPr>"#,
+        r#"<w:pPrChange w:id="2" w:author="a"><w:pPr><w:rPr><w:del w:id="8" w:author="Bob"/></w:rPr></w:pPr></w:pPrChange></w:pPr>"#,
+        r#"<w:r><w:t>kept</w:t></w:r></w:p>"#,
+    );
+    let doc = parse(body, "");
+    let listed: Vec<_> = doc
+        .revisions
+        .iter()
+        .map(|revision| (revision.id.as_str(), revision.kind.as_str()))
+        .collect();
+    assert_eq!(listed, [("7", "ins"), ("8", "del")]);
+    let Block::Paragraph(paragraph) = &doc.blocks[0] else {
+        panic!("expected a paragraph");
+    };
+    // The run after the old properties is not part of those revisions.
+    assert_eq!(paragraph.runs[0].text, "kept");
+    assert!(paragraph.runs[0].revision.is_none());
+    assert!(!paragraph.runs[0].bold);
+}
