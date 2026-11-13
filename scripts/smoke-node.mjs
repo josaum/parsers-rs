@@ -3,7 +3,7 @@
 // as a STORE-only OOXML zip or a plain EML, so the check needs no committed
 // binary and survives a fresh checkout. Exits non-zero on the first failure.
 //
-// Usage: node scripts/smoke-node.mjs [docx|xlsx|pptx|email ...]
+// Usage: node scripts/smoke-node.mjs [docx|xlsx|pptx|email|geo|xsd|json ...]
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync } from 'node:fs';
@@ -93,8 +93,38 @@ const fixtures = {
     'Hello EML body',
     '',
   ].join('\r\n')),
+  // 2x2 8-bit little-endian GeoTIFF in EPSG:4326, PixelIsPoint, samples 1..4 (read back as n/255).
+  geo: () => {
+    const geokeys = [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 2, 2048, 0, 1, 4326];
+    const dataAt = 8 + 2 + 12 * 12 + 4;
+    const tags = [
+      [256, 3, 1, 2], [257, 3, 1, 2], [258, 3, 1, 8], [259, 3, 1, 1], [262, 3, 1, 1],
+      [273, 4, 1, dataAt], [277, 3, 1, 1], [278, 3, 1, 2], [279, 4, 1, 4],
+      [33550, 12, 3, dataAt + 4], [33922, 12, 6, dataAt + 28], [34735, 3, geokeys.length, dataAt + 76],
+    ];
+    const buf = Buffer.alloc(dataAt + 76 + geokeys.length * 2);
+    buf.write('II', 0, 'latin1'); buf.writeUInt16LE(42, 2); buf.writeUInt32LE(8, 4); buf.writeUInt16LE(tags.length, 8);
+    tags.forEach(([tag, type, count, value], i) => {
+      const at = 10 + i * 12;
+      buf.writeUInt16LE(tag, at); buf.writeUInt16LE(type, at + 2); buf.writeUInt32LE(count, at + 4);
+      if (type === 3 && count === 1) buf.writeUInt16LE(value, at + 8); else buf.writeUInt32LE(value, at + 8);
+    });
+    Buffer.from([1, 2, 3, 4]).copy(buf, dataAt);
+    [1, 1, 0].forEach((v, i) => buf.writeDoubleLE(v, dataAt + 4 + i * 8));
+    [0, 0, 0, 10, 50, 0].forEach((v, i) => buf.writeDoubleLE(v, dataAt + 28 + i * 8));
+    geokeys.forEach((v, i) => buf.writeUInt16LE(v, dataAt + 76 + i * 2));
+    return buf;
+  },
+  xsd: () => Buffer.from(`<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="record"><xs:complexType><xs:sequence><xs:element name="name" type="xs:string"/></xs:sequence></xs:complexType></xs:element></xs:schema>`),
   json: () => Buffer.from('{"hello":"Hello JSON","nested":{"a":1}}\n{"hello":"JSONL","nested":{"a":2}}\n'),
 };
+
+// A bad input must surface as a thrown JavaScript error, never a process abort.
+function mustThrow(call, what) {
+  let threw = false;
+  try { call(); } catch (err) { threw = err instanceof Error; }
+  if (!threw) throw new Error(`${what}: expected a thrown Error`);
+}
 
 // Each check must be non-vacuous: a fixture string round-trips through the parse.
 const checks = {
@@ -136,6 +166,31 @@ const checks = {
     if (m.extractAttachments(file, path.join(dir, 'att'), 1024).length !== 0) throw new Error('unexpected attachments');
     return `subject=${e.subject}`;
   },
+  geo(m, file) {
+    const meta = JSON.parse(m.geotiffMetadataJson(file));
+    if (meta.width !== 2 || meta.epsg_code !== 4326 || meta.pixel_is_point !== true) throw new Error(`metadata: ${JSON.stringify(meta)}`);
+    const bands = m.geotiffBands(file);
+    if (!(bands[0] instanceof Float32Array) || bands[0].length !== 4 || Array.from(bands[0]).some((v, i) => Math.abs(v - (i + 1) / 255) > 1e-6)) throw new Error('band samples missing');
+    mustThrow(() => m.geotiffBands(file, 15), 'band limit');
+    mustThrow(() => m.geotiffMetadataJson(file + '.missing'), 'missing file');
+    if (Math.abs(m.computeNdvi([0.5], [0.1])[0] - 2 / 3) > 1e-6) throw new Error('ndvi value');
+    mustThrow(() => m.computeNdvi([0.5], [0.1, 0.2]), 'ndvi length');
+    if (Math.abs(m.spectralAngle([1, 0], [0, 1]) - Math.PI / 2) > 1e-3) throw new Error('spectral angle value');
+    mustThrow(() => m.spectralAngle([1], [1, 0]), 'spectral angle length');
+    const recs = JSON.parse(m.parseGeojsonToRecordsJson('{"type":"Feature","geometry":{"type":"Point","coordinates":[10,50]},"properties":{}}'));
+    if (recs[0].lon !== 10) throw new Error('geojson point missing');
+    mustThrow(() => m.bboxAreaKm2('nope'), 'bad bbox');
+    return `version=${m.version()}, ${bands.length} band(s)`;
+  },
+  xsd(m, file) {
+    if (m.listElements(file).join() !== 'record') throw new Error('elements missing');
+    const all = JSON.parse(m.allArrowSchemasJson(file));
+    if (JSON.stringify(all.record) !== m.describeElementJson(file, 'record')) throw new Error('all schemas disagree with one');
+    if (m.validateBytesJson(file, Buffer.from('<record><name>a</name></record>')) !== '[]') throw new Error('valid document refused');
+    if (m.schemaIpcBytes(file, 'record').length === 0) throw new Error('empty schema ipc');
+    mustThrow(() => m.allArrowSchemasJson(file + '.missing'), 'missing schema');
+    return `${Object.keys(all).length} element(s)`;
+  },
   json(m, file, dir) {
     const text = readFileSync(file, 'utf8');
     const firstLine = text.split('\n')[0];
@@ -149,7 +204,7 @@ const checks = {
   },
 };
 
-const ext = { docx: 'docx', xlsx: 'xlsx', pptx: 'pptx', email: 'eml', json: 'json' };
+const ext = { docx: 'docx', xlsx: 'xlsx', pptx: 'pptx', email: 'eml', geo: 'tif', xsd: 'xsd', json: 'json' };
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(checks);
 let failures = 0;
 for (const name of wanted) {
