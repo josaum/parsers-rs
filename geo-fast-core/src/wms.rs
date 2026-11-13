@@ -173,6 +173,10 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                 run.push_text(piece);
                 continue;
             }
+            Event::CData(section) => {
+                run.push_cdata(section);
+                continue;
+            }
             Event::GeneralRef(reference) => {
                 run.push_reference(reference);
                 continue;
@@ -364,14 +368,22 @@ mod tests {
         }
     }
 
-    /// A CDATA section has never been read here, and of the character data
-    /// on either side of other markup the first stretch is the value.
+    /// A CDATA section used to be skipped: a layer named only in one had an
+    /// empty name and was left out, and `pre<![CDATA[mid]]>post` was read as
+    /// `pre`. It is text like the rest of the value, taken as written. Of
+    /// the character data on either side of a comment or a child element
+    /// the first stretch is still the value.
     #[test]
-    fn cdata_in_a_layer_title_is_not_read() {
+    fn cdata_in_a_layer_title_is_read_as_text() {
         let untitled = vec![("n".to_string(), String::new(), vec![])];
-        assert_eq!(layers_with("<![CDATA[X &amp; Y]]>"), untitled);
+        assert_eq!(layers_with("<![CDATA[X &amp; Y]]>"), both("X &amp; Y"));
+        assert_eq!(
+            layers_with("<![CDATA[Roads & <Rivers>]]>"),
+            both("Roads & <Rivers>")
+        );
+        assert_eq!(layers_with("<![CDATA[]]>"), untitled);
         assert_eq!(layers_with("   "), untitled);
-        assert_eq!(layers_with("pre<![CDATA[mid]]>post"), both("pre"));
+        assert_eq!(layers_with("pre<![CDATA[mid]]>post"), both("premidpost"));
         assert_eq!(layers_with("a<!-- c -->b"), both("a"));
         assert_eq!(layers_with("<b>x</b>y"), both("x"));
     }

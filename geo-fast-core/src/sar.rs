@@ -106,6 +106,11 @@ impl SarParser {
                     buf.clear();
                     continue;
                 }
+                Event::CData(section) => {
+                    run.push_cdata(section);
+                    buf.clear();
+                    continue;
+                }
                 Event::GeneralRef(reference) => {
                     run.push_reference(reference);
                     buf.clear();
@@ -374,6 +379,11 @@ impl SarParser {
                     buf.clear();
                     continue;
                 }
+                Event::CData(section) => {
+                    run.push_cdata(section);
+                    buf.clear();
+                    continue;
+                }
                 Event::GeneralRef(reference) => {
                     run.push_reference(reference);
                     buf.clear();
@@ -616,13 +626,21 @@ mod tests {
         }
     }
 
-    /// No reader in this module has ever read a CDATA section, and character
-    /// data on either side of other markup is taken one stretch at a time,
-    /// the last one winning.
+    /// A CDATA section used to be skipped: a platform named only in one was
+    /// "no platform", and `pre<![CDATA[mid]]>post` was read as `post`. It is
+    /// text like the rest of the value, taken as written. Character data on
+    /// either side of a comment is still one stretch at a time, the last one
+    /// winning.
     #[test]
-    fn cdata_in_a_platform_name_is_not_read() {
-        assert!(sensor("<![CDATA[X &amp; Y]]>").is_err());
-        assert_eq!(sensor("pre<![CDATA[mid]]>post").as_deref(), Ok("post"));
+    fn cdata_in_a_platform_name_is_read_as_text() {
+        assert_eq!(sensor("<![CDATA[X &amp; Y]]>").as_deref(), Ok("X &amp; Y"));
+        assert_eq!(sensor("<![CDATA[A < B]]>").as_deref(), Ok("A < B"));
+        assert_eq!(
+            sensor("pre<![CDATA[mid]]>post").as_deref(),
+            Ok("premidpost")
+        );
+        assert_eq!(sensor(" a <![CDATA[ & ]]> b ").as_deref(), Ok("a  &  b"));
+        assert!(sensor("<![CDATA[]]>").is_err());
         assert_eq!(sensor("a<!-- c -->b").as_deref(), Ok("b"));
         assert!(sensor("   ").is_err());
     }
@@ -645,13 +663,13 @@ mod tests {
         assert_eq!(parsed.incidence_angle_deg, 39.25);
         assert_eq!(parsed.orbit_direction, "ascending");
         assert_eq!(parsed.bbox, BBox::new(-60.0, -12.0, -58.0, -10.0));
-        // A CDATA section holds no value for a numeric field either.
+        // A numeric field in a CDATA section is read too.
         let parsed = SarParser::parse_safe_manifest(&manifest(
             "S1",
             "<resolution><![CDATA[10.5]]></resolution>",
         ))
         .expect("manifest");
-        assert_eq!(parsed.resolution_m, 0.0);
+        assert_eq!(parsed.resolution_m, 10.5);
     }
 
     #[test]
@@ -667,7 +685,7 @@ mod tests {
         assert_eq!(points[0].sample, 200.0);
         assert_eq!(points[0].geo.lat, -10.5);
         assert_eq!(points[0].geo.lon, -59.25);
-        assert_eq!(points[0].height, 0.0);
+        assert_eq!(points[0].height, 150.0);
     }
 
     /// quick-xml 0.36 failed to unescape such a value and the reader then

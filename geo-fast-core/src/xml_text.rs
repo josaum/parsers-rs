@@ -7,7 +7,7 @@
 //! back the one string they spell.
 
 use quick_xml::escape::resolve_predefined_entity;
-use quick_xml::events::{BytesRef, BytesText};
+use quick_xml::events::{BytesCData, BytesRef, BytesText};
 
 /// Whitespace as XML defines it: space, tab, carriage return and line feed.
 ///
@@ -19,8 +19,9 @@ fn is_xml_whitespace(c: char) -> bool {
 
 /// The character data between two pieces of markup.
 ///
-/// Feed it every text and reference event, and call [`TextRun::take`] when
-/// any other event arrives. Literal whitespace at either end of the run is
+/// Feed it every text, reference and CDATA event, and call [`TextRun::take`]
+/// when any other event arrives. A CDATA section is text like the rest: its
+/// content is taken as written, markup characters and whitespace included. Literal whitespace at either end of the run is
 /// dropped; whitespace written as a reference (`&#32;`) is content and stays.
 ///
 /// A reference that cannot be resolved (an entity that is not one of XML's
@@ -60,6 +61,23 @@ impl TextRun {
             self.trailing_whitespace = piece.len() - content_len;
         }
         self.text.push_str(piece);
+    }
+
+    /// Appends the content of a CDATA section, exactly as written.
+    ///
+    /// An empty section adds nothing.
+    pub(crate) fn push_cdata(&mut self, section: &BytesCData<'_>) {
+        let Ok(content) = section.decode() else {
+            self.started = true;
+            self.undecodable = true;
+            return;
+        };
+        if content.is_empty() {
+            return;
+        }
+        self.started = true;
+        self.trailing_whitespace = 0;
+        self.text.push_str(&content);
     }
 
     /// Appends what an entity or character reference stands for.
