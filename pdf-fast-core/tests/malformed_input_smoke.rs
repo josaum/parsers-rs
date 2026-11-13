@@ -934,49 +934,103 @@ fn a_run_of_saved_states_does_not_grow_the_table_extractor() {
     });
 }
 
-/// Runs `parse` on a thread with half of the harness's small stack.
-fn run_on_half_the_small_stack<F>(parse: F)
+/// Runs `parse` on a thread with a stack of `stack_bytes`.
+fn run_on_stack<F>(stack_bytes: usize, parse: F)
 where
     F: FnOnce() + Send + 'static,
 {
     std::thread::Builder::new()
-        .stack_size(smoke::SMALL_STACK_BYTES / 2)
+        .stack_size(stack_bytes)
         .spawn(parse)
-        .expect("spawn half-stack thread")
+        .expect("spawn reduced-stack thread")
         .join()
-        .expect("parser panicked on half the small stack");
+        .expect("parser panicked on a reduced stack");
 }
 
-/// The two nesting inputs again, on half the stack.
-///
-/// Passing on the small stack says the recursion fits; it does not say by
-/// how much. With the limits these inputs hit, the parsers once needed over
-/// three quarters of that stack in an unoptimized macOS build, which passed
-/// here and overflowed now and then on Windows, where frames are larger.
-/// Halving the stack makes a lost margin fail on every platform.
-#[test]
-fn deep_nesting_leaves_half_the_small_stack_unused() {
-    let _serial = serial();
-    for (open, close) in [
-        (&b"["[..], &b"]"[..]),
-        (b"<< /A ", b" >>"),
-        (b"[ << /A ", b" >> ]"),
-    ] {
-        let mut document = b"%PDF-1.7\n1 0 obj\n".to_vec();
-        document.extend(smoke::nested(open, b"1", close, 200_000));
+/// Parses one object nested `levels` turns deep on a `stack_bytes` stack.
+fn parse_nested_object(open: &[u8], close: &[u8], levels: usize, closed: bool, stack_bytes: usize) {
+    let mut document = b"%PDF-1.7\n1 0 obj\n".to_vec();
+    if closed {
+        document.extend(smoke::nested(open, b"1", close, levels));
         document.extend_from_slice(b"\nendobj\n");
-        run_on_half_the_small_stack(move || {
-            exercise_text(&document, ParseOptions::default());
-        });
+    } else {
+        // Cut off after the last opening delimiter, as the fuzzer found it.
+        document.extend(smoke::nested(open, b"", b"", levels));
     }
+    run_on_stack(stack_bytes, move || {
+        exercise_text(&document, ParseOptions::default());
+    });
+}
+
+/// Reads a content stream of arrays nested `levels` deep on a `stack_bytes`
+/// stack.
+fn read_nested_content(levels: usize, closed: bool, stack_bytes: usize) {
+    let close: &[u8] = if closed { b"]" } else { b"" };
     let mut payloads = Payloads::seed();
-    payloads.content = smoke::nested(b"[", b"(x)", b"]", 200_000);
+    payloads.content = smoke::nested(b"[", b"(x)", close, levels);
     payloads.content.extend_from_slice(b" TJ");
     let document = document(&payloads);
-    run_on_half_the_small_stack(move || {
+    run_on_stack(stack_bytes, move || {
         exercise_text(&document, tight_options());
         exercise_tables(&document, tight_options());
     });
+}
+
+/// The shapes the object parser is given, with how many turns of each reach
+/// its 128-level limit: the last shape opens two containers a turn.
+const NESTED_OBJECT_SHAPES: [(&[u8], &[u8], usize); 3] = [
+    (b"[", b"]", 128),
+    (b"<< /A ", b" >>", 128),
+    (b"[ << /A ", b" >> ]", 64),
+];
+
+/// Nesting far past the limits, on a quarter of the small stack.
+///
+/// Passing on the small stack says the parsers fit; it does not say by how
+/// much. When both parsers recursed, these inputs needed over three quarters
+/// of that stack in an unoptimized macOS build, which passed here and
+/// overflowed now and then on Windows, where frames are larger. Neither
+/// parser recurses now, and a refused input builds no value, so a quarter of
+/// the stack is several times what this needs: a parser that goes back to
+/// following input depth on the call stack fails here on every platform.
+#[test]
+fn refused_nesting_leaves_three_quarters_of_the_small_stack_unused() {
+    let _serial = serial();
+    let stack_bytes = smoke::SMALL_STACK_BYTES / 4;
+    for (open, close, _) in NESTED_OBJECT_SHAPES {
+        for closed in [true, false] {
+            parse_nested_object(open, close, 200_000, closed, stack_bytes);
+        }
+    }
+    for closed in [true, false] {
+        read_nested_content(200_000, closed, stack_bytes);
+    }
+}
+
+/// Nesting at the limits and one level under them, on half the small stack.
+///
+/// These inputs are accepted, so the whole nested value is built and then
+/// walked and dropped, and that later code does recurse once per level. This
+/// is the deepest value the parsers hand out, which makes it the most stack
+/// any nesting can cost; half the stack is about three times what it needs
+/// in an unoptimized macOS build. Raising either limit shows up here.
+#[test]
+fn nesting_at_the_limit_leaves_half_the_small_stack_unused() {
+    let _serial = serial();
+    let stack_bytes = smoke::SMALL_STACK_BYTES / 2;
+    for (open, close, at_limit) in NESTED_OBJECT_SHAPES {
+        for levels in [at_limit, at_limit - 1] {
+            for closed in [true, false] {
+                parse_nested_object(open, close, levels, closed, stack_bytes);
+            }
+        }
+    }
+    // The content tokenizer accepts 128 levels of arrays.
+    for levels in [128, 127] {
+        for closed in [true, false] {
+            read_nested_content(levels, closed, stack_bytes);
+        }
+    }
 }
 
 // ── Seed sanity ─────────────────────────────────────────────────────────────
