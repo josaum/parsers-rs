@@ -56,9 +56,6 @@ use std::collections::{HashMap, HashSet};
 use serde_json::map::Map;
 use serde_json::Value;
 
-/// Maximum `$ref` hops before a schema is treated as cyclic.
-const MAX_REF_DEPTH: usize = 32;
-
 /// Deepest array/object nesting [`validate`] accepts in the schema and in the
 /// document: the parser's default, [`crate::DEFAULT_MAX_NESTING_DEPTH`].
 ///
@@ -68,25 +65,41 @@ pub const MAX_VALIDATION_NESTING_DEPTH: usize = crate::DEFAULT_MAX_NESTING_DEPTH
 
 /// Most subschema applications that may be in progress at once.
 ///
-/// `$ref` lets a schema apply itself in place, so the recursion is not
-/// bounded by the nesting of the schema alone: 32 reference hops through a
-/// schema nested 60 deep would otherwise recurse 1,920 levels and overflow
-/// the stack. 128 leaves two in-place applications for every level of a
-/// 64-level document, and at the 4 to 8 KiB a level measured in an
-/// unoptimized build stays within 1 MiB of stack.
-pub const MAX_APPLICATION_DEPTH: usize = 128;
+/// The validator recurses once per application, and `$ref`, `allOf` and the
+/// other in-place keywords apply schemas without descending the document, so
+/// this depth is not bounded by the 64 levels of nesting alone. 2,048 allows
+/// 32 nested applications for every one of the 64 levels a document may
+/// have; a schema that wraps each level in a handful of `allOf`/`anyOf`/
+/// `$ref` layers uses 5 to 10.
+///
+/// Stack: an application measured 4 to 8 KiB in an unoptimized build. The
+/// first [`INLINE_APPLICATION_DEPTH`] levels run on the caller's stack; a
+/// validation that needs more is run again on a thread whose stack is
+/// `MAX_APPLICATION_DEPTH * STACK_BYTES_PER_APPLICATION` (64 MiB of address
+/// space, touched only as far as the recursion goes).
+pub const MAX_APPLICATION_DEPTH: usize = 2_048;
+
+/// Applications nested on the caller's own stack before validation moves to
+/// a dedicated thread: 64 levels at up to 8 KiB each stay within 512 KiB.
+const INLINE_APPLICATION_DEPTH: usize = 64;
+
+/// Stack reserved per nested application on the dedicated thread: four
+/// times the 8 KiB measured in an unoptimized build.
+const STACK_BYTES_PER_APPLICATION: usize = 32 * 1024;
+
+/// Most results remembered per validation; past this, results are recomputed.
+const MAX_REMEMBERED_RESULTS: usize = 1_000_000;
 
 /// Subschema applications allowed per schema node and document value.
 ///
 /// One validation may apply at most
 /// `VALIDATION_STEPS_PER_PAIR * (schema values + 1) * (document values + 1)`
-/// subschemas. Without `$ref`, a schema node meets each document value at
-/// most once (plus once per property name under `propertyNames`), so any
-/// reference-free schema uses under 2 steps per pair; the factor of 64
-/// leaves room for definitions legitimately reached through several
-/// references. A schema that branches into itself, such as
-/// `{"allOf":[{"$ref":"#"},{"$ref":"#"}]}`, doubles its work with every
-/// reference hop and exhausts the budget instead.
+/// subschemas. This is a backstop, not a working limit: the result of
+/// applying a `$ref` target or an `anyOf`/`oneOf`/`not`/`if`/`contains`
+/// candidate to an array or object is remembered for the rest of the
+/// validation, so a schema node is fully applied to a document value about
+/// once and the work is at most the product of the two sizes. Only schemas
+/// that fan out in place on a scalar can reach it.
 pub const VALIDATION_STEPS_PER_PAIR: u64 = 64;
 
 /// Most bytes of regular-expression text one validation may compile.
@@ -255,20 +268,20 @@ struct Applied<'v> {
     evaluated: Evaluated<'v>,
 }
 
-struct Ctx<'a> {
+struct Ctx<'a, 'v> {
     root: &'a Value,
     /// `$anchor`/plain-name fragment name -> JSON pointers that define it.
     anchors: HashMap<String, Vec<String>>,
-    /// `$ref` hops taken so far; caps recursive schemas.
-    ref_depth: usize,
     /// Compiled patterns, keyed by pattern text, so rows never recompile.
     patterns: HashMap<String, Result<regex::Regex, String>>,
     /// Bytes of pattern text compiled so far.
     pattern_bytes: usize,
-    /// `$ref` hops allowed on one path.
-    max_ref_depth: usize,
     /// Subschema applications in progress.
     depth: usize,
+    /// Applications that may be in progress on this stack.
+    max_depth: usize,
+    /// Set when `max_depth` was the limit that stopped the validation.
+    too_deep: bool,
     /// Subschema applications started so far.
     steps: u64,
     /// Subschema applications allowed in total.
@@ -278,7 +291,27 @@ struct Ctx<'a> {
     /// the limit was hit could be discarded by `anyOf`, or turned into a pass
     /// by `not`.
     halted: Option<&'static str>,
+    /// Results of shared applications, by (schema node, document value)
+    /// address. Both trees are borrowed for the whole validation, so an
+    /// address identifies a node.
+    remembered: HashMap<(usize, usize), Remembered<'v>>,
+    /// Shared applications currently running; meeting one again means the
+    /// schema applies itself to the same value without end.
+    running: HashSet<(usize, usize)>,
 }
+
+/// The outcome of one subschema application, kept for reuse.
+struct Remembered<'v> {
+    passed: bool,
+    evaluated: Evaluated<'v>,
+    /// Findings with `path` relative to the value the schema was applied to.
+    findings: Vec<Finding>,
+}
+
+/// Why validation stopped at a schema that applies itself forever.
+const ENDLESS_SELF_APPLICATION: &str = "validation stopped: the schema applies itself to \
+     the same value without end (a `$ref` cycle that never descends into the document); \
+     the document was not fully validated";
 
 /// Why validation stopped at the work budget.
 const BUDGET_EXHAUSTED: &str = "validation stopped: the schema needs more subschema \
@@ -291,7 +324,7 @@ const PATTERN_BUDGET_EXHAUSTED: &str = "validation stopped: the schema and docum
      the document was not fully validated";
 
 /// Why validation stopped at the application depth.
-const TOO_MANY_NESTED_APPLICATIONS: &str = "validation stopped: more than 128 subschema \
+const TOO_MANY_NESTED_APPLICATIONS: &str = "validation stopped: more than 2048 subschema \
      applications are nested inside each other; the document was not fully validated";
 
 /// Counts the values in `root` and its deepest array/object nesting, without
@@ -319,12 +352,7 @@ fn measure(root: &Value) -> (u64, usize) {
 
 /// Runs one validation and returns the findings with the number of subschema
 /// applications it started. `budget` of `None` applies the documented budget.
-fn run(
-    document: &Value,
-    schema: &Value,
-    max_ref_depth: usize,
-    budget: Option<u64>,
-) -> (Vec<Finding>, u64) {
+fn run(document: &Value, schema: &Value, budget: Option<u64>) -> (Vec<Finding>, u64) {
     let (schema_values, schema_depth) = measure(schema);
     let (document_values, document_depth) = measure(document);
     for (what, depth) in [("schema", schema_depth), ("document", document_depth)] {
@@ -336,34 +364,101 @@ fn run(
             return (vec![Finding::error("$", message)], 0);
         }
     }
+    let budget = budget.unwrap_or_else(|| {
+        VALIDATION_STEPS_PER_PAIR
+            .saturating_mul(schema_values.saturating_add(1))
+            .saturating_mul(document_values.saturating_add(1))
+    });
+    let (findings, steps, too_deep) =
+        run_on_this_stack(document, schema, budget, INLINE_APPLICATION_DEPTH);
+    if !too_deep {
+        return (findings, steps);
+    }
+    // Deeper than the caller's stack is trusted with: start again on a
+    // thread with a stack sized for the full application depth.
+    let stack_bytes = MAX_APPLICATION_DEPTH * STACK_BYTES_PER_APPLICATION;
+    let deep = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(stack_bytes)
+            .spawn_scoped(scope, || {
+                run_on_this_stack(document, schema, budget, MAX_APPLICATION_DEPTH)
+            })
+            .ok()
+            .and_then(|handle| handle.join().ok())
+    });
+    match deep {
+        Some((findings, steps, _)) => (findings, steps),
+        None => (
+            vec![Finding::error("$", TOO_MANY_NESTED_APPLICATIONS)],
+            steps,
+        ),
+    }
+}
+
+/// Validates with at most `max_depth` nested applications; the last value
+/// reports whether that depth was what stopped it.
+fn run_on_this_stack(
+    document: &Value,
+    schema: &Value,
+    budget: u64,
+    max_depth: usize,
+) -> (Vec<Finding>, u64, bool) {
     let mut findings = Vec::new();
     let mut ctx = Ctx {
         root: schema,
         anchors: collect_anchors(schema),
-        ref_depth: 0,
         patterns: HashMap::new(),
         pattern_bytes: 0,
-        max_ref_depth,
         depth: 0,
+        max_depth,
+        too_deep: false,
         steps: 0,
-        budget: budget.unwrap_or_else(|| {
-            VALIDATION_STEPS_PER_PAIR
-                .saturating_mul(schema_values.saturating_add(1))
-                .saturating_mul(document_values.saturating_add(1))
-        }),
+        budget,
         halted: None,
+        remembered: HashMap::new(),
+        running: HashSet::new(),
     };
     let mut path = String::from("$");
     validate_node(document, schema, &mut path, &mut ctx, &mut findings);
     if let Some(reason) = ctx.halted {
         // Findings gathered around an abandoned application are not
         // verdicts, so only the reason is reported.
-        return (vec![Finding::error("$", reason)], ctx.steps);
+        return (vec![Finding::error("$", reason)], ctx.steps, ctx.too_deep);
     }
-    (findings, ctx.steps)
+    (findings, ctx.steps, false)
 }
 
-impl Ctx<'_> {
+impl<'a> Ctx<'a, '_> {
+    /// Hands the shared state to a context for values with another lifetime
+    /// (the scratch value of `propertyNames`); [`Ctx::rejoin`] takes it back.
+    fn fork<'s>(&mut self) -> Ctx<'a, 's> {
+        Ctx {
+            root: self.root,
+            anchors: std::mem::take(&mut self.anchors),
+            patterns: std::mem::take(&mut self.patterns),
+            pattern_bytes: self.pattern_bytes,
+            depth: self.depth,
+            max_depth: self.max_depth,
+            too_deep: self.too_deep,
+            steps: self.steps,
+            budget: self.budget,
+            halted: self.halted,
+            remembered: HashMap::new(),
+            running: HashSet::new(),
+        }
+    }
+
+    fn rejoin(&mut self, inner: Ctx<'a, '_>) {
+        self.anchors = inner.anchors;
+        self.patterns = inner.patterns;
+        self.pattern_bytes = inner.pattern_bytes;
+        self.too_deep = inner.too_deep;
+        self.steps = inner.steps;
+        self.halted = inner.halted;
+    }
+}
+
+impl Ctx<'_, '_> {
     /// Compiles `pattern` once per validation, within the pattern budget.
     ///
     /// Returns `None` when the budget is exhausted; validation is then
@@ -395,7 +490,7 @@ impl Ctx<'_> {
 /// [`Severity::Error`] finding at `$` that says so: an unfinished validation
 /// is never reported as a clean document.
 pub fn validate(document: &Value, schema: &Value) -> Vec<Finding> {
-    run(document, schema, MAX_REF_DEPTH, None).0
+    run(document, schema, None).0
 }
 
 /// True when any finding is an [`Severity::Error`].
@@ -419,7 +514,7 @@ fn validate_node<'v>(
     value: &'v Value,
     schema: &Value,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     if ctx.halted.is_some() {
@@ -430,8 +525,9 @@ fn validate_node<'v>(
         ctx.halted = Some(BUDGET_EXHAUSTED);
         return Evaluated::default();
     }
-    if ctx.depth >= MAX_APPLICATION_DEPTH {
+    if ctx.depth >= ctx.max_depth {
         ctx.halted = Some(TOO_MANY_NESTED_APPLICATIONS);
+        ctx.too_deep = true;
         return Evaluated::default();
     }
     ctx.depth += 1;
@@ -444,7 +540,7 @@ fn apply_schema<'v>(
     value: &'v Value,
     schema: &Value,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     match schema {
@@ -473,7 +569,7 @@ fn applying<'v>(
     value: &'v Value,
     schema: &Value,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Applied<'v> {
     let mut local = Vec::new();
@@ -491,17 +587,84 @@ fn applying_soft<'v>(
     value: &'v Value,
     schema: &Value,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Applied<'v> {
+    applying_shared(value, schema, path, ctx, findings, true)
+}
+
+/// Applies a subschema whose outcome can be asked for again: a `$ref`
+/// target, or a candidate of `anyOf`/`oneOf`/`not`/`if`/`contains`.
+///
+/// The outcome for an array or object is remembered by (schema node,
+/// document value), so a recursive schema that offers several alternatives
+/// per level does each piece of work once instead of once per path to it.
+/// Meeting an application that is still running means the schema applies
+/// itself to the same value forever; that stops the validation.
+///
+/// With `soft`, errors feed the verdict only and warnings are surfaced.
+fn applying_shared<'v>(
+    value: &'v Value,
+    schema: &Value,
+    path: &mut String,
+    ctx: &mut Ctx<'_, 'v>,
+    findings: &mut Vec<Finding>,
+    soft: bool,
+) -> Applied<'v> {
+    let key = (
+        std::ptr::from_ref(schema) as usize,
+        std::ptr::from_ref(value) as usize,
+    );
+    let surfaced = |finding: &Finding| !soft || finding.severity == Severity::Warning;
+    if let Some(known) = ctx.remembered.get(&key) {
+        findings.extend(
+            known
+                .findings
+                .iter()
+                .filter(|finding| surfaced(finding))
+                .map(|finding| Finding {
+                    severity: finding.severity,
+                    path: format!("{path}{}", finding.path),
+                    message: finding.message.clone(),
+                }),
+        );
+        return Applied {
+            passed: known.passed,
+            evaluated: known.evaluated.clone(),
+        };
+    }
+    if !ctx.running.insert(key) {
+        ctx.halted = Some(ENDLESS_SELF_APPLICATION);
+        return Applied {
+            passed: true,
+            evaluated: Evaluated::default(),
+        };
+    }
+    let base = path.len();
     let mut local = Vec::new();
     let evaluated = validate_node(value, schema, path, ctx, &mut local);
+    ctx.running.remove(&key);
     let passed = !local.iter().any(|f| f.severity == Severity::Error);
-    findings.extend(
-        local
-            .into_iter()
-            .filter(|f| f.severity == Severity::Warning),
-    );
+    let container = value.is_array() || value.is_object();
+    if container && ctx.halted.is_none() && ctx.remembered.len() < MAX_REMEMBERED_RESULTS {
+        let relative = local
+            .iter()
+            .map(|finding| Finding {
+                severity: finding.severity,
+                path: finding.path.get(base..).unwrap_or_default().to_owned(),
+                message: finding.message.clone(),
+            })
+            .collect();
+        ctx.remembered.insert(
+            key,
+            Remembered {
+                passed,
+                evaluated: evaluated.clone(),
+                findings: relative,
+            },
+        );
+    }
+    findings.extend(local.into_iter().filter(surfaced));
     Applied { passed, evaluated }
 }
 
@@ -527,7 +690,7 @@ fn apply_object<'v>(
     value: &'v Value,
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     // Classify every keyword first: anything this validator neither applies
@@ -560,18 +723,12 @@ fn apply_object<'v>(
 
     if let Some(reference) = obj.get("$ref").and_then(|r| r.as_str()) {
         match resolve_ref(reference, ctx) {
-            Some(target) if ctx.ref_depth < ctx.max_ref_depth => {
-                ctx.ref_depth += 1;
-                let applied = applying(value, target, path, ctx, findings);
-                ctx.ref_depth -= 1;
+            Some(target) => {
+                let applied = applying_shared(value, target, path, ctx, findings, false);
                 if applied.passed {
                     evaluated.merge(&applied.evaluated);
                 }
             }
-            Some(_) => findings.push(Finding::warning(
-                path,
-                format!("$ref {reference:?} exceeds the recursion budget; skipped"),
-            )),
             None => findings.push(Finding::warning(
                 path,
                 format!("$ref {reference:?} does not resolve in this document; skipped"),
@@ -759,7 +916,7 @@ fn check_string(
     s: &str,
     obj: &Map<String, Value>,
     path: &str,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, '_>,
     findings: &mut Vec<Finding>,
 ) {
     let len = s.chars().count() as u64;
@@ -831,7 +988,7 @@ fn check_item<'v>(
     subschema: &Value,
     index: usize,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
     evaluated: &mut Evaluated<'v>,
 ) {
@@ -850,7 +1007,7 @@ fn check_array<'v>(
     arr: &'v [Value],
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     let mut evaluated = Evaluated::default();
@@ -1013,7 +1170,7 @@ fn check_contains<'v>(
     arr: &'v [Value],
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
     evaluated: &mut Evaluated<'v>,
 ) {
@@ -1068,7 +1225,7 @@ fn check_prop<'v>(
     value: &'v Value,
     subschema: &Value,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
     evaluated: &mut Evaluated<'v>,
 ) {
@@ -1088,7 +1245,7 @@ fn check_object<'v>(
     map: &'v Map<String, Value>,
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     let mut evaluated = Evaluated::default();
@@ -1220,7 +1377,11 @@ fn check_object<'v>(
                 slot.clear();
                 slot.push_str(key);
             }
-            applying(&scratch, names, path, ctx, findings);
+            // The scratch value does not live as long as the document, so
+            // it is validated through a context of its own lifetime.
+            let mut inner = ctx.fork();
+            applying(&scratch, names, path, &mut inner, findings);
+            ctx.rejoin(inner);
             path.truncate(saved);
         }
     }
@@ -1296,7 +1457,7 @@ fn check_combinators<'v>(
     value: &'v Value,
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     let mut evaluated = Evaluated::default();
@@ -1366,16 +1527,9 @@ fn check_combinators<'v>(
     }
 
     if let Some(not_schema) = obj.get("not") {
-        let mut local = Vec::new();
-        let _ = validate_node(value, not_schema, path, ctx, &mut local);
-        let passed = !local.iter().any(|f| f.severity == Severity::Error);
         // `not` contributes no annotations; a skipped check inside still
         // warns, because the verdict is then uncertain.
-        findings.extend(
-            local
-                .into_iter()
-                .filter(|f| f.severity == Severity::Warning),
-        );
+        let passed = applying_soft(value, not_schema, path, ctx, findings).passed;
         if passed {
             findings.push(Finding::error(path, "value matches the `not` schema"));
         }
@@ -1408,7 +1562,7 @@ fn check_unevaluated<'v>(
     value: &'v Value,
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     evaluated_total: &Evaluated<'v>,
     findings: &mut Vec<Finding>,
 ) {
@@ -1546,7 +1700,7 @@ fn collect_anchors(root: &Value) -> HashMap<String, Vec<String>> {
     anchors
 }
 
-fn resolve_ref<'a>(reference: &str, ctx: &Ctx<'a>) -> Option<&'a Value> {
+fn resolve_ref<'a>(reference: &str, ctx: &Ctx<'a, '_>) -> Option<&'a Value> {
     if reference == "#" {
         return Some(ctx.root);
     }
@@ -2092,18 +2246,17 @@ mod tests {
     }
 
     #[test]
-    fn branching_reference_cycles_double_per_hop_until_the_budget_stops_them() {
+    fn branching_reference_cycles_are_stopped_at_once() {
         let schema = json!({"allOf": [{"$ref": "#"}, {"$ref": "#"}]});
         let document = json!(1);
-        // Unbounded, the applications double with every allowed hop.
-        let steps = [4, 8, 12, 16].map(|hops| run(&document, &schema, hops, Some(u64::MAX)).1);
-        assert_eq!(steps, [93, 1_533, 24_573, 393_213]);
-        // With the documented budget the same schema stops early and says so.
-        let (findings, steps) = run(&document, &schema, MAX_REF_DEPTH, None);
-        assert_eq!(steps, VALIDATION_STEPS_PER_PAIR * 7 * 2 + 1);
+        // Left alone this doubled per reference hop (93, 1,533, 24,573 and
+        // 393,213 applications at 4, 8, 12 and 16 hops). The schema applies
+        // itself to the same value, which is now recognized at once.
+        let (findings, steps) = run(&document, &schema, None);
+        assert!(steps < 10, "{steps} applications");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Error);
-        assert!(findings[0].message.contains("work budget"));
+        assert!(findings[0].message.contains("without end"));
         // The exhaustion survives `not` and `anyOf`, which drop inner errors.
         let hidden = json!({"not": {"anyOf": [{"allOf": [{"$ref": "#"}, {"$ref": "#"}]}]}});
         assert!(has_errors(&validate(&document, &hidden)));
@@ -2134,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn in_place_reference_chains_stop_at_the_application_depth() {
+    fn in_place_reference_chains_are_reported_as_endless() {
         // 32 hops through 60 nested `not` would recurse 1,920 levels.
         let mut schema = json!({"$ref": "#"});
         for _ in 0..60 {
@@ -2142,7 +2295,7 @@ mod tests {
         }
         let findings = validate(&json!(1), &schema);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.contains("nested inside each other"));
+        assert!(findings[0].message.contains("without end"));
     }
 
     #[test]
@@ -2202,10 +2355,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fails until the following commit"]
     fn recursive_discriminated_unions_validate_in_polynomial_work() {
         let schema = union_schema(8);
-        let (findings, steps) = run(&union_chain(40, "k3"), &schema, MAX_REF_DEPTH, None);
+        let (findings, steps) = run(&union_chain(40, "k3"), &schema, None);
         assert_eq!(findings, []);
         assert!(steps < 10_000, "{steps} applications");
         let findings = validate(&union_chain(40, "nope"), &schema);
@@ -2214,7 +2366,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fails until the following commit"]
     fn linked_lists_deeper_than_32_are_fully_validated() {
         let schema = json!({
             "type": "object",
@@ -2234,7 +2385,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fails until the following commit"]
     fn wrapped_recursive_schemas_validate_to_the_nesting_limit() {
         let schema = json!({
             "$ref": "#/$defs/node",
@@ -2516,8 +2666,9 @@ mod tests {
             "$ref": "#/$defs/loopA"
         });
         let findings = validate(&json!(1), &schema);
-        assert!(!findings.iter().any(|f| f.severity == Severity::Error));
-        assert!(findings.iter().any(|f| f.severity == Severity::Warning));
+        // A cycle that never reaches the document is reported, not skipped.
+        assert_eq!(findings.len(), 1);
+        assert!(has_errors(&findings));
     }
 
     #[test]
