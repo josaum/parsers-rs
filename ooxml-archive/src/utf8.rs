@@ -251,13 +251,23 @@ fn within_limit(available: &[u8], position: u64, limit: u64) -> io::Result<&[u8]
     }
     let room = limit.saturating_sub(position);
     if room == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("part is larger than {limit} bytes once repaired to UTF-8"),
-        ));
+        return Err(over_limit(limit));
     }
     let length = usize::try_from(room).map_or(available.len(), |room| room.min(available.len()));
     Ok(&available[..length])
+}
+
+/// The error for output past `limit`.
+///
+/// Out of line, so that formatting it takes no room in the frames of the
+/// read path, which the XML reader's own frames sit on.
+#[cold]
+#[inline(never)]
+fn over_limit(limit: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("part is larger than {limit} bytes once repaired to UTF-8"),
+    )
 }
 
 impl<R: BufRead> Read for LossyUtf8<R> {

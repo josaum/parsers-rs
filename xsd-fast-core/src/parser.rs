@@ -166,6 +166,35 @@ pub(crate) fn schema_input(bytes: &[u8], limit: usize) -> SchemaInput<'_> {
     LossyUtf8::with_limit(bytes, limit.max(bytes.len()) as u64)
 }
 
+/// Makes the reader for one schema document, on the heap.
+///
+/// No reader of a schema document collects element text: declarations are
+/// read from attributes alone, and annotations are skipped. So trimming,
+/// which works on each piece of text between references, cannot change a
+/// value here. For the same reason a bare `&` in that text, which is not
+/// well-formed, is passed over and does not fail the load: published
+/// schemas carry them in documentation.
+///
+/// The reader is built here, not in the caller, so that neither it nor the
+/// temporary it is moved from takes room in [`Loader::parse_bytes`]' frame,
+/// which recursion through includes repeats.
+#[inline(never)]
+fn schema_reader(bytes: &[u8], limit: usize) -> Box<Reader<SchemaInput<'_>>> {
+    let mut reader = Box::new(Reader::from_reader(schema_input(bytes, limit)));
+    reader.config_mut().trim_text(true);
+    reader.config_mut().allow_dangling_amp = true;
+    reader
+}
+
+/// Whether the end tag `e` closes `xs:schema`.
+///
+/// Kept out of [`Loader::parse_bytes`] so that its temporaries do not take
+/// room in a frame that recursion through includes repeats.
+#[inline(never)]
+fn closes_schema(e: &quick_xml::events::BytesEnd<'_>, input: &SchemaInput<'_>) -> bool {
+    local_name(e.name().as_ref(), Repairs::end(input, e)) == "schema"
+}
+
 /// Tells the bytes the reader replaced in the event it read last from text
 /// the document holds.
 ///
@@ -392,16 +421,10 @@ impl Loader {
     }
 
     fn parse_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let mut reader = Reader::from_reader(schema_input(bytes, self.max_schema_bytes));
-        // No reader of a schema document collects element text: declarations
-        // are read from attributes alone, and annotations are skipped. So
-        // trimming, which works on each piece of text between references,
-        // cannot change a value here.
-        reader.config_mut().trim_text(true);
-        // For the same reason a bare `&` in that text, which is not
-        // well-formed, is passed over and does not fail the load: published
-        // schemas carry them in documentation.
-        reader.config_mut().allow_dangling_amp = true;
+        // This frame stays on the stack while an include is followed, once
+        // per file in the chain, so the reader and its repair state live on
+        // the heap rather than here.
+        let mut reader = schema_reader(bytes, self.max_schema_bytes);
 
         let mut file = FileState {
             ns_map: HashMap::new(),
@@ -416,8 +439,7 @@ impl Loader {
                 Ok(Event::Start(ref e)) => self.top_level_start(e, &mut reader, &mut file)?,
                 Ok(Event::Empty(ref e)) => self.top_level_empty(e, reader.get_ref(), &mut file)?,
                 Ok(Event::End(ref e)) => {
-                    if local_name(e.name().as_ref(), Repairs::end(reader.get_ref(), e)) == "schema"
-                    {
+                    if closes_schema(e, reader.get_ref()) {
                         file.in_schema = false;
                     }
                     None
@@ -670,29 +692,37 @@ fn next_tag(reader: &mut Reader<SchemaInput<'_>>, buf: &mut Vec<u8>, context: &s
     loop {
         buf.clear();
         match reader.read_event_into(buf) {
-            Ok(Event::Start(ref e)) => {
-                let repairs = Repairs::tag(reader.get_ref(), e);
-                return Ok(Tag::Start {
-                    local: local_name(e.name().as_ref(), repairs),
-                    attrs: collect_attrs(e, repairs),
-                });
-            }
-            Ok(Event::Empty(ref e)) => {
-                let repairs = Repairs::tag(reader.get_ref(), e);
-                return Ok(Tag::Empty {
-                    local: local_name(e.name().as_ref(), repairs),
-                    attrs: collect_attrs(e, repairs),
-                });
-            }
-            Ok(Event::End(ref e)) => {
-                return Ok(Tag::End {
-                    local: local_name(e.name().as_ref(), Repairs::end(reader.get_ref(), e)),
-                });
-            }
+            Ok(Event::Start(ref e)) => return Ok(start_tag(e, reader.get_ref(), false)),
+            Ok(Event::Empty(ref e)) => return Ok(start_tag(e, reader.get_ref(), true)),
+            Ok(Event::End(ref e)) => return Ok(end_tag(e, reader.get_ref())),
             Ok(Event::Eof) => return Ok(Tag::Eof),
             Err(e) => return Err(anyhow::anyhow!("{context} parse error: {e}")),
             _ => {}
         }
+    }
+}
+
+/// The [`Tag`] for a start or (`empty`) empty tag.
+///
+/// Built outside [`next_tag`], whose frame sits under the reader's own while
+/// an event is read, so these temporaries never add to that deepest point.
+#[inline(never)]
+fn start_tag(e: &quick_xml::events::BytesStart<'_>, input: &SchemaInput<'_>, empty: bool) -> Tag {
+    let repairs = Repairs::tag(input, e);
+    let local = local_name(e.name().as_ref(), repairs);
+    let attrs = collect_attrs(e, repairs);
+    if empty {
+        Tag::Empty { local, attrs }
+    } else {
+        Tag::Start { local, attrs }
+    }
+}
+
+/// The [`Tag`] for an end tag; see [`start_tag`].
+#[inline(never)]
+fn end_tag(e: &quick_xml::events::BytesEnd<'_>, input: &SchemaInput<'_>) -> Tag {
+    Tag::End {
+        local: local_name(e.name().as_ref(), Repairs::end(input, e)),
     }
 }
 
