@@ -1337,3 +1337,78 @@ fn probe_interpreter_stack() {
         .expect("render thread finished");
     println!("probe {spec}: rendered, width {rendered}");
 }
+
+/// A page filled with a tiling pattern whose cell is `bbox` with steps
+/// `x_step` and `y_step` and an optional pattern `/Matrix`.
+fn tiled_page(bbox: &str, x_step: &str, y_step: &str, matrix: &str) -> Vec<u8> {
+    one_page(
+        "/Resources << /Pattern << /P 10 0 R >> >>",
+        "/Pattern cs /P scn 0 0 100 100 re f",
+        vec![(
+            10,
+            stream(
+                &format!(
+                    "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                     /BBox [{bbox}] /XStep {x_step} /YStep {y_step} {matrix} /Resources << >>"
+                ),
+                "0 0 1 rg 0 0 1 1 re f",
+            ),
+        )],
+    )
+}
+
+#[test]
+fn an_interpreter_panic_comes_back_as_an_error_and_the_caller_carries_on() {
+    // A step the interpreter rounds to no pixels at all: hayro 0.5 makes a
+    // cell renderer zero pixels wide and indexes into it. The copies it
+    // stamps are few, so nothing in front of the interpreter refuses it.
+    let bytes = tiled_page("0 0 1000 1000", "0.4", "1000", "");
+    let document = open(&bytes);
+    for _ in 0..2 {
+        let error = document
+            .page_rasterized_png_interpreted_checked(0, 72.0)
+            .expect_err("the interpreter's panic is an error");
+        assert!(
+            error.to_string().contains("interpreted render failed"),
+            "unexpected error {error}"
+        );
+    }
+    assert!(document.page_rasterized_png_interpreted(0, 72.0).is_none());
+    // The caller's thread is still usable and the document still answers.
+    assert_eq!(document.pages().len(), 1);
+}
+
+#[test]
+fn a_tiling_pattern_stamping_too_many_copies_is_refused() {
+    // 0.004 by 0.004 over a 100 by 100 page is 625 million copies.
+    let started = std::time::Instant::now();
+    assert_refused(
+        "a step of 0.004",
+        &tiled_page("0 0 1000 1000", "0.004", "0.004", ""),
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "refusing took {:?}",
+        started.elapsed()
+    );
+    // A pattern matrix that shrinks the cell shrinks the step with it.
+    assert_refused(
+        "a cell shrunk by its matrix",
+        &tiled_page("0 0 10 10", "10", "10", "/Matrix [0.0001 0 0 0.0001 0 0]"),
+    );
+    assert_refused("a zero step", &tiled_page("0 0 10 10", "0", "10", ""));
+    assert_refused(
+        "a degenerate matrix",
+        &tiled_page("0 0 10 10", "10", "10", "/Matrix [1 0 1 0 0 0]"),
+    );
+}
+
+#[test]
+fn an_ordinary_tiled_fill_still_renders() {
+    assert_renders("ten-point tiles", &tiled_page("0 0 10 10", "10", "10", ""));
+    assert_renders("one-point tiles", &tiled_page("0 0 1 1", "1", "1", ""));
+    assert_renders(
+        "tiles scaled up by their matrix",
+        &tiled_page("0 0 10 10", "10", "10", "/Matrix [3 0 0 3 0 0]"),
+    );
+}

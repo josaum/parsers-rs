@@ -688,8 +688,10 @@ fn read_bands<R: Read + Seek>(reader: R, max_band_bytes: usize) -> Result<Vec<Ve
         .dimensions()
         .map_err(|e| GeoError::Tiff(e.to_string()))?;
     let n_pixels = pixel_count(width, height)?;
+    let sample_bytes = check_sample_bits(&mut decoder)?;
     let (bands, planar) = band_layout(&mut decoder)?;
     check_band_bytes(width, height, bands, max_band_bytes)?;
+    check_uncompressed_chunks(&mut decoder, (width, height), bands, planar, sample_bytes)?;
     if planar {
         return read_planar_bands(&mut decoder, (width, height), bands, decoding_budget);
     }
@@ -798,35 +800,7 @@ fn read_planar_bands<R: Read + Seek>(
         )));
     }
 
-    let (chunk_width, chunk_height) = match decoder.get_chunk_type() {
-        ChunkType::Tile => (
-            decoder
-                .find_tag_unsigned::<u32>(Tag::TileWidth)
-                .map_err(tiff_error)?
-                .unwrap_or(0),
-            decoder
-                .find_tag_unsigned::<u32>(Tag::TileLength)
-                .map_err(tiff_error)?
-                .unwrap_or(0),
-        ),
-        ChunkType::Strip => (
-            width,
-            decoder
-                .find_tag_unsigned::<u32>(Tag::RowsPerStrip)
-                .map_err(tiff_error)?
-                .unwrap_or(height)
-                .min(height),
-        ),
-    };
-    // Not reached from any file tried: the `tiff` decoder refuses a
-    // RowsPerStrip, TileWidth or TileLength of zero when it reads the tags.
-    // The check stays so that the divisions below cannot divide by zero
-    // should a later version of the decoder let one through.
-    if chunk_width == 0 || chunk_height == 0 {
-        return Err(GeoError::InvalidFormat(format!(
-            "GeoTIFF declares strips or tiles of {chunk_width}x{chunk_height} pixels"
-        )));
-    }
+    let (chunk_width, chunk_height) = chunk_geometry(decoder, (width, height))?;
     let chunks_across = width.div_ceil(chunk_width);
     let chunks_per_plane = chunks_across
         .checked_mul(height.div_ceil(chunk_height))
@@ -896,6 +870,154 @@ fn band_layout<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<(u16, bool), 
         .map_err(|e| GeoError::Tiff(e.to_string()))?;
     let planar = samples > 1 && planar_configuration == Some(PLANAR_CONFIGURATION_SEPARATE);
     Ok((samples, planar))
+}
+
+/// Refuses samples that are not a whole number of bytes, and returns the
+/// bytes of the widest sample.
+///
+/// The decoder read 1-, 2- and 4-bit samples one byte to a sample from a
+/// bitstream that packs several samples into each byte, so the packed bytes
+/// came back as pixel values, followed by whatever the file held after the
+/// strip. Samples of 10 or 12 bits are packed across bytes the same way.
+/// Until such samples are unpacked they are refused. `BitsPerSample`
+/// defaults to 1 when absent, as TIFF specifies.
+///
+/// # Errors
+///
+/// Returns [`GeoError::UnsupportedFormat`] for a sample whose width is not a
+/// multiple of 8 bits, and [`GeoError::Tiff`] when the tag cannot be read.
+fn check_sample_bits<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<u16, GeoError> {
+    let bits = decoder
+        .find_tag_unsigned_vec::<u16>(Tag::BitsPerSample)
+        .map_err(|e| GeoError::Tiff(e.to_string()))?
+        .unwrap_or_else(|| vec![1]);
+    if let Some(packed) = bits
+        .iter()
+        .copied()
+        .find(|&bits| bits == 0 || bits % 8 != 0)
+    {
+        return Err(GeoError::UnsupportedFormat(format!(
+            "GeoTIFF samples of {packed} bits are bit-packed, which this reader does not unpack"
+        )));
+    }
+    Ok(bits.iter().copied().max().unwrap_or(8) / 8)
+}
+
+/// The width and height in pixels of one strip or tile, from the tags.
+///
+/// A strip spans the raster's width and `RowsPerStrip` rows, which defaults
+/// to the whole raster; a tile is `TileWidth` by `TileLength`.
+///
+/// # Errors
+///
+/// Returns [`GeoError::InvalidFormat`] for a chunk with no width or height,
+/// and [`GeoError::Tiff`] when a tag cannot be read.
+fn chunk_geometry<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    (width, height): (u32, u32),
+) -> Result<(u32, u32), GeoError> {
+    let tiff_error = |e: TiffError| GeoError::Tiff(e.to_string());
+    let (chunk_width, chunk_height) = match decoder.get_chunk_type() {
+        ChunkType::Tile => (
+            decoder
+                .find_tag_unsigned::<u32>(Tag::TileWidth)
+                .map_err(tiff_error)?
+                .unwrap_or(0),
+            decoder
+                .find_tag_unsigned::<u32>(Tag::TileLength)
+                .map_err(tiff_error)?
+                .unwrap_or(0),
+        ),
+        ChunkType::Strip => (
+            width,
+            decoder
+                .find_tag_unsigned::<u32>(Tag::RowsPerStrip)
+                .map_err(tiff_error)?
+                .unwrap_or(height)
+                .min(height),
+        ),
+    };
+    // Not reached from any file tried: the `tiff` decoder refuses a
+    // RowsPerStrip, TileWidth or TileLength of zero when it reads the tags.
+    // The check stays so that the divisions callers make cannot divide by
+    // zero should a later version of the decoder let one through.
+    if chunk_width == 0 || chunk_height == 0 {
+        return Err(GeoError::InvalidFormat(format!(
+            "GeoTIFF declares strips or tiles of {chunk_width}x{chunk_height} pixels"
+        )));
+    }
+    Ok((chunk_width, chunk_height))
+}
+
+/// Refuses an uncompressed raster with a strip or tile that stores fewer
+/// bytes than its pixels take.
+///
+/// The decoder reads an uncompressed chunk from its offset without stopping
+/// at the chunk's byte count, so a short chunk was filled from whatever
+/// follows it in the file. A sparse chunk (offset and byte count zero, which
+/// GDAL writes for a block with no data) was filled from the file's own
+/// header. Compressed chunks are bounded by their decoders and are not
+/// checked here.
+///
+/// A strip holds the raster's width by its rows, the last strip of a plane
+/// only the rows that remain; a tile is always stored whole. Each chunk
+/// holds every band of its pixels, or one band when the bands are planar.
+///
+/// # Errors
+///
+/// Returns [`GeoError::InvalidFormat`] for a short chunk, and
+/// [`GeoError::Tiff`] when a tag cannot be read.
+fn check_uncompressed_chunks<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    (width, height): (u32, u32),
+    bands: u16,
+    planar: bool,
+    sample_bytes: u16,
+) -> Result<(), GeoError> {
+    // A tag that cannot be read here is the decoder's to report.
+    let compression = decoder.find_tag_unsigned::<u16>(Tag::Compression);
+    if !matches!(compression, Ok(None | Some(COMPRESSION_NONE))) || width == 0 || height == 0 {
+        return Ok(());
+    }
+    let (chunk_width, chunk_height) = chunk_geometry(decoder, (width, height))?;
+    let (kind, counts_tag) = match decoder.get_chunk_type() {
+        ChunkType::Tile => ("tile", Tag::TileByteCounts),
+        ChunkType::Strip => ("strip", Tag::StripByteCounts),
+    };
+    let Some(counts) = decoder
+        .find_tag_unsigned_vec::<u64>(counts_tag)
+        .map_err(|e| GeoError::Tiff(e.to_string()))?
+    else {
+        return Ok(());
+    };
+
+    let rows_of_chunks = height.div_ceil(chunk_height);
+    let chunks_per_plane = u64::from(width.div_ceil(chunk_width)) * u64::from(rows_of_chunks);
+    let samples_per_pixel = if planar { 1 } else { u64::from(bands) };
+    for (index, &count) in counts.iter().enumerate() {
+        let index = index as u64;
+        let rows = match decoder.get_chunk_type() {
+            ChunkType::Tile => chunk_height,
+            ChunkType::Strip => {
+                // Strips of a plane run top to bottom; `index` counts on
+                // through the planes after the first.
+                let strip = (index % chunks_per_plane.max(1)) as u32;
+                chunk_height.min(height.saturating_sub(strip.saturating_mul(chunk_height)))
+            }
+        };
+        let needed = u64::from(chunk_width)
+            .saturating_mul(u64::from(rows))
+            .saturating_mul(samples_per_pixel)
+            .saturating_mul(u64::from(sample_bytes));
+        if count < needed {
+            let sparse = if count == 0 { " (a sparse block)" } else { "" };
+            return Err(GeoError::InvalidFormat(format!(
+                "GeoTIFF {kind} {index} stores {count} bytes{sparse}, but its uncompressed \
+                 pixels take {needed}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Opens a TIFF decoder whose allocation limits follow the size of the input.
@@ -2546,5 +2668,140 @@ mod tests {
         assert_eq!(parsed.upper_left(), Some((-48.0, -15.0)));
         assert_bbox(&parsed.bbox.expect("bbox"), -48.0, -15.5, -47.0, -15.0);
         assert_eq!(parsed.epsg_code, Some(4326));
+    }
+
+    /// One IFD entry: `tag`, TIFF `kind` (3 SHORT, 4 LONG), `count`, and the
+    /// value or the offset of the values.
+    fn ifd_entry(file: &mut Vec<u8>, tag: u16, kind: u16, count: u32, value: u32) {
+        file.extend_from_slice(&tag.to_le_bytes());
+        file.extend_from_slice(&kind.to_le_bytes());
+        file.extend_from_slice(&count.to_le_bytes());
+        file.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// A strip's stored bytes, and the `(offset, count)` it declares instead
+    /// of its own, if any.
+    type Strip<'a> = (&'a [u8], Option<(u32, u32)>);
+
+    /// An uncompressed little-endian gray TIFF of `bits`-bit samples, built
+    /// by hand so that its strips can be declared shorter than they are.
+    ///
+    /// Each strip's bytes are stored before the directory, so a read that
+    /// runs past a strip lands in the file's own structure, as it does in a
+    /// real file. A strip is declared at its own offset and length unless
+    /// `(offset, count)` is given.
+    fn gray_tiff(
+        (width, height): (u16, u16),
+        bits: u16,
+        rows_per_strip: u16,
+        strips: &[Strip<'_>],
+    ) -> Vec<u8> {
+        let mut file = b"II*\0\0\0\0\0".to_vec();
+        let (mut offsets, mut counts) = (Vec::new(), Vec::new());
+        for (data, declared) in strips {
+            let at = u32::try_from(file.len()).expect("small file");
+            file.extend_from_slice(data);
+            let (offset, count) =
+                declared.unwrap_or((at, u32::try_from(data.len()).expect("small strip")));
+            offsets.push(offset);
+            counts.push(count);
+        }
+        if file.len() % 2 == 1 {
+            file.push(0);
+        }
+        let ifd = u32::try_from(file.len()).expect("small file");
+        file[4..8].copy_from_slice(&ifd.to_le_bytes());
+        const ENTRIES: u16 = 9;
+        let arrays_at = ifd + 2 + 12 * u32::from(ENTRIES) + 4;
+        let mut arrays = Vec::new();
+        let mut longs = |values: &[u32]| -> u32 {
+            if let [value] = values {
+                return *value;
+            }
+            let at = arrays_at + u32::try_from(arrays.len()).expect("small file");
+            for value in values {
+                arrays.extend_from_slice(&value.to_le_bytes());
+            }
+            at
+        };
+        let offsets_field = longs(&offsets);
+        let counts_field = longs(&counts);
+        let strip_count = u32::try_from(strips.len()).expect("few strips");
+        file.extend_from_slice(&ENTRIES.to_le_bytes());
+        ifd_entry(&mut file, 256, 3, 1, u32::from(width));
+        ifd_entry(&mut file, 257, 3, 1, u32::from(height));
+        ifd_entry(&mut file, 258, 3, 1, u32::from(bits));
+        ifd_entry(&mut file, 259, 3, 1, 1);
+        ifd_entry(&mut file, 262, 3, 1, 1);
+        ifd_entry(&mut file, 273, 4, strip_count, offsets_field);
+        ifd_entry(&mut file, 277, 3, 1, 1);
+        ifd_entry(&mut file, 278, 3, 1, u32::from(rows_per_strip));
+        ifd_entry(&mut file, 279, 4, strip_count, counts_field);
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&arrays);
+        file
+    }
+
+    /// 1-bit samples were read one byte to a sample, so the packed bytes and
+    /// the directory after them came back as pixel values.
+    #[test]
+    fn samples_packed_below_a_byte_are_refused_by_name() {
+        let packed = gray_tiff((8, 2), 1, 2, &[(&[0b1010_1010, 0b0101_0101], None)]);
+        let error = bands_of(&packed).expect_err("1-bit samples are refused");
+        assert!(
+            matches!(&error, GeoError::UnsupportedFormat(m) if m.contains("1 bits are bit-packed")),
+            "{error}"
+        );
+        // 12-bit samples are packed across bytes, two to three bytes.
+        let twelve = gray_tiff((4, 1), 12, 1, &[(&[0; 6], None)]);
+        let error = bands_of(&twelve).expect_err("12-bit samples are refused");
+        assert!(
+            matches!(&error, GeoError::UnsupportedFormat(m) if m.contains("12 bits are bit-packed")),
+            "{error}"
+        );
+    }
+
+    /// An uncompressed strip shorter than its pixels was filled from the
+    /// bytes after it, here the file's directory.
+    #[test]
+    fn an_uncompressed_strip_shorter_than_its_pixels_is_refused() {
+        let short = gray_tiff((4, 4), 8, 4, &[(&[7; 8], None)]);
+        let error = bands_of(&short).expect_err("a short strip is refused");
+        assert!(
+            matches!(&error, GeoError::InvalidFormat(m)
+                if m.contains("strip 0 stores 8 bytes") && m.contains("take 16")),
+            "{error}"
+        );
+    }
+
+    /// A sparse strip (offset and count zero, as GDAL writes for an empty
+    /// block) was filled from the file's own header.
+    #[test]
+    fn a_sparse_uncompressed_strip_is_refused() {
+        let sparse = gray_tiff((4, 4), 8, 4, &[(&[], Some((0, 0)))]);
+        let error = bands_of(&sparse).expect_err("a sparse strip is refused");
+        assert!(
+            matches!(&error, GeoError::InvalidFormat(m) if m.contains("sparse")),
+            "{error}"
+        );
+    }
+
+    /// Strips holding exactly their pixels still read, the last one with
+    /// only the rows that remain.
+    #[test]
+    fn exact_uncompressed_strips_still_read() {
+        let rows: Vec<u8> = (1..=15).collect();
+        let exact = gray_tiff(
+            (3, 5),
+            8,
+            2,
+            &[
+                (&rows[..6], None),
+                (&rows[6..12], None),
+                (&rows[12..], None),
+            ],
+        );
+        let expected: Vec<f32> = rows.iter().map(|&v| unit_u8(v)).collect();
+        assert_eq!(bands_of(&exact).expect("exact strips"), vec![expected]);
     }
 }
