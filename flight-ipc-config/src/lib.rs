@@ -570,10 +570,28 @@ pub fn do_put_unsupported() -> Status {
 /// root itself becomes `.`. Both the root as configured and its canonical
 /// form are rewritten, because parsers report whichever one they opened.
 ///
-/// A mention only counts when it ends at a path boundary, so a root of
-/// `/data` leaves `/data2/x` alone. A relative root, or a root with no
-/// name of its own such as `/`, cannot be told apart from ordinary text
-/// and is left as it is.
+/// A mention only counts where the root starts a path and ends at a path
+/// boundary:
+///
+/// - Before it comes the start of the text or a character that does not
+///   continue a file name. Letters, digits, `_`, `-` and `.` continue a
+///   name, so `/mnt/data` and `n/a` are left alone for roots `/data` and
+///   `/a`; so does a separator, so `x//data` is left alone. Everything
+///   else (spaces, quotes, brackets, `=`, `:` and the like) starts a path.
+/// - After `scheme://` the text is a host, not a path, and is left alone:
+///   `http://data/x`. After `scheme:///` it is a path: a `file:///` URL of
+///   the root loses its scheme with the root, because what is left is no
+///   longer a URL.
+/// - After it comes the end of the text, a separator, or a character that
+///   does not continue a file name, so `/data2/x`, `/data-old` and
+///   `/data.bak` are left alone. A `.` that no letter, digit, `_` or `-`
+///   follows is sentence punctuation, and the mention before it is the
+///   root.
+///
+/// Where the two readings are in doubt the root is rewritten: mangled
+/// text is better than an answer that says where the root is. A relative
+/// root, or a root with no name of its own such as `/`, cannot be told
+/// apart from ordinary text and is left as it is.
 pub fn root_relative_error_text(message: &str, root: &Path) -> String {
     let mut needles: Vec<String> = Vec::with_capacity(2);
     for candidate in [root.canonicalize().ok(), Some(root.to_path_buf())]
@@ -599,43 +617,94 @@ pub fn root_relative_error_text(message: &str, root: &Path) -> String {
     text
 }
 
+/// Whether `c` can continue a file name that a mention of the root would
+/// otherwise end or start in the middle of.
+fn continues_file_name(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// Where the text before a mention of the root stops being kept, or `None`
+/// when the root's text does not start a path there.
+///
+/// The result is `before.len()` unless doubled separators or a URL scheme
+/// in front of the root go with it.
+fn mention_start(before: &str) -> Option<usize> {
+    let kept = before.trim_end_matches(std::path::is_separator);
+    let separators = before.len() - kept.len();
+    let last = kept.chars().next_back();
+    match (last, separators) {
+        (None, _) => Some(0),
+        (Some(c), 0) if continues_file_name(c) => None,
+        (Some(_), 0) => Some(before.len()),
+        // `scheme://<root>`: the root's text is the host of a URL.
+        (Some(':'), 1) => None,
+        // `scheme:///<root>`: a URL of the root. The scheme goes too.
+        (Some(':'), _) => {
+            let scheme = kept[..kept.len() - 1].trim_end_matches(|c: char| {
+                c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
+            });
+            Some(scheme.len())
+        }
+        // `name//<root>`: the tail of a longer path.
+        (Some(c), _) if continues_file_name(c) => None,
+        // A path that starts with doubled separators.
+        (Some(_), _) => Some(kept.len()),
+    }
+}
+
+/// How the text after a mention of the root is read: `None` when a longer
+/// name merely starts like the root, otherwise how many bytes of `after`
+/// belong to the mention and whether a name below the root follows.
+fn mention_end(after: &str) -> Option<(usize, bool)> {
+    let below = after.trim_start_matches(std::path::is_separator);
+    let separators = after.len() - below.len();
+    let mut following = below.chars();
+    let next = following.next();
+    if separators > 0 {
+        // `<root>/` alone still means the root itself.
+        let names_a_child = next.is_some_and(|c| {
+            !c.is_whitespace() && !matches!(c, ':' | ',' | ';' | '"' | '\'' | ')' | ']')
+        });
+        return Some((separators, names_a_child));
+    }
+    match next {
+        // A full stop that ends a sentence, not `<root>.bak`.
+        Some('.') => {
+            let extends = following
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-'));
+            (!extends).then_some((0, false))
+        }
+        Some(c) if continues_file_name(c) => None,
+        _ => Some((0, false)),
+    }
+}
+
 /// One pass of [`root_relative_error_text`] for one spelling of the root.
 fn strip_root_mentions(message: &str, root: &str) -> String {
     let mut out = String::with_capacity(message.len());
-    let mut rest = message;
-    while let Some(at) = rest.find(root) {
-        let after = &rest[at + root.len()..];
-        out.push_str(&rest[..at]);
-        let mut following = after.chars();
-        match following.next() {
-            Some(separator) if std::path::is_separator(separator) => {
-                // `<root>/` alone still means the root itself.
-                let names_a_child = following
-                    .next()
-                    .is_some_and(|next| !next.is_whitespace() && next != ':');
-                if !names_a_child {
-                    out.push('.');
-                }
-                rest = following_str(after, separator);
-            }
-            Some(next) if next.is_alphanumeric() || matches!(next, '_' | '-' | '.') => {
-                // A longer name that merely starts like the root.
-                out.push_str(root);
-                rest = after;
-            }
-            _ => {
-                out.push('.');
-                rest = after;
-            }
+    // `message[..copied]` is accounted for in `out`.
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(found) = message.get(from..).and_then(|rest| rest.find(root)) {
+        let at = from + found;
+        let end = at + root.len();
+        let bounds = mention_start(&message[..at]).zip(mention_end(&message[end..]));
+        let Some((keep_to, (consumed, names_a_child))) = bounds else {
+            // Not a mention: look again one character on, not one root on,
+            // so an overlapping mention is still found.
+            from = at + root.chars().next().map_or(1, char::len_utf8);
+            continue;
+        };
+        out.push_str(message.get(copied..keep_to.max(copied)).unwrap_or(""));
+        if !names_a_child {
+            out.push('.');
         }
+        copied = end + consumed;
+        from = copied;
     }
-    out.push_str(rest);
+    out.push_str(message.get(copied..).unwrap_or(""));
     out
-}
-
-/// `text` without its leading `separator`.
-fn following_str(text: &str, separator: char) -> &str {
-    text.get(separator.len_utf8()..).unwrap_or("")
 }
 
 /// Returns `status` with the served root rewritten out of its message.
@@ -1041,5 +1110,87 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
         std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    /// Roots that need not exist: only the text matters.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_path_that_starts_at_the_root_is_rewritten() {
+        for (root, message, expected) in [
+            // The root's text inside a longer name or path is not the root.
+            (
+                "/data",
+                "http://example.com/data/types and application/data",
+                "http://example.com/data/types and application/data",
+            ),
+            ("/a", "n/a", "n/a"),
+            (
+                "/srv/root",
+                "open /mnt/srv/root/a.x",
+                "open /mnt/srv/root/a.x",
+            ),
+            (
+                "/srv/root",
+                "open /srv/root-old/a.x",
+                "open /srv/root-old/a.x",
+            ),
+            ("/srv/root", "open /srv/root.bak", "open /srv/root.bak"),
+            ("/srv/root", "open /srv/root2/a.x", "open /srv/root2/a.x"),
+            // A URL whose host is spelled like the root is not the root.
+            ("/data", "get http://data/x", "get http://data/x"),
+            // A file URL names the root: the answer is the path below it.
+            ("/srv/root", "see file:///srv/root/a.xsd", "see a.xsd"),
+            ("/srv/root", "see file:/srv/root/a.xsd", "see file:a.xsd"),
+            // Doubled separators.
+            ("/srv/root", "/srv/root//a.x", "a.x"),
+            ("/srv/root", "open //srv/root/a.x", "open a.x"),
+            // Sentence punctuation after the root.
+            ("/srv/root", "cannot read /srv/root.", "cannot read .."),
+            ("/srv/root", "read /srv/root. Then", "read .. Then"),
+            ("/srv/root", "read /srv/root, then", "read ., then"),
+            // The ones that always worked.
+            (
+                "/srv/root",
+                "read /srv/root/: is a directory",
+                "read .: is a directory",
+            ),
+            (
+                "/srv/root",
+                "open /srv/root/a/../root/b.x",
+                "open a/../root/b.x",
+            ),
+            ("/srv/root", "stat /srv/root/.", "stat ."),
+            ("/srv/root", "/srv/root/a and /srv/root/b", "a and b"),
+            ("/srv/root", "open \"/srv/root/a b.x\"", "open \"a b.x\""),
+            ("/srv/root", "open '/srv/root'", "open '.'"),
+            ("/srv/root", "path=/srv/root/a.x", "path=a.x"),
+            ("/srv/root/", "open /srv/root/a.x", "open a.x"),
+            ("/", "open /a/b: c", "open /a/b: c"),
+            ("srv/root", "open srv/root/a.x", "open srv/root/a.x"),
+        ] {
+            assert_eq!(
+                root_relative_error_text(message, Path::new(root)),
+                expected,
+                "root {root}: {message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_rewritten_in_both_spellings() {
+        let base = std::env::temp_dir().join(format!(
+            "flight-ipc-config-linked-root-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canon = real.canonicalize().unwrap();
+        let message = format!("{}/a.x and {}/b.x.", link.display(), canon.display());
+        assert_eq!(root_relative_error_text(&message, &link), "a.x and b.x.");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
