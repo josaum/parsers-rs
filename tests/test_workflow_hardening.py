@@ -1130,6 +1130,30 @@ def test_every_fuzz_lockfile_is_checked():
     assert not [p for p in ROOT.glob("*/*/fuzz/Cargo.toml")], "a deeper fuzz package escapes the glob"
 
 
+RUST_CACHE_STEP = re.compile(
+    r"^      - uses: Swatinem/rust-cache@[0-9a-f]{40} # \S+\n(?P<rest>(?:        .*\n)*)", re.MULTILINE
+)
+
+
+def assert_release_keeps_cargo_bin(release: str) -> None:
+    """No rust-cache step in release.yml cleans ~/.cargo/bin.
+
+    The release's macOS jobs run on a self-hosted runner that shares the
+    owner's ~/.cargo, and rust-cache's post step deletes the files it found
+    in ~/.cargo/bin (rustup among them) unless `cache-bin` is off.
+    """
+    steps = list(RUST_CACHE_STEP.finditer(release))
+    assert steps, "release.yml has no rust-cache step to check"
+    for step in steps:
+        assert re.search(r'^          cache-bin: "false"$', step["rest"], re.MULTILINE), (
+            "a release rust-cache step would delete ~/.cargo/bin on the self-hosted runner"
+        )
+
+
+def test_the_release_never_cleans_the_runner_cargo_bin():
+    assert_release_keeps_cargo_bin(read(RELEASE))
+
+
 def test_feature_gated_code_is_linted_and_tested():
     assert_gated_features_are_built_and_tested(read(CI))
 
@@ -1410,6 +1434,8 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_ci_jobs, CI, "\n  lean-formal:\n", "\n  lean:\n"),
         (assert_ci_jobs, CI, "\n  rust:\n", "\n  rust:\n    name: Rust\n"),
         (assert_fuzz_lockfiles_checked, CI, FUZZ_LOCKFILE_CHECK, ""),
+        (assert_release_keeps_cargo_bin, RELEASE, '          cache-bin: "false"\n', ""),
+        (assert_release_keeps_cargo_bin, RELEASE, 'cache-bin: "false"', 'cache-bin: "true"'),
         (assert_fuzz_lockfiles_checked, CI, "cargo metadata --locked --format-version 1", "cargo metadata --format-version 1"),
         (assert_fuzz_lockfiles_checked, CI, "for manifest in */fuzz/Cargo.toml", "for manifest in xsd-fast-core/fuzz/Cargo.toml"),
         (assert_gated_features_are_built_and_tested, CI, "      - run: cargo test -p geo-fast-core --locked --features http\n", ""),
