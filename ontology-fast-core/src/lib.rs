@@ -224,28 +224,121 @@ impl ParsedOntology {
 /// every triple for every pattern. This is the same answer without the scan.
 #[derive(Clone, Debug, Default)]
 pub struct OntologyIndex {
-    by_subject: BTreeMap<String, Vec<u32>>,
-    by_predicate: BTreeMap<String, Vec<u32>>,
-    by_object: BTreeMap<String, Vec<u32>>,
+    by_subject: IndexColumn,
+    by_predicate: IndexColumn,
+    by_object: IndexColumn,
+}
+
+/// One position of the index: every distinct term with its row ordinals.
+///
+/// Stored as four flat buffers rather than a map of vectors, so a column costs
+/// four bytes per row plus the text of each distinct term once, whatever the
+/// number of distinct terms.
+#[derive(Clone, Debug, Default)]
+struct IndexColumn {
+    /// The distinct terms, concatenated in ascending order.
+    text: String,
+    /// `text_ends[i]` is where term `i` ends in `text`; it starts where term
+    /// `i - 1` ends.
+    text_ends: Vec<usize>,
+    /// `run_ends[i]` is where the ordinals of term `i` end in `ordinals`.
+    run_ends: Vec<usize>,
+    /// Row ordinals grouped by term, ascending within each group.
+    ordinals: Vec<u32>,
+}
+
+impl IndexColumn {
+    /// Build the column for one position of `rows`.
+    ///
+    /// `rows[ordinal][position]` is a term number below `terms.len()`, and two
+    /// different numbers never name the same text.
+    fn build(rows: &[[u32; 3]], position: usize, terms: &[String]) -> Self {
+        // Rows per term, then the distinct terms of this position in text order.
+        let mut counts = vec![0_usize; terms.len()];
+        for row in rows {
+            counts[row[position] as usize] += 1;
+        }
+        let mut present: Vec<u32> = rows.iter().map(|row| row[position]).collect();
+        present.sort_unstable();
+        present.dedup();
+        present.sort_unstable_by(|left, right| terms[*left as usize].cmp(&terms[*right as usize]));
+
+        let mut column = Self {
+            text: String::with_capacity(
+                present.iter().map(|term| terms[*term as usize].len()).sum(),
+            ),
+            text_ends: Vec::with_capacity(present.len()),
+            run_ends: Vec::with_capacity(present.len()),
+            ordinals: vec![0; rows.len()],
+        };
+        // `counts` turns from a row count into the next free slot of the run.
+        let mut filled = 0_usize;
+        for term in present {
+            let term = term as usize;
+            column.text.push_str(&terms[term]);
+            column.text_ends.push(column.text.len());
+            let rows_of_term = counts[term];
+            counts[term] = filled;
+            filled += rows_of_term;
+            column.run_ends.push(filled);
+        }
+        for (ordinal, row) in (0_u32..).zip(rows) {
+            let slot = &mut counts[row[position] as usize];
+            column.ordinals[*slot] = ordinal;
+            *slot += 1;
+        }
+        column
+    }
+
+    fn term(&self, rank: usize) -> &str {
+        let start = if rank == 0 {
+            0
+        } else {
+            self.text_ends[rank - 1]
+        };
+        &self.text[start..self.text_ends[rank]]
+    }
+
+    /// Row ordinals whose term at this position is exactly `term`.
+    fn rows(&self, term: &str) -> &[u32] {
+        // Binary search over the sorted distinct terms.
+        let (mut low, mut high) = (0, self.text_ends.len());
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match self.term(middle).cmp(term) {
+                std::cmp::Ordering::Less => low = middle + 1,
+                std::cmp::Ordering::Greater => high = middle,
+                std::cmp::Ordering::Equal => {
+                    let start = if middle == 0 {
+                        0
+                    } else {
+                        self.run_ends[middle - 1]
+                    };
+                    return &self.ordinals[start..self.run_ends[middle]];
+                }
+            }
+        }
+        &[]
+    }
 }
 
 impl OntologyIndex {
     /// Row ordinals whose subject is exactly `subject`.
     #[must_use]
     pub fn by_subject(&self, subject: &str) -> &[u32] {
-        self.by_subject.get(subject).map_or(&[], Vec::as_slice)
+        self.by_subject.rows(subject)
     }
 
     /// Row ordinals whose predicate is exactly `predicate`.
     #[must_use]
     pub fn by_predicate(&self, predicate: &str) -> &[u32] {
-        self.by_predicate.get(predicate).map_or(&[], Vec::as_slice)
+        self.by_predicate.rows(predicate)
     }
 
     /// Row ordinals whose object is exactly `object`.
     #[must_use]
     pub fn by_object(&self, object: &str) -> &[u32] {
-        self.by_object.get(object).map_or(&[], Vec::as_slice)
+        self.by_object.rows(object)
     }
 
     /// Row ordinals matching an `(s, p, o)` pattern; `None` is a wildcard.
@@ -280,27 +373,12 @@ impl OntologyIndex {
             .iter()
             .copied()
             .filter(|ordinal| {
-                // Every column is pushed in ascending ordinal order, which is
+                // Every run is filled in ascending ordinal order, which is
                 // what makes the binary search valid.
                 rest.iter()
                     .all(|column| column.binary_search(ordinal).is_ok())
             })
             .collect()
-    }
-
-    fn insert(&mut self, ordinal: u32, triple: &TripleText) {
-        self.by_subject
-            .entry(triple.subject.clone())
-            .or_default()
-            .push(ordinal);
-        self.by_predicate
-            .entry(triple.predicate.clone())
-            .or_default()
-            .push(ordinal);
-        self.by_object
-            .entry(triple.object.clone())
-            .or_default()
-            .push(ordinal);
     }
 }
 
@@ -402,10 +480,11 @@ pub fn parse_turtle(
             object: rendered[*object as usize].clone(),
         })
         .collect();
-    let mut index = OntologyIndex::default();
-    for (ordinal, triple) in (0_u32..).zip(&triples) {
-        index.insert(ordinal, triple);
-    }
+    let index = OntologyIndex {
+        by_subject: IndexColumn::build(&rows, 0, &rendered),
+        by_predicate: IndexColumn::build(&rows, 1, &rendered),
+        by_object: IndexColumn::build(&rows, 2, &rendered),
+    };
 
     Ok(ParsedOntology {
         triples,
