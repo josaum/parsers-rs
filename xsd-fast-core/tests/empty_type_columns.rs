@@ -82,11 +82,12 @@ fn a_parent_keeps_its_shape_beside_an_empty_child() {
         .iter()
         .map(|field| field.as_ref().clone())
         .collect();
+    // Each is in one branch of the choice, so either may be absent.
     assert_eq!(
         branches,
         [
-            Field::new("none", DataType::Utf8, false),
-            Field::new("some", DataType::Utf8, false),
+            Field::new("none", DataType::Utf8, true),
+            Field::new("some", DataType::Utf8, true),
         ]
     );
 

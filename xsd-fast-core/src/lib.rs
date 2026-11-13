@@ -28,7 +28,10 @@
 //! `arrow::ArrowShape::attributes_on_simple_children` makes such a child a
 //! struct of its value and all its attributes.
 //! - Resolves multi-file schemas (relative `schemaLocation` paths)
-//! - Derives an Arrow `Schema` from a root element (for downstream Flight / IPC)
+//! - Derives an Arrow `Schema` from a root element (for downstream Flight / IPC),
+//!   with one column per name: sibling elements of one name are one column,
+//!   a scalar across the branches of a choice and a `List` otherwise (see
+//!   the `arrow` module, "One column per name")
 //! - Validates XML byte slices against the parsed schema rules (enumeration, pattern,
 //!   minLength/maxLength, minInclusive/maxInclusive for simple types)
 //! - Produces structured [`ValidationError`] values — never panics on bad input

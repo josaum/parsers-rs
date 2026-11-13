@@ -12,6 +12,49 @@
 //! the element. Multi-occurrence particles (`maxOccurs > 1` or unbounded) are
 //! emitted as `List<item>`. Wildcards (`xs:any`) derive no column.
 //!
+//! ## One column per name
+//!
+//! Sibling columns never share a name, so every column can be read by name
+//! (pyarrow's `StructArray.field(name)` raised `KeyError` and polars
+//! `DuplicateError` on the shape this replaces). Elements of one model group
+//! that share a local name are one column, at the position of the first:
+//!
+//! - In an `xs:choice` that occurs at most once, each branch holds the name
+//!   at most once and only one branch occurs, so the column is a scalar of
+//!   their common type, unless one of them repeats or lies in a model group
+//!   that repeats.
+//! - Anywhere else (a sequence, `xs:all`, a repeated choice, or a choice
+//!   branch that repeats) the column is a `List` of their common type, so
+//!   `<a/><b/><a/>` reads as one list `a`. A repeated particle contributes
+//!   its items, not a nested list; any other column that is a list (a child
+//!   whose one column is a list, or an `xs:list` value) is one item, so the
+//!   merged column is a list of lists. The list is nullable only when every
+//!   element it merges is optional.
+//!
+//! A nested group is merged first, then its columns with those of the group
+//! around it, so inherited particles merge with the ones a type adds. Types
+//! are common when they are equal up to nullability; the merged type is
+//! nullable wherever one of them is. A child element two of whose own
+//! columns merged stays a struct, even with one column left, so no column
+//! path is lost. A column of referenced attributes only (see below) that
+//! merges with one of the child's own columns does not count as a merge: the
+//! child keeps the shape it had, though its one column may become a list.
+//!
+//! Elements whose types differ keep their own columns and positions, and
+//! every one after the first is renamed `name#2`, `name#3`, ... in document
+//! order, taking the least number that no column of the group holds (a
+//! nested group's rename included), and numbering from the name before any
+//! `#`, so a name never carries two. `#` cannot occur in an XML name, as `@`
+//! (attributes) and `$` (`$text`) cannot. Particles are matched by local
+//! name: the model does not keep the namespace of an element particle.
+//!
+//! ## Nullability under a choice
+//!
+//! A column a choice derives is nullable unless the choice is required and
+//! the column's name occurs in every branch. Every column of an optional
+//! group is nullable, and so is every column of a nested sequence that does
+//! not occur exactly once.
+//!
 //! An attribute that reaches a type through `xs:attribute ref` or
 //! `xs:attributeGroup ref` is a column of the root element, and of a child
 //! element with no column or more than one column of its own. **By default
@@ -128,7 +171,12 @@ pub struct ArrowShape {
 }
 
 impl ArrowShape {
-    /// The default shape: today's columns, unchanged.
+    /// The default shape, which [`SchemaSet::to_arrow_schema`] uses.
+    ///
+    /// A child element whose own content derives one column is that column,
+    /// without the attributes that reach its type by reference. Sibling
+    /// elements of one name are one column whatever the shape; see the
+    /// module documentation, "One column per name".
     pub fn new() -> Self {
         Self::default()
     }
@@ -214,10 +262,7 @@ impl SchemaSet {
         let walked = derivation.fields_from_type(&decl.type_def, 0, String::new(), &mut fields);
         *steps_left -= allowed - derivation.steps_left;
         walked?;
-        let fields = fields
-            .into_iter()
-            .map(unmark_referenced)
-            .collect::<Vec<_>>();
+        let fields = fields.into_iter().map(unmark).collect::<Vec<_>>();
         Ok(Arc::new(Schema::new(fields)))
     }
 
@@ -466,7 +511,7 @@ impl Derivation<'_> {
         if self.opts.include_attributes {
             self.emit_attributes(ct, prefix, fields)?;
         }
-        self.fields_from_content(&ct.content, depth, prefix, fields)
+        self.fields_from_content(&ct.content, ct.content_occurrence, depth, prefix, fields)
     }
 
     fn emit_attributes(
@@ -491,13 +536,15 @@ impl Derivation<'_> {
         Ok(())
     }
 
-    /// Flattens one content model into columns at `prefix`.
+    /// Flattens one content model, which occurs `occ` times, into columns
+    /// at `prefix`.
     ///
     /// This is the only function a nested model group re-enters, so it is
     /// where the recursion of a derivation is counted and refused.
     fn fields_from_content(
         &mut self,
         content: &ContentModel,
+        occ: OccurrenceConstraint,
         depth: usize,
         prefix: &str,
         fields: &mut Vec<Field>,
@@ -507,15 +554,31 @@ impl Derivation<'_> {
                 "resource_limit: arrow_nesting_depth: content models nest deeper than {MAX_DERIVATION_NESTING}"
             );
         }
-        let particles = match content {
-            ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
+        let (particles, choice) = match content {
+            ContentModel::Sequence(p) | ContentModel::All(p) => (p, false),
+            ContentModel::Choice(p) => (p, true),
             ContentModel::SimpleContent(st) => return self.emit_text(st, prefix, fields),
             ContentModel::Empty => return Ok(()),
         };
+        let start = fields.len();
+        // Where each branch of a choice ends in `fields`.
+        let mut ends = Vec::new();
         self.nesting += 1;
-        let result = self.fields_from_particles(particles, depth, prefix, fields);
+        let result = self.fields_from_particles(
+            particles,
+            depth,
+            prefix,
+            fields,
+            choice.then_some(&mut ends),
+        );
         self.nesting -= 1;
-        result
+        result?;
+        if choice {
+            settle_choice(fields, start, &ends, occ);
+        } else {
+            merge_group_columns(fields, start, false);
+        }
+        Ok(())
     }
 
     /// Emits the `$text` column of a simple-content type.
@@ -534,12 +597,15 @@ impl Derivation<'_> {
         self.emit(fields, Field::new(name, dt, true))
     }
 
+    /// Flattens `particles` into columns at `prefix`, pushing to `ends`,
+    /// when given, the length of `fields` after each particle.
     fn fields_from_particles(
         &mut self,
         particles: &[Particle],
         depth: usize,
         prefix: &str,
         fields: &mut Vec<Field>,
+        mut ends: Option<&mut Vec<usize>>,
     ) -> Result<()> {
         let model = self.model;
         for particle in particles {
@@ -553,12 +619,15 @@ impl Derivation<'_> {
                     }
                     None => self.emit_unresolved_element(&qn.local, prefix, fields)?,
                 },
-                // A nested model group (typically an xs:choice). Flatten each
-                // branch into its own column at the current prefix; mark them
-                // nullable since at most one branch is selected per instance.
-                ElementRef::Group(group) => self.fields_from_group(group, depth, prefix, fields)?,
+                // A nested model group: its columns join the current prefix.
+                ElementRef::Group(group) => {
+                    self.fields_from_group(group, particle.occurrence, depth, prefix, fields)?;
+                }
                 // A wildcard admits elements the schema does not declare.
                 ElementRef::Any(_) => {}
+            }
+            if let Some(ends) = ends.as_deref_mut() {
+                ends.push(fields.len());
             }
         }
         Ok(())
@@ -603,17 +672,23 @@ impl Derivation<'_> {
         let col_path = column_path(prefix, &decl.name.local);
         let nillable = decl.nillable;
         let own = inner_fields.iter().filter(|f| !is_referenced(f)).count();
-        if own == 1 && !self.shape.attributes_on_simple_children {
+        // Columns of its own merged into one were several before the merge,
+        // and keep the struct and the attributes they had. Merged columns
+        // made only of referenced attributes are not its own, as before.
+        let merged = inner_fields
+            .iter()
+            .any(|f| is_merged(f) && !is_referenced(f));
+        let single = own == 1 && !merged;
+        if single && !self.shape.attributes_on_simple_children {
             // A child whose other content derives one column keeps the shape
             // it had before attribute references were resolved: that column,
             // named after the child.
             inner_fields.retain(|f| !is_referenced(f));
         }
-        let mut inner_fields: Vec<Field> =
-            inner_fields.into_iter().map(unmark_referenced).collect();
+        let mut inner_fields: Vec<Field> = inner_fields.into_iter().map(unmark).collect();
         // A repeated child with no column of its own was a list of empty
         // structs; one referenced attribute keeps it a list of structs.
-        let keep_struct = own == 0 && occ.is_multi();
+        let keep_struct = (own == 0 && occ.is_multi()) || merged;
         if occ.is_multi() {
             // Wrap the inner type in a List.
             let item_field = if inner_fields.len() == 1 && !keep_struct {
@@ -624,10 +699,8 @@ impl Derivation<'_> {
             } else {
                 Field::new("item", DataType::Struct(inner_fields.into()), nillable)
             };
-            self.emit(
-                fields,
-                Field::new(col_path, DataType::List(Arc::new(item_field)), occ.min == 0),
-            )
+            let list = Field::new(col_path, DataType::List(Arc::new(item_field)), occ.min == 0);
+            self.emit(fields, with_mark(list, REPEATED_MARK))
         } else {
             let nullable = occ.min == 0 || nillable;
             // A child with no column of its own had no column at all before
@@ -640,7 +713,7 @@ impl Derivation<'_> {
                     field
                 }
             };
-            if inner_fields.len() == 1 {
+            if inner_fields.len() == 1 && !merged {
                 let f = inner_fields
                     .remove(0)
                     .with_name(&col_path)
@@ -657,20 +730,34 @@ impl Derivation<'_> {
         }
     }
 
-    /// Flatten a nested model group's branches into columns at `prefix`.
+    /// Flattens a nested model group, which occurs `occ` times, into
+    /// columns at `prefix`.
     ///
-    /// Branches of an `xs:choice` are mutually exclusive, so every column produced
-    /// here is forced nullable regardless of the branch's declared `minOccurs`.
+    /// A choice sets the nullability of its own columns (see
+    /// [`settle_choice`]). Every column of an optional group is nullable, and
+    /// so is every column of a sequence that does not occur exactly once,
+    /// which may be left out whole or hold children another repetition lacks.
     fn fields_from_group(
         &mut self,
         group: &ContentModel,
+        occ: OccurrenceConstraint,
         depth: usize,
         prefix: &str,
         fields: &mut Vec<Field>,
     ) -> Result<()> {
         let start = fields.len();
-        self.fields_from_content(group, depth, prefix, fields)?;
-        force_nullable(&mut fields[start..]);
+        self.fields_from_content(group, occ, depth, prefix, fields)?;
+        let is_choice = matches!(group, ContentModel::Choice(_));
+        let derived = fields.get_mut(start..).unwrap_or_default();
+        if occ.min == 0 || (!is_choice && occ != OccurrenceConstraint::default()) {
+            force_nullable(derived);
+        }
+        if occ.is_multi() {
+            // A choice around the group cannot merge these into a scalar.
+            for field in derived {
+                *field = with_mark(field.clone(), IN_REPEAT_MARK);
+            }
+        }
         Ok(())
     }
 }
@@ -693,11 +780,33 @@ fn declares_nothing(ct: &ComplexType) -> bool {
 /// reaches the derived schema.
 const REFERENCED_MARK: &str = "xsd-fast-core.referenced";
 
+/// Metadata key marking, during one derivation, the `List` column of a
+/// repeated particle, as against a list-typed value (`xs:list`). It never
+/// reaches the derived schema.
+const REPEATED_MARK: &str = "xsd-fast-core.repeated";
+
+/// Metadata key marking, during one derivation, a column merged from sibling
+/// columns of one name. It never reaches the derived schema.
+const MERGED_MARK: &str = "xsd-fast-core.merged";
+
+/// Metadata key marking, during one derivation, a column derived inside a
+/// model group that repeats, whose element may occur more than once
+/// although its column is not a list. It never reaches the derived schema.
+const IN_REPEAT_MARK: &str = "xsd-fast-core.in-repeat";
+
+/// Every mark a derivation may set; see [`unmark`].
+const MARKS: [&str; 4] = [REFERENCED_MARK, REPEATED_MARK, MERGED_MARK, IN_REPEAT_MARK];
+
+/// `field` with the derivation mark `mark` added to its metadata.
+fn with_mark(field: Field, mark: &str) -> Field {
+    let mut metadata = field.metadata().clone();
+    metadata.insert(mark.to_owned(), String::new());
+    field.with_metadata(metadata)
+}
+
 /// `field` marked as the column of a referenced attribute.
 fn mark_referenced(field: Field) -> Field {
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert(REFERENCED_MARK.to_owned(), String::new());
-    field.with_metadata(metadata)
+    with_mark(field, REFERENCED_MARK)
 }
 
 /// Whether `field` is the column of a referenced attribute.
@@ -705,19 +814,220 @@ fn is_referenced(field: &Field) -> bool {
     field.metadata().contains_key(REFERENCED_MARK)
 }
 
-/// `field` without the referenced-attribute mark.
-fn unmark_referenced(field: Field) -> Field {
-    if is_referenced(&field) {
+/// Whether `field` is the `List` column of a repeated particle.
+fn is_repeated(field: &Field) -> bool {
+    field.metadata().contains_key(REPEATED_MARK)
+}
+
+/// Whether `field` was derived inside a model group that repeats.
+fn in_repeat(field: &Field) -> bool {
+    field.metadata().contains_key(IN_REPEAT_MARK)
+}
+
+/// Whether `field` was merged from sibling columns of one name.
+fn is_merged(field: &Field) -> bool {
+    field.metadata().contains_key(MERGED_MARK)
+}
+
+/// `field` without any derivation mark.
+fn unmark(field: Field) -> Field {
+    if MARKS
+        .iter()
+        .any(|mark| field.metadata().contains_key(*mark))
+    {
         let mut metadata = field.metadata().clone();
-        metadata.remove(REFERENCED_MARK);
+        for mark in MARKS {
+            metadata.remove(mark);
+        }
         field.with_metadata(metadata)
     } else {
         field
     }
 }
 
-/// Marks every field nullable: a choice selects at most one branch, so none
-/// of its columns are mandatory.
+/// Merges and settles the columns a choice emitted at `fields[start..]`.
+///
+/// `ends` holds where each branch's columns end. A choice that occurs at
+/// most once is exclusive: its columns of one name, at most one per branch,
+/// merge into one scalar unless one of them repeats. A column is nullable
+/// unless it occurs in every branch of a choice that is required.
+fn settle_choice(fields: &mut Vec<Field>, start: usize, ends: &[usize], occ: OccurrenceConstraint) {
+    // The names each branch derives.
+    let mut branches: Vec<std::collections::HashSet<String>> = Vec::with_capacity(ends.len());
+    let mut from = start;
+    for &end in ends {
+        let names = fields.get(from..end).unwrap_or_default();
+        branches.push(names.iter().map(|f| f.name().clone()).collect());
+        from = end;
+    }
+    merge_group_columns(fields, start, !occ.is_multi());
+    for field in fields.iter_mut().skip(start) {
+        let in_every = branches.iter().all(|names| names.contains(field.name()));
+        if (occ.min == 0 || !in_every) && !field.is_nullable() {
+            *field = field.clone().with_nullable(true);
+        }
+    }
+}
+
+/// Merges the columns one model group emitted at `fields[start..]` that
+/// share a name; see the module documentation, "One column per name".
+///
+/// `exclusive` is true for a choice that occurs at most once. A merged
+/// column stands where its first part stood; parts that cannot merge keep
+/// their own positions. Names are taken in document order, so the result
+/// does not depend on hashing.
+fn merge_group_columns(fields: &mut Vec<Field>, start: usize, exclusive: bool) {
+    let group = fields.get(start..).unwrap_or_default();
+    let mut seen = std::collections::HashSet::with_capacity(group.len());
+    if group.iter().all(|f| seen.insert(f.name().as_str())) {
+        return;
+    }
+    let mut slots: Vec<Option<Field>> = fields.split_off(start).into_iter().map(Some).collect();
+    // Positions of the columns of each name, names in order of first appearance.
+    let mut positions: Vec<Vec<usize>> = Vec::new();
+    let mut slot: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (at, field) in slots.iter().enumerate() {
+        let Some(field) = field else { continue };
+        match slot.get(field.name()) {
+            Some(&group) => {
+                if let Some(at_all) = positions.get_mut(group) {
+                    at_all.push(at);
+                }
+            }
+            None => {
+                slot.insert(field.name().clone(), positions.len());
+                positions.push(vec![at]);
+            }
+        }
+    }
+    // Names a rename must not take: every name of the group, and each
+    // rename made so far.
+    let mut used: std::collections::HashSet<String> = slot.into_keys().collect();
+    for at_all in positions.iter().filter(|at_all| at_all.len() > 1) {
+        let parts: Vec<Field> = at_all
+            .iter()
+            .filter_map(|&at| slots.get_mut(at).and_then(Option::take))
+            .collect();
+        match merge_columns(&parts, exclusive) {
+            Some(merged) => {
+                if let Some(first) = at_all.first().and_then(|&at| slots.get_mut(at)) {
+                    *first = Some(merged);
+                }
+            }
+            None => {
+                for (index, (&at, part)) in at_all.iter().zip(parts).enumerate() {
+                    let part = if index == 0 {
+                        part
+                    } else {
+                        let name = next_ordinal_name(part.name(), &mut used);
+                        part.with_name(name)
+                    };
+                    if let Some(slot) = slots.get_mut(at) {
+                        *slot = Some(part);
+                    }
+                }
+            }
+        }
+    }
+    fields.extend(slots.into_iter().flatten());
+}
+
+/// One column for `parts`, sibling columns of one name, or `None` when
+/// their types cannot be merged.
+///
+/// Parts of an `exclusive` choice, none of them repeated, merge into a
+/// scalar; any others into a `List` of what one occurrence holds.
+fn merge_columns(parts: &[Field], exclusive: bool) -> Option<Field> {
+    let scalar = exclusive && !parts.iter().any(|f| is_repeated(f) || in_repeat(f));
+    // The value one occurrence holds, and whether it may be null.
+    let item = |field: &Field| match (scalar, is_repeated(field), field.data_type()) {
+        (false, true, DataType::List(item)) => (item.data_type().clone(), item.is_nullable()),
+        _ => (field.data_type().clone(), field.is_nullable()),
+    };
+    let (first, rest) = parts.split_first()?;
+    let (mut data_type, mut item_nullable) = item(first);
+    for part in rest {
+        let (next, nullable) = item(part);
+        data_type = unify(&data_type, &next)?;
+        item_nullable |= nullable;
+    }
+    let name = first.name().clone();
+    let merged = if scalar {
+        Field::new(name, data_type, item_nullable)
+    } else {
+        // Absent only when every part may be absent.
+        let nullable = parts.iter().all(Field::is_nullable);
+        let item = Field::new("item", data_type, item_nullable);
+        with_mark(
+            Field::new(name, DataType::List(Arc::new(item)), nullable),
+            REPEATED_MARK,
+        )
+    };
+    // Only columns of the element's own merged count as a merge to the
+    // element: a referenced attribute's column it may leave out.
+    let own = parts.iter().filter(|f| !is_referenced(f)).count();
+    let merged = if own >= 2 {
+        with_mark(merged, MERGED_MARK)
+    } else {
+        merged
+    };
+    Some(if own == 0 {
+        mark_referenced(merged)
+    } else {
+        merged
+    })
+}
+
+/// `name#n` for the base of `name` (before any `#`) and the least `n` from
+/// 2 not in `used`, which it is added to.
+fn next_ordinal_name(name: &str, used: &mut std::collections::HashSet<String>) -> String {
+    let base = name.split('#').next().unwrap_or(name);
+    let mut ordinal = 2usize;
+    loop {
+        let candidate = format!("{base}#{ordinal}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        ordinal += 1;
+    }
+}
+
+/// The type both `a` and `b` fit: equal up to the nullability of nested
+/// fields, which is kept wherever either has it. `None` if they differ
+/// otherwise.
+fn unify(a: &DataType, b: &DataType) -> Option<DataType> {
+    if a == b {
+        return Some(a.clone());
+    }
+    match (a, b) {
+        (DataType::Struct(fa), DataType::Struct(fb)) if fa.len() == fb.len() => {
+            let mut fields = Vec::with_capacity(fa.len());
+            for (x, y) in fa.iter().zip(fb.iter()) {
+                if x.name() != y.name() {
+                    return None;
+                }
+                let data_type = unify(x.data_type(), y.data_type())?;
+                fields.push(Field::new(
+                    x.name(),
+                    data_type,
+                    x.is_nullable() || y.is_nullable(),
+                ));
+            }
+            Some(DataType::Struct(fields.into()))
+        }
+        (DataType::List(x), DataType::List(y)) if x.name() == y.name() => {
+            let data_type = unify(x.data_type(), y.data_type())?;
+            Some(DataType::List(Arc::new(Field::new(
+                x.name(),
+                data_type,
+                x.is_nullable() || y.is_nullable(),
+            ))))
+        }
+        _ => None,
+    }
+}
+
+/// Marks every field nullable: the group that derived them may be absent.
 fn force_nullable(fields: &mut [Field]) {
     for field in fields {
         if !field.is_nullable() {

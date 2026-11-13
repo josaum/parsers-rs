@@ -49,6 +49,56 @@ request.
     attachment each), 23 from address parsing (the ones inspected are
     mutated, malformed address lines), 4 from quoted semicolons, 1 from a
     delimiter at the end, and 45 from two or more of these together.
+- **xsd (Arrow):** sibling columns no longer share a name. Before, a type
+  whose elements share a local name (repeated in a sequence, in branches of
+  a choice, inherited and redeclared, or in a nested group) gave a struct,
+  or a top-level schema, with several children of that name, which pyarrow
+  (`StructArray.field(name)`: `KeyError`) and polars (`DuplicateError`)
+  could not read by name. Now they are one column, at the position of the
+  first:
+  - across the branches of a choice that occurs at most once, where each
+    branch holds the name once and none repeats it, a scalar of their
+    common type;
+  - otherwise (a sequence, a repeated choice, a branch that repeats the
+    name or holds it twice) a `List` of their common type. A repeated
+    particle adds its items; any other list column (a child whose one
+    column is a list, or an `xs:list` value) is one item, making a list of
+    lists.
+
+  A child two of whose own columns merged stays a struct. Elements whose
+  types differ keep their own columns and positions and are renamed
+  `name#2`, `name#3`, ... (none on the corpus). Attributes keep their `@`
+  prefix, so an attribute and an element never collided.
+- **xsd (Arrow):** a column under an `xs:choice` is nullable unless the
+  choice is required and the column's name occurs in every branch. A
+  type's own top-level choice was not covered: a branch element such as
+  XML-DSig `PGPKeyID` in `PGPData` was non-nullable although the other
+  branch leaves it out. A column of a nested choice that occurs in every
+  branch is no longer forced nullable.
+- **xsd (model):** a sequence that is one branch of a choice is kept as an
+  `ElementRef::Group` holding a `ContentModel::Sequence`, even when it
+  occurs once; it used to be written into the choice, so `(a, b) | (a, c)`
+  read as one choice of four elements. Validation reads such a branch as it
+  did before, so its findings do not change.
+
+  Measured on 452 real schemas (399 load; the same ones load, and no
+  element's derivation newly fails), counting each global element's derived
+  tree separately: 196 schemas change. Groups of same-name siblings go from
+  164,082 (528 distinct per struct shape and name) to 0. Of the 20,436
+  merged columns, 1,201 are scalars, 1,280 keep their parts' list depth
+  (repeated parts in one list, or a scalar of list values) and 17,955 add a
+  list level; 181,105 column paths gain a list level. Column paths, counting
+  each duplicate's subtree, fall from 7,862,594 to 4,199,285; the 4,199,285
+  distinct paths are the same before and after (list levels ignored), so
+  none is lost. Apart from the merges and their ancestors, no column changes
+  type or order, and 301,480 change nullability (301,479 become nullable, 1
+  non-nullable). In the source, 21 of 276 (choice, name) groups merge into
+  a scalar; in 227 every part repeats (lists before too, now one list), 22
+  have a branch that holds the name twice and 6 a repeated choice. The
+  model changes for 241 schemas; written back into their choices, their
+  branch sequences give exactly the earlier model for all 399, and that is
+  what validation reads. Validation of 12 instance documents found beside 7
+  of the schemas gives the same findings before and after.
 
 ## v2026.11.13.2
 

@@ -940,7 +940,7 @@ fn parse_particles(
                 }
                 "sequence" => {
                     let inner = parse_particles(reader, ns_map, "sequence", depth + 1)?;
-                    push_nested_sequence(&attrs, inner, &mut particles);
+                    push_nested_sequence(&attrs, inner, end_tag == "choice", &mut particles);
                 }
                 "choice" => {
                     // A nested choice is a discriminated union; preserve it
@@ -1599,13 +1599,20 @@ fn push_choice_group(
 /// occurrence it is kept as one group particle: an optional sequence may be
 /// left out whole, required children included, which its particles written
 /// in the parent could not say.
+///
+/// In a choice (`in_choice`) a sequence is always kept as a group: it is one
+/// branch, and written into the choice its particles would read as one
+/// branch each, so `(a, b) | (a, c)` could not be told from one `(a, b, a)`
+/// branch. Validation still reads such a branch's particles as the choice's
+/// own, as it did when the parser wrote them there.
 fn push_nested_sequence(
     attrs: &HashMap<String, String>,
     inner: Vec<Particle>,
+    in_choice: bool,
     particles: &mut Vec<Particle>,
 ) {
     let occurrence = parse_occurrence(attrs);
-    if occurrence == OccurrenceConstraint::default() {
+    if occurrence == OccurrenceConstraint::default() && !in_choice {
         particles.extend(inner);
     } else {
         particles.push(Particle {
@@ -1810,7 +1817,7 @@ fn parse_derivation_children(
             Tag::Start { local, attrs } => match local.as_str() {
                 "sequence" | "all" => {
                     let inner = parse_particles(reader, ns_map, &local, depth + 1)?;
-                    push_nested_sequence(&attrs, inner, particles);
+                    push_nested_sequence(&attrs, inner, false, particles);
                 }
                 "choice" => {
                     let inner = parse_particles(reader, ns_map, "choice", depth + 1)?;

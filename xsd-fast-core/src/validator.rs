@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::parser::{schema_input, Repairs, SchemaInput, SchemaSet};
 use crate::schema::{
-    ComplexType, ContentModel, ElementRef, Particle, SchemaModel, SimpleTypeDef, XsdType,
+    ComplexType, ContentModel, ElementRef, OccurrenceConstraint, Particle, SchemaModel,
+    SimpleTypeDef, XsdType,
 };
 
 /// Deepest nesting of list item types checked.
@@ -215,6 +216,9 @@ struct ContentIndex<'m> {
     declared: HashSet<&'m str>,
     /// Positions of the direct particles that are wildcards.
     wildcards: Vec<usize>,
+    /// The direct particles, which every position above indexes; see
+    /// [`walked_particles`].
+    particles: Vec<&'m Particle>,
 }
 
 impl<'m> ValidationContext<'m> {
@@ -741,13 +745,11 @@ impl<'m> ValidationContext<'m> {
             always: Vec::new(),
             declared: HashSet::new(),
             wildcards: Vec::new(),
+            particles: walked_particles(content),
         };
-        let (particles, is_choice): (&'m [_], bool) = match content {
-            ContentModel::Sequence(p) | ContentModel::All(p) => (p, false),
-            ContentModel::Choice(p) => (p, true),
-            ContentModel::SimpleContent(_) | ContentModel::Empty => (&[], false),
-        };
-        for (position, particle) in particles.iter().enumerate() {
+        let is_choice = matches!(content, ContentModel::Choice(_));
+        let particles = std::mem::take(&mut index.particles);
+        for (position, particle) in particles.iter().copied().enumerate() {
             let (name, occurrence) = match &particle.element {
                 ElementRef::Inline(decl) => {
                     let resolved = self.resolve_xsd_type(&decl.type_def);
@@ -800,6 +802,7 @@ impl<'m> ValidationContext<'m> {
                 index.always.push(position);
             }
         }
+        index.particles = particles;
         let index = Rc::new(index);
         self.content_indexes.insert(key, Rc::clone(&index));
         index
@@ -959,9 +962,9 @@ impl<'m> ValidationContext<'m> {
         content: &'m ContentModel,
         child_counts: &HashMap<String, usize>,
     ) {
-        let (particles, is_choice) = match content {
-            ContentModel::Sequence(p) | ContentModel::All(p) => (p, false),
-            ContentModel::Choice(p) => (p, true),
+        let is_choice = match content {
+            ContentModel::Sequence(_) | ContentModel::All(_) => false,
+            ContentModel::Choice(_) => true,
             _ => return,
         };
 
@@ -976,7 +979,10 @@ impl<'m> ValidationContext<'m> {
         positions.dedup();
 
         let mut branch_total = 0usize;
-        for particle in positions.into_iter().filter_map(|at| particles.get(at)) {
+        for particle in positions
+            .into_iter()
+            .filter_map(|at| index.particles.get(at).copied())
+        {
             if self.errors.len() >= self.opts.max_errors {
                 return;
             }
@@ -1038,15 +1044,15 @@ impl<'m> ValidationContext<'m> {
 
         // A wildcard branch is taken by a child no named particle claims.
         if is_choice && branch_total == 0 {
-            branch_total = self.wildcard_matches(&index, particles);
+            branch_total = self.wildcard_matches(&index);
         }
 
         // For a required top-level choice, at least one branch must appear,
         // unless a wildcard branch may itself be left out.
         if is_choice
             && branch_total == 0
-            && !particles.is_empty()
-            && !optional_wildcard(&index, particles)
+            && !index.particles.is_empty()
+            && !optional_wildcard(&index)
         {
             self.push_error(
                 ValidationSeverity::Error,
@@ -1066,16 +1072,22 @@ impl<'m> ValidationContext<'m> {
         content: &'m ContentModel,
         child_counts: &HashMap<String, usize>,
     ) -> usize {
-        let particles = match content {
-            ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
-            _ => return 0,
-        };
+        if !matches!(
+            content,
+            ContentModel::Sequence(_) | ContentModel::All(_) | ContentModel::Choice(_)
+        ) {
+            return 0;
+        }
         let index = self.content_index(content);
         let mut total = child_counts.iter().fold(0usize, |total, (name, count)| {
             let declared = index.by_name.get(name.as_str()).map_or(0, Vec::len);
             total.saturating_add(count.saturating_mul(declared))
         });
-        for particle in index.groups.iter().filter_map(|at| particles.get(*at)) {
+        for particle in index
+            .groups
+            .iter()
+            .filter_map(|at| index.particles.get(*at).copied())
+        {
             if let ElementRef::Group(inner) = &particle.element {
                 total = total.saturating_add(self.group_branch_count(inner, child_counts));
             }
@@ -1083,26 +1095,30 @@ impl<'m> ValidationContext<'m> {
         // Only a choice is selected by what its wildcards take: in a
         // sequence the child may belong to another wildcard of the type.
         if matches!(content, ContentModel::Choice(_)) {
-            total = total.saturating_add(self.wildcard_matches(&index, particles));
+            total = total.saturating_add(self.wildcard_matches(&index));
         }
         total
     }
 
     /// Whether a choice has a wildcard branch that may be left out.
     fn choice_may_be_empty(&mut self, content: &'m ContentModel) -> bool {
-        let ContentModel::Choice(particles) = content else {
+        if !matches!(content, ContentModel::Choice(_)) {
             return false;
-        };
+        }
         let index = self.content_index(content);
-        optional_wildcard(&index, particles)
+        optional_wildcard(&index)
     }
 
-    /// Children that the wildcards among `particles` take: those no named
-    /// particle of the element's type claims, in a namespace a wildcard
-    /// admits, counted once per wildcard admitting them.
-    fn wildcard_matches(&self, index: &ContentIndex<'m>, particles: &'m [Particle]) -> usize {
+    /// Children that the wildcards of `index` take: those no named particle
+    /// of the element's type claims, in a namespace a wildcard admits,
+    /// counted once per wildcard admitting them.
+    fn wildcard_matches(&self, index: &ContentIndex<'m>) -> usize {
         let mut total = 0usize;
-        for particle in index.wildcards.iter().filter_map(|at| particles.get(*at)) {
+        for particle in index
+            .wildcards
+            .iter()
+            .filter_map(|at| index.particles.get(*at).copied())
+        {
             if let ElementRef::Any(wildcard) = &particle.element {
                 for (namespace, count) in &self.unclaimed {
                     if wildcard.admits(namespace.as_deref()) {
@@ -1174,13 +1190,44 @@ impl<'m> ValidationContext<'m> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Whether one of the wildcards among `particles` may occur zero times.
-fn optional_wildcard(index: &ContentIndex<'_>, particles: &[Particle]) -> bool {
+/// Whether one of the wildcards of `index` may occur zero times.
+fn optional_wildcard(index: &ContentIndex<'_>) -> bool {
     index
         .wildcards
         .iter()
-        .filter_map(|at| particles.get(*at))
+        .filter_map(|at| index.particles.get(*at))
         .any(|particle| particle.occurrence.min == 0)
+}
+
+/// The particles validation walks for `content`, in document order.
+///
+/// They are the content's own, except that a sequence that is one branch
+/// of a choice and occurs exactly once is written into the choice. The
+/// parser keeps such a sequence as a group so the Arrow derivation can tell
+/// its branches apart; validation reads them as the parser wrote them
+/// before, so its findings do not change.
+fn walked_particles(content: &ContentModel) -> Vec<&Particle> {
+    match content {
+        ContentModel::Sequence(p) | ContentModel::All(p) => p.iter().collect(),
+        ContentModel::Choice(p) => {
+            let mut walked = Vec::with_capacity(p.len());
+            for particle in p {
+                match &particle.element {
+                    ElementRef::Group(group)
+                        if particle.occurrence == OccurrenceConstraint::default() =>
+                    {
+                        match group.as_ref() {
+                            ContentModel::Sequence(inner) => walked.extend(inner.iter()),
+                            _ => walked.push(particle),
+                        }
+                    }
+                    _ => walked.push(particle),
+                }
+            }
+            walked
+        }
+        ContentModel::SimpleContent(_) | ContentModel::Empty => Vec::new(),
+    }
 }
 
 /// Whether a start tag carries `xsi:nil` with a true value.
