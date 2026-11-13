@@ -194,6 +194,23 @@ def assert_installers_are_pinned(text: str) -> None:
         ), f"`{install}`: not pinned to an exact version"
 
 
+def assert_ci_runs_on_every_push_and_pull_request(ci: str) -> None:
+    """ci.yml's jobs are required checks: no trigger filter may leave one unreported."""
+    triggers = top_level(ci, "on") or ""
+    # A pull request with no qualifier at all, and pushes to main.
+    assert re.search(r"^  pull_request:\n(?!    )", triggers, re.MULTILINE), (
+        "pull_request must carry no filter: a filtered run leaves required checks pending"
+    )
+    assert re.search(r"^  push:\n    branches: \[main\]\n(?!    )", triggers, re.MULTILINE), (
+        "push must run for every commit on main"
+    )
+    for filtered in ("paths", "paths-ignore", "branches-ignore", "tags-ignore", "types"):
+        assert not re.search(rf"^\s+{filtered}:", triggers, re.MULTILINE), (
+            f"ci.yml must not filter its triggers with `{filtered}`"
+        )
+    assert len(re.findall(r"^\s+branches:", triggers, re.MULTILINE)) == 1
+
+
 def assert_toolchain_named(text: str) -> None:
     """A SHA-pinned dtolnay/rust-toolchain installs nothing unless told what."""
     channel = re.search(r'^channel = "([^"]+)"$', read(ROOT / "rust-toolchain.toml"), re.MULTILINE)
@@ -596,6 +613,10 @@ def test_checkouts_keep_no_credentials_and_installers_are_pinned(path: Path):
     assert_installers_are_pinned(read(path))
 
 
+def test_ci_triggers_carry_no_filter():
+    assert_ci_runs_on_every_push_and_pull_request(read(CI))
+
+
 @pytest.mark.parametrize("path", ALL_WORKFLOWS, ids=workflow_id)
 def test_only_the_publishing_job_holds_a_write_token(path: Path):
     assert_least_privilege(read(path), WRITERS.get(path.name))
@@ -690,6 +711,15 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_installers_are_pinned, CI, ELAN_RUN, "          wget -qO- https://example.invalid/install.sh | sh\n"),
         (assert_installers_are_pinned, CI, ELAN_RUN, "          wget -q https://example.invalid/elan-init && chmod +x elan-init && ./elan-init -y\n"),
         (assert_installers_are_pinned, CI, ELAN_RUN, '          cat "$RUNNER_TEMP/elan.tar.gz" | python3\n'),
+        # A trigger filter that leaves a required check unreported.
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "  pull_request:\n", '  pull_request:\n    paths-ignore:\n      - "**.md"\n'),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "  pull_request:\n", '  pull_request:\n    paths:\n      - "**.rs"\n'),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "  pull_request:\n", "  pull_request:\n    branches: [main]\n"),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "  pull_request:\n", "  pull_request:\n    types: [opened]\n"),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "    branches: [main]\n", "    branches: [main]\n    paths-ignore:\n      - docs/**\n"),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "    branches: [main]\n", '    branches: [main]\n    paths:\n      - "**.rs"\n'),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "    branches: [main]\n", "    branches-ignore: [main]\n"),
+        (assert_ci_runs_on_every_push_and_pull_request, CI, "    branches: [main]\n", "    branches: [release]\n"),
         (assert_installers_are_pinned, RELEASE, "cargo install cargo-cyclonedx --locked --version 0.5.10", "cargo install cargo-cyclonedx --locked"),
         (assert_installers_are_pinned, RELEASE, "cargo install cargo-cyclonedx --locked --version 0.5.10", "cargo install cargo-cyclonedx --version 0.5.10"),
         (assert_installers_are_pinned, AUDIT, " --locked --version 0.23.0", " --locked --version 0.23"),
