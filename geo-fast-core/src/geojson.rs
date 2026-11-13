@@ -89,14 +89,29 @@ const MAX_NESTING_DEPTH: usize = 32;
 /// or `Feature`, and [`GeoError::UnsupportedFormat`] for a geometry type this
 /// crate does not read.
 pub fn parse_geojson_str(s: &str) -> Result<Vec<GeoFeature>, GeoError> {
-    if exceeds_nesting_depth(s, MAX_NESTING_DEPTH) {
+    check_nesting_depth(s.as_bytes())?;
+    let v: Value = serde_json::from_str(s)
+        .map_err(|e| GeoError::InvalidFormat(format!("JSON parse error: {e}")))?;
+    geojson_to_features(&v)
+}
+
+/// Refuses a JSON document that nests deeper than [`MAX_NESTING_DEPTH`].
+///
+/// Run on the text before `serde_json` is given it, by
+/// [`parse_geojson_str`] and by the WFS client, which reads its response as
+/// bytes.
+///
+/// # Errors
+///
+/// Returns [`GeoError::InvalidFormat`] when arrays and objects in `json`
+/// nest deeper than [`MAX_NESTING_DEPTH`] levels.
+pub(crate) fn check_nesting_depth(json: &[u8]) -> Result<(), GeoError> {
+    if exceeds_nesting_depth(json, MAX_NESTING_DEPTH) {
         return Err(GeoError::InvalidFormat(format!(
             "GeoJSON nests arrays and objects deeper than {MAX_NESTING_DEPTH} levels"
         )));
     }
-    let v: Value = serde_json::from_str(s)
-        .map_err(|e| GeoError::InvalidFormat(format!("JSON parse error: {e}")))?;
-    geojson_to_features(&v)
+    Ok(())
 }
 
 /// Returns whether arrays and objects in `json` nest deeper than `limit`.
@@ -105,12 +120,12 @@ pub fn parse_geojson_str(s: &str) -> Result<Vec<GeoFeature>, GeoError> {
 /// tracks string literals so brackets inside them are not counted, and counts
 /// opening brackets everywhere else. Up to the first syntax error a JSON
 /// parser is never nested deeper than this count, which is all the limit
-/// needs.
-fn exceeds_nesting_depth(json: &str, limit: usize) -> bool {
+/// needs. Only ASCII bytes are looked at, so it reads UTF-8 as bytes.
+fn exceeds_nesting_depth(json: &[u8], limit: usize) -> bool {
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    for byte in json.bytes() {
+    for &byte in json {
         if in_string {
             if escaped {
                 escaped = false;
