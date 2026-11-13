@@ -365,13 +365,11 @@ fn parse_html_inner(
     supplied_base_url: Option<&str>,
     options: &ParseOptions,
 ) -> Result<WebDocument, WebParseError> {
-    // The tree builder is quadratic in nesting depth, so deep input is
-    // refused before it is handed over; the built tree is then checked
-    // exactly, because the lexical scan only estimates the depth.
-    if nesting::lexical_depth_exceeds(html.as_bytes(), MAX_NESTING_DEPTH) {
-        return Err(WebParseError::NestingLimitExceeded);
-    }
-    let document = Html::parse_document(html);
+    // The tree builder is quadratic in nesting depth, so the limit is
+    // enforced while the tree is built; the finished tree is checked again
+    // because the tree builder may also move nodes after appending them.
+    let document = nesting::parse_document_within(html, MAX_NESTING_DEPTH)
+        .ok_or(WebParseError::NestingLimitExceeded)?;
     check_tree_depth(&document)?;
     let mut budget = Budget::new(options.max_nodes, options.max_text_bytes);
 

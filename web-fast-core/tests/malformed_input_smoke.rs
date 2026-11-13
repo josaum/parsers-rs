@@ -314,6 +314,41 @@ fn nesting_beyond_the_limit_is_an_error_not_truncation() {
     }
 }
 
+/// The nesting limit is enforced on the tree as it is built, so it follows
+/// the HTML parsing rules exactly: markup that only looks deep is accepted,
+/// and markup that only looks shallow is refused before the cost grows.
+#[test]
+fn the_nesting_limit_follows_the_real_tree() {
+    let divs = "<div>".repeat(600);
+    for shallow in [
+        "<image>".repeat(600),
+        format!("<title/>{divs}"),
+        format!("<script src=x/>{divs}"),
+        format!("<svg><![CDATA[ > {divs} ]]></svg><p>x"),
+        "<table><tr><td><tbody>".repeat(200),
+    ] {
+        let result = parse_text(&shallow);
+        assert!(result.is_ok(), "refused: {}", &shallow[..40]);
+    }
+    let many = "<div>".repeat(100_000);
+    for deep in [
+        "<div/>".repeat(100_000),
+        format!("<!-- c --!>{many}"),
+        format!("<svg><title>{many}"),
+        format!("<p><b><i>{many}"),
+    ] {
+        assert!(
+            matches!(parse_text(&deep), Err(WebParseError::NestingLimitExceeded)),
+            "accepted: {}",
+            &deep[..40]
+        );
+    }
+    // Whatever the tree builder makes of these, it must be bounded.
+    let _ = parse_text(&format!("<select>{many}"));
+    let _ = parse_text(&format!("<template>{many}"));
+    let _ = parse_text(&"<a><table>".repeat(50_000));
+}
+
 /// Long documents that are not deeply nested must not trip the nesting limit:
 /// implied end tags, void elements, self-closing SVG shapes, and markup that
 /// only appears inside a script, a comment or an attribute value.
