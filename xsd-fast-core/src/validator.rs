@@ -15,7 +15,7 @@ use quick_xml::events::{BytesRef, BytesStart, BytesText, Event};
 use quick_xml::{Reader, XmlVersion};
 use serde::{Deserialize, Serialize};
 
-use crate::parser::SchemaSet;
+use crate::parser::{not_utf8, SchemaSet};
 use crate::schema::{
     ComplexType, ContentModel, ElementRef, Particle, SchemaModel, SimpleTypeDef, XsdType,
 };
@@ -120,6 +120,7 @@ impl SchemaSet {
             outside_text_reported: false,
             namespaces: Vec::new(),
             unclaimed: Vec::new(),
+            repaired: false,
         };
         ctx.validate_document(xml)?;
         Ok(ctx.errors)
@@ -173,6 +174,10 @@ struct ValidationContext<'m> {
     outside_text_reported: bool,
     /// Prefix declarations of the open elements, innermost last.
     namespaces: Vec<PrefixBinding>,
+    /// Whether the document had bytes that are not UTF-8 and is read with
+    /// U+FFFD in their place. A name, text or value holding U+FFFD is then
+    /// treated as not UTF-8, as it was when the reader handed over raw bytes.
+    repaired: bool,
     /// Children of the element being checked that no named particle of its
     /// type claims, by namespace, for its wildcards.
     unclaimed: Vec<(Option<String>, usize)>,
@@ -219,7 +224,9 @@ struct ContentIndex<'m> {
 
 impl<'m> ValidationContext<'m> {
     fn validate_document(&mut self, xml: &[u8]) -> Result<()> {
-        let mut reader = Reader::from_reader(xml);
+        let xml = String::from_utf8_lossy(xml);
+        self.repaired = matches!(xml, std::borrow::Cow::Owned(_));
+        let mut reader = Reader::from_reader(xml.as_bytes());
         // Text is not trimmed as it is read. An element's value can arrive in
         // several pieces (text, a CDATA section, more text), and trimming each
         // piece would delete the spaces between them. The whole value is
@@ -238,8 +245,7 @@ impl<'m> ValidationContext<'m> {
                 Ok(Event::Start(ref e)) => {
                     let local = {
                         let name_bytes = e.name();
-                        let raw = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("?");
-                        strip_prefix(raw).to_owned()
+                        strip_prefix(self.name_text(name_bytes.as_ref())).to_owned()
                     };
                     self.path.push(local.clone());
                     self.count_root();
@@ -249,7 +255,7 @@ impl<'m> ValidationContext<'m> {
 
                     let xsd_type = self.resolve_child_type(&local);
                     let nil = says_nil(e, &self.namespaces) && self.child_is_nillable(&local);
-                    let namespace = self.element_namespace(e.name().as_ref());
+                    let namespace = self.element_namespace(e.name().as_ref().as_bytes());
 
                     if let Some(parent) = self.type_stack.last_mut() {
                         *parent
@@ -270,8 +276,7 @@ impl<'m> ValidationContext<'m> {
                 Ok(Event::Empty(ref e)) => {
                     let local = {
                         let name_bytes = e.name();
-                        let raw = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("?");
-                        strip_prefix(raw).to_owned()
+                        strip_prefix(self.name_text(name_bytes.as_ref())).to_owned()
                     };
                     self.path.push(local.clone());
                     self.count_root();
@@ -281,7 +286,7 @@ impl<'m> ValidationContext<'m> {
 
                     let xsd_type = self.resolve_child_type(&local);
                     let nil = says_nil(e, &self.namespaces) && self.child_is_nillable(&local);
-                    let namespace = self.element_namespace(e.name().as_ref());
+                    let namespace = self.element_namespace(e.name().as_ref().as_bytes());
                     self.close_namespaces();
 
                     if let Some(parent) = self.type_stack.last_mut() {
@@ -315,9 +320,10 @@ impl<'m> ValidationContext<'m> {
                 Ok(Event::Text(ref t)) => {
                     self.check_text_references(t);
                     self.check_outside_text(t);
-                    if let Ok(text) = t.decode() {
+                    let text: &str = t;
+                    if !not_utf8(self.repaired, text) {
                         if let Some(frame) = self.type_stack.last_mut() {
-                            frame.text.push_str(&text);
+                            frame.text.push_str(text);
                         }
                     }
                 }
@@ -332,8 +338,9 @@ impl<'m> ValidationContext<'m> {
                     }
                 }
                 Ok(Event::DocType(ref doctype)) => {
-                    if let Ok(text) = doctype.decode() {
-                        self.entities = internal_entities(&text);
+                    let text: &str = doctype;
+                    if !not_utf8(self.repaired, text) {
+                        self.entities = internal_entities(text);
                     }
                 }
                 // A CDATA section is element text written literally: it is
@@ -341,7 +348,7 @@ impl<'m> ValidationContext<'m> {
                 Ok(Event::CData(ref data)) => {
                     self.report_outside_text();
                     if let Some(frame) = self.type_stack.last_mut() {
-                        frame.text.push_str(&String::from_utf8_lossy(data));
+                        frame.text.push_str(data);
                     }
                 }
                 Ok(Event::End(_)) => {
@@ -383,6 +390,15 @@ impl<'m> ValidationContext<'m> {
         Ok(())
     }
 
+    /// An element name as written; `?` when the name is not UTF-8.
+    fn name_text<'n>(&self, raw: &'n str) -> &'n str {
+        if not_utf8(self.repaired, raw) {
+            "?"
+        } else {
+            raw
+        }
+    }
+
     /// Records the prefixes the element just opened declares.
     ///
     /// Called with the element already on the path. Only `xmlns:prefix`
@@ -391,20 +407,21 @@ impl<'m> ValidationContext<'m> {
     fn open_namespaces(&mut self, start: &BytesStart<'_>) {
         let depth = self.path.len();
         for attribute in start.attributes().with_checks(false).flatten() {
-            if let Some(prefix) = attribute.key.as_ref().strip_prefix(b"xmlns:") {
+            let key = attribute.key.as_ref().as_bytes();
+            if let Some(prefix) = key.strip_prefix(b"xmlns:") {
                 self.namespaces.push(PrefixBinding {
                     depth,
                     prefix: prefix.to_vec(),
-                    uri: attribute.value.to_vec(),
-                    is_instance: attribute.value.as_ref() == XSI_NAMESPACE,
+                    uri: attribute.value.as_bytes().to_vec(),
+                    is_instance: attribute.value.as_bytes() == XSI_NAMESPACE,
                 });
-            } else if attribute.key.as_ref() == b"xmlns" {
+            } else if key == b"xmlns" {
                 // The default namespace, which unprefixed element names
                 // take; never the instance namespace's prefix.
                 self.namespaces.push(PrefixBinding {
                     depth,
                     prefix: Vec::new(),
-                    uri: attribute.value.to_vec(),
+                    uri: attribute.value.as_bytes().to_vec(),
                     is_instance: false,
                 });
             }
@@ -450,15 +467,15 @@ impl<'m> ValidationContext<'m> {
             match reader.read_event_into(buf) {
                 Ok(Event::Start(ref e)) => {
                     let name_bytes = e.name();
-                    let raw = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("?");
-                    self.path.push(strip_prefix(raw).to_owned());
+                    let local = strip_prefix(self.name_text(name_bytes.as_ref())).to_owned();
+                    self.path.push(local);
                     self.count_root();
                     self.check_attribute_references(e);
                 }
                 Ok(Event::Empty(ref e)) => {
                     let name_bytes = e.name();
-                    let raw = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("?");
-                    self.path.push(strip_prefix(raw).to_owned());
+                    let local = strip_prefix(self.name_text(name_bytes.as_ref())).to_owned();
+                    self.path.push(local);
                     self.count_root();
                     self.check_attribute_references(e);
                     self.path.pop();
@@ -497,7 +514,7 @@ impl<'m> ValidationContext<'m> {
     /// References arrive as events of their own, so an `&` still inside a
     /// text event is one that starts no reference.
     fn check_text_references(&mut self, text: &BytesText<'_>) {
-        if !self.reference_reported && text.contains(&b'&') {
+        if !self.reference_reported && text.contains('&') {
             self.report_reference("&");
         }
     }
@@ -513,20 +530,23 @@ impl<'m> ValidationContext<'m> {
             return;
         }
         let entities = &self.entities;
+        let repaired = self.repaired;
         let ill_formed = start
             .attributes()
             .with_checks(false)
             .flatten()
-            .filter(|attribute| attribute.value.contains(&b'&'))
+            .filter(|attribute| attribute.value.contains('&'))
             .any(|attribute| {
                 // Declared replacement text holds no reference, so one level
-                // of expansion is all there is.
-                attribute
-                    .normalized_value_with(XmlVersion::Implicit1_0, 1, |name| {
-                        resolve_predefined_entity(name)
-                            .or_else(|| entities.get(name).map(String::as_str))
-                    })
-                    .is_err()
+                // of expansion is all there is. A value that is not UTF-8
+                // cannot be read, as before.
+                not_utf8(repaired, &attribute.value)
+                    || attribute
+                        .normalized_value_with(XmlVersion::Implicit1_0, 1, |name| {
+                            resolve_predefined_entity(name)
+                                .or_else(|| entities.get(name).map(String::as_str))
+                        })
+                        .is_err()
             });
         if ill_formed {
             self.report_reference("an attribute value");
@@ -593,6 +613,7 @@ impl<'m> ValidationContext<'m> {
     /// Reports text outside the root element, unless it is only white space.
     fn check_outside_text(&mut self, text: &BytesText<'_>) {
         let blank = text
+            .as_bytes()
             .iter()
             .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'));
         if !blank {
@@ -1161,10 +1182,10 @@ fn says_nil(start: &BytesStart<'_>, namespaces: &[PrefixBinding]) -> bool {
         .with_checks(false)
         .flatten()
         .any(|attribute| {
-            let Some(prefix) = attribute.key.as_ref().strip_suffix(b":nil") else {
+            let Some(prefix) = attribute.key.as_ref().as_bytes().strip_suffix(b":nil") else {
                 return false;
             };
-            matches!(attribute.value.as_ref().trim_ascii(), b"true" | b"1")
+            matches!(attribute.value.as_bytes().trim_ascii(), b"true" | b"1")
                 && namespaces
                     .iter()
                     .rev()
@@ -1258,19 +1279,18 @@ fn push_reference(
             return true;
         }
         Ok(None) => {
-            if let Ok(name) = reference.decode() {
-                let resolved = resolve_predefined_entity(&name)
-                    .or_else(|| declared.get(name.as_ref()).map(String::as_str));
-                if let Some(resolved) = resolved {
-                    text.push_str(resolved);
-                    return true;
-                }
+            let name: &str = reference;
+            let resolved =
+                resolve_predefined_entity(name).or_else(|| declared.get(name).map(String::as_str));
+            if let Some(resolved) = resolved {
+                text.push_str(resolved);
+                return true;
             }
         }
         Err(_) => {}
     }
     text.push('&');
-    text.push_str(&String::from_utf8_lossy(reference));
+    text.push_str(reference);
     text.push(';');
     false
 }

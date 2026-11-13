@@ -22,7 +22,7 @@ arrow-array = { workspace = true, optional = true }
 arrow-ipc = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
 memmap2 = "0.9"
-quick-xml = "0.41"
+quick-xml = "0.42"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 indexmap = { version = "2.2", features = ["serde"] }

@@ -8,7 +8,6 @@
 use anyhow::{anyhow, Context, Result};
 use flate2::read::DeflateDecoder;
 use memmap2::Mmap;
-use quick_xml::encoding::Decoder;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
@@ -22,6 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 mod properties;
+pub mod utf8;
 
 pub use properties::parse_simple_props;
 
@@ -378,13 +378,15 @@ pub struct RelEntry {
 
 /// Parse a `.rels` XML part into Id/Type maps and an entry list.
 pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
-    let mut reader = xml_reader(Cursor::new(xml));
+    let xml = utf8::lossy_utf8(xml);
+    let repaired = matches!(xml, Cow::Owned(_));
+    let mut reader = xml_reader(Cursor::new(xml.as_ref()));
     let mut buf = Vec::new();
     let mut rels = Relationships::default();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if local_name(e.name().as_ref()) != b"Relationship" {
+                if local_name(e.name().as_ref().as_bytes()) != b"Relationship" {
                     buf.clear();
                     continue;
                 }
@@ -392,13 +394,13 @@ pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
                 let mut rel_type = None;
                 let mut target = None;
                 for attr in e.attributes().with_checks(false).flatten() {
-                    let key = local_name(attr.key.as_ref());
+                    let key = local_name(attr.key.as_ref().as_bytes());
                     if key == b"Id" {
-                        id = Some(attr_text(&attr, reader.decoder())?.to_string());
+                        id = Some(attr_text(&attr, repaired)?.to_string());
                     } else if key == b"Type" {
-                        rel_type = Some(attr_text(&attr, reader.decoder())?.to_string());
+                        rel_type = Some(attr_text(&attr, repaired)?.to_string());
                     } else if key == b"Target" {
-                        target = Some(attr_text(&attr, reader.decoder())?.to_string());
+                        target = Some(attr_text(&attr, repaired)?.to_string());
                     }
                 }
                 if let (Some(id), Some(rel_type), Some(target)) = (id, rel_type, target) {
@@ -544,8 +546,16 @@ fn xml_reader<R: BufRead>(input: R) -> Reader<R> {
 /// The value is normalized as XML 1.0 requires: a literal tab, line feed or
 /// carriage return becomes a space, while one written as a character
 /// reference (`&#9;`) is kept.
-fn attr_text<'a>(attr: &Attribute<'a>, decoder: Decoder) -> Result<Cow<'a, str>> {
-    Ok(attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)?)
+///
+/// `repaired` says the part had bytes that are not UTF-8 and was read with
+/// U+FFFD in their place. A value holding one is then an error, as a value
+/// that is not UTF-8 always was.
+fn attr_text<'a>(attr: &Attribute<'a>, repaired: bool) -> Result<Cow<'a, str>> {
+    let value = attr.normalized_value(XmlVersion::Implicit1_0)?;
+    if repaired && value.contains(char::REPLACEMENT_CHARACTER) {
+        return Err(anyhow!("attribute value is not UTF-8"));
+    }
+    Ok(value)
 }
 
 fn local_name(name: &[u8]) -> &[u8] {

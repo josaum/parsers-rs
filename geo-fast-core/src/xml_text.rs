@@ -36,17 +36,38 @@ pub(crate) struct TextRun {
     started: bool,
     /// Whether a piece was not valid in the document's encoding.
     undecodable: bool,
+    /// Whether the document had bytes that are not UTF-8 and is read with
+    /// U+FFFD in their place. Kept from one run to the next.
+    repaired: bool,
 }
 
 impl TextRun {
+    /// A run over a document that was read with U+FFFD in place of bytes
+    /// that are not UTF-8 when `repaired` is true.
+    ///
+    /// A piece holding U+FFFD is then undecodable, as a piece that was not
+    /// UTF-8 always was.
+    pub(crate) fn new(repaired: bool) -> Self {
+        Self {
+            repaired,
+            ..Self::default()
+        }
+    }
+
+    /// Whether `piece` stood for bytes that are not UTF-8.
+    fn is_undecodable(&self, piece: &str) -> bool {
+        self.repaired && piece.contains(char::REPLACEMENT_CHARACTER)
+    }
+
     /// Appends a piece of literal text.
     pub(crate) fn push_text(&mut self, piece: &BytesText<'_>) {
-        let Ok(decoded) = piece.decode() else {
+        let decoded: &str = piece;
+        if self.is_undecodable(decoded) {
             self.started = true;
             self.undecodable = true;
             return;
-        };
-        let mut piece: &str = &decoded;
+        }
+        let mut piece: &str = decoded;
         if !self.started {
             piece = piece.trim_start_matches(is_xml_whitespace);
             if piece.is_empty() {
@@ -67,34 +88,36 @@ impl TextRun {
     ///
     /// An empty section adds nothing.
     pub(crate) fn push_cdata(&mut self, section: &BytesCData<'_>) {
-        let Ok(content) = section.decode() else {
+        let content: &str = section;
+        if self.is_undecodable(content) {
             self.started = true;
             self.undecodable = true;
             return;
-        };
+        }
         if content.is_empty() {
             return;
         }
         self.started = true;
         self.trailing_whitespace = 0;
-        self.text.push_str(&content);
+        self.text.push_str(content);
     }
 
     /// Appends what an entity or character reference stands for.
     pub(crate) fn push_reference(&mut self, reference: &BytesRef<'_>) {
         self.started = true;
-        let Ok(name) = reference.decode() else {
+        let name: &str = reference;
+        if self.is_undecodable(name) {
             self.undecodable = true;
             return;
-        };
+        }
         self.trailing_whitespace = 0;
         if let Ok(Some(character)) = reference.resolve_char_ref() {
             self.text.push(character);
-        } else if let Some(replacement) = resolve_predefined_entity(&name) {
+        } else if let Some(replacement) = resolve_predefined_entity(name) {
             self.text.push_str(replacement);
         } else {
             self.text.push('&');
-            self.text.push_str(&name);
+            self.text.push_str(name);
             self.text.push(';');
         }
     }
@@ -106,6 +129,7 @@ impl TextRun {
     /// unknown, but the element did have one.
     pub(crate) fn take(&mut self) -> Option<String> {
         let run = std::mem::take(self);
+        self.repaired = run.repaired;
         if !run.started {
             return None;
         }

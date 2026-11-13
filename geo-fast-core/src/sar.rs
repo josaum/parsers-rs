@@ -5,6 +5,8 @@
 //!
 //! Extracts: metadata, bounding box, polarization, GCP grid.
 
+use std::borrow::Cow;
+
 use crate::error::GeoError;
 use crate::types::{BBox, Coordinate};
 use crate::xml_text::TextRun;
@@ -114,10 +116,13 @@ impl SarParser {
         use quick_xml::events::Event;
         use quick_xml::Reader;
 
-        let mut reader = Reader::from_reader(xml_bytes);
+        // Bytes that are not UTF-8 read as U+FFFD; see `TextRun::new`.
+        let xml = String::from_utf8_lossy(xml_bytes);
+        let repaired = matches!(xml, Cow::Owned(_));
+        let mut reader = Reader::from_reader(xml.as_bytes());
         configure(&mut reader);
         let mut buf = Vec::with_capacity(4096);
-        let mut run = TextRun::default();
+        let mut run = TextRun::new(repaired);
 
         let mut sensor = String::new();
         let mut acquisition_date = String::new();
@@ -240,7 +245,7 @@ impl SarParser {
 
             match &event {
                 Event::Start(e) => {
-                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let tag_name = e.name().as_ref().to_string();
                     match tag_name.as_str() {
                         "safe:platform" | "platform" => in_platform = true,
                         "safe:instrument" | "instrument" if in_platform => in_instrument = true,
@@ -249,10 +254,14 @@ impl SarParser {
                                 .attributes()
                                 .with_checks(false)
                                 .flatten()
-                                .find(|attr| attr.key.local_name().as_ref() == b"abbreviation")
+                                .find(|attr| attr.key.local_name().as_ref() == "abbreviation")
                                 .and_then(|attr| {
                                     attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                         .ok()
+                                })
+                                // A value that was not UTF-8 is unreadable.
+                                .filter(|value| {
+                                    !(repaired && value.contains(char::REPLACEMENT_CHARACTER))
                                 })
                                 .map(|value| value.trim().to_string())
                                 .filter(|value| !value.is_empty());
@@ -266,7 +275,7 @@ impl SarParser {
                     current_tag = tag_name;
                 }
                 Event::End(e) => {
-                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let tag_name = e.name().as_ref().to_string();
                     match tag_name.as_str() {
                         "safe:platform" | "platform" => {
                             in_platform = false;
@@ -428,10 +437,12 @@ impl SarParser {
         use quick_xml::events::Event;
         use quick_xml::Reader;
 
-        let mut reader = Reader::from_reader(annotation_xml);
+        // Bytes that are not UTF-8 read as U+FFFD; see `TextRun::new`.
+        let xml = String::from_utf8_lossy(annotation_xml);
+        let mut reader = Reader::from_reader(xml.as_bytes());
         configure(&mut reader);
         let mut buf = Vec::with_capacity(2048);
-        let mut run = TextRun::default();
+        let mut run = TextRun::new(matches!(xml, Cow::Owned(_)));
 
         let mut gcps: Vec<GroundControlPoint> = Vec::new();
 
@@ -485,7 +496,7 @@ impl SarParser {
 
             match &event {
                 Event::Start(e) => {
-                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let tag = e.name().as_ref().to_string();
                     if tag == "geolocationGridPoint" {
                         in_gcp = true;
                         gcp_line = 0.0;
@@ -497,7 +508,7 @@ impl SarParser {
                     current_tag = tag;
                 }
                 Event::End(e) => {
-                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let tag = e.name().as_ref().to_string();
                     if tag == "geolocationGridPoint" && in_gcp {
                         gcps.push(GroundControlPoint {
                             geo: Coordinate::new(gcp_lon, gcp_lat),

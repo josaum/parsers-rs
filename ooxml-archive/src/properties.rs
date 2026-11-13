@@ -51,7 +51,8 @@ use crate::{local_name, xml_reader};
 /// Returns an error when `xml` is not well-formed enough to read, for
 /// example when an end tag does not match its start tag.
 pub fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let mut reader = xml_reader(Cursor::new(xml));
+    let xml = crate::utf8::lossy_utf8(xml);
+    let mut reader = xml_reader(Cursor::new(xml.as_ref()));
     let mut buf = Vec::new();
     let mut out: HashMap<String, String> = HashMap::new();
     let mut current_key: Option<String> = None;
@@ -92,7 +93,7 @@ pub fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                 }
                 match event {
                     Event::Start(e) => {
-                        let raw = e.name().as_ref().to_vec();
+                        let raw = e.name().as_ref().as_bytes().to_vec();
                         let name = local_name(&raw);
                         if depth == 1 {
                             property = Some(String::from_utf8_lossy(name).to_string());
@@ -107,7 +108,7 @@ pub fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                     Event::Empty(e) => {
                         // A self-closing element inside a property is an
                         // item with no text.
-                        let raw = e.name().as_ref().to_vec();
+                        let raw = e.name().as_ref().as_bytes().to_vec();
                         if depth > 1 && !is_property_container(local_name(&raw)) {
                             if let Some(key) = property.clone() {
                                 push_nested_item(&mut out, key, "");
@@ -223,8 +224,8 @@ fn normalize_datetime(value: &str) -> String {
 /// reference is resolved like [`reference_string`].
 fn character_data(event: &Event<'_>) -> Option<String> {
     match event {
-        Event::Text(text) => Some(String::from_utf8_lossy(text).into_owned()),
-        Event::CData(data) => Some(String::from_utf8_lossy(data).into_owned()),
+        Event::Text(text) => Some(text.to_string()),
+        Event::CData(data) => Some(data.to_string()),
         Event::GeneralRef(reference) => Some(reference_string(reference)),
         _ => None,
     }
@@ -237,10 +238,10 @@ fn character_data(event: &Event<'_>) -> Option<String> {
 /// or a character reference that names no character, is kept as written
 /// (`&name;`) rather than dropped.
 fn reference_string(reference: &BytesRef<'_>) -> String {
-    let name = String::from_utf8_lossy(reference);
+    let name: &str = reference;
     match reference.resolve_char_ref() {
         Ok(Some(ch)) => ch.to_string(),
-        Ok(None) => match quick_xml::escape::resolve_xml_entity(&name) {
+        Ok(None) => match quick_xml::escape::resolve_xml_entity(name) {
             Some(text) => text.to_string(),
             None => format!("&{name};"),
         },
