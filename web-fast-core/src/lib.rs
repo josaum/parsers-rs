@@ -13,6 +13,7 @@ use encoding_rs::{Encoding, UTF_8};
 use scraper::{node::Node, ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -89,7 +90,8 @@ pub struct ParseOptions {
     pub max_input_bytes: usize,
     /// Maximum number of emitted blocks, links, images, tables, and JSON-LD values.
     pub max_nodes: usize,
-    /// Maximum UTF-8 byte size of all emitted text combined.
+    /// Maximum UTF-8 byte size of all emitted text combined, including the
+    /// `dom_path` of every block, link, image and table.
     pub max_text_bytes: usize,
     /// Optional WHATWG encoding label. UTF-8 is required when absent.
     pub encoding_label: Option<String>,
@@ -373,6 +375,50 @@ fn parse_html_inner(
     check_tree_depth(&document)?;
     let mut budget = Budget::new(options.max_nodes, options.max_text_bytes);
 
+    // Position of every element among its same-named siblings, computed in
+    // one pass with a running counter per parent. Counting the previous
+    // siblings of each element on demand cost n(n-1)/2 sibling visits for n
+    // siblings: 4.5 million for 3,000 paragraphs in one body.
+    let mut positions = HashMap::new();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for parent in document.tree.root().descendants() {
+        if !parent.has_children() {
+            continue;
+        }
+        counts.clear();
+        for child in parent.children().filter_map(ElementRef::wrap) {
+            let count = counts.entry(child.value().name()).or_insert(0);
+            *count += 1;
+            positions.insert(child.id(), *count);
+        }
+    }
+    // `dom_path` is emitted text as long as the element is deep, so it is
+    // charged to the text budget like any other emitted text.
+    let structural_path =
+        |element: ElementRef<'_>, budget: &mut Budget| -> Result<String, WebParseError> {
+            let mut parts = std::iter::once(element)
+                .chain(element.ancestors().filter_map(ElementRef::wrap))
+                .map(|ancestor| {
+                    let position = positions.get(&ancestor.id()).copied().unwrap_or(1);
+                    (ancestor.value().name(), position)
+                })
+                .collect::<Vec<_>>();
+            parts.reverse();
+            let mut path = String::new();
+            for (name, position) in parts {
+                path.push('/');
+                path.push_str(name);
+                path.push('[');
+                path.push_str(&position.to_string());
+                path.push(']');
+            }
+            if path.is_empty() {
+                path.push('/');
+            }
+            budget.add_text(&path)?;
+            Ok(path)
+        };
+
     let supplied_base = supplied_base_url.and_then(|value| Url::parse(value).ok());
     let base_selector = selector("base[href]")?;
     let declared_base = document
@@ -408,7 +454,7 @@ fn parse_html_inner(
         blocks.push(WebBlock {
             ordinal: ordinal(blocks.len())?,
             kind,
-            dom_path: structural_path(element),
+            dom_path: structural_path(element, &mut budget)?,
             text,
             heading_level: tag
                 .strip_prefix('h')
@@ -431,7 +477,7 @@ fn parse_html_inner(
         budget.add_text(&text)?;
         links.push(WebLink {
             ordinal: ordinal(links.len())?,
-            dom_path: structural_path(element),
+            dom_path: structural_path(element, &mut budget)?,
             text,
             href: href.to_owned(),
             resolved_url: resolve_url(effective_base.as_ref(), Some(href)),
@@ -451,7 +497,7 @@ fn parse_html_inner(
         budget.add_node()?;
         images.push(WebImage {
             ordinal: ordinal(images.len())?,
-            dom_path: structural_path(element),
+            dom_path: structural_path(element, &mut budget)?,
             src: src.to_owned(),
             resolved_url: resolve_url(effective_base.as_ref(), Some(src)),
             alt: element.value().attr("alt").map(str::to_owned),
@@ -476,7 +522,7 @@ fn parse_html_inner(
         let rows = table_rows(&parts.rows, &mut budget, &mut ignored_spans)?;
         tables.push(WebTable {
             ordinal: ordinal(tables.len())?,
-            dom_path: structural_path(table),
+            dom_path: structural_path(table, &mut budget)?,
             caption,
             rows,
         });
@@ -791,24 +837,6 @@ fn is_hidden_element(element: ElementRef<'_>) -> bool {
             element.value().name(),
             "script" | "style" | "noscript" | "template" | "svg" | "canvas"
         )
-}
-
-fn structural_path(element: ElementRef<'_>) -> String {
-    let mut parts = std::iter::once(element)
-        .chain(element.ancestors().filter_map(ElementRef::wrap))
-        .map(|ancestor| {
-            let name = ancestor.value().name();
-            let position = ancestor
-                .prev_siblings()
-                .filter_map(ElementRef::wrap)
-                .filter(|sibling| sibling.value().name() == name)
-                .count()
-                + 1;
-            format!("{name}[{position}]")
-        })
-        .collect::<Vec<_>>();
-    parts.reverse();
-    format!("/{}", parts.join("/"))
 }
 
 fn resolve_url(base: Option<&Url>, raw: Option<&str>) -> Option<String> {

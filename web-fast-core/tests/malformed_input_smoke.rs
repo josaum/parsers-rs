@@ -200,6 +200,28 @@ fn span_created_cells_are_capped_as_an_error() {
     assert_eq!(document.tables[0].rows[0].len(), 1_000_000);
 }
 
+/// `dom_path` grows with depth and is stored per block, so it counts toward
+/// the text budget: 2,000 blocks at depth 500 carry about 6 KiB of path each.
+#[test]
+fn dom_paths_are_charged_to_the_text_budget() {
+    let html = "<div>".repeat(500) + &"<p>x".repeat(2_000);
+    let options = ParseOptions {
+        max_text_bytes: 1 << 20,
+        ..ParseOptions::default()
+    };
+    assert!(matches!(
+        parse_html(&html, None, options),
+        Err(WebParseError::TextLimitExceeded)
+    ));
+    let document = parse_html(&html, None, ParseOptions::default()).expect("default budget");
+    let last = document.blocks.last().expect("blocks");
+    assert!(
+        last.dom_path.ends_with("/div[1]/p[2000]"),
+        "{}",
+        last.dom_path
+    );
+}
+
 #[test]
 fn deeply_nested_divs_are_bounded_on_a_small_stack() {
     for (open, close) in [
