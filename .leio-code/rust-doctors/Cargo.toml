@@ -2,6 +2,9 @@
 name = "parsers-doctors"
 version = "0.1.0"
 edition = "2024"
+# The repository's licence. cargo-deny checks this package against deny.toml
+# like the workspace, and refuses a package with no licence at all.
+license = "MIT OR Apache-2.0"
 publish = false
 [workspace]
 [dependencies]
