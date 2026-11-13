@@ -43,5 +43,21 @@ jobs:
         # A vulnerability fails the scan by default; `--deny unsound` makes an
         # unsoundness advisory, which is otherwise only a warning, fail it too.
         run: cargo audit --deny unsound
-      - name: The same for the repository doctors' own lockfile
+
+  cargo-audit-doctors:
+    # A job of its own, not a later step of the one above: a step is skipped
+    # once an earlier step fails, so a finding in the workspace would hide
+    # whatever the doctors' lockfile holds.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.23.0
+      - name: Fail on a vulnerability or an unsoundness advisory in the doctors' lockfile
         run: cargo audit --deny unsound --file .leio-code/rust-doctors/Cargo.lock

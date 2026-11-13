@@ -397,18 +397,31 @@ def assert_audit_contract(audit: str) -> None:
     listed = {line.strip()[2:].strip('"') for line in paths["paths"].splitlines()}
     assert {"Cargo.lock", "Cargo.toml", "**/Cargo.toml", DOCTORS_LOCK} <= listed
     assert "workflow_call" not in triggers, "the audit must not be callable from a release"
-    assert re.search(
-        r"^ +run: cargo install cargo-audit --locked --version [0-9]+\.[0-9]+\.[0-9]+$",
-        body,
-        re.MULTILINE,
-    ), "cargo-audit must be installed at a pinned version"
-    scans = re.findall(r"^ +run: (cargo audit\b.*)$", body, re.MULTILINE)
-    # Every lockfile in the repository: the workspace's, then the doctors'.
+    # One job per lockfile. As steps of one job the second scan would be
+    # skipped whenever the first one fails, and so would never report.
+    expected = {
+        "cargo-audit": "cargo audit --deny unsound",
+        "cargo-audit-doctors": f"cargo audit --deny unsound --file {DOCTORS_LOCK}",
+    }
     assert (ROOT / DOCTORS_LOCK).is_file()
-    assert scans == [
-        "cargo audit --deny unsound",
-        f"cargo audit --deny unsound --file {DOCTORS_LOCK}",
-    ], scans
+    blocks = jobs(audit)
+    assert set(blocks) == set(expected), "one audit job per lockfile, and nothing else"
+    versions = set()
+    for name, block in blocks.items():
+        install = re.findall(
+            r"^ +run: cargo install cargo-audit --locked --version ([0-9]+\.[0-9]+\.[0-9]+)$",
+            block,
+            re.MULTILINE,
+        )
+        assert len(install) == 1, f"{name}: cargo-audit must be installed at a pinned version"
+        versions.add(install[0])
+        scans = re.findall(r"^ +run: (cargo audit\b.*)$", block, re.MULTILINE)
+        assert scans == [expected[name]], f"{name}: {scans}"
+        # Each scan reports on its own: no job waits for, or is gated by, another.
+        assert job_value(block, "needs") is None, f"{name}: must not wait for another job"
+        assert job_value(block, "if") is None, f"{name}: can be skipped"
+        assert not re.search(r"^\s*(?:- )?if:", block, re.MULTILINE), f"{name}: a step can be skipped"
+    assert len(versions) == 1, "both scans must use the same cargo-audit"
     # No advisory is waved through, here or in cargo-audit's own configuration.
     assert "--ignore" not in body
     assert "continue-on-error" not in body
@@ -686,6 +699,11 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_audit_contract, AUDIT, "cargo audit --deny unsound", "cargo audit --deny unsound || true"),
         (assert_audit_contract, AUDIT, "        run: cargo audit --deny unsound", "        continue-on-error: true\n        run: cargo audit --deny unsound"),
         (assert_audit_contract, AUDIT, "        run: cargo audit --deny unsound --file .leio-code/rust-doctors/Cargo.lock\n", "        run: cargo audit --version\n"),
+        (assert_audit_contract, AUDIT, "\n  cargo-audit-doctors:\n", "\n"),
+        (assert_audit_contract, AUDIT, "  cargo-audit-doctors:\n", "  cargo-audit-doctors:\n    needs: cargo-audit\n"),
+        (assert_audit_contract, AUDIT, "  cargo-audit-doctors:\n", "  cargo-audit-doctors:\n    if: success()\n"),
+        (assert_audit_contract, AUDIT, "      - name: Fail on a vulnerability or an unsoundness advisory in the doctors' lockfile\n", "      - name: Fail on a vulnerability or an unsoundness advisory in the doctors' lockfile\n        if: github.event_name == 'schedule'\n"),
+        (assert_audit_contract, AUDIT, "    timeout-minutes: 20\n", "    timeout-minutes: 20\n    continue-on-error: true\n"),
         (assert_audit_contract, AUDIT, "cargo audit --deny unsound --file", "cargo audit --file"),
         (assert_audit_contract, AUDIT, "--file .leio-code/rust-doctors/Cargo.lock", "--file Cargo.lock"),
         (assert_audit_contract, AUDIT, "      - .leio-code/rust-doctors/Cargo.lock\n", ""),
