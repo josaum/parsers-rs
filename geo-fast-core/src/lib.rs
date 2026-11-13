@@ -60,6 +60,7 @@ pub mod sar;
 pub mod shapefile;
 pub mod thermal;
 pub mod types;
+mod xml_text;
 
 #[cfg(feature = "http")]
 pub mod wms;
@@ -78,7 +79,10 @@ pub use types::{BBox, Coordinate, GeoFeature, GeoPoint, Geometry};
 
 // Re-export parser functions for convenience
 pub use geojson::{features_to_geojson, geojson_to_features, parse_geojson_str};
-pub use geotiff::{parse_geotiff_bands, parse_geotiff_metadata, GeoTiffMetadata};
+pub use geotiff::{
+    parse_geotiff_bands, parse_geotiff_bands_with_limit, parse_geotiff_geokey_params,
+    parse_geotiff_metadata, GeoKeyParams, GeoTiffMetadata,
+};
 pub use shapefile::{parse_shapefile, parse_shapefile_bytes, ShapefileData};
 
 /// Prelude module for convenient imports.

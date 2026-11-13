@@ -383,13 +383,36 @@ impl HyperspectralParser {
     /// ```
     ///
     /// Output is in `[-1.0, 1.0]`.  Pixels where `NIR + Red == 0` are set to 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `nir_band` and `red_band` differ in length. A caller that
+    /// does not control both lengths uses [`Self::try_compute_ndvi`].
     pub fn compute_ndvi(nir_band: &[f32], red_band: &[f32]) -> Vec<f32> {
-        assert_eq!(
-            nir_band.len(),
-            red_band.len(),
-            "NIR and Red bands must have equal length"
-        );
-        nir_band
+        match Self::try_compute_ndvi(nir_band, red_band) {
+            Ok(ndvi) => ndvi,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// Compute NDVI from near-infrared and red bands of unchecked lengths.
+    ///
+    /// The same values as [`Self::compute_ndvi`], for bands that come from a
+    /// caller or a file and may not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeoError::Validation`] when `nir_band` and `red_band` differ
+    /// in length.
+    pub fn try_compute_ndvi(nir_band: &[f32], red_band: &[f32]) -> Result<Vec<f32>, GeoError> {
+        if nir_band.len() != red_band.len() {
+            return Err(GeoError::Validation(format!(
+                "NIR and Red bands must have equal length, got {} and {}",
+                nir_band.len(),
+                red_band.len()
+            )));
+        }
+        Ok(nir_band
             .iter()
             .zip(red_band.iter())
             .map(|(&nir, &red)| {
@@ -400,7 +423,7 @@ impl HyperspectralParser {
                     (nir - red) / sum
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// Compute the spectral angle (in radians) between a pixel spectrum and
@@ -411,12 +434,36 @@ impl HyperspectralParser {
     /// ```
     ///
     /// Smaller angle → more similar spectra.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `pixel_spectrum` and `reference` differ in length. A
+    /// caller that does not control both lengths uses
+    /// [`Self::try_spectral_angle`].
     pub fn spectral_angle(pixel_spectrum: &[f32], reference: &[f32]) -> f32 {
-        assert_eq!(
-            pixel_spectrum.len(),
-            reference.len(),
-            "Spectra must have equal length"
-        );
+        match Self::try_spectral_angle(pixel_spectrum, reference) {
+            Ok(angle) => angle,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// Compute the spectral angle between two spectra of unchecked lengths.
+    ///
+    /// The same value as [`Self::spectral_angle`], for spectra that come from
+    /// a caller or a file and may not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeoError::Validation`] when `pixel_spectrum` and `reference`
+    /// differ in length.
+    pub fn try_spectral_angle(pixel_spectrum: &[f32], reference: &[f32]) -> Result<f32, GeoError> {
+        if pixel_spectrum.len() != reference.len() {
+            return Err(GeoError::Validation(format!(
+                "Spectra must have equal length, got {} and {}",
+                pixel_spectrum.len(),
+                reference.len()
+            )));
+        }
         let dot: f64 = pixel_spectrum
             .iter()
             .zip(reference.iter())
@@ -435,10 +482,10 @@ impl HyperspectralParser {
 
         let denom = norm_a * norm_b;
         if denom < 1e-12 {
-            return std::f32::consts::FRAC_PI_2; // 90 degrees for zero vectors
+            return Ok(std::f32::consts::FRAC_PI_2); // 90 degrees for zero vectors
         }
         let cos_angle = (dot / denom).clamp(-1.0, 1.0);
-        cos_angle.acos() as f32
+        Ok(cos_angle.acos() as f32)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
@@ -787,6 +834,54 @@ mod tests {
         assert!((ndvi[1] - 0.2).abs() < 1e-6); // (0.6-0.4)/(0.6+0.4)
         assert!((ndvi[2] - 0.0).abs() < 1e-6); // zero / zero → 0
         assert!((ndvi[3] - 0.0).abs() < 1e-6); // equal → 0
+    }
+
+    /// Bands of different lengths used to be an `assert_eq!` and nothing
+    /// else: a caller holding two arrays it did not make had no way to ask.
+    #[test]
+    fn mismatched_band_lengths_are_an_error_from_the_try_forms() {
+        let error = HyperspectralParser::try_compute_ndvi(&[0.8, 0.6], &[0.2])
+            .expect_err("bands of 2 and 1 samples");
+        assert!(
+            matches!(&error, GeoError::Validation(message) if message.contains("2 and 1")),
+            "{error}"
+        );
+        let error = HyperspectralParser::try_spectral_angle(&[1.0], &[1.0, 0.0, 0.0])
+            .expect_err("spectra of 1 and 3 samples");
+        assert!(
+            matches!(&error, GeoError::Validation(message) if message.contains("1 and 3")),
+            "{error}"
+        );
+        // Empty inputs match each other.
+        assert_eq!(
+            HyperspectralParser::try_compute_ndvi(&[], &[]).expect("empty"),
+            Vec::<f32>::new()
+        );
+    }
+
+    #[test]
+    fn try_forms_agree_with_the_panicking_forms() {
+        let (nir, red) = ([0.8f32, 0.6, 0.0, 0.5], [0.2f32, 0.4, 0.0, 0.5]);
+        assert_eq!(
+            HyperspectralParser::try_compute_ndvi(&nir, &red).expect("ndvi"),
+            HyperspectralParser::compute_ndvi(&nir, &red)
+        );
+        assert_eq!(
+            HyperspectralParser::try_spectral_angle(&nir, &red).expect("angle"),
+            HyperspectralParser::spectral_angle(&nir, &red)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "NIR and Red bands must have equal length")]
+    fn compute_ndvi_still_panics_on_mismatched_lengths() {
+        HyperspectralParser::compute_ndvi(&[0.8, 0.6], &[0.2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Spectra must have equal length")]
+    fn spectral_angle_still_panics_on_mismatched_lengths() {
+        HyperspectralParser::spectral_angle(&[1.0], &[1.0, 0.0]);
     }
 
     #[test]

@@ -144,11 +144,9 @@ fn one_invalid_byte_in_sheet_text_costs_one_character() {
 
 #[test]
 fn an_unknown_entity_is_kept_as_written() {
+    // Only the unknown entity stays as written; `&amp;` beside it resolves.
     let sst = b"<si><t>a &bogus; b &amp; c</t></si><si><t>x</t></si>";
-    assert_eq!(
-        texts(workbook(sst, SHARED_CELLS)),
-        ["a &bogus; b &amp; c", "x"]
-    );
+    assert_eq!(texts(workbook(sst, SHARED_CELLS)), ["a &bogus; b & c", "x"]);
 }
 
 #[test]

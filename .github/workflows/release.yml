@@ -30,14 +30,46 @@ env:
   NODE_BINDINGS: docx-fast-node xlsx-fast-node xlsx-fast-write-node pptx-fast-node pdf-fast-node pdf-fast-write-node email-fast-node xsd-fast-node json-fast-node geo-fast-node
 
 jobs:
+  on-main:
+    # A release tag must name a commit that is on main. The gate below leaves
+    # out ci.yml's binding jobs on the grounds that they already ran for this
+    # commit; that holds only for a commit that reached main through CI. A
+    # manual trial from another ref is let through: it publishes nothing.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Refuse a release tag whose commit is not on main
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *) echo "$GITHUB_REF is not a release tag; nothing will be published."; exit 0 ;;
+          esac
+          # The checkout is one commit deep; ancestry needs the history.
+          git fetch --no-tags --depth=2147483647 origin '+refs/heads/main:refs/remotes/origin/main'
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
   verify:
-    # The whole of ci.yml, on hosted runners. A called workflow can narrow the
-    # token this job passes it but never widen it, so it is read-only here and
-    # again in ci.yml. A job that calls a workflow cannot carry a timeout;
-    # each job in ci.yml has its own.
+    needs: on-main
+    # ci.yml on hosted runners, without its `python-bindings` and
+    # `node-bindings` jobs: `wheels` and `node` below build the same wheels and
+    # Node packages for the release targets, and running both made a release
+    # wait about twice as long. Every other job in ci.yml still gates the
+    # release. What this leaves out of a release run: `wheels` runs the
+    # binding tests only on aarch64 Linux; on the other targets it installs and
+    # imports every wheel, and the tests are the ones ci.yml ran when the
+    # commit reached main, which `on-main` insists it did.
+    # A called workflow can narrow the token this job passes it but
+    # never widen it, so it is read-only here and again in ci.yml. A job that
+    # calls a workflow cannot carry a timeout; each job in ci.yml has its own.
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+    with:
+      skip_binding_jobs: true
 
   wheels:
     needs: verify
@@ -53,6 +85,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -93,6 +127,20 @@ jobs:
             (cd "$crate" && maturin build --release --locked --target "${{ matrix.target }}" ${{ matrix.compat }} --out ../dist)
           done
           ls -1 dist
+      - name: Install and import every wheel built for ${{ matrix.target }}
+        # The ARM leg has a fuller smoke of its own below. Here: no wheel is
+        # uploaded that this target's own interpreter could not install and
+        # import. The binding tests themselves run in ci.yml.
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r -a built_bindings <<< "$BINDINGS"
+          built_wheels=(dist/*.whl)
+          test "${#built_wheels[@]}" -eq "${#built_bindings[@]}"
+          python -m pip install "pyarrow==25.0.1"
+          python -m pip install --no-index --no-deps dist/*.whl
+          python -I -c "import importlib, os; [importlib.import_module(crate.removesuffix('-py').replace('-', '_')) for crate in os.environ['BINDINGS'].split()]"
       - name: Build native ARM manylinux wheels
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
@@ -154,6 +202,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -198,6 +248,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -217,7 +269,7 @@ jobs:
       - name: Embed exactly one CycloneDX SBOM per wheel
         run: |
           set -euo pipefail
-          cargo install cargo-cyclonedx --locked
+          cargo install cargo-cyclonedx --locked --version 0.5.10
           for core in *-core *-write ooxml-archive; do
             cargo cyclonedx --manifest-path "$core/Cargo.toml" -f json --describe crate
           done
