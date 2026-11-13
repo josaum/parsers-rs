@@ -328,6 +328,48 @@ mod tests {
     }
 
     #[test]
+    fn truncated_group4_drops_the_unfinished_row() {
+        // Row 1: H `001`, white 2 `0111`, black 6 `0010`: changes [2].
+        // Row 2: V0 `1` (2 white), VL1 `010` (5 black), then the data ends.
+        //
+        // hayro-ccitt 0.2 kept the 7 pixels of row 2 and padded the 8th white.
+        // 0.5.0 returns the error before handing row 2 to the sink.
+        let raw = [0x2E, 0x54];
+        let image = image(8, 3, &[("K", PdfValue::Integer(-1))]);
+        assert_eq!(
+            decode(&raw, &image),
+            [[W, W, B, B, B, B, B, B], [W; 8], [W; 8]].concat()
+        );
+    }
+
+    #[test]
+    fn group3_damaged_line_with_eols_is_recovered() {
+        // EOL, row 1 (4 white, 4 black), EOL, row 2: white 0, black 4, then
+        // the invalid code `000000001`, EOL, row 3 like row 1.
+        //
+        // hayro-ccitt 0.5 fills the rest of the damaged row white and resumes
+        // at the next EOL. 0.2 stopped at the damaged row, so row 3 was padding.
+        let raw = [0x00, 0x1B, 0x60, 0x02, 0x6A, 0xC0, 0x20, 0x03, 0x6C];
+        let image = image(
+            8,
+            3,
+            &[
+                ("K", PdfValue::Integer(0)),
+                ("EndOfLine", PdfValue::Bool(true)),
+            ],
+        );
+        assert_eq!(
+            decode(&raw, &image),
+            [
+                [W, W, W, W, B, B, B, B],
+                [B, B, B, B, W, W, W, W],
+                [W, W, W, W, B, B, B, B],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
     fn padding_stays_white_when_black_is_1() {
         // `/Columns 4` inside an 8-pixel `/Width`, and 3 rows for 2 coded rows.
         // Row 1 and 2: 2 white `0111`, 2 black `11`.
