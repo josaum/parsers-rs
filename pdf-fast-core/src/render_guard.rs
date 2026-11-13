@@ -296,7 +296,7 @@ fn object_id(object: &Object<'_>) -> Option<StreamId> {
         Object::Stream(stream) => stream.dict().data(),
         _ => return None,
     };
-    (!data.is_empty()).then(|| (data.as_ptr() as usize, data.len()))
+    (!data.is_empty()).then_some((data.as_ptr() as usize, data.len()))
 }
 
 fn stream_id(stream: &Stream<'_>) -> StreamId {
