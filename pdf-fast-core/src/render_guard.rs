@@ -103,6 +103,31 @@ const GLYPH_COST: u32 = 30_000;
 /// a render that would not finish. Ordinary pages need tens to hundreds.
 const MAX_VETTED_CONTEXTS: usize = 1_000_000;
 
+/// Most objects (arrays, dictionaries, streams) one render will follow
+/// while bounding the depth of colour spaces, functions and shadings.
+const MAX_VETTED_OBJECTS: usize = 2_000_000;
+
+/// Deepest array, dictionary and reference nesting accepted in a colour
+/// space, function, shading, pattern, graphics state or image dictionary.
+///
+/// The interpreter builds these by recursion: about 2.7 KB of stack per
+/// nested stitching function and 1.6 KB per nested colour space in the
+/// measurements that found the fault. Real ones are under ten deep, a
+/// `/DeviceN` space with process and colorant dictionaries being the
+/// deepest common case.
+const MAX_OBJECT_DEPTH: usize = 64;
+
+/// Most opening brackets accepted in one content stream. See
+/// [`check_nesting`]. The tokenizer was measured to overflow 8 MiB at about
+/// 131,000 nested arrays, some 64 bytes a level; allowing four times that
+/// for an unoptimized build, this many cost under 13 MiB of the render
+/// stack.
+const MAX_CONTENT_OPENINGS: usize = 50_000;
+
+/// Most opening brackets accepted in one PostScript calculator function,
+/// whose parser recurses once per `{` at about 400 bytes a level.
+const MAX_PROGRAM_OPENINGS: usize = 1_000;
+
 /// Identity of a stream: where its dictionary sits in the file.
 type StreamId = (usize, usize);
 
@@ -276,6 +301,9 @@ struct Walk<'a> {
     fonts: HashMap<(u32, u32, Vec<u8>), ()>,
     stack: Vec<Frame<'a>>,
     visited: usize,
+    objects: usize,
+    /// The page's own resources, the chain every stream ends in.
+    root: Resources<'a>,
     /// Decoded bytes scanned so far, and the most this render may scan.
     decoded: usize,
     decode_allowance: usize,
@@ -324,7 +352,90 @@ impl<'a> Walk<'a> {
     /// allowance.
     fn scan_content(&mut self, content: &[u8]) -> Result<Scan> {
         self.spend(content.len())?;
+        check_nesting(content, MAX_CONTENT_OPENINGS)?;
         Ok(Scan::of(content))
+    }
+
+    /// Bounds the depth of every object the interpreter may build from one
+    /// level of resources: colour spaces, shadings, graphics states,
+    /// patterns and the dictionaries of XObjects.
+    fn vet_resource_objects(&mut self, resources: &Resources<'a>) -> Result<()> {
+        for dict in [
+            &resources.color_spaces,
+            &resources.shadings,
+            &resources.ext_g_states,
+            &resources.patterns,
+            &resources.x_objects,
+        ] {
+            self.vet_object(Object::Dict(dict.clone()))?;
+        }
+        Ok(())
+    }
+
+    /// Refuses an object graph nested deeper than [`MAX_OBJECT_DEPTH`].
+    ///
+    /// The interpreter builds functions and colour spaces by plain
+    /// recursion over arrays, dictionaries and references. This follows the
+    /// same graph with a stack of its own. It does not follow `/Resources`,
+    /// `/Parent` or a soft mask's `/G`, which lead to content streams and
+    /// are bounded by the walk over those.
+    fn vet_object(&mut self, root: Object<'a>) -> Result<()> {
+        let mut pending = vec![(root, 0usize)];
+        while let Some((object, depth)) = pending.pop() {
+            if depth > MAX_OBJECT_DEPTH {
+                return Err(refused(
+                    "a colour space, function or shading is nested deeper than can be built",
+                ));
+            }
+            self.count_object()?;
+            let dict = match object {
+                Object::Array(array) => {
+                    for item in array.iter::<Object<'a>>() {
+                        if matches!(item, Object::Array(_) | Object::Dict(_) | Object::Stream(_)) {
+                            pending.push((item, depth + 1));
+                        }
+                    }
+                    continue;
+                }
+                Object::Dict(dict) => dict,
+                Object::Stream(stream) => {
+                    if stream.dict().get::<u8>(&b"FunctionType"[..]) == Some(4) {
+                        // The calculator parser recurses once per `{`.
+                        if let Ok(program) = stream.decoded() {
+                            self.spend(program.len())?;
+                            check_nesting(&program, MAX_PROGRAM_OPENINGS)?;
+                        }
+                    }
+                    stream.dict().clone()
+                }
+                _ => continue,
+            };
+            for key in dict.keys() {
+                if matches!(&*key, b"Resources" | b"Parent" | b"G") {
+                    continue;
+                }
+                let Some(value) = dict.get::<Object<'a>>(key) else {
+                    continue;
+                };
+                if matches!(
+                    value,
+                    Object::Array(_) | Object::Dict(_) | Object::Stream(_)
+                ) {
+                    pending.push((value, depth + 1));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn count_object(&mut self) -> Result<()> {
+        self.objects += 1;
+        if self.objects > MAX_VETTED_OBJECTS {
+            return Err(refused(
+                "the page's resources hold more nested objects than can be checked",
+            ));
+        }
+        Ok(())
     }
 
     /// Counts `bytes` of decoded data against what the document's decode
@@ -362,6 +473,7 @@ impl<'a> Walk<'a> {
             target: None,
             shows_glyphs: false,
         };
+        self.vet_resource_objects(&frame.resources)?;
         self.expand(&mut frame, &child.scan)?;
         self.stack.push(frame);
         Ok(())
@@ -415,10 +527,18 @@ impl<'a> Walk<'a> {
     /// Queues `stream` as a child of `frame`, or settles it on the spot when
     /// it uses no resources and so cannot reach anything.
     fn queue(&mut self, frame: &mut Frame<'a>, route: Route, stream: &Stream<'a>) -> Result<()> {
+        // The stream's dictionary carries objects of its own, such as a
+        // transparency group's colour space.
+        self.vet_object(Object::Dict(stream.dict().clone()))?;
         let Some(scan) = self.scan(stream)? else {
             return Ok(());
         };
         if scan.is_empty() {
+            // This walk never enters it, so its own resources are checked
+            // here: the interpreter still builds whatever they hold if the
+            // stream's operators use a colour space or shading by name.
+            let own = Resources::from_parent(own_resources(stream.dict()), self.root.clone());
+            self.vet_resource_objects(&own)?;
             settle(frame, route, 0, 0);
             return Ok(());
         }
@@ -590,6 +710,27 @@ fn settle(parent: &mut Frame<'_>, route: Route, form_chain: u32, height: u32) {
     }
 }
 
+/// Refuses content whose brackets could nest deeper than `limit`.
+///
+/// The tokenizer recurses once per nested `[`, `<<` or `{`. Telling real
+/// nesting from brackets inside strings and inline image data would take
+/// the tokenizer itself, so this counts every opening bracket in the
+/// stream: nesting can never be deeper than that. It is coarse on purpose.
+/// A stream with more opening brackets than the limit is refused even when
+/// none of them nest.
+fn check_nesting(content: &[u8], limit: usize) -> Result<()> {
+    let openings = content
+        .iter()
+        .filter(|byte| matches!(byte, b'[' | b'<' | b'{'))
+        .count();
+    if openings > limit {
+        return Err(refused(
+            "a stream has more opening brackets than the tokenizer can safely nest",
+        ));
+    }
+    Ok(())
+}
+
 /// Whether a stream decodes to the same bytes however it was reached.
 fn decode_is_fixed(stream: &Stream<'_>) -> bool {
     if !matches!(stream.raw_data(), std::borrow::Cow::Borrowed(_)) {
@@ -627,10 +768,22 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
         fonts: HashMap::new(),
         stack: Vec::new(),
         visited: 0,
+        objects: 0,
+        root: page.resources().clone(),
         decoded: 0,
         decode_allowance,
         next_id: 1,
     };
+
+    // Every level of resources the page inherits from the page tree. The
+    // page's own level is checked again when its stream is entered; the
+    // levels above it only here.
+    let mut level = Some(page.resources());
+    while let Some(resources) = level {
+        walk.count()?;
+        walk.vet_resource_objects(resources)?;
+        level = resources.parent();
+    }
 
     // The page's own stream. The interpreter decodes it through the same
     // cache, so scanning it here costs no second decode.
@@ -669,14 +822,16 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
         else {
             continue;
         };
+        walk.vet_object(Object::Dict(appearance.dict().clone()))?;
+        let own =
+            Resources::from_parent(own_resources(appearance.dict()), page.resources().clone());
         let Some(scan) = walk.scan(&appearance)? else {
             continue;
         };
         if scan.is_empty() {
+            walk.vet_resource_objects(&own)?;
             continue;
         }
-        let own =
-            Resources::from_parent(own_resources(appearance.dict()), page.resources().clone());
         walk.run(
             Child {
                 route: Route::Form,

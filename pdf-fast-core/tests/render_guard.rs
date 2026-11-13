@@ -413,8 +413,88 @@ fn deep_page_tree(depth: usize) -> Vec<u8> {
     pdf(&objects)
 }
 
+const SHADED_PAGE: &str = "/Resources << /Shading << /S << /ShadingType 2 /ColorSpace \
+                           /DeviceGray /Coords [0 0 100 100] /Function 10 0 R >> >> >>";
+
+/// A shading whose function is `depth` stitching functions, each holding
+/// the next.
+fn nested_stitching_functions(depth: usize) -> Vec<u8> {
+    let depth = u32::try_from(depth).expect("small depth");
+    let mut rest = Vec::new();
+    for level in 0..depth {
+        rest.push((
+            10 + level,
+            format!(
+                "<< /FunctionType 3 /Domain [0 1] /Functions [{} 0 R] /Bounds [] \
+                 /Encode [0 1] >>",
+                11 + level
+            )
+            .into_bytes(),
+        ));
+    }
+    rest.push((
+        10 + depth,
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>".to_vec(),
+    ));
+    one_page(SHADED_PAGE, "/S sh", rest)
+}
+
+/// A colour space that is `depth` `/Indexed` (or `/Separation`) spaces,
+/// each based on the next.
+fn nested_colour_spaces(depth: usize, separation: bool) -> Vec<u8> {
+    let depth = u32::try_from(depth).expect("small depth");
+    let mut rest = Vec::new();
+    for level in 0..depth {
+        let body = if separation {
+            format!(
+                "[/Separation /X {} 0 R << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] \
+                 /N 1 >>]",
+                11 + level
+            )
+        } else {
+            format!("[/Indexed {} 0 R 0 <00>]", 11 + level)
+        };
+        rest.push((10 + level, body.into_bytes()));
+    }
+    rest.push((10 + depth, b"[/CalGray << /WhitePoint [1 1 1] >>]".to_vec()));
+    one_page(
+        "/Resources << /ColorSpace << /C 10 0 R >> >>",
+        "/C cs 0 sc 0 0 10 10 re f",
+        rest,
+    )
+}
+
+/// A shading whose function is a PostScript calculator with `depth` nested
+/// procedures.
+fn nested_calculator_procedures(depth: usize) -> Vec<u8> {
+    let program = format!("{}1 {}", "{ ".repeat(depth), "} ".repeat(depth));
+    one_page(
+        SHADED_PAGE,
+        "/S sh",
+        vec![(
+            10,
+            stream("/FunctionType 4 /Domain [0 1] /Range [0 1]", &program),
+        )],
+    )
+}
+
+/// A page whose content holds `depth` nested arrays.
+fn nested_content_arrays(depth: usize) -> Vec<u8> {
+    let content = format!(
+        "BT {}{} TJ ET 0 0 10 10 re f",
+        "[".repeat(depth),
+        "]".repeat(depth)
+    );
+    one_page("", &content, Vec::new())
+}
+
 fn fixture(route: &str, depth: usize) -> Vec<u8> {
     match route {
+        "stitch" => nested_stitching_functions(depth),
+        "indexed" => nested_colour_spaces(depth, false),
+        "separation" => nested_colour_spaces(depth, true),
+        "calculator" => nested_calculator_procedures(depth),
+        "arrays" => nested_content_arrays(depth),
         "pagetree" => deep_page_tree(depth),
         "decodepath" => form_that_decodes_by_path(),
         "form" => form_chain(depth),
@@ -562,6 +642,38 @@ fn a_hundred_thousand_distinct_names_are_scanned_quickly() {
 fn a_page_tree_nested_100_000_deep_is_refused() {
     assert_refused("deep page tree", &deep_page_tree(100_000));
     assert_renders("page tree 20 deep", &deep_page_tree(20));
+}
+
+#[test]
+fn deeply_nested_functions_and_colour_spaces_are_refused() {
+    assert_refused("stitching functions", &nested_stitching_functions(30_000));
+    assert_refused(
+        "indexed colour spaces",
+        &nested_colour_spaces(50_000, false),
+    );
+    assert_refused(
+        "separation colour spaces",
+        &nested_colour_spaces(50_000, true),
+    );
+    assert_refused(
+        "calculator procedures",
+        &nested_calculator_procedures(200_000),
+    );
+    assert_renders("stitching functions 5 deep", &nested_stitching_functions(5));
+    assert_renders(
+        "indexed colour spaces 3 deep",
+        &nested_colour_spaces(3, false),
+    );
+    assert_renders(
+        "calculator procedures 5 deep",
+        &nested_calculator_procedures(5),
+    );
+}
+
+#[test]
+fn deeply_nested_arrays_in_content_are_refused() {
+    assert_refused("content arrays", &nested_content_arrays(1_500_000));
+    assert_renders("content arrays 20 deep", &nested_content_arrays(20));
 }
 
 #[test]
