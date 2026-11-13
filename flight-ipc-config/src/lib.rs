@@ -490,24 +490,53 @@ pub enum FlightIpcConfigError {
 // binaries (docx-fast-flight, pptx-fast-flight).  Do not diverge them here.
 // ---------------------------------------------------------------------------
 
-/// Canonicalize `path` (joined under `root` when relative) and reject any
-/// resolution that escapes the Flight root.
+/// The one message for every path this server will not serve.
+///
+/// Clients may match on it. It never carries operating system error text,
+/// which would tell a missing file from an unreadable one.
+pub const FILE_NOT_FOUND: &str = "file not found";
+
+/// The one answer for every path this server will not serve.
+///
+/// A missing file, a file outside the root, a dangling link, a directory
+/// and a path that cannot be read all get this `NotFound`, so an answer
+/// never says what exists on the server.
+pub fn file_not_found() -> Status {
+    Status::not_found(FILE_NOT_FOUND)
+}
+
+/// Resolves `path` to the canonical path of a regular file below `root`.
+///
+/// A relative `path` is taken below `root`. Links are followed, and the
+/// file they lead to must itself be below the root.
+///
+/// The same file system calls are made, in the same order, whether or not
+/// the path exists and wherever it leads: the root is resolved, then the
+/// path, then the path is examined. Only then is the answer chosen, so the
+/// work done does not depend on what was found. What remains is the cost
+/// of those calls themselves: resolving a path that exists walks all of
+/// it, and resolving one that does not stops at the first missing name.
+///
+/// # Errors
+///
+/// [`file_not_found`] when `path` is missing, is not a regular file, leads
+/// outside the root or cannot be examined; the cases are deliberately not
+/// told apart. `Internal` when the root itself cannot be resolved.
 pub fn resolve_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
+    let root_canon = root
+        .canonicalize()
+        .map_err(|_| Status::internal("failed to resolve root"))?;
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         root.join(path)
     };
-    let canon = joined
-        .canonicalize()
-        .map_err(|_| Status::not_found("file not found"))?;
-    let root_canon = root
-        .canonicalize()
-        .map_err(|_| Status::internal("failed to resolve root"))?;
-    if !canon.starts_with(&root_canon) {
-        return Err(Status::permission_denied("path escapes root"));
+    let canon = joined.canonicalize();
+    let is_file = std::fs::metadata(&joined).is_ok_and(|found| found.is_file());
+    match canon {
+        Ok(canon) if is_file && canon.starts_with(&root_canon) => Ok(canon),
+        _ => Err(file_not_found()),
     }
-    Ok(canon)
 }
 
 /// Split `input` on the first `?` into a `(path, query)` pair, zero-copy.
@@ -562,6 +591,163 @@ pub fn do_put_unsupported() -> Status {
     Status::unimplemented(DO_PUT_UNSUPPORTED)
 }
 
+/// Rewrites every mention of the served root in `message` as a root-relative path.
+///
+/// Parser errors name the file they failed on by its canonical path on the
+/// server. A caller only ever supplied a path below the root, so that is
+/// all an answer may name: `<root>/sub/a.txt` becomes `sub/a.txt` and the
+/// root itself becomes `.`. Both the root as configured and its canonical
+/// form are rewritten, because parsers report whichever one they opened.
+///
+/// A mention only counts where the root starts a path and ends at a path
+/// boundary:
+///
+/// - Before it comes the start of the text or a character that does not
+///   continue a file name. Letters, digits, `_`, `-` and `.` continue a
+///   name, so `/mnt/data` and `n/a` are left alone for roots `/data` and
+///   `/a`; so does a separator, so `x//data` is left alone. Everything
+///   else (spaces, quotes, brackets, `=`, `:` and the like) starts a path.
+/// - After `scheme://` the text is a host, not a path, and is left alone:
+///   `http://data/x`. After `scheme:///` it is a path: a `file:///` URL of
+///   the root loses its scheme with the root, because what is left is no
+///   longer a URL.
+/// - After it comes the end of the text, a separator, or a character that
+///   does not continue a file name, so `/data2/x`, `/data-old` and
+///   `/data.bak` are left alone. A `.` that no letter, digit, `_` or `-`
+///   follows is sentence punctuation, and the mention before it is the
+///   root.
+///
+/// Where the two readings are in doubt the root is rewritten: mangled
+/// text is better than an answer that says where the root is. A relative
+/// root, or a root with no name of its own such as `/`, cannot be told
+/// apart from ordinary text and is left as it is.
+pub fn root_relative_error_text(message: &str, root: &Path) -> String {
+    let mut needles: Vec<String> = Vec::with_capacity(2);
+    for candidate in [root.canonicalize().ok(), Some(root.to_path_buf())]
+        .into_iter()
+        .flatten()
+    {
+        if !candidate.is_absolute() || candidate.file_name().is_none() {
+            continue;
+        }
+        let text = candidate.to_string_lossy();
+        let text = text.trim_end_matches(std::path::MAIN_SEPARATOR);
+        if !text.is_empty() && !needles.iter().any(|known| known == text) {
+            needles.push(text.to_owned());
+        }
+    }
+    // Longest first, so a root that is a prefix of the other cannot leave
+    // the tail of the longer one behind.
+    needles.sort_by_key(|needle| std::cmp::Reverse(needle.len()));
+    let mut text = message.to_owned();
+    for needle in &needles {
+        text = strip_root_mentions(&text, needle);
+    }
+    text
+}
+
+/// Whether `c` can continue a file name that a mention of the root would
+/// otherwise end or start in the middle of.
+fn continues_file_name(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// Where the text before a mention of the root stops being kept, or `None`
+/// when the root's text does not start a path there.
+///
+/// The result is `before.len()` unless doubled separators or a URL scheme
+/// in front of the root go with it.
+fn mention_start(before: &str) -> Option<usize> {
+    let kept = before.trim_end_matches(std::path::is_separator);
+    let separators = before.len() - kept.len();
+    let last = kept.chars().next_back();
+    match (last, separators) {
+        (None, _) => Some(0),
+        (Some(c), 0) if continues_file_name(c) => None,
+        (Some(_), 0) => Some(before.len()),
+        // `scheme://<root>`: the root's text is the host of a URL.
+        (Some(':'), 1) => None,
+        // `scheme:///<root>`: a URL of the root. The scheme goes too.
+        (Some(':'), _) => {
+            let scheme = kept[..kept.len() - 1].trim_end_matches(|c: char| {
+                c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
+            });
+            Some(scheme.len())
+        }
+        // `name//<root>`: the tail of a longer path.
+        (Some(c), _) if continues_file_name(c) => None,
+        // A path that starts with doubled separators.
+        (Some(_), _) => Some(kept.len()),
+    }
+}
+
+/// How the text after a mention of the root is read: `None` when a longer
+/// name merely starts like the root, otherwise how many bytes of `after`
+/// belong to the mention and whether a name below the root follows.
+fn mention_end(after: &str) -> Option<(usize, bool)> {
+    let below = after.trim_start_matches(std::path::is_separator);
+    let separators = after.len() - below.len();
+    let mut following = below.chars();
+    let next = following.next();
+    if separators > 0 {
+        // `<root>/` alone still means the root itself.
+        let names_a_child = next.is_some_and(|c| {
+            !c.is_whitespace() && !matches!(c, ':' | ',' | ';' | '"' | '\'' | ')' | ']')
+        });
+        return Some((separators, names_a_child));
+    }
+    match next {
+        // A full stop that ends a sentence, not `<root>.bak`.
+        Some('.') => {
+            let extends = following
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-'));
+            (!extends).then_some((0, false))
+        }
+        Some(c) if continues_file_name(c) => None,
+        _ => Some((0, false)),
+    }
+}
+
+/// One pass of [`root_relative_error_text`] for one spelling of the root.
+fn strip_root_mentions(message: &str, root: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    // `message[..copied]` is accounted for in `out`.
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(found) = message.get(from..).and_then(|rest| rest.find(root)) {
+        let at = from + found;
+        let end = at + root.len();
+        let bounds = mention_start(&message[..at]).zip(mention_end(&message[end..]));
+        let Some((keep_to, (consumed, names_a_child))) = bounds else {
+            // Not a mention: look again one character on, not one root on,
+            // so an overlapping mention is still found.
+            from = at + root.chars().next().map_or(1, char::len_utf8);
+            continue;
+        };
+        out.push_str(message.get(copied..keep_to.max(copied)).unwrap_or(""));
+        if !names_a_child {
+            out.push('.');
+        }
+        copied = end + consumed;
+        from = copied;
+    }
+    out.push_str(message.get(copied..).unwrap_or(""));
+    out
+}
+
+/// Returns `status` with the served root rewritten out of its message.
+///
+/// The code is kept. See [`root_relative_error_text`] for what is rewritten.
+pub fn root_relative_status(status: Status, root: &Path) -> Status {
+    let text = root_relative_error_text(status.message(), root);
+    if text == status.message() {
+        status
+    } else {
+        Status::new(status.code(), text)
+    }
+}
+
 /// Parsed query-string overrides shared by the read-only parser Flight
 /// servers: `table` selection plus batch-size and inflate-limit tuning.
 #[derive(Default, Debug, Clone)]
@@ -571,54 +757,65 @@ pub struct FlightQuery {
     pub max_inflate: Option<usize>,
 }
 
-/// Resolve a `FlightDescriptor` (path components or UTF-8 cmd) to a rooted
-/// path plus its parsed query overrides.
-pub fn descriptor_to_request(
-    root: &Path,
+/// The path and the raw query string a `FlightDescriptor` names, before the
+/// path is looked up. The query is empty when the descriptor carries none.
+///
+/// Servers with their own query keys parse the query themselves and then
+/// call [`resolve_path`]; [`descriptor_to_request`] does both for the shared
+/// keys.
+pub fn descriptor_path_and_query(
     descriptor: &FlightDescriptor,
-) -> Result<(PathBuf, FlightQuery), Status> {
+) -> Result<(PathBuf, String), Status> {
     if !descriptor.path.is_empty() {
         let mut parts = descriptor.path.clone();
-        let mut query = FlightQuery::default();
+        let mut query = String::new();
         if let Some(last) = parts.last_mut() {
             let last_value = last.clone();
             if let Some((base, q)) = split_query(&last_value) {
                 *last = base.to_string();
-                query = parse_query(q)?;
+                query = q.to_string();
             }
         }
         let path = parts.into_iter().fold(PathBuf::new(), |mut buf, part| {
             buf.push(part);
             buf
         });
-        resolve_path(root, &path).map(|path| (path, query))
+        Ok((path, query))
     } else if !descriptor.cmd.is_empty() {
         let cmd = std::str::from_utf8(&descriptor.cmd)
             .map_err(|_| Status::invalid_argument("descriptor cmd must be utf-8 path"))?;
         let (path_str, query) = split_query(cmd).unwrap_or((cmd, ""));
-        let query = if query.is_empty() {
-            FlightQuery::default()
-        } else {
-            parse_query(query)?
-        };
-        resolve_path(root, Path::new(path_str)).map(|path| (path, query))
+        Ok((PathBuf::from(path_str), query.to_string()))
     } else {
         Err(Status::invalid_argument("missing flight descriptor path"))
     }
 }
 
+/// The path and the raw query string a `Ticket` names, before the path is
+/// looked up. The query is empty when the ticket carries none.
+pub fn ticket_path_and_query(ticket: &Ticket) -> Result<(&str, &str), Status> {
+    let path = std::str::from_utf8(&ticket.ticket)
+        .map_err(|_| Status::invalid_argument("ticket must be utf-8 path"))?;
+    Ok(split_query(path).unwrap_or((path, "")))
+}
+
+/// Resolve a `FlightDescriptor` (path components or UTF-8 cmd) to a rooted
+/// path plus its parsed query overrides.
+pub fn descriptor_to_request(
+    root: &Path,
+    descriptor: &FlightDescriptor,
+) -> Result<(PathBuf, FlightQuery), Status> {
+    let (path, query) = descriptor_path_and_query(descriptor)?;
+    let query = parse_query(&query)?;
+    resolve_path(root, &path).map(|path| (path, query))
+}
+
 /// Resolve a `Ticket` (UTF-8 path with optional query string) to a rooted
 /// path plus its parsed query overrides.
 pub fn ticket_to_request(root: &Path, ticket: &Ticket) -> Result<(PathBuf, FlightQuery), Status> {
-    let path = std::str::from_utf8(&ticket.ticket)
-        .map_err(|_| Status::invalid_argument("ticket must be utf-8 path"))?;
-    let (path_str, query_str) = split_query(path).unwrap_or((path, ""));
-    let query = if query_str.is_empty() {
-        FlightQuery::default()
-    } else {
-        parse_query(query_str)?
-    };
-    resolve_path(root, Path::new(path_str)).map(|path| (path, query))
+    let (path, query) = ticket_path_and_query(ticket)?;
+    let query = parse_query(query)?;
+    resolve_path(root, Path::new(path)).map(|path| (path, query))
 }
 
 /// Parse `table` / `batch`|`batch_size` / `max_inflate` query pairs; unknown
@@ -671,6 +868,61 @@ pub fn parse_query(query: &str) -> Result<FlightQuery, Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_text_names_files_relative_to_the_root() {
+        let base = std::env::temp_dir().join(format!(
+            "flight-ipc-config-root-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let root = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        let canon = root.canonicalize().unwrap();
+        let shown = canon.display();
+        let sibling = format!("{shown}2/x");
+
+        for (message, expected) in [
+            (
+                format!("open: {shown}/sub/a.xsd: denied"),
+                "open: sub/a.xsd: denied".to_owned(),
+            ),
+            (format!("mmap: {shown}"), "mmap: .".to_owned()),
+            (
+                format!("read {shown}: is a directory"),
+                "read .: is a directory".to_owned(),
+            ),
+            (
+                format!("read {shown}/: is a directory"),
+                "read .: is a directory".to_owned(),
+            ),
+            (format!("{shown}/a and {shown}/b"), "a and b".to_owned()),
+            (
+                format!("open: {}/a.xsd", root.display()),
+                "open: a.xsd".to_owned(),
+            ),
+            (format!("open: {sibling}"), format!("open: {sibling}")),
+            ("no path here".to_owned(), "no path here".to_owned()),
+        ] {
+            assert_eq!(
+                root_relative_error_text(&message, &root),
+                expected,
+                "{message}"
+            );
+        }
+
+        // Roots that cannot be recognised in running text are left alone.
+        assert_eq!(root_relative_error_text("a/b: c", Path::new("/")), "a/b: c");
+        assert_eq!(
+            root_relative_error_text("see ./a.b", Path::new(".")).len(),
+            9
+        );
+
+        let status = root_relative_status(Status::internal(format!("mmap: {shown}")), &root);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.message(), "mmap: .");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn absent_values_are_none_and_non_none_is_rejected_before_io() {
@@ -880,12 +1132,116 @@ mod tests {
         let resolved = resolve_path(&root, Path::new("inside.txt")).expect("inside resolves");
         assert_eq!(resolved, inside_file.canonicalize().expect("canon"));
 
-        let err = resolve_path(&root, &outside_file).expect_err("escape must fail");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        let err = resolve_path(&root, Path::new("../outside/outside.txt"))
-            .expect_err("relative escape must fail");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        // Outside the root, a file that is there and one that is not are
+        // answered alike, and like a missing file inside the root.
+        let missing = resolve_path(&root, Path::new("missing.txt")).expect_err("missing");
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+        for probe in [
+            outside_file.clone(),
+            outside.join("missing.txt"),
+            PathBuf::from("../outside/outside.txt"),
+            PathBuf::from("../outside/missing.txt"),
+            PathBuf::from("../outside"),
+            PathBuf::from(".."),
+            PathBuf::from("nul\0.txt"),
+            // A directory is not a file to serve: the root, and one below it.
+            PathBuf::new(),
+            PathBuf::from("."),
+            PathBuf::from("inside.txt/child"),
+        ] {
+            let err = resolve_path(&root, &probe).expect_err("must fail");
+            assert_eq!(err.code(), missing.code(), "{probe:?}");
+            assert_eq!(err.message(), missing.message(), "{probe:?}");
+        }
+        std::fs::create_dir_all(root.join("sub")).expect("sub dir");
+        let err = resolve_path(&root, Path::new("sub")).expect_err("a directory");
+        assert_eq!(
+            (err.code(), err.message()),
+            (missing.code(), missing.message())
+        );
 
         std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    /// Roots that need not exist: only the text matters.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_path_that_starts_at_the_root_is_rewritten() {
+        for (root, message, expected) in [
+            // The root's text inside a longer name or path is not the root.
+            (
+                "/data",
+                "http://example.com/data/types and application/data",
+                "http://example.com/data/types and application/data",
+            ),
+            ("/a", "n/a", "n/a"),
+            (
+                "/srv/root",
+                "open /mnt/srv/root/a.x",
+                "open /mnt/srv/root/a.x",
+            ),
+            (
+                "/srv/root",
+                "open /srv/root-old/a.x",
+                "open /srv/root-old/a.x",
+            ),
+            ("/srv/root", "open /srv/root.bak", "open /srv/root.bak"),
+            ("/srv/root", "open /srv/root2/a.x", "open /srv/root2/a.x"),
+            // A URL whose host is spelled like the root is not the root.
+            ("/data", "get http://data/x", "get http://data/x"),
+            // A file URL names the root: the answer is the path below it.
+            ("/srv/root", "see file:///srv/root/a.xsd", "see a.xsd"),
+            ("/srv/root", "see file:/srv/root/a.xsd", "see file:a.xsd"),
+            // Doubled separators.
+            ("/srv/root", "/srv/root//a.x", "a.x"),
+            ("/srv/root", "open //srv/root/a.x", "open a.x"),
+            // Sentence punctuation after the root.
+            ("/srv/root", "cannot read /srv/root.", "cannot read .."),
+            ("/srv/root", "read /srv/root. Then", "read .. Then"),
+            ("/srv/root", "read /srv/root, then", "read ., then"),
+            // The ones that always worked.
+            (
+                "/srv/root",
+                "read /srv/root/: is a directory",
+                "read .: is a directory",
+            ),
+            (
+                "/srv/root",
+                "open /srv/root/a/../root/b.x",
+                "open a/../root/b.x",
+            ),
+            ("/srv/root", "stat /srv/root/.", "stat ."),
+            ("/srv/root", "/srv/root/a and /srv/root/b", "a and b"),
+            ("/srv/root", "open \"/srv/root/a b.x\"", "open \"a b.x\""),
+            ("/srv/root", "open '/srv/root'", "open '.'"),
+            ("/srv/root", "path=/srv/root/a.x", "path=a.x"),
+            ("/srv/root/", "open /srv/root/a.x", "open a.x"),
+            ("/", "open /a/b: c", "open /a/b: c"),
+            ("srv/root", "open srv/root/a.x", "open srv/root/a.x"),
+        ] {
+            assert_eq!(
+                root_relative_error_text(message, Path::new(root)),
+                expected,
+                "root {root}: {message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_rewritten_in_both_spellings() {
+        let base = std::env::temp_dir().join(format!(
+            "flight-ipc-config-linked-root-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canon = real.canonicalize().unwrap();
+        let message = format!("{}/a.x and {}/b.x.", link.display(), canon.display());
+        assert_eq!(root_relative_error_text(&message, &link), "a.x and b.x.");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
