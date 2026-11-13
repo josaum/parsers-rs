@@ -554,6 +554,19 @@ fn header_lines_that_are_costly_to_decode_are_refused() {
     }
 }
 
+/// Body text is never costed as a header, whatever line precedes it: only a
+/// delimiter line of a declared boundary starts a part's headers.
+#[test]
+fn body_lines_after_a_dash_line_are_not_costed_as_headers() {
+    let words = unended_encoded_words(4_000);
+    for dashes in ["-- ", "-----Original Message-----", "-- a comment"] {
+        let message = format!("Subject: s\r\n\r\nhello\r\n{dashes}\r\nX:{words}\r\n\r\n");
+        let email = parse_eml_bytes(message.as_bytes(), ParseOptions::default())
+            .expect("body text is not a header");
+        assert_eq!(email.subject.as_deref(), Some("s"), "{dashes}");
+    }
+}
+
 /// An unfolded `To:` of 2,000 properly encoded recipients is ordinary work
 /// for `mailparse` (a few milliseconds optimized), with or without a raw
 /// non-ASCII character on the line, and base64 padding (`==?=`) does not

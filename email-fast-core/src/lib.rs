@@ -983,16 +983,26 @@ const MAX_HEADER_DECODE_COST: u64 = 3_000_000_000;
 /// The cost is counted by replaying that search on every header value
 /// ([`header_line_decode_cost`]), so a header costs here what it costs
 /// there. The headers read are those at the start of `raw` and those after
-/// every line that begins with `--`, up to the next empty line: `mailparse`
-/// reads headers at the start of the message and after a multipart
-/// delimiter line. This has to happen before `mailparse` sees the message,
-/// because it decodes the `Content-*` headers of every part on its own.
+/// every multipart delimiter line, up to the next empty line, as in
+/// `mailparse`. A delimiter line is one that begins with `--` and a boundary
+/// that a `Content-Type` header read earlier declares; other lines that
+/// begin with `--` (a signature separator, a forwarded-message banner) are
+/// body text. Every header `mailparse` decodes is read here; a few it does
+/// not decode are read too, since a boundary stays in force to the end of
+/// the message and a closing delimiter counts as one. This has to happen
+/// before `mailparse` sees the message, because it decodes the `Content-*`
+/// headers of every part on its own.
 ///
 /// # Errors
 ///
 /// Returns an error once the cost passes `limit`.
 fn header_decode_cost(raw: &[u8], limit: u64) -> Result<u64> {
-    let mut scan = HeaderScan { cost: 0, limit };
+    let mut scan = HeaderScan {
+        cost: 0,
+        limit,
+        delimiters: Vec::new(),
+        block_has_content_type: false,
+    };
     let mut in_headers = true;
     // Where the header being read began; it ends at the next line that is
     // not a continuation line.
@@ -1018,7 +1028,12 @@ fn header_decode_cost(raw: &[u8], limit: u64) -> Result<u64> {
                 }
             }
         } else {
-            in_headers = line.starts_with(b"--");
+            in_headers = line.starts_with(b"--")
+                && scan
+                    .delimiters
+                    .iter()
+                    .any(|delimiter| line.starts_with(delimiter));
+            scan.block_has_content_type = false;
         }
         pos = line_end + 1;
     }
@@ -1034,6 +1049,12 @@ struct HeaderScan {
     cost: u64,
     /// The cost at which the scan gives up.
     limit: u64,
+    /// `--` and each boundary a `Content-Type` header has declared so far.
+    delimiters: Vec<Vec<u8>>,
+    /// Whether the header block being read already had a `Content-Type`.
+    /// `mailparse` uses the first one of a block, so only that one can
+    /// declare a boundary.
+    block_has_content_type: bool,
 }
 
 impl HeaderScan {
@@ -1061,9 +1082,34 @@ impl HeaderScan {
         while let [rest @ .., b'\r' | b'\n'] = value {
             value = rest;
         }
-        if !value.windows(2).any(|pair| pair == b"=?") {
-            return Ok(());
+        if value.windows(2).any(|pair| pair == b"=?") {
+            self.add_value_cost(value)?;
         }
+        if !self.block_has_content_type && header[..colon].eq_ignore_ascii_case(b"Content-Type") {
+            self.block_has_content_type = true;
+            self.declare_boundary(header);
+        }
+        Ok(())
+    }
+
+    /// Records the boundary a `Content-Type` header declares, if any.
+    ///
+    /// The header is handed to `mailparse` itself, so the boundary is the
+    /// one it will search for, whatever folding, quoting or encoding the
+    /// header uses. Its decoding cost is already counted and within the
+    /// limit.
+    fn declare_boundary(&mut self, header: &[u8]) {
+        let Ok((parsed, _)) = mailparse::parse_header(header) else {
+            return;
+        };
+        let content_type = mailparse::parse_content_type(&parsed.get_value());
+        if let Some(boundary) = content_type.params.get("boundary") {
+            self.delimiters.push(format!("--{boundary}").into_bytes());
+        }
+    }
+
+    /// Adds the cost of decoding one header value that holds a `=?`.
+    fn add_value_cost(&mut self, value: &[u8]) -> Result<()> {
         // Valid UTF-8 is read as such and anything else as Latin-1.
         let text: std::borrow::Cow<'_, str> = match std::str::from_utf8(value) {
             Ok(text) => text.into(),
@@ -2592,6 +2638,47 @@ mod malformed_input_unit_tests {
         // The count stops soon after the limit.
         let hostile = " =?a?=x".repeat(100_000);
         assert!(header_line_decode_cost(&hostile, 1_000) > 1_000);
+    }
+
+    #[test]
+    fn header_decode_cost_reads_part_headers_only_after_a_declared_boundary() {
+        let costly = " =?a?=x".repeat(50);
+        let line_cost = header_line_decode_cost(costly.trim_start(), u64::MAX);
+        let cost =
+            |message: String| header_decode_cost(message.as_bytes(), u64::MAX).expect("no limit");
+        // Lines that begin with `--` in a body are text, and so is what
+        // follows them.
+        for dashes in ["-- ", "-----Original Message-----", "-- SQL comment", "--b"] {
+            assert_eq!(
+                cost(format!(
+                    "Subject: x\n\nbody\n{dashes}\nSubject:{costly}\n\n"
+                )),
+                0,
+                "{dashes}"
+            );
+        }
+        // The boundary may be quoted, folded or declared by a part.
+        for content_type in [
+            "Content-Type: multipart/mixed; boundary=\"b c\"",
+            "Content-Type: multipart/mixed;\n boundary=\"b c\"",
+            "content-type: multipart/mixed; BOUNDARY=\"b c\"",
+        ] {
+            assert_eq!(
+                cost(format!(
+                    "{content_type}\n\n--b c\nSubject:{costly}\n\ntext\n"
+                )),
+                line_cost,
+                "{content_type}"
+            );
+        }
+        assert_eq!(
+            cost(format!(
+                "Content-Type: multipart/mixed; boundary=a\n\n--a\n\
+                 Content-Type: multipart/alternative; boundary=b\n\n--b\n\
+                 Subject:{costly}\n\ntext\n--b--\n--a--\n"
+            )),
+            line_cost
+        );
     }
 
     #[test]
