@@ -1047,6 +1047,86 @@ fn sections_cannot_re_read_one_run_of_entries_through_a_hidden_keyword() {
     );
 }
 
+/// Only the work budget stops this one. Six cross-reference streams, each
+/// under the decode cap and each all rows for object numbers the file does
+/// not have, hang off a small newest table by `/Prev`. No single section is
+/// refused; together they are more rows than the budget allows.
+#[test]
+fn many_cross_reference_streams_under_the_decode_cap_spend_the_budget() {
+    let _serial = serial();
+    let rows = 8_192usize;
+    let (mut bytes, first) = one_revision();
+    let data = zlib(&vec![0u8; rows]);
+    let mut previous = first;
+    for number in 30..36 {
+        let at = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "{number} 0 obj\n<< /Type /XRef /Size 9 /W [0 0 1] /Index [1000 {rows}] \
+                 /Prev {previous} /Filter /FlateDecode /Length {} >>\nstream\n",
+                data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        previous = at;
+    }
+    let table = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 9 /Root 1 0 R /Prev {previous} >>\n\
+             startxref\n{table}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    assert!(
+        bytes.len() * 4 + 4096 > rows,
+        "each stream is under the decode cap"
+    );
+    assert!(
+        6 * rows > chain_work_bound(&bytes),
+        "together they exceed the budget"
+    );
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+    assert_eq!(document.pages().len(), 1);
+    let work = document.xref_chain_work();
+    println!("budget test: {work} units for {} bytes", bytes.len());
+    assert!(
+        work <= chain_work_bound(&bytes) + 64,
+        "{work} units of work for a {} byte file",
+        bytes.len()
+    );
+}
+
+/// Only the "numbers the scan produced" rule stops this one. A well-formed
+/// table lists 100,000 in-use objects the file does not contain. Nothing
+/// may be kept for them.
+#[test]
+fn entries_for_objects_the_scan_never_saw_are_not_kept() {
+    let _serial = serial();
+    let (mut bytes, first) = one_revision();
+    let listed = 100_000usize;
+    let table = bytes.len();
+    bytes.extend_from_slice(format!("xref\n1000 {listed}\n").as_bytes());
+    for _ in 0..listed {
+        bytes.extend_from_slice(b"0000000000 00000 n \n");
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 9 /Root 1 0 R /Prev {first} >>\nstartxref\n{table}\n%%EOF\n")
+            .as_bytes(),
+    );
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+    assert_eq!(document.pages().len(), 1);
+    let kept = document.xref_chain_entries();
+    println!(
+        "filter test: {kept} entries kept, {} units for {} bytes",
+        document.xref_chain_work(),
+        bytes.len()
+    );
+    assert!(kept <= 3, "{kept} entries kept for a three-object file");
+}
+
 // ── Seed sanity ─────────────────────────────────────────────────────────────
 
 /// The seed has to reach the readers it claims to; a seed whose streams fail

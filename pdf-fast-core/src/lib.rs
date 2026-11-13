@@ -467,6 +467,9 @@ pub struct PdfDocument {
     /// chain.
     #[cfg_attr(feature = "serde", serde(skip))]
     xref_work: usize,
+    /// In-use entries the chain kept, before it was applied or discarded.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    xref_entries: usize,
     #[cfg_attr(feature = "serde", serde(skip))]
     decoded_byte_budget: DecodedByteBudget,
     /// PDF header line (e.g. `%PDF-1.7`) when one was recovered.
@@ -673,7 +676,8 @@ impl PdfDocument {
             .map(|(index, object)| ((object.object_number, object.generation), index))
             .collect();
         // Then the document as its cross-reference chain defines it.
-        let (catalog, xref_work) = apply_xref_chain(bytes, &objects, &streams, &mut object_index);
+        let (catalog, xref_work, xref_entries) =
+            apply_xref_chain(bytes, &objects, &streams, &mut object_index);
 
         if objects.len() >= options.max_objects {
             warnings.push(PdfWarning {
@@ -698,6 +702,7 @@ impl PdfDocument {
             object_index,
             catalog,
             xref_work,
+            xref_entries,
             decoded_byte_budget,
             header,
             objects,
@@ -767,6 +772,14 @@ impl PdfDocument {
     #[doc(hidden)]
     pub fn xref_chain_work(&self) -> usize {
         self.xref_work
+    }
+
+    /// In-use cross-reference entries kept while following the chain,
+    /// whether or not the chain was then applied. Exposed so tests can
+    /// show nothing is kept for objects the scan never produced.
+    #[doc(hidden)]
+    pub fn xref_chain_entries(&self) -> usize {
+        self.xref_entries
     }
 
     /// Resolve pages and their associated content/image streams.
@@ -7698,8 +7711,8 @@ const XREF_DECODE_MULTIPLE: usize = 4;
 /// Where the cross-reference chain says an in-use object is.
 #[derive(Clone, Copy)]
 enum XrefEntry {
-    /// At a byte offset in the file.
-    At(usize),
+    /// At a byte offset in the file, with this generation.
+    At(usize, u16),
     /// Inside the object stream with this object number.
     Packed(u32),
 }
@@ -7734,12 +7747,37 @@ impl XrefChain<'_> {
 
     /// Reads the classic table at `offset`. Returns its trailer and where
     /// the section ends. Free entries are read past and not recorded.
+    ///
+    /// The format accepted is the renderer's (hayro-syntax 0.5.0,
+    /// `xref.rs` 762-786 and `XRefEntry::read` at 670-692): after each
+    /// `first count` header, exactly twenty bytes per entry, ten digits of
+    /// offset, a separator, five digits of generation, a separator and `n`
+    /// for in use. Anything else is `None`, as it is there.
     fn read_table(&mut self, offset: usize) -> Option<(PdfDictionary, usize)> {
         let bytes = self.bytes;
+        let blanks = |cursor: &mut usize| {
+            while bytes
+                .get(*cursor)
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0))
+            {
+                *cursor += 1;
+            }
+        };
+        let digits = |field: &[u8]| -> Option<usize> {
+            field.iter().try_fold(0usize, |value, byte| {
+                byte.is_ascii_digit()
+                    .then(|| {
+                        value
+                            .checked_mul(10)?
+                            .checked_add(usize::from(*byte - b'0'))
+                    })
+                    .flatten()
+            })
+        };
         let mut cursor = offset.checked_add(4)?;
         loop {
             self.charge(1)?;
-            skip_whitespace_and_comments(bytes, &mut cursor);
+            blanks(&mut cursor);
             if bytes.get(cursor..)?.starts_with(b"trailer") {
                 cursor = cursor.checked_add(7)?;
                 break;
@@ -7747,26 +7785,25 @@ impl XrefChain<'_> {
             let mut parser = ValueParser::new(bytes, cursor);
             let first = number_to_u32(parser.parse_number_token().ok()?)?;
             cursor = parser.pos;
-            skip_whitespace_and_comments(bytes, &mut cursor);
+            blanks(&mut cursor);
             let mut parser = ValueParser::new(bytes, cursor);
             let count = number_to_u32(parser.parse_number_token().ok()?)?;
             cursor = parser.pos;
+            blanks(&mut cursor);
             for index in 0..count {
-                skip_whitespace_and_comments(bytes, &mut cursor);
-                let mut parser = ValueParser::new(bytes, cursor);
-                let position = number_to_usize(parser.parse_number_token().ok()?)?;
-                cursor = parser.pos;
-                skip_whitespace_and_comments(bytes, &mut cursor);
-                let mut parser = ValueParser::new(bytes, cursor);
-                parser.parse_number_token().ok()?;
-                cursor = parser.pos;
-                skip_whitespace_and_comments(bytes, &mut cursor);
-                match bytes.get(cursor)? {
-                    b'n' => self.offer(first.checked_add(index)?, XrefEntry::At(position))?,
-                    b'f' => self.charge(1)?,
-                    _ => return None,
+                let end = cursor.checked_add(20)?;
+                let entry = bytes.get(cursor..end)?;
+                let position = digits(entry.get(..10)?)?;
+                let generation = u16::try_from(digits(entry.get(11..16)?)?).ok()?;
+                if entry.get(17) == Some(&b'n') {
+                    self.offer(
+                        first.checked_add(index)?,
+                        XrefEntry::At(position, generation),
+                    )?;
+                } else {
+                    self.charge(1)?;
                 }
-                cursor = cursor.checked_add(1)?;
+                cursor = end;
             }
         }
         skip_whitespace_and_comments(bytes, &mut cursor);
@@ -7819,11 +7856,17 @@ impl XrefChain<'_> {
                     return Some(());
                 };
                 let (kind, rest) = row.split_at_checked(kind_width)?;
-                let (second, _third) = rest.split_at_checked(second_width)?;
+                let (second, third) = rest.split_at_checked(second_width)?;
                 let number = first.checked_add(u32::try_from(index).ok()?)?;
                 // A missing type field means an in-use object.
                 match if kind_width == 0 { 1 } else { field(kind) } {
-                    1 => self.offer(number, XrefEntry::At(usize::try_from(field(second)).ok()?))?,
+                    1 => self.offer(
+                        number,
+                        XrefEntry::At(
+                            usize::try_from(field(second)).ok()?,
+                            u16::try_from(field(third)).ok()?,
+                        ),
+                    )?,
                     2 => self.offer(
                         number,
                         XrefEntry::Packed(u32::try_from(field(second)).ok()?),
@@ -7875,17 +7918,32 @@ fn starts_its_line(bytes: &[u8], offset: usize) -> bool {
 /// [`XREF_DECODE_MULTIPLE`] times the file length. All of it draws on one
 /// budget of [`XREF_WORK_PER_BYTE`] units per byte of file.
 ///
-/// Nothing is changed unless the chain proves itself by leading to a
-/// catalog this scan also found at the offset the chain gives, and for any
-/// one object the scan's answer stands when the chain points somewhere the
-/// scan found nothing. A missing, damaged or exhausted chain leaves the
-/// scan-order index as it was and returns no catalog.
+/// The chain is all or nothing, because the renderer's is. A table that is
+/// not in the strict twenty-byte entry format, an in-use entry that does
+/// not land exactly on that object's header, a section that cannot be
+/// read, a `/Root` that is not a catalog, or a spent budget each discard
+/// everything read: the scan-order index stands for every object and no
+/// catalog is returned.
+///
+/// # Known differences from the renderer
+///
+/// Two remain, both older than this function.
+///
+/// * This function refuses some tables the renderer follows: one with
+///   other bytes before `xref` on its line, one swallowed by an unfinished
+///   final object's span, and one written inside a stream body. Extraction
+///   then uses scan order while the renderer uses the table, so when an
+///   object is written twice they can read different copies.
+/// * An object whose only cross-reference entry is free, or one appended
+///   after the last `%%EOF` and listed nowhere, is not in the renderer's
+///   map. This crate's scan still finds it, so its text is extracted from
+///   a page the renderer draws without it.
 fn apply_xref_chain(
     bytes: &[u8],
     objects: &[PdfObject],
     streams: &[PdfStream],
     object_index: &mut HashMap<(u32, u16), usize>,
-) -> (Option<(u32, u16)>, usize) {
+) -> (Option<(u32, u16)>, usize, usize) {
     let known: HashSet<u32> = objects.iter().map(|object| object.object_number).collect();
     let mut chain = XrefChain {
         bytes,
@@ -7898,7 +7956,7 @@ fn apply_xref_chain(
             .saturating_add(4096),
     };
     let catalog = follow_xref_chain(&mut chain, objects, streams, object_index);
-    (catalog, chain.work)
+    (catalog, chain.work, chain.entries.len())
 }
 
 /// The body of [`apply_xref_chain`], with `None` for every way the chain
@@ -8005,11 +8063,9 @@ fn follow_xref_chain(
                     .iter()
                     .any(|(start, end)| *start <= cursor && cursor < *end);
             if !enterable {
-                break;
+                return None;
             }
-            let Some((trailer, end)) = chain.read_table(cursor) else {
-                break;
-            };
+            let (trailer, end) = chain.read_table(cursor)?;
             tables.push((cursor, end));
             // A hybrid file's stream belongs to this section: it places the
             // objects the table could not describe.
@@ -8017,18 +8073,12 @@ fn follow_xref_chain(
                 .get_integer("XRefStm")
                 .and_then(|value| usize::try_from(value).ok())
             {
-                let _ = read_stream_at(chain, &mut seen_streams, hybrid);
+                read_stream_at(chain, &mut seen_streams, hybrid)?;
             }
             trailer
         } else {
-            let Some(dictionary) = read_stream_at(chain, &mut seen_streams, offset) else {
-                break;
-            };
-            dictionary
+            read_stream_at(chain, &mut seen_streams, offset)?
         };
-        if chain.work > chain.budget {
-            return None;
-        }
         if root.is_none() {
             if let Some(PdfValue::Reference {
                 object_number,
@@ -8043,21 +8093,67 @@ fn follow_xref_chain(
             .and_then(|value| usize::try_from(value).ok());
     }
 
-    // Where the chain puts object `number`, as an index into `objects`.
-    let locate = |number: u32, entry: XrefEntry, index: &HashMap<(u32, u16), usize>| match entry {
-        XrefEntry::At(offset) => at(offset).filter(|found| {
-            objects
-                .get(*found)
-                .is_some_and(|object| object.object_number == number)
-        }),
-        XrefEntry::Packed(container) => {
-            let container = objects.get(*index.get(&(container, 0))?)?;
-            packed.get(&(number, container.span.start)).copied()
+    // Every in-use entry at an offset must land exactly on the header of
+    // that object, number and generation, as the scan recorded it. The
+    // renderer reads `N G obj` at the offset with no skipping and compares
+    // the identifier (hayro-syntax 0.5.0, `xref.rs` 518-522), and on the
+    // first offset that fails it throws its whole map away and rebuilds by
+    // scanning (534-545). So one bad entry here discards the whole chain.
+    let mut placed: Vec<(u32, usize)> = Vec::new();
+    let mut packed_entries: Vec<(u32, u32)> = Vec::new();
+    for (number, entry) in &chain.entries {
+        match *entry {
+            XrefEntry::At(offset, generation) => {
+                let found = *by_offset.get(&offset)?;
+                let object = objects.get(found)?;
+                if object.object_number != *number || object.generation != generation {
+                    return None;
+                }
+                placed.push((*number, found));
+            }
+            XrefEntry::Packed(container) => packed_entries.push((*number, container)),
         }
-    };
+    }
 
     let root = root?;
-    let root_index = locate(root.0, *chain.entries.get(&root.0)?, object_index)?;
+    // Every generation the scan indexed, by object number.
+    let mut generations: HashMap<u32, Vec<u16>> = HashMap::new();
+    for (number, generation) in object_index.keys() {
+        generations.entry(*number).or_default().push(*generation);
+    }
+    let mut chosen = object_index.clone();
+    let choose = |chosen: &mut HashMap<(u32, u16), usize>, number: u32, found: usize| {
+        let Some(object) = objects.get(found) else {
+            return;
+        };
+        for generation in generations.get(&number).into_iter().flatten() {
+            chosen.remove(&(number, *generation));
+        }
+        chosen.insert((number, object.generation), found);
+    };
+    for (number, found) in placed {
+        choose(&mut chosen, number, found);
+    }
+    // Then the objects inside object streams, now that every container is
+    // settled. One this scan did not unpack keeps the scan's answer: the
+    // renderer does not rebuild its map over an object stream.
+    for (number, container) in packed_entries {
+        let found = chosen
+            .get(&(container, 0))
+            .and_then(|index| objects.get(*index))
+            .and_then(|container| packed.get(&(number, container.span.start)));
+        if let Some(found) = found {
+            choose(&mut chosen, number, *found);
+        }
+    }
+    let root_index = *generations
+        .get(&root.0)
+        .into_iter()
+        .flatten()
+        .find_map(|generation| chosen.get(&(root.0, *generation)))?;
+    if !chain.entries.contains_key(&root.0) {
+        return None;
+    }
     let is_catalog = objects
         .get(root_index)?
         .dictionary
@@ -8067,33 +8163,7 @@ fn follow_xref_chain(
     if !is_catalog {
         return None;
     }
-
-    // Containers first, so a packed object finds the right object stream.
-    let mut ordered: Vec<(u32, XrefEntry)> = chain
-        .entries
-        .iter()
-        .map(|(number, entry)| (*number, *entry))
-        .collect();
-    ordered.sort_by_key(|(number, entry)| (matches!(entry, XrefEntry::Packed(_)), *number));
-    // Every generation the scan indexed, by object number.
-    let mut generations: HashMap<u32, Vec<u16>> = HashMap::new();
-    for (number, generation) in object_index.keys() {
-        generations.entry(*number).or_default().push(*generation);
-    }
-    for (number, entry) in ordered {
-        // The chain points somewhere this scan found nothing: keep the
-        // scan's answer for this object.
-        let Some(found) = locate(number, entry, object_index) else {
-            continue;
-        };
-        let Some(object) = objects.get(found) else {
-            continue;
-        };
-        for generation in generations.get(&number).into_iter().flatten() {
-            object_index.remove(&(number, *generation));
-        }
-        object_index.insert((number, object.generation), found);
-    }
+    *object_index = chosen;
     Some((root.0, objects.get(root_index)?.generation))
 }
 

@@ -525,3 +525,181 @@ fn a_hybrid_file_takes_packed_objects_from_its_cross_reference_stream() {
         assert!(words(&document).contains("Two"));
     }
 }
+
+/// How `two_copies` writes its table.
+#[derive(Clone, Copy, PartialEq)]
+enum Table {
+    /// Well formed.
+    Strict,
+    /// Entries written as `offset 0 n`, not twenty bytes each.
+    LooseEntries,
+    /// Object 4's offset points at a comment written just before it.
+    OffsetOnAComment,
+    /// The font's offset is off by one; every other entry is right.
+    OneWrongOffset,
+    /// Other bytes before `xref` on its line.
+    JunkBeforeKeyword,
+    /// Object 4's only entry is free.
+    OnlyEntryFree,
+}
+
+/// One page whose content stream, object 4, is written twice ("First", then
+/// "Second"). The table names the first copy unless `second` is set.
+fn two_copies(second: bool, table: Table) -> Vec<u8> {
+    let word = |word: &str, x: u32| {
+        stream(&format!(
+            "{x} 40 30 30 re f BT /F1 12 Tf {x} 100 Td ({word}) Tj ET"
+        ))
+    };
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = write_objects(
+        &mut out,
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+            (3, page(2, 4)),
+            (9, FONT.to_string()),
+        ],
+    );
+    if table == Table::OneWrongOffset {
+        if let Some(font) = offsets.last_mut() {
+            font.1 += 1;
+        }
+    }
+    let first = out.len();
+    if table == Table::OffsetOnAComment {
+        out.extend_from_slice(b"%pad\n");
+    }
+    write_objects(&mut out, &[(4, word("First", 20))]);
+    let later = out.len();
+    write_objects(&mut out, &[(4, word("Second", 120))]);
+    let xref_line = out.len();
+    if table == Table::JunkBeforeKeyword {
+        out.extend_from_slice(b"junk ");
+    }
+    let xref = out.len();
+    out.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    for (number, offset) in offsets {
+        let line = if table == Table::LooseEntries {
+            format!("{number} 1\n{offset} 0 n\n")
+        } else {
+            format!("{number} 1\n{offset:010} 00000 n \n")
+        };
+        out.extend_from_slice(line.as_bytes());
+    }
+    let listed = if second { later } else { first };
+    let entry = match table {
+        Table::LooseEntries => format!("4 1\n{listed} 0 n\n"),
+        Table::OnlyEntryFree => "4 1\n0000000000 00001 f \n".to_string(),
+        _ => format!("4 1\n{listed:010} 00000 n \n"),
+    };
+    out.extend_from_slice(entry.as_bytes());
+    let _ = xref_line;
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 100 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+/// Which copy the text extraction read and which the interpreter drew.
+#[cfg(feature = "rasterize")]
+fn copies_used(bytes: &[u8]) -> (&'static str, &'static str) {
+    let render = |bytes: &[u8]| {
+        open(bytes)
+            .page_rasterized_png_interpreted_checked(0, 72.0)
+            .expect("renders")
+            .expect("draws")
+    };
+    let first = render(&two_copies(false, Table::Strict));
+    let second = render(&two_copies(true, Table::Strict));
+    assert_ne!(first, second, "the reference renders must differ");
+    let words = words(&open(bytes));
+    let extracted = match (words.contains("First"), words.contains("Second")) {
+        (true, false) => "first",
+        (false, true) => "second",
+        _ => "neither or both",
+    };
+    let png = render(bytes);
+    let drawn = if png == first {
+        "first"
+    } else if png == second {
+        "second"
+    } else {
+        "neither"
+    };
+    (extracted, drawn)
+}
+
+#[cfg(feature = "rasterize")]
+#[test]
+fn a_well_formed_table_picks_the_copy_for_text_and_picture_alike() {
+    assert_eq!(
+        copies_used(&two_copies(false, Table::Strict)),
+        ("first", "first")
+    );
+    assert_eq!(
+        copies_used(&two_copies(true, Table::Strict)),
+        ("second", "second")
+    );
+}
+
+#[cfg(feature = "rasterize")]
+#[test]
+fn a_table_the_renderer_rejects_is_not_followed_for_text_either() {
+    // The renderer throws its whole map away at the first thing it cannot
+    // read and rebuilds by scanning, which finds the later copy. Following
+    // the table for text alone showed "First" under a picture of "Second".
+    for table in [Table::LooseEntries, Table::OffsetOnAComment] {
+        let (extracted, drawn) = copies_used(&two_copies(false, table));
+        assert_eq!(extracted, drawn, "text and picture read different copies");
+        assert_eq!(extracted, "second");
+    }
+}
+
+/// Known difference: the renderer discovers a bad offset only when it reads
+/// that object, and rebuilds its map then. Here the bad entry is the
+/// font's, which it reads after it has already fetched the content stream
+/// through the table, so it draws the first copy. This crate cannot know
+/// the order the renderer will read objects in; it discards the whole
+/// chain for any bad entry and extracts the second.
+#[cfg(feature = "rasterize")]
+#[test]
+#[ignore = "known difference from the renderer: it repairs its map lazily, in read order"]
+fn one_wrong_offset_among_correct_ones_should_pick_the_same_copy_for_both() {
+    let (extracted, drawn) = copies_used(&two_copies(false, Table::OneWrongOffset));
+    assert_eq!(extracted, drawn);
+}
+
+/// Known difference: the renderer follows a table with other bytes before
+/// `xref` on its line; this crate does not enter one there and falls back
+/// to scan order, so the two read different copies.
+#[cfg(feature = "rasterize")]
+#[test]
+#[ignore = "known difference from the renderer: table entry rule is stricter"]
+fn a_table_after_junk_on_its_line_should_pick_the_same_copy_for_both() {
+    let (extracted, drawn) = copies_used(&two_copies(false, Table::JunkBeforeKeyword));
+    assert_eq!(extracted, drawn);
+}
+
+/// Known difference: an object whose only entry is free is not in the
+/// renderer's map, so the page is drawn without it, but this crate's scan
+/// still finds it and extracts its text.
+#[cfg(feature = "rasterize")]
+#[test]
+#[ignore = "known difference from the renderer: free-only objects are extracted"]
+fn an_object_whose_only_entry_is_free_should_be_neither_drawn_nor_extracted() {
+    let document = open(&two_copies(false, Table::OnlyEntryFree));
+    let drawn = document
+        .page_rasterized_png_interpreted_checked(0, 72.0)
+        .expect("renders");
+    let words = words(&document);
+    let reference = open(&two_copies(true, Table::Strict))
+        .page_rasterized_png_interpreted_checked(0, 72.0)
+        .expect("renders");
+    assert_eq!(
+        drawn == reference,
+        words.contains("Second"),
+        "text {words:?} does not match what was drawn"
+    );
+    assert!(drawn != reference && !words.contains("Second"));
+}
