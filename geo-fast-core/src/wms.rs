@@ -7,6 +7,9 @@
 
 #![cfg(feature = "http")]
 
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use reqwest::Client;
@@ -218,7 +221,8 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
             match std::mem::take(&mut capture) {
                 Capture::Name => layer.name = text,
                 Capture::Title => layer.title = text,
-                Capture::Crs => layer.add_crs(text),
+                // Repeats are dropped once, when the document has been read.
+                Capture::Crs => layer.crs_list.push(text),
                 Capture::Edge(edge) => layer.edges[edge] = text.trim().parse().ok(),
                 Capture::Nothing => {}
             }
@@ -343,14 +347,15 @@ fn resolve_inheritance(declared: Vec<Option<OpenLayer>>) -> Result<Vec<WmsLayer>
                     "WMS capabilities: the reference systems the layers inherit                      take more than {MAX_INHERITED_CRS_BYTES} bytes"
                 ))
             })?;
-            let own = std::mem::replace(&mut layer.crs_list, parent.crs_list.clone());
-            layer.crs_bytes = parent.crs_bytes;
-            for crs in own {
-                layer.add_crs(crs);
-            }
+            let own = std::mem::take(&mut layer.crs_list);
+            layer.crs_list = merge_crs(&parent.crs_list, own);
             layer.geographic = layer.geographic.or(parent.geographic);
             layer.bounding = layer.bounding.or(parent.bounding);
+        } else {
+            let own = std::mem::take(&mut layer.crs_list);
+            layer.crs_list = merge_crs(&[], own);
         }
+        layer.crs_bytes = copy_cost(&layer.crs_list);
         resolved.push(Some(layer));
     }
     Ok(resolved
@@ -358,6 +363,64 @@ fn resolve_inheritance(declared: Vec<Option<OpenLayer>>) -> Result<Vec<WmsLayer>
         .flatten()
         .filter_map(OpenLayer::into_layer)
         .collect())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times two reference systems were compared on this thread.
+    static CRS_COMPARISONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A reference system as a member of the set of those a layer has.
+struct Seen<'a>(&'a str);
+
+impl PartialEq for Seen<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        CRS_COMPARISONS.with(|count| count.set(count.get() + 1));
+        self.0 == other.0
+    }
+}
+
+impl Eq for Seen<'_> {}
+
+impl Hash for Seen<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+/// The reference systems of a layer: `inherited`, then those of `own` that
+/// are not there yet, each once and in the order they were first written.
+///
+/// `inherited` is a list this function returned, so it has no repeats. The
+/// work is linear in the two lists together: membership is asked of a hash
+/// set, not of the list. Nothing is hashed for a layer that declares none.
+fn merge_crs(inherited: &[String], own: Vec<String>) -> Vec<String> {
+    if own.is_empty() {
+        return inherited.to_vec();
+    }
+    let mut seen: HashSet<Seen<'_>> = HashSet::with_capacity(inherited.len() + own.len());
+    seen.extend(inherited.iter().map(|crs| Seen(crs)));
+    let is_new: Vec<bool> = own.iter().map(|crs| seen.insert(Seen(crs))).collect();
+    drop(seen);
+    let added = is_new.iter().filter(|new| **new).count();
+    let mut merged = Vec::with_capacity(inherited.len() + added);
+    merged.extend_from_slice(inherited);
+    merged.extend(
+        own.into_iter()
+            .zip(is_new)
+            .filter_map(|(crs, new)| new.then_some(crs)),
+    );
+    merged
+}
+
+/// What a copy of `crs_list` counts for against [`MAX_INHERITED_CRS_BYTES`].
+fn copy_cost(crs_list: &[String]) -> usize {
+    crs_list.iter().fold(0usize, |cost, crs| {
+        cost.saturating_add(crs.len())
+            .saturating_add(std::mem::size_of::<String>())
+    })
 }
 
 /// Positions of the four edges in [`OpenLayer::edges`].
@@ -394,8 +457,8 @@ struct OpenLayer {
     parent: Option<usize>,
     name: String,
     title: String,
-    /// Reference systems, each once: the layer's own, and once resolved the
-    /// ancestors' before them.
+    /// Reference systems: the layer's own as they are written, and once
+    /// resolved the ancestors' before them, each once.
     crs_list: Vec<String>,
     /// What a copy of `crs_list` counts for against
     /// [`MAX_INHERITED_CRS_BYTES`].
@@ -427,17 +490,6 @@ impl OpenLayer {
             bounding: None,
             edges: [None; 4],
             in_geographic_box: false,
-        }
-    }
-
-    /// Adds a reference system unless the layer already has it.
-    fn add_crs(&mut self, crs: String) {
-        if !self.crs_list.contains(&crs) {
-            self.crs_bytes = self
-                .crs_bytes
-                .saturating_add(crs.len())
-                .saturating_add(std::mem::size_of::<String>());
-            self.crs_list.push(crs);
         }
     }
 
@@ -709,6 +761,143 @@ mod tests {
                 ("c", "", Some(BBox::new(5.0, 6.0, 7.0, 8.0))),
             ]
         );
+    }
+
+    /// 1,500 sibling layers, none inside another: names, titles, repeated
+    /// reference systems, every way of writing a box, and groups without a
+    /// name.
+    fn flat_capabilities() -> String {
+        let mut xml = String::from("<C>");
+        for i in 0..1500 {
+            xml.push_str("<Layer>");
+            if i % 7 != 3 {
+                xml.push_str(&format!("<Name>layer{i}</Name>"));
+            }
+            if i % 2 == 0 {
+                xml.push_str(&format!("<Title>Layer &amp; {i}</Title>"));
+            }
+            for system in 0..i % 5 {
+                xml.push_str(&format!("<CRS>EPSG:{}</CRS>", 4326 + system));
+            }
+            if i % 3 == 0 {
+                // Declared twice: returned once.
+                xml.push_str("<SRS>EPSG:4326</SRS><CRS>CRS:84</CRS>");
+            }
+            match i % 4 {
+                0 => xml.push_str(&format!(
+                    "<LatLonBoundingBox minx=\"-{i}\" miny=\"-1\" maxx=\"{i}\" maxy=\"1\"/>"
+                )),
+                1 => xml.push_str(&format!(
+                    "<BoundingBox CRS=\"EPSG:3857\" minx=\"0\" miny=\"0\" maxx=\"{i}\" maxy=\"2\"/>"
+                )),
+                2 => xml.push_str(&format!(
+                    "<EX_GeographicBoundingBox>\
+                     <westBoundLongitude>-10</westBoundLongitude>\
+                     <eastBoundLongitude>10</eastBoundLongitude>\
+                     <southBoundLatitude>-{i}.5</southBoundLatitude>\
+                     <northBoundLatitude>{i}.5</northBoundLatitude>\
+                     </EX_GeographicBoundingBox>"
+                )),
+                _ => {}
+            }
+            xml.push_str("<Style><Name>s</Name><Title>S</Title></Style></Layer>");
+        }
+        xml.push_str("</C>");
+        xml
+    }
+
+    /// A document without nesting reads as it did before layers inherited:
+    /// the numbers below were taken from the parser as it was.
+    #[test]
+    fn flat_document_reads_as_before() {
+        let layers = parse_capabilities_xml(&flat_capabilities()).expect("capabilities");
+        let strings = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        let systems: usize = layers.iter().map(|layer| layer.crs_list.len()).sum();
+        let boxes = layers.iter().filter(|layer| layer.bbox.is_some()).count();
+        let titled = layers
+            .iter()
+            .filter(|layer| !layer.title.is_empty())
+            .count();
+        assert_eq!(
+            (layers.len(), systems, boxes, titled),
+            (1286, 3085, 965, 643)
+        );
+        let spot = |name: &str| {
+            let layer = layers.iter().find(|layer| layer.name == name);
+            layer.map(|l| (l.title.clone(), l.crs_list.clone(), l.bbox))
+        };
+        assert_eq!(
+            spot("layer9"),
+            Some((
+                String::new(),
+                strings(&["EPSG:4326", "EPSG:4327", "EPSG:4328", "EPSG:4329", "CRS:84"]),
+                Some(BBox::new(0.0, 0.0, 9.0, 2.0))
+            ))
+        );
+        assert_eq!(
+            spot("layer750"),
+            Some((
+                "Layer & 750".to_string(),
+                strings(&["EPSG:4326", "CRS:84"]),
+                Some(BBox::new(-10.0, -750.5, 10.0, 750.5))
+            ))
+        );
+        assert_eq!(
+            spot("layer1499"),
+            Some((
+                String::new(),
+                strings(&["EPSG:4326", "EPSG:4327", "EPSG:4328", "EPSG:4329"]),
+                None
+            ))
+        );
+        assert_eq!(layers[0].name, "layer0");
+        assert_eq!(layers[1285].name, "layer1499");
+    }
+
+    /// Reference systems are told apart through a hash set, so reading
+    /// `n` of them takes about `n` comparisons. Each used to be compared
+    /// with every one before it: 20,000 took 200,000,000 comparisons, here
+    /// and again for every layer that declared what its parent had.
+    #[test]
+    fn reference_systems_are_deduplicated_in_linear_work() {
+        // One layer, 20,000 different systems and each of them once more.
+        let mut xml = String::from("<C><Layer><Name>n</Name>");
+        for system in (0..20_000).chain(0..20_000) {
+            xml.push_str(&format!("<CRS>EPSG:{system}</CRS>"));
+        }
+        xml.push_str("</Layer></C>");
+        CRS_COMPARISONS.with(|count| count.set(0));
+        let layers = parse_capabilities_xml(&xml).expect("capabilities");
+        let comparisons = CRS_COMPARISONS.with(std::cell::Cell::get);
+        assert_eq!(layers[0].crs_list.len(), 20_000);
+        assert_eq!(layers[0].crs_list[19_999], "EPSG:19999");
+        assert!(comparisons <= 4 * 40_000, "{comparisons} comparisons");
+
+        // A root with 2,000 systems and 50 children that declare them all
+        // again, last first, and one of their own.
+        let mut xml = String::from("<C><Layer><Name>root</Name>");
+        for system in 0..2000 {
+            xml.push_str(&format!("<CRS>EPSG:{system}</CRS>"));
+        }
+        for child in 0..50 {
+            xml.push_str(&format!(
+                "<Layer><Name>l{child}</Name><CRS>own{child}</CRS>"
+            ));
+            for system in (0..2000).rev() {
+                xml.push_str(&format!("<CRS>EPSG:{system}</CRS>"));
+            }
+            xml.push_str("</Layer>");
+        }
+        xml.push_str("</Layer></C>");
+        CRS_COMPARISONS.with(|count| count.set(0));
+        let layers = parse_capabilities_xml(&xml).expect("capabilities");
+        let comparisons = CRS_COMPARISONS.with(std::cell::Cell::get);
+        assert_eq!(layers.len(), 51);
+        assert!(layers[1..].iter().all(|layer| layer.crs_list.len() == 2001));
+        assert_eq!(layers[50].crs_list[1999], "EPSG:1999");
+        assert_eq!(layers[50].crs_list[2000], "own49");
+        // 102,050 systems are written in the document.
+        assert!(comparisons <= 4 * 102_050, "{comparisons} comparisons");
     }
 
     /// `children` named layers under a root without a name that declares
