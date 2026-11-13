@@ -20,7 +20,7 @@ anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 flate2 = "1.0"
 memmap2 = "0.9"
-quick-xml = "0.41"
+quick-xml = "0.42"
 rawzip = "0.5.2"
 
 [dev-dependencies]
