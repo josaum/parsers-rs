@@ -3845,8 +3845,107 @@ pub struct PdfDictionaryEntry {
     pub value: PdfValue,
 }
 
+/// An array or dictionary part-way through being copied by
+/// [`PdfValue::clone`].
+enum CopiedContainer<'a> {
+    Array {
+        rest: std::slice::Iter<'a, PdfValue>,
+        copied: Vec<PdfValue>,
+    },
+    Dictionary {
+        rest: std::slice::Iter<'a, PdfDictionaryEntry>,
+        copied: Vec<PdfDictionaryEntry>,
+        /// Key of the entry whose value is being copied.
+        key: &'a str,
+    },
+}
+
+/// Copies a value without recursing once per level of nesting.
+///
+/// The derived implementation calls itself for every array and dictionary
+/// level, and a value nested to the parser's limit then needs more stack to
+/// copy than to parse: page resources are copied on the way to every reader.
+/// Containers being copied are kept in a list instead.
+impl Clone for PdfValue {
+    fn clone(&self) -> Self {
+        let mut open: Vec<CopiedContainer<'_>> = Vec::new();
+        let mut source = self;
+        loop {
+            let mut finished = match source {
+                Self::Null => Some(Self::Null),
+                Self::Bool(value) => Some(Self::Bool(*value)),
+                Self::Integer(value) => Some(Self::Integer(*value)),
+                Self::Real(value) => Some(Self::Real(*value)),
+                Self::Name(value) => Some(Self::Name(value.clone())),
+                Self::String(value) => Some(Self::String(value.clone())),
+                Self::HexString(value) => Some(Self::HexString(value.clone())),
+                Self::Reference {
+                    object_number,
+                    generation,
+                } => Some(Self::Reference {
+                    object_number: *object_number,
+                    generation: *generation,
+                }),
+                Self::Raw(value) => Some(Self::Raw(value.clone())),
+                Self::Array(values) => {
+                    open.push(CopiedContainer::Array {
+                        rest: values.iter(),
+                        copied: Vec::with_capacity(values.len()),
+                    });
+                    None
+                }
+                Self::Dictionary(dictionary) => {
+                    open.push(CopiedContainer::Dictionary {
+                        rest: dictionary.entries.iter(),
+                        copied: Vec::with_capacity(dictionary.entries.len()),
+                        key: "",
+                    });
+                    None
+                }
+            };
+            // Hand a finished copy to the container it belongs in, and keep
+            // closing containers until one has another child to copy.
+            loop {
+                let Some(top) = open.last_mut() else {
+                    // Nothing is open, so the copy is the whole value: a
+                    // container that was just opened is still in the list.
+                    return finished.unwrap_or(Self::Null);
+                };
+                match top {
+                    CopiedContainer::Array { rest, copied } => {
+                        copied.extend(finished.take());
+                        if let Some(next) = rest.next() {
+                            source = next;
+                            break;
+                        }
+                    }
+                    CopiedContainer::Dictionary { rest, copied, key } => {
+                        if let Some(value) = finished.take() {
+                            copied.push(PdfDictionaryEntry {
+                                key: (*key).to_owned(),
+                                value,
+                            });
+                        }
+                        if let Some(entry) = rest.next() {
+                            *key = &entry.key;
+                            source = &entry.value;
+                            break;
+                        }
+                    }
+                }
+                finished = open.pop().map(|container| match container {
+                    CopiedContainer::Array { copied, .. } => Self::Array(copied),
+                    CopiedContainer::Dictionary { copied, .. } => {
+                        Self::Dictionary(PdfDictionary { entries: copied })
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// A PDF value as recovered from a dictionary or array.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[cfg_attr(feature = "serde", serde(tag = "type", content = "value"))]
 pub enum PdfValue {

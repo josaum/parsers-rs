@@ -1010,10 +1010,11 @@ fn refused_nesting_leaves_three_quarters_of_the_small_stack_unused() {
 /// Nesting at the limits and one level under them, on half the small stack.
 ///
 /// These inputs are accepted, so the whole nested value is built and then
-/// walked and dropped, and that later code does recurse once per level. This
-/// is the deepest value the parsers hand out, which makes it the most stack
-/// any nesting can cost; half the stack is about three times what it needs
-/// in an unoptimized macOS build. Raising either limit shows up here.
+/// walked and dropped, and dropping does recurse once per level. Where the
+/// value sits matters: one inside a page's `/Resources` is also copied on
+/// the way to every reader, and copying once recursed too, at several times
+/// the cost of dropping. So the value is placed there as well as in an
+/// object of its own. Raising either limit shows up here.
 #[test]
 fn nesting_at_the_limit_leaves_half_the_small_stack_unused() {
     let _serial = serial();
@@ -1024,6 +1025,24 @@ fn nesting_at_the_limit_leaves_half_the_small_stack_unused() {
                 parse_nested_object(open, close, levels, closed, stack_bytes);
             }
         }
+    }
+    // Two dictionaries enclose the array, so 126 levels reach the limit.
+    for levels in [126, 125] {
+        let mut page =
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Deep ".to_vec();
+        page.extend(smoke::nested(b"[", b"1", b"]", levels));
+        page.extend_from_slice(b" /Font << /F1 5 0 R >> >> >>");
+        let document = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+            page,
+            stream("", b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET 0 0 m 100 0 l S"),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ]);
+        run_on_stack(stack_bytes, move || {
+            exercise_text(&document, ParseOptions::default());
+            exercise_tables(&document, ParseOptions::default());
+        });
     }
     // The content tokenizer accepts 128 levels of arrays.
     for levels in [128, 127] {
@@ -1107,9 +1126,14 @@ fn read_on_small_stack(document: Vec<u8>) {
     });
 }
 
-/// A glyph whose procedure shows the glyph itself, and two glyphs that show
-/// each other. The procedure ran again for every level with nothing to stop
-/// it, so either one overflowed the stack and aborted the process.
+/// A glyph whose procedure shows the glyph itself, two glyphs that show each
+/// other, and five that show each other in a ring. The procedure ran again
+/// for every level with nothing to stop it, so each of these overflowed the
+/// stack and aborted the process.
+///
+/// A cycle has to stay inside one font and use no `Tf`: a glyph procedure is
+/// run with no resources, so a font selected inside one selects nothing and a
+/// form invoked inside one is not found.
 #[test]
 fn a_type3_glyph_that_shows_itself_is_not_followed() {
     let _serial = serial();
@@ -1131,36 +1155,11 @@ fn a_type3_glyph_that_shows_itself_is_not_followed() {
         ]],
         &[],
     ));
-}
-
-/// The cycles that pass through a font selection or a form: a glyph that
-/// selects its own font and shows a glyph that does the same back, two fonts
-/// whose glyphs show each other, and a glyph that invokes a form whose
-/// content shows the glyph. Each has to end.
-#[test]
-fn type3_cycles_through_fonts_and_forms_end() {
-    let _serial = serial();
-    read_on_small_stack(type3_document(
-        b"BT /T0 10 Tf (ab) Tj ET",
-        &[vec![
-            b"500 0 d0 BT /T0 10 Tf (b) Tj ET".to_vec(),
-            b"500 0 d0 BT /T0 10 Tf (a) Tj ET".to_vec(),
-        ]],
-        &[],
-    ));
-    read_on_small_stack(type3_document(
-        b"BT /T0 10 Tf (a) Tj /T1 10 Tf (a) Tj ET",
-        &[
-            vec![b"500 0 d0 BT /T1 10 Tf (a) Tj ET".to_vec()],
-            vec![b"500 0 d0 BT /T0 10 Tf (a) Tj ET".to_vec()],
-        ],
-        &[],
-    ));
-    read_on_small_stack(type3_document(
-        b"BT /T0 10 Tf (a) Tj ET /Fm0 Do",
-        &[vec![b"500 0 d0 /Fm0 Do".to_vec()]],
-        &[b"BT /T0 10 Tf (a) Tj ET".to_vec()],
-    ));
+    // Five glyphs in a ring, longer than the nesting that is followed.
+    let ring = (*b"bcdea")
+        .map(|next| format!("500 0 d0 ({}) Tj", char::from(next)).into_bytes())
+        .to_vec();
+    read_on_small_stack(type3_document(b"BT /T0 10 Tf (abcde) Tj ET", &[ring], &[]));
 }
 
 /// The deepest path a page can take: as many nested forms as are followed,
@@ -1185,10 +1184,24 @@ fn nested_forms_and_glyph_procedures_leave_half_the_small_stack_unused() {
     });
 }
 
+/// Bytes of glyph procedure the reader executes for one pass over
+/// `document`, and whether that pass was refused for exceeding a limit.
+fn glyph_procedure_work(document: &[u8]) -> (u64, bool) {
+    let document = parse(document, ParseOptions::default()).expect("document parses");
+    let before = pdf_fast_core::vector_text::glyph_procedure_bytes_read();
+    let refused = document.vector_glyph_descriptors_checked(8).is_err();
+    let after = pdf_fast_core::vector_text::glyph_procedure_bytes_read();
+    (after - before, refused)
+}
+
+/// The cap on glyph procedure executed inside other glyph procedures.
+const NESTED_GLYPH_BYTES: u64 = 16 * 1024 * 1024;
+
 /// A glyph shown three thousand times whose procedure shows another three
 /// thousand times, three levels deep: twenty-seven billion procedure runs
-/// from ten kilobytes of content. What a page may execute inside glyph
-/// procedures is capped, so this returns; without the cap it does not finish.
+/// from ten kilobytes of content. The reader stops at its cap on nested
+/// procedures and says so, having read the cap plus one procedure for each
+/// glyph the page itself shows.
 #[test]
 fn nested_type3_glyph_procedures_do_not_multiply_without_bound() {
     let _serial = serial();
@@ -1201,11 +1214,79 @@ fn nested_type3_glyph_procedures_do_not_multiply_without_bound() {
     let mut content = b"BT /T0 10 Tf (".to_vec();
     content.extend(std::iter::repeat_n(b'a', 3_000));
     content.extend_from_slice(b") Tj ET");
-    read_on_small_stack(type3_document(
+    let document = type3_document(
         &content,
         &[vec![shown(b'b'), shown(b'c'), BOX_GLYPH.to_vec()]],
         &[],
-    ));
+    );
+    let (work, refused) = glyph_procedure_work(&document);
+    assert!(refused, "the nested procedure cap is reported");
+    let page_level = 3_000 * shown(b'b').len() as u64;
+    assert!(
+        work <= NESTED_GLYPH_BYTES + page_level,
+        "read {work} bytes of glyph procedure"
+    );
+}
+
+/// A glyph whose procedure shows itself a hundred thousand times. Each show
+/// is refused, and refusing must not cost the procedure's length: the reader
+/// compared the whole procedure every time, which made this quadratic. The
+/// procedure is read once.
+#[test]
+fn refusing_a_self_showing_glyph_costs_nothing_per_show() {
+    let _serial = serial();
+    let mut procedure = b"500 0 d0 (".to_vec();
+    procedure.extend(std::iter::repeat_n(b'a', 100_000));
+    procedure.extend_from_slice(b") Tj");
+    let length = procedure.len() as u64;
+    let document = type3_document(b"BT /T0 10 Tf (a) Tj ET", &[vec![procedure]], &[]);
+    let (work, refused) = glyph_procedure_work(&document);
+    assert!(!refused, "a cycle is skipped, not an error");
+    assert_eq!(work, length);
+}
+
+/// A box glyph padded to a kilobyte, and a composite glyph that shows it.
+fn composite_font() -> Vec<Vec<u8>> {
+    let mut part = BOX_GLYPH.to_vec();
+    part.resize(1_024, b' ');
+    vec![part, b"500 0 d0 (a) Tj".to_vec()]
+}
+
+/// Pages of five and eight thousand composite glyphs keep every outline. A
+/// cap small enough to stop these dropped the glyphs past it without a word.
+#[test]
+fn a_page_of_composite_type3_glyphs_keeps_every_outline() {
+    let _serial = serial();
+    for shows in [5_000, 8_000] {
+        let mut content = b"BT /T0 10 Tf 72 700 Td (".to_vec();
+        content.extend(std::iter::repeat_n(b'b', shows));
+        content.extend_from_slice(b") Tj ET");
+        let document = type3_document(&content, &[composite_font()], &[]);
+        assert_eq!(text_and_outline_count(&document).1, shows);
+    }
+}
+
+/// Composite glyphs whose part is a megabyte long spend the nested procedure
+/// cap before the honest glyphs after them are reached. The checked reader
+/// reports the limit; it does not hand back a page with glyphs missing.
+#[test]
+fn a_spent_glyph_procedure_cap_is_an_error_not_missing_glyphs() {
+    let _serial = serial();
+    let mut heavy = BOX_GLYPH.to_vec();
+    heavy.resize(1024 * 1024, b' ');
+    let fonts = vec![vec![heavy, b"500 0 d0 (a) Tj".to_vec()], composite_font()];
+    let mut content = b"BT /T0 10 Tf 72 700 Td (".to_vec();
+    content.extend(std::iter::repeat_n(b'b', 20));
+    content.extend_from_slice(b") Tj /T1 10 Tf (bbbbbbbbbb) Tj ET");
+    let document = type3_document(&content, &fonts, &[]);
+    let document = parse(&document, ParseOptions::default()).expect("document parses");
+    let error = document
+        .vector_glyph_descriptors_checked(8)
+        .expect_err("the cap is reported");
+    assert!(
+        format!("{error:#}").contains("glyph procedures nested"),
+        "{error:#}"
+    );
 }
 
 /// What the glyph reader finds in `document`: the semantic text, and how many
