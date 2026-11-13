@@ -414,6 +414,11 @@ impl SchemaModel {
     /// its end, however long. Types that do not inherit are left
     /// byte-identical.
     ///
+    /// A recursive type, one holding an element whose inline type extends
+    /// the type itself or a type that leads back to it, is unrolled to a
+    /// fixed nesting. Below that, the inline type keeps only what it
+    /// declares itself.
+    ///
     /// Idempotent in effect for the common case, but intended to run exactly
     /// once, immediately after a schema set finishes loading. A cycle is
     /// broken at the first name met twice, and the chain walk does not
@@ -459,14 +464,23 @@ impl SchemaModel {
             uncharged_text_bytes: 0,
         };
 
+        let mut folding = Vec::new();
+
         for (name, ct) in self.complex_types.iter_mut() {
-            resolve_complex_type(ct, Some(name.as_str()), &originals, 0, &mut budget)?;
+            resolve_complex_type(
+                ct,
+                Some(name.as_str()),
+                &originals,
+                0,
+                &mut folding,
+                &mut budget,
+            )?;
         }
         // A global element can hold an inline type, which can extend a named
         // type itself or hold elements whose inline types do.
         for element in self.global_elements.values_mut() {
             if let XsdType::Complex(inline) = &mut element.type_def {
-                resolve_complex_type(inline, None, &originals, 0, &mut budget)?;
+                resolve_complex_type(inline, None, &originals, 0, &mut folding, &mut budget)?;
             }
         }
         Ok(())
@@ -655,12 +669,28 @@ impl CopyCost {
 
 /// Deepest nesting of inline types and model groups folded in one type.
 ///
-/// The parser refuses a schema nested deeper than its own bound, which is
-/// well below this, so a loaded schema never reaches it. It exists for a
-/// model built or deserialized by a caller: folding recurses once per level,
-/// and a model nested deeper than this is refused instead of being left
-/// partly folded.
+/// A backstop, not the rule that ends a fold. Folding recurses once per
+/// level, and a fold can nest deeper than the schema text does: every base
+/// copied into an inline type brings its own inline types with it. A
+/// recursive type is ended by [`MAX_RECURSIVE_FOLD_DEPTH`] long before this.
+/// What is left to reach it is a long run of different named types, each
+/// with an inline child extending the next, or a model built or deserialized
+/// by a caller; such a model is refused instead of being left partly folded.
 const MAX_INHERITANCE_NESTING: usize = 256;
+
+/// Nesting up to which a recursive type is unrolled.
+///
+/// A named type can hold an element whose inline type extends that same
+/// type, directly or through other types. That is legal, and folding it has
+/// no end: the copied base holds the inline extension again. An inline type
+/// whose base is already being folded around it is therefore folded again
+/// only above this nesting, and below it keeps the particles and attributes
+/// it declares itself. Sixteen is how deep recursion was unrolled before the
+/// fold followed bases to any depth, so a recursive schema keeps the model
+/// it had. Raising it deepens every later walk over the model (validation,
+/// Arrow derivation, `Clone`, `Drop`) and multiplies the copies a type with
+/// several recursive children costs.
+const MAX_RECURSIVE_FOLD_DEPTH: usize = 16;
 
 /// Resolve one complex type in place: fold its base, then recurse into inline
 /// children so nested `complexContent`/`extension` is resolved as well.
@@ -669,18 +699,29 @@ const MAX_INHERITANCE_NESTING: usize = 256;
 /// points straight back at the type itself. `depth` is the nesting of this
 /// type inside the named type being resolved; it has no bearing on how long
 /// a chain of bases is followed.
-fn resolve_complex_type(
+///
+/// `folding` names the bases being folded around this type: every named type
+/// whose copied particles the walk is inside of. A base met again there is
+/// recursion, which is unrolled to [`MAX_RECURSIVE_FOLD_DEPTH`] and no
+/// further.
+fn resolve_complex_type<'a>(
     ct: &mut ComplexType,
     owner: Option<&str>,
-    originals: &IndexMap<String, ComplexType>,
+    originals: &'a IndexMap<String, ComplexType>,
     depth: usize,
+    folding: &mut Vec<&'a str>,
     budget: &mut InheritanceBudget,
 ) -> anyhow::Result<()> {
     check_inheritance_nesting(depth)?;
+    let outer = folding.len();
     // Fold the base chain into this type's content + attributes.
-    if let Some(base) = ct.base.clone() {
+    let base = ct
+        .base
+        .as_ref()
+        .filter(|base| depth < MAX_RECURSIVE_FOLD_DEPTH || !folding.contains(&base.local.as_str()));
+    if let Some(base) = base.cloned() {
         if let Some((mut base_particles, mut base_attrs)) =
-            collect_base(&base.local, owner, originals, budget)?
+            collect_base(&base.local, owner, originals, folding, budget)?
         {
             match &mut ct.content {
                 // The type's own particles move behind the inherited ones.
@@ -701,11 +742,13 @@ fn resolve_complex_type(
     }
 
     // Recurse into inline complex types so nested extensions are resolved too.
+    // The bases just folded stay named while their copies are walked.
     if let Some(particles) = content_particles_mut(&mut ct.content) {
         for particle in particles {
-            resolve_element_ref(&mut particle.element, originals, depth + 1, budget)?;
+            resolve_element_ref(&mut particle.element, originals, depth + 1, folding, budget)?;
         }
     }
+    folding.truncate(outer);
     Ok(())
 }
 
@@ -721,10 +764,11 @@ fn check_inheritance_nesting(depth: usize) -> anyhow::Result<()> {
 }
 
 /// Resolve any inline complex type reachable through one particle's element.
-fn resolve_element_ref(
+fn resolve_element_ref<'a>(
     element: &mut ElementRef,
-    originals: &IndexMap<String, ComplexType>,
+    originals: &'a IndexMap<String, ComplexType>,
     depth: usize,
+    folding: &mut Vec<&'a str>,
     budget: &mut InheritanceBudget,
 ) -> anyhow::Result<()> {
     check_inheritance_nesting(depth)?;
@@ -732,13 +776,19 @@ fn resolve_element_ref(
         ElementRef::Inline(decl) => {
             if let XsdType::Complex(inner) = &mut decl.type_def {
                 // Inline types are anonymous; they have no name to self-reference.
-                resolve_complex_type(inner, None, originals, depth, budget)?;
+                resolve_complex_type(inner, None, originals, depth, folding, budget)?;
             }
         }
         ElementRef::Group(group) => {
             if let Some(particles) = content_particles_mut(group) {
                 for particle in particles {
-                    resolve_element_ref(&mut particle.element, originals, depth + 1, budget)?;
+                    resolve_element_ref(
+                        &mut particle.element,
+                        originals,
+                        depth + 1,
+                        folding,
+                        budget,
+                    )?;
                 }
             }
         }
@@ -761,10 +811,13 @@ type Inherited = (Vec<Particle>, Vec<AttributeDecl>);
 /// that the walk itself is bounded, and everything copied is charged at its
 /// [`CopyCost`] before the copy is made. A chain the budget cannot pay for is
 /// an error, never a partly inherited type.
-fn collect_base(
+///
+/// The name of every type on the chain is appended to `folding`.
+fn collect_base<'a>(
     base_local: &str,
     owner: Option<&str>,
-    originals: &IndexMap<String, ComplexType>,
+    originals: &'a IndexMap<String, ComplexType>,
+    folding: &mut Vec<&'a str>,
     budget: &mut InheritanceBudget,
 ) -> anyhow::Result<Option<Inherited>> {
     // Nearest base first.
@@ -785,6 +838,7 @@ fn collect_base(
             text_bytes: 0,
         })?;
         chain.push(base);
+        folding.push(name.as_str());
         next = base.base.as_ref().map(|base| base.local.as_str());
     }
     if chain.is_empty() {

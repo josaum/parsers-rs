@@ -1,0 +1,104 @@
+//! A type whose inline child extends the type itself.
+//!
+//! Recursive types are legal XSD. Folding the base into the inline extension
+//! copies the base, which holds the same inline extension again, so the fold
+//! has to stop by itself instead of running into a resource limit.
+
+use xsd_fast_core::schema::{ComplexType, ContentModel, ElementRef, XsdType};
+use xsd_fast_core::{ParseOptions, SchemaSet, ValidateOptions};
+
+const SELF_RECURSIVE: &[u8] = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:complexType name="N"><xs:sequence><xs:element name="v" type="xs:string"/><xs:element name="child" minOccurs="0"><xs:complexType><xs:complexContent><xs:extension base="N"><xs:sequence><xs:element name="x" type="xs:string" minOccurs="0"/></xs:sequence></xs:extension></xs:complexContent></xs:complexType></xs:element></xs:sequence></xs:complexType><xs:element name="root" type="N"/></xs:schema>"#;
+
+const MUTUALLY_RECURSIVE: &[u8] = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:complexType name="A"><xs:sequence>
+    <xs:element name="a" type="xs:string"/>
+    <xs:element name="toB" minOccurs="0"><xs:complexType><xs:complexContent>
+      <xs:extension base="B"><xs:sequence><xs:element name="xa" type="xs:string" minOccurs="0"/></xs:sequence></xs:extension>
+    </xs:complexContent></xs:complexType></xs:element>
+  </xs:sequence></xs:complexType>
+  <xs:complexType name="B"><xs:sequence>
+    <xs:element name="b" type="xs:string"/>
+    <xs:element name="toA" minOccurs="0"><xs:complexType><xs:complexContent>
+      <xs:extension base="A"><xs:sequence><xs:element name="xb" type="xs:string" minOccurs="0"/></xs:sequence></xs:extension>
+    </xs:complexContent></xs:complexType></xs:element>
+  </xs:sequence></xs:complexType>
+  <xs:element name="root" type="A"/>
+</xs:schema>"#;
+
+#[test]
+fn a_type_whose_inline_child_extends_it_loads_and_validates() {
+    let schema =
+        SchemaSet::load_bytes(SELF_RECURSIVE, ParseOptions::default()).expect("schema loads");
+    let findings = schema
+        .validate(
+            b"<root><v/><child><v/><child><v/></child></child></root>",
+            ValidateOptions::default(),
+        )
+        .expect("validation runs");
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn mutually_recursive_inline_extensions_load_and_validate() {
+    let schema =
+        SchemaSet::load_bytes(MUTUALLY_RECURSIVE, ParseOptions::default()).expect("schema loads");
+    let findings = schema
+        .validate(
+            b"<root><a/><toB><b/><toA><a/><toB><b/><xa/></toB><xb/></toA><xa/></toB></root>",
+            ValidateOptions::default(),
+        )
+        .expect("validation runs");
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+/// Names of the elements a complex type declares, in order.
+fn children(complex: &ComplexType) -> Vec<&str> {
+    let ContentModel::Sequence(particles) = &complex.content else {
+        panic!("expected a sequence, got {:?}", complex.content);
+    };
+    particles
+        .iter()
+        .map(|particle| match &particle.element {
+            ElementRef::Inline(decl) => decl.name.local.as_str(),
+            other => panic!("expected an inline element, got {other:?}"),
+        })
+        .collect()
+}
+
+/// The inline type of the `child` element of `complex`.
+fn child_type(complex: &ComplexType) -> &ComplexType {
+    let ContentModel::Sequence(particles) = &complex.content else {
+        panic!("expected a sequence, got {:?}", complex.content);
+    };
+    particles
+        .iter()
+        .find_map(|particle| match &particle.element {
+            ElementRef::Inline(decl) if decl.name.local == "child" => match &decl.type_def {
+                XsdType::Complex(inner) => Some(inner),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("a child element with an inline type")
+}
+
+// The recursion is unrolled several levels, as it was before bases were
+// followed to any depth, and then ends at an inline type left as written.
+#[test]
+fn recursion_is_unrolled_some_levels_and_then_ends() {
+    let schema =
+        SchemaSet::load_bytes(SELF_RECURSIVE, ParseOptions::default()).expect("schema loads");
+    let mut complex = &schema.model().complex_types["N"];
+    assert_eq!(children(complex), ["v", "child"]);
+    for level in 1..=8 {
+        complex = child_type(complex);
+        assert_eq!(children(complex), ["v", "child", "x"], "level {level}");
+    }
+    let mut levels = 8;
+    while children(complex).contains(&"child") {
+        complex = child_type(complex);
+        levels += 1;
+        assert!(levels < 64, "the recursion does not end");
+    }
+    assert_eq!(children(complex), ["x"]);
+}
