@@ -56,13 +56,22 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 /// Deepest nesting of brackets one document may use.
 ///
-/// The Turtle parser keeps a few hundred bytes of state for every `[ ... ]`,
-/// `( ... )`, `<< ... >>` or `{| ... |}` it is inside, so a megabyte of opening
-/// brackets would otherwise cost hundreds of megabytes before a single
-/// statement is read. Ten thousand levels is far beyond any authored
+/// The Turtle parser keeps a few hundred bytes of heap state for every
+/// `[ ... ]`, `( ... )`, `<< ... >>` or `{| ... |}` it is inside, so a megabyte
+/// of opening brackets would otherwise cost hundreds of megabytes before a
+/// single statement is read. Ten thousand levels is far beyond any authored
 /// ontology and holds that state to a few megabytes. A document that nests
 /// deeper is refused with [`OntologyError::ResourceLimit`] naming
 /// `nesting_depth`, by every entry point, before it is parsed.
+///
+/// What this bounds is the parser's heap: its state for open brackets is a
+/// list, not recursion, so `[`, `(`, `<<` and `{|` cost no call stack however
+/// deep they go. It does not bound the call stack. The one construct that
+/// costs stack per level is the RDF 1.2 triple term `<<( ... )>>`, whose
+/// value is a term that owns a term; that has its own, much lower limit,
+/// [`MAX_TRIPLE_TERM_DEPTH`]. Nor does it bound how many brackets a document
+/// has in total, or what its statements cost: those are the source, statement
+/// and term budgets.
 ///
 /// The guard is a scan of the bytes, not a parse, and it runs first. It
 /// counts what the parser would count in a well-formed document, so no valid
@@ -72,6 +81,42 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// reported [`OntologyError::Syntax`]: it is refused either way, but the code
 /// may differ.
 pub const MAX_NESTING_DEPTH: usize = 10_000;
+
+/// Deepest nesting of RDF 1.2 triple terms, `<<( ... )>>`, in one document.
+///
+/// A triple term is a term that owns another statement, so a triple term
+/// inside a triple term is a chain of boxes. The parser builds that chain,
+/// and the chain is taken apart again, by recursion: every level costs call
+/// stack, where every other bracket costs only heap (see
+/// [`MAX_NESTING_DEPTH`], which counts each `<<(` as two brackets and so
+/// admitted five thousand of them). Measured on macOS/arm64 with `oxttl`
+/// 0.2.5, a level costs about 720 bytes of stack in an unoptimized build and
+/// about 330 in an optimized one, the same for every entry point; five
+/// thousand levels overflow a 1 MiB thread and one thousand a 256 KiB one.
+///
+/// Thirty-two levels hold the stack this nesting can add to about 23 KiB
+/// unoptimized (11 KiB optimized), under a tenth of a 256 KiB worker thread,
+/// and are far beyond authored data, which nests a triple term a few levels
+/// at most (a statement about a statement about a statement is three). A
+/// document that
+/// nests deeper is refused with [`OntologyError::ResourceLimit`] naming
+/// `triple_term_depth`, by every entry point, before it is parsed.
+///
+/// The limit bounds only what triple-term nesting adds. It is not a bound on
+/// the parser's whole stack: with no nesting at all an unoptimized build of
+/// the parser already needs about 150 KiB (under 16 KiB optimized), so an
+/// unoptimized build cannot run on a thread much smaller than 256 KiB at any
+/// depth. Reified
+/// triples `<< ... >>` and annotation blocks `{| ... |}` do not recurse and
+/// are held by [`MAX_NESTING_DEPTH`] alone.
+///
+/// Like [`MAX_NESTING_DEPTH`], the guard is the scan of the bytes that runs
+/// first: it counts the `<<(` tokens open at once, which is at least the
+/// depth of any term the parser builds. A [`parse_turtle`] or
+/// [`parse_turtle_terms`] call still refuses every triple term within the
+/// limit with [`OntologyError::TripleTerm`]; only [`declared_prefixes`] reads
+/// such a document.
+pub const MAX_TRIPLE_TERM_DEPTH: usize = 32;
 
 /// Least text one document's terms may expand to, whatever its size: 256 MiB.
 ///
@@ -445,8 +490,10 @@ impl OntologyIndex {
 /// # Errors
 ///
 /// Returns [`OntologyError::Syntax`] for malformed Turtle or non-UTF-8 input,
-/// [`OntologyError::ResourceLimit`] when a budget, [`MAX_NESTING_DEPTH`] or the
-/// expanded-text allowance ([`TERM_BYTES_PER_SOURCE_BYTE`]) is exceeded, [`OntologyError::NamedGraph`] when a quad names a graph, and
+/// [`OntologyError::ResourceLimit`] when a budget, [`MAX_NESTING_DEPTH`],
+/// [`MAX_TRIPLE_TERM_DEPTH`] or the expanded-text allowance
+/// ([`TERM_BYTES_PER_SOURCE_BYTE`]) is exceeded,
+/// [`OntologyError::NamedGraph`] when a quad names a graph, and
 /// [`OntologyError::TripleTerm`] for an RDF 1.2 triple term. A base direction
 /// is not refused here: the text form keeps a literal's lexical form only, so
 /// direction is erased exactly as the language tag and datatype are.
@@ -566,8 +613,10 @@ pub fn parse_turtle(
 /// # Errors
 ///
 /// Returns [`OntologyError::Syntax`] for malformed Turtle or non-UTF-8 input,
-/// [`OntologyError::ResourceLimit`] when a budget, [`MAX_NESTING_DEPTH`] or the
-/// expanded-text allowance ([`TERM_BYTES_PER_SOURCE_BYTE`]) is exceeded, [`OntologyError::NamedGraph`] when a quad names a graph,
+/// [`OntologyError::ResourceLimit`] when a budget, [`MAX_NESTING_DEPTH`],
+/// [`MAX_TRIPLE_TERM_DEPTH`] or the expanded-text allowance
+/// ([`TERM_BYTES_PER_SOURCE_BYTE`]) is exceeded,
+/// [`OntologyError::NamedGraph`] when a quad names a graph,
 /// [`OntologyError::TripleTerm`] for an RDF 1.2 triple term, and
 /// [`OntologyError::BaseDirection`] for a literal carrying a base direction.
 pub fn parse_turtle_terms(
@@ -626,7 +675,8 @@ pub fn parse_turtle_terms(
 /// # Errors
 ///
 /// Returns [`OntologyError::ResourceLimit`] when `source` exceeds
-/// `limits.max_source_bytes`, [`MAX_NESTING_DEPTH`] or the expanded-text
+/// `limits.max_source_bytes`, [`MAX_NESTING_DEPTH`],
+/// [`MAX_TRIPLE_TERM_DEPTH`] or the expanded-text
 /// allowance ([`TERM_BYTES_PER_SOURCE_BYTE`]), and [`OntologyError::Syntax`]
 /// when the document does not parse: a table read from half a document would
 /// be a guess.
@@ -658,12 +708,22 @@ fn read_default_graph(
     // the bytes of each term but steps over a comment without decoding it, so
     // the document as a whole is checked here, for both views alike.
     std::str::from_utf8(source).map_err(|error| OntologyError::Syntax(error.to_string()))?;
-    if nests_deeper_than(source, MAX_NESTING_DEPTH) {
-        return Err(OntologyError::ResourceLimit {
-            resource: "nesting_depth",
-            limit: MAX_NESTING_DEPTH,
-            observed: MAX_NESTING_DEPTH + 1,
-        });
+    match first_nesting_past(source, MAX_NESTING_DEPTH, MAX_TRIPLE_TERM_DEPTH) {
+        Some(Nesting::Brackets) => {
+            return Err(OntologyError::ResourceLimit {
+                resource: "nesting_depth",
+                limit: MAX_NESTING_DEPTH,
+                observed: MAX_NESTING_DEPTH + 1,
+            });
+        }
+        Some(Nesting::TripleTerms) => {
+            return Err(OntologyError::ResourceLimit {
+                resource: "triple_term_depth",
+                limit: MAX_TRIPLE_TERM_DEPTH,
+                observed: MAX_TRIPLE_TERM_DEPTH + 1,
+            });
+        }
+        None => {}
     }
     let mut blank_labels = BlankLabels::for_document(source);
     let term_budget = term_byte_budget(source.len());
@@ -688,7 +748,27 @@ fn read_default_graph(
         .collect())
 }
 
+/// A nesting limit of [`first_nesting_past`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Nesting {
+    /// Brackets of any kind open at once.
+    Brackets,
+    /// Triple terms, `<<(`, open at once.
+    TripleTerms,
+}
+
 /// Whether `source` opens more than `limit` brackets inside one another.
+#[cfg(test)]
+fn nests_deeper_than(source: &[u8], limit: usize) -> bool {
+    first_nesting_past(source, limit, usize::MAX).is_some()
+}
+
+/// The first nesting limit `source` passes, reading from its start.
+///
+/// `limit` is for brackets of any kind open at once, `triple_term_limit` for
+/// `<<(` open at once. The tokenizer reads `<<(` and `)>>` as one token each,
+/// never with white space inside, and accepts `)>>` only where it closes a
+/// `<<(`; each still counts as two brackets toward `limit`.
 ///
 /// A scan of the bytes, not a parse: it steps over what cannot hold a bracket
 /// (comments, quoted strings, IRIs and escaped characters) and counts `(`,
@@ -696,8 +776,9 @@ fn read_default_graph(
 /// tokenizer for as long as the document is well formed, and the parser stops
 /// at the first token that is not, so the count is the parser's own depth for
 /// every byte the parser would go on to read.
-fn nests_deeper_than(source: &[u8], limit: usize) -> bool {
+fn first_nesting_past(source: &[u8], limit: usize, triple_term_limit: usize) -> Option<Nesting> {
     let mut depth = 0_usize;
+    let mut triple_terms = 0_usize;
     let mut at = 0_usize;
     while let Some(byte) = source.get(at).copied() {
         at += 1;
@@ -705,10 +786,17 @@ fn nests_deeper_than(source: &[u8], limit: usize) -> bool {
             b'(' | b'[' | b'{' => {
                 depth += 1;
                 if depth > limit {
-                    return true;
+                    return Some(Nesting::Brackets);
                 }
             }
-            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b')' => {
+                depth = depth.saturating_sub(1);
+                // `)>>`: the `>>` is counted when the scan reaches it.
+                if source.get(at) == Some(&b'>') && source.get(at + 1) == Some(&b'>') {
+                    triple_terms = triple_terms.saturating_sub(1);
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
             // An escaped character in a prefixed name, `ex:a\(b`.
             b'\\' => at += 1,
             b'#' => {
@@ -723,7 +811,14 @@ fn nests_deeper_than(source: &[u8], limit: usize) -> bool {
                 at += 1;
                 depth += 1;
                 if depth > limit {
-                    return true;
+                    return Some(Nesting::Brackets);
+                }
+                // `<<(`: the `(` is counted when the scan reaches it.
+                if source.get(at) == Some(&b'(') {
+                    triple_terms += 1;
+                    if triple_terms > triple_term_limit {
+                        return Some(Nesting::TripleTerms);
+                    }
                 }
             }
             b'<' => {
@@ -749,7 +844,7 @@ fn nests_deeper_than(source: &[u8], limit: usize) -> bool {
             _ => {}
         }
     }
-    false
+    None
 }
 
 /// The offset just past the quoted string whose opening `quote` ends at `at`.
@@ -795,25 +890,36 @@ fn enforce_term_budget(observed: usize, budget: usize) -> Result<(), OntologyErr
 }
 
 /// The text bytes of every term of `triple`, as the parser expanded them.
+///
+/// A loop, not recursion: a triple term is a chain through the object
+/// position, and the chain is followed without the call stack.
 fn triple_term_bytes(triple: &oxrdf::Triple) -> usize {
-    let subject = match &triple.subject {
-        NamedOrBlankNode::NamedNode(node) => node.as_str().len(),
-        NamedOrBlankNode::BlankNode(node) => node.as_str().len(),
-    };
-    let object = match &triple.object {
-        Term::NamedNode(node) => node.as_str().len(),
-        Term::BlankNode(node) => node.as_str().len(),
-        Term::Literal(literal) => literal
-            .value()
-            .len()
-            .saturating_add(literal.datatype().as_str().len())
-            .saturating_add(literal.language().map_or(0, str::len)),
-        // Nested no deeper than `MAX_NESTING_DEPTH`: each level is a `<<`.
-        Term::Triple(inner) => triple_term_bytes(inner),
-    };
-    subject
-        .saturating_add(triple.predicate.as_str().len())
-        .saturating_add(object)
+    let mut bytes = 0_usize;
+    let mut next = Some(triple);
+    while let Some(triple) = next.take() {
+        let subject = match &triple.subject {
+            NamedOrBlankNode::NamedNode(node) => node.as_str().len(),
+            NamedOrBlankNode::BlankNode(node) => node.as_str().len(),
+        };
+        let object = match &triple.object {
+            Term::NamedNode(node) => node.as_str().len(),
+            Term::BlankNode(node) => node.as_str().len(),
+            Term::Literal(literal) => literal
+                .value()
+                .len()
+                .saturating_add(literal.datatype().as_str().len())
+                .saturating_add(literal.language().map_or(0, str::len)),
+            Term::Triple(inner) => {
+                next = Some(inner);
+                0
+            }
+        };
+        bytes = bytes
+            .saturating_add(subject)
+            .saturating_add(triple.predicate.as_str().len())
+            .saturating_add(object);
+    }
+    bytes
 }
 
 /// Refuse the first distinct statement beyond `limits.max_statements`.
@@ -1680,6 +1786,11 @@ mod tests {
         assert_eq!(count("<a:s> <a:p> 'xy'^^<a:dt> ."), 6 + 2 + 4);
         // A triple term's own three terms.
         assert_eq!(count("<a:s> <a:p> <<( <a:x> <a:y> <a:z> )>> ."), 6 + 9);
+        // Every level of a nested one.
+        assert_eq!(
+            count("<a:s> <a:p> <<( <a:x> <a:y> <<( <a:x> <a:y> 'z' )>> )>> ."),
+            6 + 6 + 6 + 1 + 39
+        );
     }
 
     #[test]
@@ -1715,5 +1826,26 @@ mod tests {
             "<a:a> <a:b> 1 {| <a:b> 2 {| <a:b> 3 |} |} .",
             1
         ));
+        // Triple terms have their own count: `<<(` open at once. Each is two
+        // brackets, so the bracket limit is kept out of the way here.
+        let past = |text: &str, limit| first_nesting_past(text.as_bytes(), 100, limit);
+        let two = "<a:a> <a:b> <<( <a:a> <a:b> <<( <a:a> <a:b> 1 )>> )>> .";
+        assert_eq!(past(two, 1), Some(Nesting::TripleTerms));
+        assert_eq!(past(two, 2), None);
+        // Siblings do not nest, and a reified triple or a collection is not a
+        // triple term.
+        let siblings = "<a:a> <a:b> <<( <a:a> <a:b> 1 )>> , <<( <a:a> <a:b> 2 )>> , \
+                        << <a:a> <a:b> ( 3 ) >> , ( ( 4 ) ) .";
+        assert_eq!(past(siblings, 1), None);
+        assert_eq!(past(siblings, 0), Some(Nesting::TripleTerms));
+        // Whichever limit is passed first is the one reported.
+        assert_eq!(
+            first_nesting_past(two.as_bytes(), 1, 1),
+            Some(Nesting::Brackets)
+        );
+        assert_eq!(
+            first_nesting_past(two.as_bytes(), 3, 1),
+            Some(Nesting::TripleTerms)
+        );
     }
 }

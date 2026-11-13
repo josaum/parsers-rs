@@ -16,6 +16,7 @@ truncated.
 | `source_bytes` | 64 MiB | `OntologyLimits::max_source_bytes` |
 | `statements` | 2,000,000 distinct statements | `OntologyLimits::max_statements` |
 | `nesting_depth` | 10,000 brackets inside one another | `MAX_NESTING_DEPTH` (fixed) |
+| `triple_term_depth` | 32 triple terms `<<( ... )>>` inside one another | `MAX_TRIPLE_TERM_DEPTH` (fixed) |
 | `term_bytes` | the larger of 256 MiB and 32 bytes per source byte | `TERM_BYTES_FLOOR`, `TERM_BYTES_PER_SOURCE_BYTE` (fixed) |
 
 `nesting_depth` counts `[`, `(`, `<<` and `{|` that are open at once. Earlier
