@@ -35,6 +35,7 @@
 //! preserves structure and provenance, and the output is unsigned.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{BuildHasher, Hash, RandomState};
 
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
 use oxttl::TurtleParser;
@@ -566,49 +567,32 @@ pub fn parse_turtle_terms(
     limits: OntologyLimits,
 ) -> Result<Vec<TripleTerms>, OntologyError> {
     // Deduplication compares six numbers per statement instead of the
-    // statement's text: each distinct string is numbered once.
+    // statement's text: each distinct string is numbered once, and the one
+    // copy kept of it is the one in the row that first used it.
     let mut triples: Vec<TripleTerms> = Vec::new();
-    let mut strings = StringNumbers::default();
+    let mut strings: RowStrings = RowStrings::default();
     let mut seen: HashSet<[u32; 6]> = HashSet::new();
     read_default_graph(source, limits, |quad, blank_labels| {
         let subject = match &quad.subject {
             NamedOrBlankNode::NamedNode(node) => node.as_str(),
             NamedOrBlankNode::BlankNode(node) => blank_labels.label(node.as_str()),
-        };
-        let subject_number = strings.number(subject)?;
-        let subject = subject.to_owned();
-        let predicate = quad.predicate.as_str();
+        }
+        .to_owned();
         let object = object_view(&quad.object, blank_labels)?;
-        // Zero is "absent"; a present string is its number plus one.
-        let (kind, value, datatype, language) = match &object {
-            TermView::Iri(iri) => (0, strings.number(iri)?, 0, 0),
-            TermView::Blank(label) => (1, strings.number(label)?, 0, 0),
-            TermView::Literal {
-                value,
-                datatype,
-                language,
-            } => (
-                2,
-                strings.number(value)?,
-                strings.optional_number(datatype.as_deref())?,
-                strings.optional_number(language.as_deref())?,
-            ),
-        };
-        let key = [
-            subject_number,
-            strings.number(predicate)?,
-            kind,
-            value,
-            datatype,
-            language,
-        ];
+        // The row goes in first so that its strings can be numbered where
+        // they will stay. A string seen for the first time gives the row a
+        // key never seen before, so a row taken out again was never the home
+        // of any string.
+        triples.push(TripleTerms {
+            subject,
+            predicate: quad.predicate.as_str().to_owned(),
+            object,
+        });
+        let key = strings.key_of_last(&triples)?;
         if seen.insert(key) {
             enforce_statement_budget(seen.len(), limits)?;
-            triples.push(TripleTerms {
-                subject,
-                predicate: predicate.to_owned(),
-                object,
-            });
+        } else {
+            triples.pop();
         }
         Ok(())
     })?;
@@ -838,7 +822,7 @@ fn enforce_statement_budget(observed: usize, limits: OntologyLimits) -> Result<(
 ///
 /// Two terms are one term only when both the kind and the text agree: the IRI
 /// `urn:x` and the literal `"urn:x"` are different terms.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TermKind {
     /// A full IRI in subject or object position, abbreviated at render time.
     Iri = 0,
@@ -848,24 +832,79 @@ enum TermKind {
     Predicate = 2,
 }
 
+/// Numbers for distinct keys, by first appearance, hashing each key once.
+///
+/// A map keyed on the strings themselves hashes a new string twice (the
+/// lookup, then the insert) and every string again whenever the table grows.
+/// This table is keyed on the 64-bit hash instead and leaves the text with
+/// the caller: a lookup hashes its key once, then asks the caller whether a
+/// candidate number really is that key.
+#[derive(Debug, Default)]
+struct Numbers<S = RandomState> {
+    state: S,
+    /// The latest number assigned under each hash.
+    latest: HashMap<u64, u32>,
+    /// `earlier[n]` is an earlier number with the hash of `n`, or `NO_NUMBER`.
+    earlier: Vec<u32>,
+}
+
+/// "No number": the end of a chain in [`Numbers`]. Never assigned.
+const NO_NUMBER: u32 = u32::MAX;
+
+impl<S: BuildHasher> Numbers<S> {
+    /// The number of `key`, and whether this call assigned it.
+    ///
+    /// `is_key(n)` answers whether number `n` was assigned to this same key.
+    /// Numbers start at zero and are assigned in order, so a caller that
+    /// keeps one record per number appends one when the answer is "new".
+    fn number(
+        &mut self,
+        key: impl Hash,
+        is_key: impl Fn(u32) -> bool,
+    ) -> Result<(u32, bool), OntologyError> {
+        let hash = self.state.hash_one(key);
+        let latest = self.latest.get(&hash).copied().unwrap_or(NO_NUMBER);
+        let mut candidate = latest;
+        while candidate != NO_NUMBER {
+            if is_key(candidate) {
+                return Ok((candidate, false));
+            }
+            candidate = self
+                .earlier
+                .get(candidate as usize)
+                .copied()
+                .unwrap_or(NO_NUMBER);
+        }
+        let number = u32::try_from(self.earlier.len()).unwrap_or(NO_NUMBER);
+        // Refuses `NO_NUMBER` itself, so the sentinel is never a number.
+        next_number(number)?;
+        self.latest.insert(hash, number);
+        self.earlier.push(latest);
+        Ok((number, true))
+    }
+}
+
 /// The distinct terms of one document, numbered by first appearance.
 #[derive(Debug, Default)]
 struct StagedTerms {
-    /// One table per [`TermKind`]; the numbers are unique across all three.
-    by_kind: [HashMap<String, u32>; 3],
-    count: u32,
+    numbers: Numbers,
+    /// The kind and the full text of each term, at the index of its number.
+    kinds: Vec<TermKind>,
+    texts: Vec<String>,
 }
 
 impl StagedTerms {
     /// The number of the term `text` of kind `kind`, assigning the next on first sight.
     fn number(&mut self, kind: TermKind, text: &str) -> Result<u32, OntologyError> {
-        let table = &mut self.by_kind[kind as usize];
-        if let Some(number) = table.get(text) {
-            return Ok(*number);
+        let (kinds, texts) = (&self.kinds, &self.texts);
+        let (number, new) = self.numbers.number((kind, text), |number| {
+            let number = number as usize;
+            kinds.get(number) == Some(&kind) && texts.get(number).map(String::as_str) == Some(text)
+        })?;
+        if new {
+            self.kinds.push(kind);
+            self.texts.push(text.to_owned());
         }
-        let number = self.count;
-        self.count = next_number(number)?;
-        table.insert(text.to_owned(), number);
         Ok(number)
     }
 
@@ -878,55 +917,101 @@ impl StagedTerms {
         abbreviator: &Abbreviator<'_>,
         budget: usize,
     ) -> Result<Vec<String>, OntologyError> {
-        let mut rendered = vec![String::new(); self.count as usize];
         let mut bytes = 0_usize;
-        let mut place = |number: u32, text: String| {
-            bytes = bytes.saturating_add(text.len());
-            rendered[number as usize] = text;
-            enforce_term_budget(bytes, budget)
-        };
-        let [iris, verbatim, predicates] = self.by_kind;
-        // The tables are walked in hash order, but every text lands in the
-        // slot of its own number, so the result does not depend on that order.
-        for (iri, number) in iris {
-            place(number, abbreviator.abbreviate(&iri))?;
-        }
-        for (text, number) in verbatim {
-            place(number, text)?;
-        }
-        for (iri, number) in predicates {
-            let text = if iri == RDF_TYPE {
-                "a".to_owned()
-            } else {
-                abbreviator.abbreviate(&iri)
-            };
-            place(number, text)?;
-        }
-        Ok(rendered)
+        self.kinds
+            .into_iter()
+            .zip(self.texts)
+            .map(|(kind, text)| {
+                let text = match kind {
+                    TermKind::Verbatim => text,
+                    TermKind::Predicate if text == RDF_TYPE => "a".to_owned(),
+                    TermKind::Iri | TermKind::Predicate => abbreviator.abbreviate(&text),
+                };
+                bytes = bytes.saturating_add(text.len());
+                enforce_term_budget(bytes, budget)?;
+                Ok(text)
+            })
+            .collect()
     }
 }
 
-/// Distinct strings numbered by first appearance, for the term view's deduplication.
+/// Numbers for the distinct strings of the term view's rows.
+///
+/// No string is copied to be numbered: each number records the row and the
+/// part of it where its string was first seen.
 #[derive(Debug, Default)]
-struct StringNumbers {
-    numbers: HashMap<String, u32>,
-    count: u32,
+struct RowStrings<S = RandomState> {
+    numbers: Numbers<S>,
+    /// Where the string of each number lives, at the index of the number.
+    homes: Vec<(usize, RowPart)>,
 }
 
-impl StringNumbers {
-    /// The number of `text`, assigning the next on first sight. Never zero.
-    fn number(&mut self, text: &str) -> Result<u32, OntologyError> {
-        if let Some(number) = self.numbers.get(text) {
-            return Ok(*number);
-        }
-        self.count = next_number(self.count)?;
-        self.numbers.insert(text.to_owned(), self.count);
-        Ok(self.count)
-    }
+/// One string-valued part of a [`TripleTerms`] row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowPart {
+    Subject,
+    Predicate,
+    /// An IRI, a blank label or a literal's lexical form.
+    Object,
+    Datatype,
+    Language,
+}
 
-    /// As [`Self::number`], with zero for an absent string.
-    fn optional_number(&mut self, text: Option<&str>) -> Result<u32, OntologyError> {
-        text.map_or(Ok(0), |text| self.number(text))
+impl RowPart {
+    /// This part of `row`, when the row has it.
+    fn of(self, row: &TripleTerms) -> Option<&str> {
+        match (self, &row.object) {
+            (Self::Subject, _) => Some(&row.subject),
+            (Self::Predicate, _) => Some(&row.predicate),
+            (
+                Self::Object,
+                TermView::Iri(text) | TermView::Blank(text) | TermView::Literal { value: text, .. },
+            ) => Some(text),
+            (Self::Datatype, TermView::Literal { datatype, .. }) => datatype.as_deref(),
+            (Self::Language, TermView::Literal { language, .. }) => language.as_deref(),
+            (Self::Datatype | Self::Language, _) => None,
+        }
+    }
+}
+
+impl<S: BuildHasher> RowStrings<S> {
+    /// The deduplication key of the last row of `rows`: six numbers.
+    ///
+    /// Two rows have the same key exactly when they are the same statement.
+    /// Zero is "absent"; a present string is its number plus one.
+    fn key_of_last(&mut self, rows: &[TripleTerms]) -> Result<[u32; 6], OntologyError> {
+        let Some((row, last)) = rows.len().checked_sub(1).zip(rows.last()) else {
+            return Ok([0; 6]);
+        };
+        let kind = match &last.object {
+            TermView::Iri(_) => 0,
+            TermView::Blank(_) => 1,
+            TermView::Literal { .. } => 2,
+        };
+        let mut number = |part: RowPart| -> Result<u32, OntologyError> {
+            let Some(text) = part.of(last) else {
+                return Ok(0);
+            };
+            let homes = &self.homes;
+            let (number, new) = self.numbers.number(text, |number| {
+                homes
+                    .get(number as usize)
+                    .and_then(|(home, part)| part.of(rows.get(*home)?))
+                    == Some(text)
+            })?;
+            if new {
+                self.homes.push((row, part));
+            }
+            next_number(number)
+        };
+        Ok([
+            number(RowPart::Subject)?,
+            number(RowPart::Predicate)?,
+            kind,
+            number(RowPart::Object)?,
+            number(RowPart::Datatype)?,
+            number(RowPart::Language)?,
+        ])
     }
 }
 
@@ -1420,6 +1505,132 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A `BuildHasher` that counts the bytes it is asked to hash.
+    #[derive(Clone, Debug, Default)]
+    struct CountingState(std::rc::Rc<std::cell::Cell<usize>>);
+
+    struct CountingHasher {
+        inner: std::collections::hash_map::DefaultHasher,
+        bytes: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::hash::Hasher for CountingHasher {
+        fn finish(&self) -> u64 {
+            self.inner.finish()
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.bytes.set(self.bytes.get() + bytes.len());
+            self.inner.write(bytes);
+        }
+    }
+
+    impl std::hash::BuildHasher for CountingState {
+        type Hasher = CountingHasher;
+
+        fn build_hasher(&self) -> CountingHasher {
+            CountingHasher {
+                inner: std::collections::hash_map::DefaultHasher::new(),
+                bytes: std::rc::Rc::clone(&self.0),
+            }
+        }
+    }
+
+    #[test]
+    fn numbering_a_string_hashes_it_once_per_lookup() {
+        let state = CountingState::default();
+        let mut numbers = Numbers {
+            state: state.clone(),
+            latest: HashMap::new(),
+            earlier: Vec::new(),
+        };
+        let mut texts: Vec<String> = Vec::new();
+        let (count, length) = (200, 1_000);
+        for n in 0..count {
+            let text = format!("{n:0length$}");
+            let number = u32::try_from(n).expect("small");
+            let first = numbers.number(text.as_str(), |known| texts[known as usize] == text);
+            assert_eq!(first, Ok((number, true)));
+            texts.push(text.clone());
+            let again = numbers.number(text.as_str(), |known| texts[known as usize] == text);
+            assert_eq!(again, Ok((number, false)));
+        }
+        let looked_up = 2 * count * length;
+        let hashed = state.0.get();
+        assert!(
+            hashed <= looked_up + looked_up / 10,
+            "{hashed} bytes hashed for {looked_up} bytes looked up"
+        );
+    }
+
+    /// A `BuildHasher` under which every key has the same hash.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct OneHash;
+
+    impl std::hash::Hasher for OneHash {
+        fn finish(&self) -> u64 {
+            7
+        }
+
+        fn write(&mut self, _: &[u8]) {}
+    }
+
+    impl BuildHasher for OneHash {
+        type Hasher = Self;
+
+        fn build_hasher(&self) -> Self {
+            Self
+        }
+    }
+
+    #[test]
+    fn strings_that_share_a_hash_still_get_their_own_numbers() {
+        let mut strings = RowStrings {
+            numbers: Numbers {
+                state: OneHash,
+                latest: HashMap::new(),
+                earlier: Vec::new(),
+            },
+            homes: Vec::new(),
+        };
+        let row = |subject: &str, object: TermView| TripleTerms {
+            subject: subject.to_owned(),
+            predicate: "a:p".to_owned(),
+            object,
+        };
+        let literal = |value: &str, language: Option<&str>| TermView::Literal {
+            value: value.to_owned(),
+            datatype: None,
+            language: language.map(str::to_owned),
+        };
+        let mut rows = Vec::new();
+        let mut keys = Vec::new();
+        for next in [
+            row("a:s", TermView::Iri("a:o".to_owned())),
+            row("a:p", TermView::Iri("a:p".to_owned())),
+            row("a:s", TermView::Blank("a:o".to_owned())),
+            row("a:s", literal("a:o", None)),
+            row("a:s", literal("a:o", Some("en"))),
+            row("a:s", TermView::Iri("a:o".to_owned())),
+        ] {
+            rows.push(next);
+            keys.push(strings.key_of_last(&rows).expect("numbered"));
+        }
+        // Subject, predicate, kind, object text, datatype, language; a
+        // present string is its number plus one.
+        assert_eq!(
+            keys,
+            [
+                [1, 2, 0, 3, 0, 0],
+                [2, 2, 0, 2, 0, 0],
+                [1, 2, 1, 3, 0, 0],
+                [1, 2, 2, 3, 0, 0],
+                [1, 2, 2, 3, 0, 4],
+                [1, 2, 0, 3, 0, 0],
+            ]
+        );
     }
 
     #[test]
