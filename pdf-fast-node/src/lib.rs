@@ -381,7 +381,7 @@ pub struct PdfScanner {
 
 #[napi]
 impl PdfScanner {
-    #[napi(constructor)]
+    #[napi(constructor, catch_unwind)]
     pub fn new(path: String) -> Self {
         Self { path }
     }

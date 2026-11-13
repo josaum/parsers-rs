@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Compare each Node binding's `index.d.ts` with what the built module really
 // exports: the same function names, the same number of parameters, and for a
-// class the same methods. A declaration nobody can call, or an export nobody
+// class the same methods. It also requires `catch_unwind` on every `#[napi]`
+// function, method and constructor, so a Rust panic is a thrown error. A declaration nobody can call, or an export nobody
 // declared, fails the run. Needs the `.node` binaries (scripts/build-node.sh).
 //
 // Usage: node scripts/check-node-types.mjs [crate-dir ...]
@@ -39,14 +40,39 @@ function parenthesized(text, open) {
 
 const camel = (snake) => snake.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
 
-// Parameter counts of every `#[napi]` function and method, by JavaScript name.
-function rustArities(source) {
+// Crates whose functions may still lack `catch_unwind`. json-fast-node is
+// under separate review; remove it from this list when that lands.
+const PANIC_CHECK_EXEMPT = new Set(['json-fast-node']);
+
+// Every `#[napi]` function, method and constructor in a crate: its parameter
+// count and whether it is built with `catch_unwind`. Free functions are keyed
+// by JavaScript name, methods by `Class.method`, constructors by
+// `Class.constructor`, so a method never answers for a function of the same name.
+function rustItems(source) {
+  const impls = [];
+  const implRe = /#\[napi\]\s*impl (\w+)\s*\{/g;
+  for (let m = implRe.exec(source); m; m = implRe.exec(source)) {
+    let depth = 0;
+    let end = implRe.lastIndex - 1;
+    for (; end < source.length; end += 1) {
+      if (source[end] === '{') depth += 1;
+      else if (source[end] === '}' && (depth -= 1) === 0) break;
+    }
+    impls.push({ name: m[1], start: m.index, end });
+  }
   const out = new Map();
   const re = /#\[napi(?:\(([^)]*)\))?\]\s*pub fn (\w+)\s*\(/g;
   for (let m = re.exec(source); m; m = re.exec(source)) {
+    const attrs = (m[1] || '').split(',').map((a) => a.trim());
     const params = parenthesized(source, re.lastIndex - 1)
       .split(',').map((p) => p.trim()).filter((p) => p && !/^&?(mut )?self$/.test(p));
-    out.set(m[1] && m[1].includes('constructor') ? 'constructor' : camel(m[2]), arity(params.join(',')));
+    const owner = impls.find((i) => m.index > i.start && m.index < i.end);
+    const name = attrs.includes('constructor') ? 'constructor' : camel(m[2]);
+    out.set(owner ? `${owner.name}.${name}` : name, {
+      rustName: owner ? `${owner.name}::${m[2]}` : m[2],
+      arity: arity(params.join(',')),
+      catchUnwind: attrs.includes('catch_unwind'),
+    });
   }
   return out;
 }
@@ -56,7 +82,14 @@ function check(crate) {
   const problems = [];
   const dts = readFileSync(path.join(dir, 'index.d.ts'), 'utf8');
   const js = readFileSync(path.join(dir, 'index.js'), 'utf8');
-  const rust = rustArities(readFileSync(path.join(dir, 'src', 'lib.rs'), 'utf8'));
+  const rust = rustItems(readFileSync(path.join(dir, 'src', 'lib.rs'), 'utf8'));
+  // A panic that reaches Node-API unwinds out of an `extern "C"` function and
+  // ends the process. `catch_unwind` turns it into a thrown error instead.
+  if (!PANIC_CHECK_EXEMPT.has(crate)) {
+    for (const item of rust.values()) {
+      if (!item.catchUnwind) problems.push(`${item.rustName}: #[napi] without catch_unwind, so a panic would end the process`);
+    }
+  }
   const mod = require(dir);
 
   const declared = new Map();
@@ -91,8 +124,9 @@ function check(crate) {
     if (text.includes('[native code]')) {
       // Re-exported straight from the native module: count the Rust parameters.
       const native = new RegExp(`\\b${name}\\s*:\\s*native\\.(\\w+)`).exec(js);
-      real = rust.get(native ? native[1] : name);
-      if (real === undefined) { problems.push(`${name}: no #[napi] function found for it`); continue; }
+      const item = rust.get(native ? native[1] : name);
+      if (item === undefined) { problems.push(`${name}: no #[napi] function found for it`); continue; }
+      real = item.arity;
     } else {
       real = arity(parenthesized(text, text.indexOf('(')));
     }
@@ -105,8 +139,9 @@ function check(crate) {
     for (const method of real) if (!methods.has(method)) problems.push(`${name}.${method} exists but is not declared`);
     for (const [method, count] of methods) {
       if (method !== 'constructor' && !real.includes(method)) { problems.push(`${name}.${method} is declared but does not exist`); continue; }
-      const takes = rust.get(method);
-      if (takes !== undefined && takes !== count) problems.push(`${name}.${method}: declared with ${count} parameter(s), takes ${takes}`);
+      const item = rust.get(`${name}.${method}`);
+      if (item === undefined) { problems.push(`${name}.${method}: no #[napi] method found for it`); continue; }
+      if (item.arity !== count) problems.push(`${name}.${method}: declared with ${count} parameter(s), takes ${item.arity}`);
     }
   }
   return { problems, summary: `${functions.length} function(s), ${classes.size} class(es)` };
