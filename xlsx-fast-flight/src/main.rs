@@ -1086,3 +1086,204 @@ mod read_only_flight_contract_tests {
         assert!(FlightService::get_schema(&service, request).await.is_ok());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "../../flight-ipc-config/test-support/wire.rs"]
+mod flight_wire_test_support;
+
+#[cfg(all(test, unix))]
+mod wire_parity_tests {
+    //! What a Flight client sees from this server, pinned as text in
+    //! `tests/wire_transcript.txt`.
+    //!
+    //! The transcript was captured from the server while it still carried its
+    //! own copy of the Flight skeleton, so a change to any answer in it is a
+    //! change in behaviour, not in structure. Unix only: the probes include a
+    //! symbolic link and a backslash in a file name.
+    use super::*;
+    use crate::flight_auth_test_support::required_auth_verifier;
+    use crate::flight_wire_test_support::{stored_zip, Wire};
+
+    const EXPECTED: &str = include_str!("../tests/wire_transcript.txt");
+
+    /// The one-sheet workbook `xlsx-fast-core`'s own tests build
+    /// (`tests/parser_integration.rs`), as a stored archive.
+    fn fixture() -> Vec<u8> {
+        stored_zip(&[
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <workbookPr date1904="false"/>
+  <sheets>
+    <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/sharedStrings.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
+  <si><t>Hello XLSX</t></si>
+</sst>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="s"><v>0</v></c>
+      <c r="B1"><v>42</v></c>
+      <c r="C1"><f>SUM(B1,B1)</f><v>84</v></c>
+    </row>
+    <row r="2">
+      <c r="A2"><v>7</v></c>
+    </row>
+  </sheetData>
+</worksheet>"#,
+            ),
+        ])
+    }
+
+    fn service(root: &Path) -> XlsxFlightService {
+        XlsxFlightService {
+            root: root.to_path_buf(),
+            parse_options: ParseOptions {
+                decode_dates: true,
+                include_formulas: false,
+                raw_values: false,
+                max_inflate: 128 * 1024 * 1024,
+            },
+            arrow_options: ArrowOptions {
+                batch_size: 64,
+                include_sheet_names: true,
+                sheet_filter: None,
+                range_filter: None,
+                parallel_sheets: 0,
+            },
+            write_options: IpcWriteOptions::default(),
+            capability_body: b"{}".to_vec(),
+            auth_verifier: required_auth_verifier(),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_rpc_answers_as_it_did_before_the_shared_server() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("directories");
+        let fixture = fixture();
+        std::fs::write(root.join("book.xlsx"), &fixture).expect("fixture");
+        std::fs::write(root.join("sub").join("Upper.XLSX"), &fixture).expect("nested");
+        std::fs::write(root.join("notes.txt"), b"not a workbook").expect("other file");
+        std::fs::write(base.path().join("outside.xlsx"), &fixture).expect("outside");
+        std::os::unix::fs::symlink(base.path().join("outside.xlsx"), root.join("link.xlsx"))
+            .expect("symlink");
+        let outside = base.path().join("outside.xlsx");
+        let outside = outside.to_string_lossy();
+
+        let mut wire = Wire::start(service(&root), base.path()).await;
+
+        wire.handshake(false).await;
+        wire.handshake(true).await;
+        wire.list_flights(false).await;
+        wire.list_flights(true).await;
+
+        wire.get_flight_info("book.xlsx", false).await;
+        for path in [
+            "book.xlsx",
+            "book.xlsx?sheet=Sheet1&range=A1:B2",
+            "book.xlsx?table=x&max_inflate=0",
+            "book.xlsx?batch=0",
+            "book.xlsx?batch=x",
+            "book.xlsx?raw=maybe",
+            "book.xlsx?range=A:5",
+            "book.xlsx?threads=x",
+            "sub/Upper.XLSX",
+            "sub\\Upper.XLSX",
+            "missing.xlsx",
+            "../outside.xlsx",
+            "link.xlsx",
+            outside.as_ref(),
+        ] {
+            wire.get_flight_info(path, true).await;
+        }
+        wire.get_flight_info_parts(&["sub", "Upper.XLSX?batch=2"], true)
+            .await;
+        wire.get_flight_info_parts(&["sub", "..", "book.xlsx"], true)
+            .await;
+        wire.get_flight_info_cmd(b"book.xlsx?batch=2", true).await;
+        wire.get_flight_info_cmd(b"book.xlsx?batch=0", true).await;
+        wire.get_flight_info_cmd(b"\xff", true).await;
+        wire.get_flight_info_cmd(b"", true).await;
+
+        wire.poll_flight_info("book.xlsx", false).await;
+        wire.poll_flight_info("book.xlsx", true).await;
+
+        wire.get_schema("book.xlsx", false).await;
+        wire.get_schema("book.xlsx", true).await;
+        wire.get_schema("missing.xlsx?batch=0", true).await;
+
+        wire.do_get(b"book.xlsx", false).await;
+        for ticket in [
+            "book.xlsx",
+            "book.xlsx?batch=1",
+            "book.xlsx?sheet=Nope",
+            "book.xlsx?sheets=Sheet1,Nope&range=B1:C1",
+            "book.xlsx?raw=1&formulas=yes&sheet_names=off&dates=0&threads=2",
+            "book.xlsx?table=x&max_inflate=0",
+            "book.xlsx?batch=0",
+            "book.xlsx?range=A:5",
+            "book.xlsx?",
+            "sub/Upper.XLSX",
+            "sub\\Upper.XLSX",
+            "notes.txt",
+            "missing.xlsx",
+            "../outside.xlsx",
+            "sub/../book.xlsx",
+            "link.xlsx",
+            outside.as_ref(),
+            "",
+        ] {
+            wire.do_get(ticket.as_bytes(), true).await;
+        }
+        wire.do_get(b"\xff", true).await;
+
+        wire.do_put(false).await;
+        wire.do_put(true).await;
+
+        wire.do_exchange_path("book.xlsx", false).await;
+        wire.do_exchange_path("book.xlsx", true).await;
+        wire.do_exchange_path("book.xlsx?batch=0", true).await;
+        wire.do_exchange_path("missing.xlsx", true).await;
+        wire.do_exchange_metadata("book.xlsx?batch=1", true).await;
+        wire.do_exchange_metadata("../outside.xlsx", true).await;
+        wire.do_exchange("an empty message", vec![FlightData::default()], true)
+            .await;
+        wire.do_exchange("no message", Vec::new(), true).await;
+
+        wire.do_action(CAPABILITY_ACTION, "", true, false).await;
+        wire.do_action(CAPABILITY_ACTION, "", true, true).await;
+        wire.do_action("unknown", "", true, true).await;
+        wire.list_actions(false).await;
+        wire.list_actions(true).await;
+
+        assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+    }
+}
