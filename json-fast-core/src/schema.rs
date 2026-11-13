@@ -81,11 +81,13 @@ pub const MAX_VALIDATION_NESTING_DEPTH: usize = crate::DEFAULT_MAX_NESTING_DEPTH
 /// touched only as far as the recursion goes.
 pub const MAX_APPLICATION_DEPTH: usize = 2_048;
 
-/// Nested applications the caller's own stack is trusted with: at up to
-/// 8 KiB each in an unoptimized build, 128 stay within 1 MiB (an optimized
-/// build uses a quarter of that). A validation whose worst case is deeper
-/// runs on a dedicated thread from the start.
-const INLINE_APPLICATION_DEPTH: usize = 128;
+/// Nested applications the caller's own stack is trusted with.
+///
+/// Measured in an unoptimized build, an application costs 4 to 6 KiB of
+/// stack: about 52 of the worst shape fit a 256 KiB stack and about 102 fit
+/// 512 KiB. 48 keeps a caller on a 256 KiB stack safe. A validation whose
+/// worst case is deeper runs on a dedicated thread from the start.
+const INLINE_APPLICATION_DEPTH: usize = 48;
 
 /// Stack reserved per nested application on the dedicated thread: four
 /// times the 8 KiB measured in an unoptimized build.
@@ -2773,7 +2775,7 @@ mod tests {
             (0..depth).fold(json!({"v": 1}), |next, _| json!({"v": 1, "next": next}))
         };
         // Shallow recursive documents stay on the caller's stack.
-        let shallow = run(&list(10), &list_schema, None);
+        let shallow = run(&list(3), &list_schema, None);
         assert!(!shallow.spawned);
         assert_eq!(shallow.findings, []);
         // Deep ones go straight to the large stack: the work is done once.
@@ -2781,7 +2783,7 @@ mod tests {
         assert!(deep.spawned);
         assert_eq!(deep.findings, []);
         // Three applications per list node, less one: linear, and not doubled.
-        assert_eq!((shallow.steps, deep.steps), (32, 182));
+        assert_eq!((shallow.steps, deep.steps), (11, 182));
     }
 
     #[test]

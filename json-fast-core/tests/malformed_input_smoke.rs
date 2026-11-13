@@ -342,6 +342,44 @@ fn schemas_nested_to_the_parse_limit_fit_a_small_stack() {
     validate_schemas_nested_to_the_parse_limit(smoke::SMALL_STACK_BYTES);
 }
 
+/// A chain of `$defs`, each applying the next in place, makes the validator
+/// recurse once or twice per hop without descending the document. 62 hops
+/// overflowed a 256 KiB stack in an unoptimized build when up to 128 nested
+/// applications ran on the caller's stack.
+#[test]
+fn long_reference_chains_fit_a_small_stack() {
+    let links: [fn(&str) -> String; 4] = [
+        |next| format!(r##"{{"allOf":[{{"$ref":"{next}"}}]}}"##),
+        |next| format!(r##"{{"anyOf":[{{"$ref":"{next}"}}]}}"##),
+        |next| format!(r##"{{"if":true,"then":{{"$ref":"{next}"}}}}"##),
+        |next| {
+            format!(
+                r##"{{"$ref":"{next}","properties":{{"a":true}},"patternProperties":{{"^a":true}}}}"##
+            )
+        },
+    ];
+    for link in links {
+        let hops = 62;
+        let mut defs: Vec<String> = (0..hops)
+            .map(|i| format!("\"d{i}\":{}", link(&format!("#/$defs/d{}", i + 1))))
+            .collect();
+        defs.push(format!("\"d{hops}\":{{\"type\":\"object\"}}"));
+        let schema_text = format!(
+            r##"{{"$ref":"#/$defs/d0","$defs":{{{}}}}}"##,
+            defs.join(",")
+        );
+        let schema_value = json_fast_core::parse_value(&schema_text).expect("schema parses");
+        let document = json_fast_core::parse_value(r#"{"a":1}"#).expect("document parses");
+        smoke::run_on_small_stack(move || {
+            assert_eq!(schema::validate(&document, &schema_value), []);
+            assert!(schema::has_errors(&schema::validate(
+                &Value::from(1),
+                &schema_value
+            )));
+        });
+    }
+}
+
 #[test]
 fn reference_cycles_terminate() {
     for schema_text in [
