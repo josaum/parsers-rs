@@ -30,7 +30,7 @@ fn messages(document: &str, max_errors: usize) -> Vec<String> {
         .collect()
 }
 
-fn is_parse_error(message: &String) -> bool {
+fn is_parse_error(message: &str) -> bool {
     message.starts_with("XML parse error: ")
 }
 
@@ -111,7 +111,7 @@ fn an_entity_declared_in_the_internal_subset_resolves() {
     for name in ["both", "ext", "nested", "param", "missing"] {
         let found = messages(&format!("{doctype}<r><e>&{name};</e></r>"), 100);
         assert_eq!(found.len(), 2, "{name}: {found:?}");
-        assert!(found.iter().any(is_parse_error), "{name}: {found:?}");
+        assert!(found.iter().any(|m| is_parse_error(m)), "{name}: {found:?}");
         assert!(
             found.iter().any(|m| m.contains(&format!("\"&{name};\""))),
             "{name}: {found:?}"
@@ -136,6 +136,6 @@ fn declared_entities_are_bounded() {
     );
     for name in ["e256", "e299", "big"] {
         let found = messages(&format!("{doctype}<r><e>&{name};</e></r>"), 100);
-        assert!(found.iter().any(is_parse_error), "{name}: {found:?}");
+        assert!(found.iter().any(|m| is_parse_error(m)), "{name}: {found:?}");
     }
 }
