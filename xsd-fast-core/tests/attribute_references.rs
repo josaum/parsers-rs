@@ -152,3 +152,39 @@ fn a_model_serialized_without_the_referenced_flag_loads() {
         .iter()
         .all(|a| !a.referenced));
 }
+
+#[cfg(feature = "arrow")]
+#[test]
+fn the_shape_option_gives_simple_children_their_attributes() {
+    use arrow_schema::DataType;
+    use xsd_fast_core::arrow::{ArrowOptions, ArrowShape};
+    const SHAPES: &[u8] = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:attribute name="id" type="xs:string"/>
+      <xs:complexType name="Text"><xs:simpleContent><xs:extension base="xs:int">
+        <xs:attribute ref="id"/></xs:extension></xs:simpleContent></xs:complexType>
+      <xs:element name="root"><xs:complexType><xs:sequence>
+        <xs:element name="text" type="Text"/>
+      </xs:sequence></xs:complexType></xs:element>
+    </xs:schema>"#;
+    let schema = SchemaSet::load_bytes(SHAPES, ParseOptions::default()).expect("schema loads");
+    let default = schema
+        .to_arrow_schema("root", ArrowOptions::default())
+        .expect("root derives");
+    assert_eq!(
+        default.field_with_name("text").expect("text").data_type(),
+        &DataType::Int64
+    );
+    let shaped = schema
+        .to_arrow_schema_with_shape(
+            "root",
+            ArrowOptions::default(),
+            ArrowShape::new().with_attributes_on_simple_children(true),
+        )
+        .expect("root derives");
+    let DataType::Struct(fields) = shaped.field_with_name("text").expect("text").data_type() else {
+        panic!("text is a struct of its attribute and its text");
+    };
+    let names: Vec<_> = fields.iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, ["@id", "$text"]);
+    assert!(shaped.fields().iter().all(|f| f.metadata().is_empty()));
+}

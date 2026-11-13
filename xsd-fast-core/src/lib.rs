@@ -16,6 +16,17 @@
 //! - Resolves `xs:attribute ref` and `xs:attributeGroup ref`, nested groups
 //!   included
 //! - Models `xs:any` element wildcards for validation; they derive no column
+//!
+//! ## What the default Arrow shape leaves out
+//!
+//! An attribute that reaches a type through `xs:attribute ref` or
+//! `xs:attributeGroup ref` is not a column of a child element whose own
+//! content derives exactly one column (typically its text): that child stays
+//! the one column, named after the element, as before references were
+//! resolved. The same type keeps those attributes as the root element, or as
+//! a child with no column or several of its own.
+//! `arrow::ArrowShape::attributes_on_simple_children` makes such a child a
+//! struct of its value and all its attributes.
 //! - Resolves multi-file schemas (relative `schemaLocation` paths)
 //! - Derives an Arrow `Schema` from a root element (for downstream Flight / IPC)
 //! - Validates XML byte slices against the parsed schema rules (enumeration, pattern,

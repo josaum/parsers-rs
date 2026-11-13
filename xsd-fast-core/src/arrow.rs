@@ -6,9 +6,19 @@
 //!
 //! ## Flattening strategy
 //!
-//! The produced Arrow schema is **flat**: each leaf element and attribute becomes
-//! one column. Multi-occurrence particles (`maxOccurs > 1` or unbounded) are
-//! emitted as `List<item>`. Nested paths use `"parent.child"` dot-separated names.
+//! Each leaf element and each attribute of the root element becomes one
+//! column, and a child element with more than one column becomes a struct of
+//! them. A child element with exactly one column is that column, named after
+//! the element. Multi-occurrence particles (`maxOccurs > 1` or unbounded) are
+//! emitted as `List<item>`. Wildcards (`xs:any`) derive no column.
+//!
+//! An attribute that reaches a type through `xs:attribute ref` or
+//! `xs:attributeGroup ref` is a column of the root element, and of a child
+//! element with no column or more than one column of its own. **By default
+//! it is left out of a child element whose other content derives exactly one
+//! column** (typically its text), so that column keeps the shape it had
+//! before references were resolved; [`ArrowShape::attributes_on_simple_children`]
+//! makes such a child a struct of its value and all its attributes.
 //!
 //! ## Example
 //!
@@ -95,6 +105,42 @@ pub struct ArrowOptions {
     pub batch_size: usize,
 }
 
+/// How Arrow derivation shapes columns, beyond [`ArrowOptions`].
+///
+/// Kept apart from `ArrowOptions` so code that builds `ArrowOptions` field
+/// by field keeps compiling. Pass it to
+/// [`SchemaSet::to_arrow_schema_with_shape`] or
+/// [`SchemaSet::try_all_arrow_schemas_with_shape`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ArrowShape {
+    /// Whether a child element whose own content derives exactly one column
+    /// also gets the attributes that reach its type through
+    /// `xs:attribute ref` or `xs:attributeGroup ref`. Default: false.
+    ///
+    /// By default such a child is that one column, named after the element,
+    /// as it was before references were resolved, and those attributes are
+    /// left out: they are columns of the same type only where it is the
+    /// root element, or a child with no column or several of its own. When
+    /// true, the child becomes a struct of its value and all its
+    /// attributes, which changes the type of its column.
+    pub attributes_on_simple_children: bool,
+}
+
+impl ArrowShape {
+    /// The default shape: today's columns, unchanged.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`ArrowShape::attributes_on_simple_children`].
+    #[must_use]
+    pub fn with_attributes_on_simple_children(mut self, on: bool) -> Self {
+        self.attributes_on_simple_children = on;
+        self
+    }
+}
+
 impl Default for ArrowOptions {
     fn default() -> Self {
         Self {
@@ -118,8 +164,23 @@ impl SchemaSet {
     /// walk steps (types visited plus fields emitted, wrapped ones included)
     /// or its model groups nest too deeply to walk.
     pub fn to_arrow_schema(&self, root_element: &str, opts: ArrowOptions) -> Result<SchemaRef> {
+        self.to_arrow_schema_with_shape(root_element, opts, ArrowShape::default())
+    }
+
+    /// Derive an Arrow [`Schema`] for the named root element, shaped as
+    /// `shape` says; [`SchemaSet::to_arrow_schema`] uses the default shape.
+    ///
+    /// # Errors
+    ///
+    /// As [`SchemaSet::to_arrow_schema`].
+    pub fn to_arrow_schema_with_shape(
+        &self,
+        root_element: &str,
+        opts: ArrowOptions,
+        shape: ArrowShape,
+    ) -> Result<SchemaRef> {
         let mut steps = MAX_DERIVATION_STEPS;
-        self.derive_arrow_schema(root_element, &opts, &mut steps)
+        self.derive_arrow_schema(root_element, &opts, shape, &mut steps)
     }
 
     /// Derives one element's schema, taking its steps out of `steps_left`.
@@ -131,6 +192,7 @@ impl SchemaSet {
         &self,
         root_element: &str,
         opts: &ArrowOptions,
+        shape: ArrowShape,
         steps_left: &mut usize,
     ) -> Result<SchemaRef> {
         let decl = self
@@ -145,6 +207,7 @@ impl SchemaSet {
             model: &self.model,
             max_depth: opts.max_depth.min(MAX_FLATTEN_DEPTH),
             opts,
+            shape,
             steps_left: allowed,
             nesting: 0,
         };
@@ -240,7 +303,9 @@ impl SchemaSet {
             if steps_left == 0 {
                 break;
             }
-            if let Ok(schema) = self.derive_arrow_schema(name, &opts, &mut steps_left) {
+            if let Ok(schema) =
+                self.derive_arrow_schema(name, &opts, ArrowShape::default(), &mut steps_left)
+            {
                 derived.push((name.clone(), schema));
             }
         }
@@ -261,11 +326,24 @@ impl SchemaSet {
     /// the elements together take more than 4,000,000 walk steps, even if
     /// each is inside its own limit. No partial result is returned.
     pub fn try_all_arrow_schemas(&self, opts: ArrowOptions) -> Result<Vec<(String, SchemaRef)>> {
+        self.try_all_arrow_schemas_with_shape(opts, ArrowShape::default())
+    }
+
+    /// [`SchemaSet::try_all_arrow_schemas`], shaped as `shape` says.
+    ///
+    /// # Errors
+    ///
+    /// As [`SchemaSet::try_all_arrow_schemas`].
+    pub fn try_all_arrow_schemas_with_shape(
+        &self,
+        opts: ArrowOptions,
+        shape: ArrowShape,
+    ) -> Result<Vec<(String, SchemaRef)>> {
         let mut steps_left = MAX_TOTAL_DERIVATION_STEPS;
         let mut derived = Vec::with_capacity(self.model.global_elements.len());
         for name in self.model.global_elements.keys() {
             let before = steps_left;
-            match self.derive_arrow_schema(name, &opts, &mut steps_left) {
+            match self.derive_arrow_schema(name, &opts, shape, &mut steps_left) {
                 Ok(schema) => derived.push((name.clone(), schema)),
                 // The element ran out because the call did, not because it
                 // is too large on its own.
@@ -289,6 +367,7 @@ impl SchemaSet {
 struct Derivation<'a> {
     model: &'a SchemaModel,
     opts: &'a ArrowOptions,
+    shape: ArrowShape,
     /// [`ArrowOptions::max_depth`], capped at [`MAX_FLATTEN_DEPTH`].
     max_depth: usize,
     /// Steps that may still be taken before the derivation is refused.
@@ -524,7 +603,7 @@ impl Derivation<'_> {
         let col_path = column_path(prefix, &decl.name.local);
         let nillable = decl.nillable;
         let own = inner_fields.iter().filter(|f| !is_referenced(f)).count();
-        if own == 1 {
+        if own == 1 && !self.shape.attributes_on_simple_children {
             // A child whose other content derives one column keeps the shape
             // it had before attribute references were resolved: that column,
             // named after the child.
