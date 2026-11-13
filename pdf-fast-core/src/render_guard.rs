@@ -26,9 +26,9 @@
 use anyhow::{anyhow, Result};
 use hayro::hayro_syntax::content::ops::TypedInstruction;
 use hayro::hayro_syntax::content::TypedIter;
-use hayro::hayro_syntax::object::{Array, Dict, Name, Object, Stream};
+use hayro::hayro_syntax::object::{Array, Dict, MaybeRef, Name, Object, Stream};
 use hayro::hayro_syntax::page::{Page, Resources};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// Stack given to the thread that opens, vets and renders a page.
@@ -93,7 +93,7 @@ const GLYPH_COST: u32 = 30_000;
 /// that each draw the next level twice is a million draws. The interpreter
 /// would execute every one of them, so refusing past this bound also refuses
 /// a render that would not finish. Ordinary pages need tens to hundreds.
-const MAX_VETTED_CONTEXTS: usize = 100_000;
+const MAX_VETTED_CONTEXTS: usize = 1_000_000;
 
 /// Identity of a stream: where its dictionary sits in the file.
 type StreamId = (usize, usize);
@@ -122,6 +122,8 @@ impl Route {
 /// The resource names one content stream uses, by the route they can open.
 #[derive(Default)]
 struct Scan {
+    /// Names already recorded, by route, so a repeat costs one lookup.
+    seen: HashSet<(u8, Vec<u8>)>,
     /// Operands of `Do`.
     x_objects: Vec<Vec<u8>>,
     /// Pattern operands of `scn` and `SCN`.
@@ -137,22 +139,29 @@ impl Scan {
         let mut scan = Self::default();
         for instruction in TypedIter::new(content) {
             match instruction {
-                TypedInstruction::XObject(op) => remember(&mut scan.x_objects, &op.0),
+                TypedInstruction::XObject(op) => {
+                    remember(&mut scan.seen, 0, &mut scan.x_objects, &op.0);
+                }
                 TypedInstruction::NonStrokeColorNamed(op) => {
                     if let Some(name) = &op.1 {
-                        remember(&mut scan.patterns, name);
+                        remember(&mut scan.seen, 1, &mut scan.patterns, name);
                     }
                 }
                 TypedInstruction::StrokeColorNamed(op) => {
                     if let Some(name) = &op.1 {
-                        remember(&mut scan.patterns, name);
+                        remember(&mut scan.seen, 1, &mut scan.patterns, name);
                     }
                 }
-                TypedInstruction::SetGraphicsState(op) => remember(&mut scan.ext_g_states, &op.0),
-                TypedInstruction::TextFont(op) => remember(&mut scan.fonts, &op.0),
+                TypedInstruction::SetGraphicsState(op) => {
+                    remember(&mut scan.seen, 2, &mut scan.ext_g_states, &op.0);
+                }
+                TypedInstruction::TextFont(op) => {
+                    remember(&mut scan.seen, 3, &mut scan.fonts, &op.0);
+                }
                 _ => {}
             }
         }
+        scan.seen = HashSet::new();
         scan
     }
 
@@ -165,7 +174,12 @@ impl Scan {
 }
 
 /// Records `name` once, in the escaped form [`Name::new`] reads back.
-fn remember(names: &mut Vec<Vec<u8>>, name: &Name<'_>) {
+fn remember(
+    seen: &mut HashSet<(u8, Vec<u8>)>,
+    route: u8,
+    names: &mut Vec<Vec<u8>>,
+    name: &Name<'_>,
+) {
     // `Name::new` decodes `#xx` and assumes two hex digits follow every `#`,
     // so a literal `#` has to go back in as `#23`.
     let mut escaped = Vec::with_capacity(name.len());
@@ -176,7 +190,7 @@ fn remember(names: &mut Vec<Vec<u8>>, name: &Name<'_>) {
             escaped.push(byte);
         }
     }
-    if !names.contains(&escaped) {
+    if seen.insert((route, escaped.clone())) {
         names.push(escaped);
     }
 }
@@ -200,7 +214,10 @@ struct Child<'a> {
     route: Route,
     stream: StreamId,
     scan: Rc<Scan>,
-    resources: Resources<'a>,
+    /// The stream's own `/Resources`. The chain above it is only built when
+    /// the child is entered, so a stream naming many children holds one
+    /// chain, not one per child.
+    own: Dict<'a>,
 }
 
 /// One content stream in one context, part-way through being vetted.
@@ -251,6 +268,9 @@ struct Walk<'a> {
     fonts: HashMap<(u32, u32, Vec<u8>), ()>,
     stack: Vec<Frame<'a>>,
     visited: usize,
+    /// Decoded bytes scanned so far, and the most this render may scan.
+    decoded: usize,
+    decode_allowance: usize,
     next_id: u32,
 }
 
@@ -271,19 +291,47 @@ impl<'a> Walk<'a> {
 
     /// The names a stream uses, or `None` when the interpreter cannot decode
     /// it and so will not enter it.
-    fn scan(&mut self, stream: &Stream<'a>) -> Option<Rc<Scan>> {
-        self.scans
-            .entry(stream_id(stream))
-            .or_insert_with(|| {
-                stream
-                    .decoded()
-                    .ok()
-                    .map(|content| Rc::new(Scan::of(&content)))
-            })
-            .clone()
+    fn scan(&mut self, stream: &Stream<'a>) -> Result<Option<Rc<Scan>>> {
+        // What a stream decodes to can depend on how it was reached: the
+        // object model will not follow a reference back into an object the
+        // lookup is already inside, so an indirect `/DecodeParms` or
+        // `/Filter` can be present on one path and missing on another. Only
+        // a stream whose filters are written out in its own dictionary is
+        // scanned once and remembered; any other is decoded on every path.
+        let key = decode_is_fixed(stream).then(|| stream_id(stream));
+        if let Some(known) = key.and_then(|key| self.scans.get(&key)) {
+            return Ok(known.clone());
+        }
+        let scan = match stream.decoded() {
+            Ok(content) => Some(Rc::new(self.scan_content(&content)?)),
+            Err(_) => None,
+        };
+        if let Some(key) = key {
+            self.scans.insert(key, scan.clone());
+        }
+        Ok(scan)
     }
 
-    fn push(&mut self, child: Child<'a>, floor: u32) -> Result<()> {
+    /// Scans decoded content after counting its size against this render's
+    /// allowance.
+    fn scan_content(&mut self, content: &[u8]) -> Result<Scan> {
+        self.spend(content.len())?;
+        Ok(Scan::of(content))
+    }
+
+    /// Counts `bytes` of decoded data against what the document's decode
+    /// budget still has. Nothing is taken from the budget itself.
+    fn spend(&mut self, bytes: usize) -> Result<()> {
+        self.decoded = self.decoded.saturating_add(bytes);
+        if self.decoded > self.decode_allowance {
+            return Err(refused(
+                "checking the page would decode more than the document's decode budget has left",
+            ));
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, child: Child<'a>, resources: Resources<'a>, floor: u32) -> Result<()> {
         if floor > STACK_BUDGET {
             return Err(refused(
                 "content streams nest deeper than the interpreter's stack allows",
@@ -298,7 +346,7 @@ impl<'a> Walk<'a> {
             id,
             route: child.route,
             stream: child.stream,
-            resources: child.resources,
+            resources,
             floor,
             children: Vec::new(),
             form_chain: 0,
@@ -321,7 +369,7 @@ impl<'a> Walk<'a> {
                 continue;
             };
             if has_subtype(stream.dict(), b"Form") {
-                self.queue(frame, Route::Form, &stream);
+                self.queue(frame, Route::Form, &stream)?;
             }
         }
         for name in &scan.patterns {
@@ -334,7 +382,7 @@ impl<'a> Walk<'a> {
             else {
                 continue;
             };
-            self.queue(frame, Route::Pattern, &stream);
+            self.queue(frame, Route::Pattern, &stream)?;
         }
         for name in &scan.ext_g_states {
             self.count()?;
@@ -347,7 +395,7 @@ impl<'a> Walk<'a> {
             else {
                 continue;
             };
-            self.queue(frame, Route::SoftMask, &stream);
+            self.queue(frame, Route::SoftMask, &stream)?;
         }
         for name in &scan.fonts {
             self.count()?;
@@ -358,23 +406,21 @@ impl<'a> Walk<'a> {
 
     /// Queues `stream` as a child of `frame`, or settles it on the spot when
     /// it uses no resources and so cannot reach anything.
-    fn queue(&mut self, frame: &mut Frame<'a>, route: Route, stream: &Stream<'a>) {
-        let Some(scan) = self.scan(stream) else {
-            return;
+    fn queue(&mut self, frame: &mut Frame<'a>, route: Route, stream: &Stream<'a>) -> Result<()> {
+        let Some(scan) = self.scan(stream)? else {
+            return Ok(());
         };
         if scan.is_empty() {
             settle(frame, route, 0, 0);
-            return;
+            return Ok(());
         }
         frame.children.push(Child {
             route,
             stream: stream_id(stream),
             scan,
-            resources: Resources::from_parent(
-                own_resources(stream.dict()),
-                frame.resources.clone(),
-            ),
+            own: own_resources(stream.dict()),
         });
+        Ok(())
     }
 
     /// Checks the font `name` selects inside `frame`, if it is a Type 3 font.
@@ -428,7 +474,7 @@ impl<'a> Walk<'a> {
             let Some(procedure) = procedures.get::<Stream<'a>>(glyph) else {
                 continue;
             };
-            let Some(scan) = self.scan(&procedure) else {
+            let Some(scan) = self.scan(&procedure)? else {
                 continue;
             };
             if scan.is_empty() {
@@ -491,16 +537,17 @@ impl<'a> Walk<'a> {
 
     /// Vets `root` and everything beneath it; `floor` is the stack already in
     /// use when `root` starts. Returns the stack needed beneath `root`.
-    fn run(&mut self, root: Child<'a>, floor: u32) -> Result<u32> {
-        self.push(root, floor)?;
+    fn run(&mut self, root: Child<'a>, resources: Resources<'a>, floor: u32) -> Result<u32> {
+        self.push(root, resources, floor)?;
         loop {
             let Some(frame) = self.stack.last_mut() else {
                 return Ok(0);
             };
             if let Some(child) = frame.children.pop() {
                 let floor = frame.floor.saturating_add(child.route.cost());
+                let resources = Resources::from_parent(child.own.clone(), frame.resources.clone());
                 self.count()?;
-                self.push(child, floor)?;
+                self.push(child, resources, floor)?;
                 continue;
             }
             let Some(done) = self.stack.pop() else {
@@ -535,30 +582,51 @@ fn settle(parent: &mut Frame<'_>, route: Route, form_chain: u32, height: u32) {
     }
 }
 
+/// Whether a stream decodes to the same bytes however it was reached.
+fn decode_is_fixed(stream: &Stream<'_>) -> bool {
+    if !matches!(stream.raw_data(), std::borrow::Cow::Borrowed(_)) {
+        return false;
+    }
+    let dict = stream.dict();
+    [&b"Filter"[..], b"F", b"DecodeParms", b"DP", b"Length"]
+        .into_iter()
+        .all(|key| match dict.get_raw::<Object<'_>>(key) {
+            None => !dict.contains_key(key),
+            Some(MaybeRef::Ref(_)) => false,
+            Some(MaybeRef::NotRef(Object::Array(array))) => !array.data().contains(&b'R'),
+            Some(MaybeRef::NotRef(Object::Dict(dict))) => !dict.data().contains(&b'R'),
+            Some(MaybeRef::NotRef(_)) => true,
+        })
+}
+
 /// Refuses `page` unless the interpreter can render it within
 /// [`STACK_BUDGET`].
 ///
 /// `page` must be the very object handed to the interpreter afterwards, and
-/// this must run on the thread that will render it.
+/// this must run on the thread that will render it. `decode_allowance` is
+/// how many decoded bytes the check may look at; nothing is taken from the
+/// document's budget.
 ///
 /// # Errors
 ///
 /// Returns an error when a content stream reachable from the page reaches
 /// itself, when the streams nest deeper than the budget allows, when a Type 3
-/// glyph procedure could enter another content stream, or when the page
-/// describes more nested content than [`MAX_VETTED_CONTEXTS`].
-pub(crate) fn vet_page(page: &Page<'_>) -> Result<()> {
+/// glyph procedure could enter another content stream, or when checking
+/// would take more contexts or decoded bytes than its bounds allow.
+pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
     let mut walk = Walk {
         scans: HashMap::new(),
         fonts: HashMap::new(),
         stack: Vec::new(),
         visited: 0,
+        decoded: 0,
+        decode_allowance,
         next_id: 1,
     };
 
     // The page's own stream. The interpreter decodes it through the same
     // cache, so scanning it here costs no second decode.
-    let page_scan = Rc::new(Scan::of(page.page_stream().unwrap_or_default()));
+    let page_scan = Rc::new(walk.scan_content(page.page_stream().unwrap_or_default())?);
     let page_id = {
         let data = page.raw().data();
         (data.as_ptr() as usize, data.len())
@@ -569,8 +637,9 @@ pub(crate) fn vet_page(page: &Page<'_>) -> Result<()> {
                 route: Route::Form,
                 stream: page_id,
                 scan: page_scan,
-                resources: page.resources().clone(),
+                own: Dict::empty(),
             },
+            page.resources().clone(),
             PAGE_COST,
         )?;
     }
@@ -592,22 +661,22 @@ pub(crate) fn vet_page(page: &Page<'_>) -> Result<()> {
         else {
             continue;
         };
-        let Some(scan) = walk.scan(&appearance) else {
+        let Some(scan) = walk.scan(&appearance)? else {
             continue;
         };
         if scan.is_empty() {
             continue;
         }
+        let own =
+            Resources::from_parent(own_resources(appearance.dict()), page.resources().clone());
         walk.run(
             Child {
                 route: Route::Form,
                 stream: stream_id(&appearance),
                 scan,
-                resources: Resources::from_parent(
-                    own_resources(appearance.dict()),
-                    page.resources().clone(),
-                ),
+                own: Dict::empty(),
             },
+            own,
             PAGE_COST.saturating_add(FORM_COST),
         )?;
     }

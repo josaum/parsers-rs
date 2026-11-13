@@ -306,6 +306,12 @@ impl DecodedByteBudget {
         Ok(())
     }
 
+    /// Bytes the budget could still grant. Reading it spends nothing.
+    #[cfg(feature = "rasterize")]
+    fn available_bytes(&self) -> usize {
+        self.remaining.lock().map_or(0, |remaining| *remaining)
+    }
+
     fn charge_resource_bytes(&self, bytes: usize) -> Result<()> {
         let mut remaining = self
             .remaining
@@ -1077,8 +1083,9 @@ impl PdfDocument {
         // depth guard of its own, and a stack overflow there aborts the
         // process. Vet the exact page object it is about to render, on its
         // own object model, so there is no second parser to disagree with
-        // it. Nothing here is charged to the decode budget.
-        render_guard::vet_page(page)?;
+        // it. The check may look at as much decoded data as the budget has
+        // left, and takes none of it.
+        render_guard::vet_page(page, budget.available_bytes())?;
         let (width, height) = page.render_dimensions();
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return Ok(None);

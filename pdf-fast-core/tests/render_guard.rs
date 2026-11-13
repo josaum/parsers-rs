@@ -348,8 +348,52 @@ fn repeated_kids() -> Vec<u8> {
     ])
 }
 
+/// A form that decodes to different content depending on the path it is
+/// reached by. Its `/DecodeParms` is object 12, which is also the `/XObject`
+/// dictionary of form 11. Drawn from the page, the predictor in object 12
+/// applies and the form decodes to nothing drawable. Drawn from form 11
+/// through object 12, the interpreter will not follow the reference back
+/// into object 12, the predictor is dropped, and the form decodes to
+/// `/S2 Do`: itself, found through form 11's resources.
+fn form_that_decodes_by_path() -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(b"/S2 Do\n").expect("compress");
+    let hostile = encoder.finish().expect("finish compression");
+    let mut form_10 = format!(
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /FlateDecode \
+         /DecodeParms 12 0 R /Length {} >>\nstream\n",
+        hostile.len()
+    )
+    .into_bytes();
+    form_10.extend_from_slice(&hostile);
+    form_10.extend_from_slice(b"\nendstream");
+    one_page(
+        "/Resources << /XObject << /S1 10 0 R /G 11 0 R >> >>",
+        "/S1 Do /G Do",
+        vec![
+            (10, form_10),
+            (11, form("/Resources << /XObject 12 0 R >>", "/S2 Do")),
+            (
+                12,
+                b"<< /S2 10 0 R /Predictor 2 /Columns 7 /Colors 1 /BitsPerComponent 8 >>".to_vec(),
+            ),
+        ],
+    )
+}
+
+/// A page that draws `count` distinct names, none of which exists.
+fn many_names(count: usize) -> Vec<u8> {
+    let content = (0..count)
+        .map(|index| format!("/X{index:07} Do"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    one_page("", &content, Vec::new())
+}
+
 fn fixture(route: &str, depth: usize) -> Vec<u8> {
     match route {
+        "decodepath" => form_that_decodes_by_path(),
         "form" => form_chain(depth),
         "annotation" => annotation_appearance(depth),
         "pattern" => tiling_pattern(depth),
@@ -472,6 +516,23 @@ fn ordinary_use_of_every_route_still_renders() {
     assert_renders("type 3 glyph", &type3_glyph(1));
     assert_renders("soft mask", &soft_mask(1));
     assert_renders("nested soft masks", &soft_mask(2));
+}
+
+#[test]
+fn a_form_that_decodes_differently_by_path_is_refused() {
+    assert_refused("decode by path", &form_that_decodes_by_path());
+}
+
+#[test]
+fn a_hundred_thousand_distinct_names_are_scanned_quickly() {
+    // Deduplicating names by a linear search took over twenty seconds here.
+    let started = std::time::Instant::now();
+    assert_renders("many names", &many_names(100_000));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "scanning took {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
