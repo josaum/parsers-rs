@@ -3,13 +3,11 @@
 //! Sovereign PDF page manipulation — creates page subsets from existing
 //! PDFs without any external dependencies (no PyMuPDF/fitz, no pypdf).
 //!
-//! Works by parsing the classic (uncompressed) cross-reference table of the
-//! source PDF, extracting the page tree, and writing a new PDF that contains
-//! only the requested pages. The output is a minimal, valid PDF 1.4 file with
-//! uncompressed or Flate-compressed content streams.
-//!
-//! PDF 1.5+ compressed xref / object streams (`/Type /XRef`) are **not**
-//! supported: the parser fails loud rather than emitting a corrupt subset.
+//! Works by reading the cross-reference of the source PDF (classic tables,
+//! cross-reference streams, or both), extracting the page tree, and writing
+//! a new PDF that contains only the requested pages. The output is a
+//! minimal, valid PDF 1.4 file with a classic cross-reference table; content
+//! streams are copied as they are, compressed or not.
 //!
 //! ## What is read
 //!
@@ -19,9 +17,19 @@
 //!   is gone.
 //! - An **encrypted** source (trailer `/Encrypt`) is refused: its strings and
 //!   streams are ciphertext and this crate holds no keys.
-//! - A source whose cross-reference is a **stream**, or whose objects live in
-//!   **object streams** (PDF 1.5+), is refused with an error; nothing partial
-//!   is written.
+//! - A source whose cross-reference is a **stream** (`/Type /XRef`, PDF
+//!   1.5+), or a hybrid file whose table names one with `/XRefStm`, is read
+//!   like a classic one; `/Prev` chains are followed through tables and
+//!   streams alike, at most 1,024 sections. An object stored in an **object
+//!   stream** (`/Type /ObjStm`) is written to the output as an ordinary
+//!   object; the output has no object streams.
+//! - Cross-reference and object streams are decoded only when unfiltered or
+//!   `/FlateDecode`, with no predictor or a PNG predictor. Together they may
+//!   decode to at most 16 times the source's length plus 64 KiB; past that,
+//!   or when a row, an `/Index`, a `/W` or an object stream header does not
+//!   fit the data, the source is refused.
+//! - A cross-reference or object stream is never copied: a page that refers
+//!   to one is refused.
 //! - `/Count` is not trusted: the pages are the leaves reachable from the
 //!   page tree. A page tree with a cycle or with a node under two parents is
 //!   an error.
@@ -141,8 +149,10 @@ impl PdfWriter {
     ///
     /// # Errors
     ///
-    /// Returns an error when the source cannot be read as a classic-xref,
-    /// unencrypted PDF, when the selection is empty, names a page outside
+    /// Returns an error when the source cannot be read as an unencrypted PDF
+    /// (its cross-reference tables or streams, or its object streams, are
+    /// malformed or decode past their bound), when the selection is empty,
+    /// names a page outside
     /// the document or is too long, or when a selected page refers to an
     /// unselected one.
     pub fn extract_pages_from_bytes_with(
@@ -214,23 +224,24 @@ struct Pdf {
 
 impl Pdf {
     fn parse(data: &[u8]) -> Result<Self> {
-        let data = data.to_vec();
+        let startxref = find_startxref(data)?;
 
-        // Find startxref
-        let startxref = find_startxref(&data)?;
-
-        // Parse xref table
-        let (xref, trailer) = parse_xref(&data, startxref)?;
+        // One budget bounds everything decoded from this source.
+        let mut budget = DecodeBudget::for_source(data.len());
+        let (entries, trailer) = read_xref_sections(data, startxref, &mut budget)?;
 
         // An encrypted document's strings and streams are ciphertext. Copied
         // into a file without the /Encrypt dictionary they are noise, and
-        // this crate holds no keys, so refuse instead.
+        // this crate holds no keys, so refuse instead. Its object streams
+        // are ciphertext too, so this comes before any is decoded.
         if trailer.contains_key("/Encrypt") {
             return Err(anyhow!(
                 "source PDF is encrypted (its trailer has /Encrypt); \
                  decrypt it before extracting pages"
             ));
         }
+
+        let (data, xref) = unpack_object_streams(data, entries, &mut budget)?;
 
         // Get Root (catalog) object number
         let root_str = trailer
@@ -367,6 +378,17 @@ impl Pdf {
             // An object cut short must never be written as if it were whole.
             let syntax_end = stream_data_range(&self.data, &self.xref, &raw)?
                 .map_or(raw.len(), |stream| stream.start);
+            // The source's own structure is never page content: copied, it
+            // would carry every offset and object number of the source.
+            if let Some(kind) = top_level_value_bytes(&raw[..syntax_end], b"/Type")
+                .filter(|kind| name_is(kind, b"/XRef") || name_is(kind, b"/ObjStm"))
+            {
+                return Err(anyhow!(
+                    "object {} is a {} stream, which is not page content",
+                    old_obj,
+                    String::from_utf8_lossy(&kind)
+                ));
+            }
             if !delimiters_balance(&raw[..syntax_end]) {
                 return Err(anyhow!(
                     "object {} is cut short or malformed: a dictionary or array in it is not closed",
@@ -582,10 +604,6 @@ fn find_startxref(data: &[u8]) -> Result<u64> {
     parse_u64(&digits).ok_or_else(|| anyhow!("invalid startxref offset"))
 }
 
-/// Parsed cross-reference table: object number → `(byte offset, generation)`,
-/// plus the trailer key/value dictionary.
-type ParsedXref = (Xref, HashMap<String, String>);
-
 /// Most bytes read at an offset to decide whether an object header is there.
 ///
 /// `N G obj` with the largest object and generation numbers takes 20 bytes;
@@ -604,6 +622,10 @@ mod work {
         pub(super) static HEADER_BYTES: Cell<usize> = const { Cell::new(0) };
         /// Calls of [`super::effective_page_attributes`].
         pub(super) static ATTRIBUTE_WALKS: Cell<usize> = const { Cell::new(0) };
+        /// Bytes produced by decoding cross-reference and object streams.
+        pub(super) static INFLATED_BYTES: Cell<usize> = const { Cell::new(0) };
+        /// Object streams decoded.
+        pub(super) static OBJECT_STREAM_DECODES: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn add(counter: &'static LocalKey<Cell<usize>>, amount: usize) {
@@ -666,10 +688,88 @@ impl std::ops::Deref for Xref {
     }
 }
 
-/// One cross-reference section: object number → `Some((offset, generation))`
-/// for an object in use or `None` for one the section marks free, plus the
-/// section's trailer dictionary.
-type ParsedSection = (HashMap<u32, Option<(u64, u16)>>, HashMap<String, String>);
+/// One cross-reference entry, as a section gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum XrefEntry {
+    /// A free entry, or a row of a type the format does not define, which
+    /// stands for the null object (ISO 32000-1, 7.5.8.3).
+    Free,
+    /// An object at a byte offset of the file.
+    InUse {
+        /// Where its `N G obj` header is.
+        offset: u64,
+        /// Its generation number.
+        generation: u16,
+    },
+    /// The object at `index` in object stream `stream` (PDF 1.5+).
+    Compressed {
+        /// The object stream's object number.
+        stream: u32,
+        /// The object's position in that stream, from 0.
+        index: u32,
+    },
+}
+
+/// One cross-reference section's entries by object number, plus the
+/// section's trailer entries.
+type ParsedSection = (HashMap<u32, XrefEntry>, HashMap<String, String>);
+
+/// Most cross-reference sections one source may chain through `/Prev`.
+///
+/// Every section is one save of the file, and real files have a handful.
+/// Reading a section can cost a pass over the rest of the file, so the bound
+/// keeps a chain of thousands of tiny sections from costing thousands of
+/// passes.
+const MAX_XREF_SECTIONS: usize = 1024;
+
+/// Most bytes all decoded cross-reference and object streams of a source
+/// may take, as a multiple of the source's length.
+///
+/// These streams hold the file's structure, which is a small part of a real
+/// file (content streams and images are never decoded here) and compresses
+/// a few times over. Sixteen times the file leaves room for very repetitive
+/// object streams, while a deflate bomb, which expands a thousandfold, is
+/// cut off before it is in memory.
+const DECODE_MULTIPLE: usize = 16;
+
+/// Decoded bytes allowed on top of [`DECODE_MULTIPLE`], whatever the length.
+///
+/// Lets a source of a few hundred bytes decode its own small streams.
+const DECODE_FLOOR_BYTES: usize = 64 * 1024;
+
+/// Widest field of a cross-reference stream row, in bytes.
+///
+/// Eight bytes hold any 64-bit offset; a wider field can only be malformed.
+const MAX_XREF_FIELD_BYTES: usize = 8;
+
+/// What may still be decoded from one source.
+#[derive(Debug)]
+struct DecodeBudget {
+    remaining: usize,
+}
+
+impl DecodeBudget {
+    /// Returns the budget for a source of `length` bytes.
+    fn for_source(length: usize) -> Self {
+        Self {
+            remaining: length
+                .saturating_mul(DECODE_MULTIPLE)
+                .saturating_add(DECODE_FLOOR_BYTES),
+        }
+    }
+
+    /// Takes `bytes` from the budget, or fails if fewer remain.
+    fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.remaining = self.remaining.checked_sub(bytes).ok_or_else(|| {
+            anyhow!(
+                "the cross-reference and object streams decode to more than \
+                 {} times the file's length",
+                DECODE_MULTIPLE
+            )
+        })?;
+        Ok(())
+    }
+}
 
 /// Most pages one extraction may select.
 ///
@@ -686,21 +786,65 @@ const MAX_SELECTED_PAGES: usize = 8_388_607;
 /// multiplied into gigabytes.
 const MAX_REPEATED_PAGE_BYTES: usize = 16 * 1024 * 1024;
 
-fn parse_xref(data: &[u8], start: u64) -> Result<ParsedXref> {
+/// Reads the cross-reference sections from `start` back along `/Prev`.
+///
+/// Returns every object's current entry and the newest trailer. A section
+/// is a classic table, a table with the cross-reference stream its
+/// `/XRefStm` names (a hybrid file), or a cross-reference stream.
+fn read_xref_sections(data: &[u8], start: u64, budget: &mut DecodeBudget) -> Result<ParsedSection> {
     // Sections are read newest first, so the first entry seen for an object
     // is the current one. That includes a free entry: an object deleted by a
     // later revision must not come back from an earlier one.
-    let mut merged_xref: HashMap<u32, Option<(u64, u16)>> = HashMap::new();
+    let mut merged: HashMap<u32, XrefEntry> = HashMap::new();
     let mut latest_trailer = None;
-    let mut current = start;
     let mut seen = std::collections::HashSet::new();
-    loop {
+    let mut next = Some(start);
+    let mut sections: usize = 0;
+    while let Some(current) = next.take() {
         if !seen.insert(current) {
-            return Err(anyhow!("cyclic /Prev chain in classic xref tables"));
+            return Err(anyhow!("cyclic /Prev chain in cross-reference sections"));
         }
-        let (xref, trailer) = parse_xref_section(data, current)?;
-        for (object, entry) in xref {
-            merged_xref.entry(object).or_insert(entry);
+        sections = sections.saturating_add(1);
+        if sections > MAX_XREF_SECTIONS {
+            return Err(anyhow!(
+                "more than {} cross-reference sections are chained by /Prev",
+                MAX_XREF_SECTIONS
+            ));
+        }
+        let slice = usize::try_from(current)
+            .ok()
+            .and_then(|at| data.get(at..))
+            .filter(|slice| !slice.is_empty())
+            .ok_or_else(|| anyhow!("xref offset {} is outside the file", current))?;
+        let (section, trailer) = if looks_like_compressed_xref(slice) {
+            read_xref_stream(data, current, budget)?
+        } else {
+            let (mut section, trailer) = parse_xref_section(data, current)?;
+            if let Some(hidden) = trailer.get("/XRefStm") {
+                let hidden = hidden
+                    .parse::<u64>()
+                    .map_err(|_| anyhow!("invalid /XRefStm offset: {hidden}"))?;
+                if !seen.insert(hidden) {
+                    return Err(anyhow!("cyclic /XRefStm in cross-reference sections"));
+                }
+                // The stream places what the table could not describe: the
+                // objects in object streams, which the table leaves out or
+                // marks free so that older readers skip them.
+                let (stream_entries, _) = read_xref_stream(data, hidden, budget)?;
+                for (object, entry) in stream_entries {
+                    let placed = matches!(
+                        section.get(&object),
+                        Some(XrefEntry::InUse { .. } | XrefEntry::Compressed { .. })
+                    );
+                    if !placed {
+                        section.insert(object, entry);
+                    }
+                }
+            }
+            (section, trailer)
+        };
+        for (object, entry) in section {
+            merged.entry(object).or_insert(entry);
         }
         let previous = trailer
             .get("/Prev")
@@ -713,17 +857,30 @@ fn parse_xref(data: &[u8], start: u64) -> Result<ParsedXref> {
         if latest_trailer.is_none() {
             latest_trailer = Some(trailer);
         }
-        let Some(previous) = previous else { break };
-        if previous as usize >= data.len() {
-            return Err(anyhow!("/Prev offset {} is outside the file", previous));
+        if let Some(previous) = previous {
+            if usize::try_from(previous).map_or(true, |previous| previous >= data.len()) {
+                return Err(anyhow!("/Prev offset {} is outside the file", previous));
+            }
+            next = Some(previous);
         }
-        current = previous;
     }
-    let in_use = merged_xref
+    Ok((merged, latest_trailer.unwrap_or_default()))
+}
+
+/// Parses the cross-reference sections of a file whose objects all stand at
+/// file offsets, as this crate's output does.
+#[cfg(test)]
+fn parse_xref(data: &[u8], start: u64) -> Result<(Xref, HashMap<String, String>)> {
+    let mut budget = DecodeBudget::for_source(data.len());
+    let (entries, trailer) = read_xref_sections(data, start, &mut budget)?;
+    let in_use = entries
         .into_iter()
-        .filter_map(|(object, entry)| entry.map(|entry| (object, entry)))
+        .filter_map(|(object, entry)| match entry {
+            XrefEntry::InUse { offset, generation } => Some((object, (offset, generation))),
+            _ => None,
+        })
         .collect();
-    Ok((Xref::new(data, in_use), latest_trailer.unwrap_or_default()))
+    Ok((Xref::new(data, in_use), trailer))
 }
 
 fn parse_xref_section(data: &[u8], start: u64) -> Result<ParsedSection> {
@@ -732,19 +889,7 @@ fn parse_xref_section(data: &[u8], start: u64) -> Result<ParsedSection> {
         .and_then(|start| data.get(start..))
         .filter(|slice| !slice.is_empty())
         .ok_or_else(|| anyhow!("xref offset {} is outside the file", start))?;
-    // Compressed cross-reference streams (PDF 1.5+) begin with an object
-    // header (`N 0 obj`) rather than the classic `xref` keyword. Detect that
-    // early and fail loud — do not attempt a partial classic parse that would
-    // yield an empty/wrong object map and corrupt subset output.
-    if looks_like_compressed_xref(slice) {
-        return Err(anyhow!(
-            "compressed xref / object stream (PDF 1.5+) is not supported; \
-             pdf-fast-write requires a classic uncompressed xref table (PDF 1.4)"
-        ));
-    }
-
-    let mut xref: HashMap<u32, Option<(u64, u16)>> = HashMap::new();
-    let mut trailer: HashMap<String, String> = HashMap::new();
+    let mut xref: HashMap<u32, XrefEntry> = HashMap::new();
 
     // The section is read line by line up to its `trailer` keyword and no
     // further: in a file saved more than once, later revisions follow this
@@ -767,8 +912,7 @@ fn parse_xref_section(data: &[u8], start: u64) -> Result<ParsedSection> {
         if !saw_keyword {
             if line != b"xref" {
                 return Err(anyhow!(
-                    "expected classic 'xref' table, got '{}'; \
-                     compressed xref / ObjStm is not supported",
+                    "expected a cross-reference table or stream, got '{}'",
                     String::from_utf8_lossy(&line[..line.len().min(32)])
                 ));
             }
@@ -797,10 +941,12 @@ fn parse_xref_section(data: &[u8], start: u64) -> Result<ParsedSection> {
                     let object = current_obj.ok_or_else(|| {
                         anyhow!("cross-reference section numbers an object past 4294967295")
                     })?;
-                    xref.insert(
-                        object,
-                        kind.starts_with('n').then_some((offset, generation)),
-                    );
+                    let entry = if kind.starts_with('n') {
+                        XrefEntry::InUse { offset, generation }
+                    } else {
+                        XrefEntry::Free
+                    };
+                    xref.insert(object, entry);
                     current_obj = object.checked_add(1);
                 }
             }
@@ -836,16 +982,505 @@ fn parse_xref_section(data: &[u8], start: u64) -> Result<ParsedSection> {
     // A trailer's /ID strings are arbitrary bytes, so the text is lossy; the
     // values read from it are names, numbers and references.
     let dict = String::from_utf8_lossy(&after_keyword[..dict_end]);
-    for key in &["/Root", "/Size", "/Info", "/Prev"] {
-        if let Some(val) = find_dict_value(&dict, key) {
+    Ok((xref, trailer_entries(&dict)))
+}
+
+/// Returns the trailer entries this crate uses from a trailer dictionary or
+/// a cross-reference stream's dictionary.
+fn trailer_entries(dict: &str) -> HashMap<String, String> {
+    let mut trailer = HashMap::new();
+    for key in &["/Root", "/Size", "/Info", "/Prev", "/XRefStm"] {
+        if let Some(val) = find_dict_value(dict, key) {
             trailer.insert(key.to_string(), val.trim().to_string());
         }
     }
-    if find_top_level_dict_key(&dict, "/Encrypt").is_some() {
+    if find_top_level_dict_key(dict, "/Encrypt").is_some() {
         trailer.insert("/Encrypt".to_string(), "present".to_string());
     }
+    trailer
+}
 
-    Ok((xref, trailer))
+/// Reads the cross-reference stream at `offset`: its entries, and the
+/// trailer entries of its dictionary.
+fn read_xref_stream(data: &[u8], offset: u64, budget: &mut DecodeBudget) -> Result<ParsedSection> {
+    read_xref_stream_at(data, offset, budget)
+        .with_context(|| format!("cross-reference stream at byte {offset}"))
+}
+
+fn read_xref_stream_at(
+    data: &[u8],
+    offset: u64,
+    budget: &mut DecodeBudget,
+) -> Result<ParsedSection> {
+    let slice = usize::try_from(offset)
+        .ok()
+        .and_then(|offset| data.get(offset..))
+        .ok_or_else(|| anyhow!("the offset is outside the file"))?;
+    let mut cursor = 0;
+    let header = [
+        next_syntax_token(slice, &mut cursor),
+        next_syntax_token(slice, &mut cursor),
+        next_syntax_token(slice, &mut cursor),
+    ];
+    let [Some(number), Some(generation), Some(keyword)] = header else {
+        return Err(anyhow!("no object header stands there"));
+    };
+    if parse_u32(number.bytes).is_none()
+        || parse_u16(generation.bytes).is_none()
+        || keyword.bytes != b"obj"
+    {
+        return Err(anyhow!("no object header stands there"));
+    }
+    let body = slice
+        .get(keyword.end..)
+        .ok_or_else(|| anyhow!("no object header stands there"))?;
+    // Its /Length must be direct: the table that would resolve a reference
+    // is what is being read.
+    let range = stream_data_range(data, &Xref::default(), body)?
+        .ok_or_else(|| anyhow!("the object there is not a stream"))?;
+    let dictionary = body
+        .get(..range.start)
+        .ok_or_else(|| anyhow!("the object there is not a stream"))?;
+    if !top_level_value_bytes(dictionary, b"/Type").is_some_and(|kind| name_is(&kind, b"/XRef")) {
+        return Err(anyhow!("the object there is not a /Type /XRef stream"));
+    }
+    let raw = body
+        .get(range)
+        .ok_or_else(|| anyhow!("the object there is not a stream"))?;
+    let decoded = decode_stream(dictionary, raw, budget)?;
+    let widths = xref_field_widths(dictionary)?;
+    let [kind_width, second_width, third_width] = widths;
+    let row_width = kind_width
+        .checked_add(second_width)
+        .and_then(|width| width.checked_add(third_width))
+        .filter(|width| *width > 0)
+        .ok_or_else(|| anyhow!("/W gives rows of no bytes"))?;
+    let rows = decoded.len() / row_width;
+    let subsections = xref_subsections(dictionary)?;
+    let claimed = subsections
+        .iter()
+        .try_fold(0_u64, |total, (_, count)| total.checked_add(*count))
+        .ok_or_else(|| anyhow!("/Index names more entries than a file can hold"))?;
+    if usize::try_from(claimed).map_or(true, |claimed| claimed > rows) {
+        return Err(anyhow!(
+            "/Index names {claimed} entries but the stream holds {rows} rows"
+        ));
+    }
+    let mut entries = HashMap::new();
+    let mut row_bytes = decoded.chunks_exact(row_width);
+    for (first, count) in subsections {
+        for step in 0..count {
+            let row = row_bytes
+                .next()
+                .ok_or_else(|| anyhow!("/Index names more entries than the stream holds"))?;
+            let object = first
+                .checked_add(step)
+                .and_then(|object| u32::try_from(object).ok())
+                .ok_or_else(|| anyhow!("/Index numbers an object past 4294967295"))?;
+            let entry = xref_row(row, widths)?;
+            entries.entry(object).or_insert(entry);
+        }
+    }
+    Ok((entries, trailer_entries(&object_text(dictionary))))
+}
+
+/// Reads `/W`: the widths of a cross-reference stream row's three fields.
+fn xref_field_widths(dictionary: &[u8]) -> Result<[usize; 3]> {
+    let value = top_level_value_bytes(dictionary, b"/W").ok_or_else(|| anyhow!("/W is missing"))?;
+    let widths: Option<Vec<usize>> = syntax_tokens(&value)
+        .iter()
+        .filter(|token| token.bytes != b"[" && token.bytes != b"]")
+        .map(|token| parse_usize(token.bytes))
+        .collect();
+    match widths.as_deref() {
+        Some(&[kind, second, third])
+            if [kind, second, third]
+                .iter()
+                .all(|width| *width <= MAX_XREF_FIELD_BYTES) =>
+        {
+            Ok([kind, second, third])
+        }
+        _ => Err(anyhow!(
+            "/W must be three field widths of at most {} bytes each",
+            MAX_XREF_FIELD_BYTES
+        )),
+    }
+}
+
+/// Reads `/Index` as `(first object, count)` pairs; without it the stream
+/// describes objects 0 up to `/Size`.
+fn xref_subsections(dictionary: &[u8]) -> Result<Vec<(u64, u64)>> {
+    let Some(value) = top_level_value_bytes(dictionary, b"/Index") else {
+        let size = top_level_value_bytes(dictionary, b"/Size")
+            .and_then(|size| parse_u64(trim_pdf_whitespace(&size)))
+            .ok_or_else(|| anyhow!("/Size is missing or not a number"))?;
+        return Ok(vec![(0, size)]);
+    };
+    let numbers: Option<Vec<u64>> = syntax_tokens(&value)
+        .iter()
+        .filter(|token| token.bytes != b"[" && token.bytes != b"]")
+        .map(|token| parse_u64(token.bytes))
+        .collect();
+    let numbers = numbers.ok_or_else(|| anyhow!("/Index holds something other than numbers"))?;
+    let (pairs, remainder) = numbers.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(anyhow!("/Index holds an odd count of numbers"));
+    }
+    Ok(pairs
+        .iter()
+        .map(|[first, count]| (*first, *count))
+        .collect())
+}
+
+/// Reads one cross-reference stream row whose fields are `widths` wide.
+fn xref_row(row: &[u8], widths: [usize; 3]) -> Result<XrefEntry> {
+    let [kind_width, second_width, _] = widths;
+    let second_start = kind_width;
+    let third_start = second_start
+        .checked_add(second_width)
+        .ok_or_else(|| anyhow!("/W is too wide"))?;
+    let field = |range: std::ops::Range<usize>| {
+        row.get(range)
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte))
+            })
+            .ok_or_else(|| anyhow!("a row is shorter than /W"))
+    };
+    // A missing type field means type 1 (ISO 32000-1, table 17).
+    let kind = if kind_width == 0 {
+        1
+    } else {
+        field(0..second_start)?
+    };
+    let second = field(second_start..third_start)?;
+    let third = field(third_start..row.len())?;
+    Ok(match kind {
+        0 => XrefEntry::Free,
+        1 => XrefEntry::InUse {
+            offset: second,
+            generation: u16::try_from(third)
+                .map_err(|_| anyhow!("generation {third} is past 65535"))?,
+        },
+        2 => XrefEntry::Compressed {
+            stream: u32::try_from(second)
+                .map_err(|_| anyhow!("object stream {second} is past 4294967295"))?,
+            index: u32::try_from(third)
+                .map_err(|_| anyhow!("object stream index {third} is past 4294967295"))?,
+        },
+        _ => XrefEntry::Free,
+    })
+}
+
+/// Decodes the data of a cross-reference or object stream.
+///
+/// Only what these streams use is read: no filter or `/FlateDecode`, with
+/// no predictor or a PNG predictor over 8-bit single-component rows.
+fn decode_stream(dictionary: &[u8], raw: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+    let filters = top_level_value_bytes(dictionary, b"/Filter").unwrap_or_default();
+    let names: Vec<SyntaxToken<'_>> = syntax_tokens(&filters)
+        .into_iter()
+        .filter(|token| token.bytes != b"[" && token.bytes != b"]")
+        .collect();
+    let decoded = match names.as_slice() {
+        [] => {
+            budget.charge(raw.len())?;
+            raw.to_vec()
+        }
+        [name] if name_is(name.bytes, b"/FlateDecode") => inflate(raw, budget)?,
+        _ => {
+            return Err(anyhow!(
+                "filter {} is not supported for a cross-reference or object stream",
+                String::from_utf8_lossy(&filters)
+            ))
+        }
+    };
+    match top_level_value_bytes(dictionary, b"/DecodeParms") {
+        Some(parameters) => undo_png_predictor(&parameters, decoded),
+        None => Ok(decoded),
+    }
+}
+
+/// Inflates zlib data, failing as soon as it passes what `budget` allows.
+fn inflate(raw: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+    use std::io::Read;
+    // One byte past the budget is enough to know it is exceeded.
+    let limit = u64::try_from(budget.remaining)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut decoded = Vec::new();
+    flate2::read::ZlibDecoder::new(raw)
+        .take(limit)
+        .read_to_end(&mut decoded)
+        .map_err(|error| anyhow!("its FlateDecode data is corrupt: {error}"))?;
+    #[cfg(test)]
+    work::add(&work::INFLATED_BYTES, decoded.len());
+    budget.charge(decoded.len())?;
+    Ok(decoded)
+}
+
+/// Undoes the predictor `/DecodeParms` names, if any.
+fn undo_png_predictor(parameters: &[u8], decoded: Vec<u8>) -> Result<Vec<u8>> {
+    let read = |key: &[u8], default: usize| -> Result<usize> {
+        top_level_value_bytes(parameters, key).map_or(Ok(default), |value| {
+            parse_usize(trim_pdf_whitespace(&value)).ok_or_else(|| {
+                anyhow!(
+                    "predictor parameter {} is not a number",
+                    String::from_utf8_lossy(key)
+                )
+            })
+        })
+    };
+    let predictor = read(b"/Predictor", 1)?;
+    if predictor == 1 {
+        return Ok(decoded);
+    }
+    if !(10..=15).contains(&predictor) {
+        return Err(anyhow!("predictor {predictor} is not supported"));
+    }
+    let colors = read(b"/Colors", 1)?;
+    let bits = read(b"/BitsPerComponent", 8)?;
+    if colors != 1 || bits != 8 {
+        return Err(anyhow!(
+            "a predictor over {colors} colors of {bits} bits is not supported"
+        ));
+    }
+    let columns = read(b"/Columns", 1)?;
+    let stride = columns
+        .checked_add(1)
+        .filter(|_| columns > 0 && columns < decoded.len())
+        .ok_or_else(|| {
+            anyhow!(
+                "predictor /Columns {columns} does not fit {} decoded bytes",
+                decoded.len()
+            )
+        })?;
+    if !decoded.len().is_multiple_of(stride) {
+        return Err(anyhow!(
+            "PNG predictor rows of {stride} bytes do not divide the {} decoded bytes",
+            decoded.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(decoded.len());
+    let mut row = vec![0_u8; columns];
+    let mut above = vec![0_u8; columns];
+    for line in decoded.chunks_exact(stride) {
+        let Some((&kind, bytes)) = line.split_first() else {
+            continue;
+        };
+        let mut left = 0_u8;
+        let mut upper_left = 0_u8;
+        for ((value, &byte), &up) in row.iter_mut().zip(bytes).zip(above.iter()) {
+            let predicted = match kind {
+                0 => 0,
+                1 => left,
+                2 => up,
+                // The mean of two bytes, without leaving u8.
+                3 => left / 2 + up / 2 + (left & up & 1),
+                4 => paeth(left, up, upper_left),
+                _ => return Err(anyhow!("PNG predictor row type {kind} is unknown")),
+            };
+            *value = byte.wrapping_add(predicted);
+            left = *value;
+            upper_left = up;
+        }
+        out.extend_from_slice(&row);
+        std::mem::swap(&mut row, &mut above);
+    }
+    Ok(out)
+}
+
+/// The PNG Paeth predictor (RFC 2083, 6.6).
+fn paeth(left: u8, up: u8, upper_left: u8) -> u8 {
+    let (a, b, c) = (i16::from(left), i16::from(up), i16::from(upper_left));
+    // Bytes are at most 255, so none of this leaves i16.
+    let estimate = a + b - c;
+    let (to_left, to_up, to_upper_left) = (
+        (estimate - a).abs(),
+        (estimate - b).abs(),
+        (estimate - c).abs(),
+    );
+    if to_left <= to_up && to_left <= to_upper_left {
+        left
+    } else if to_up <= to_upper_left {
+        up
+    } else {
+        upper_left
+    }
+}
+
+/// Returns `source` with every object an object stream holds appended as an
+/// ordinary indirect object, and the table of the result.
+///
+/// The rest of the crate then reads an object from an object stream exactly
+/// as one at a file offset: through its `N 0 obj` header, bounded by the next
+/// object, under the same checks. Each object stream is decoded once. An
+/// object stream is read only through the objects at file offsets, so one
+/// that is itself in an object stream, directly or through its `/Length`, is
+/// an error and never a recursion.
+fn unpack_object_streams(
+    source: &[u8],
+    entries: HashMap<u32, XrefEntry>,
+    budget: &mut DecodeBudget,
+) -> Result<(Vec<u8>, Xref)> {
+    let mut in_use: HashMap<u32, (u64, u16)> = HashMap::new();
+    let mut packed: std::collections::BTreeMap<u32, Vec<(u32, u32)>> =
+        std::collections::BTreeMap::new();
+    for (object, entry) in entries {
+        match entry {
+            XrefEntry::InUse { offset, generation } => {
+                in_use.insert(object, (offset, generation));
+            }
+            XrefEntry::Compressed { stream, index } => {
+                packed.entry(stream).or_default().push((index, object));
+            }
+            XrefEntry::Free => {}
+        }
+    }
+    let mut data = source.to_vec();
+    if packed.is_empty() {
+        let xref = Xref::new(&data, in_use);
+        return Ok((data, xref));
+    }
+    let containers = Xref::new(source, in_use.clone());
+    let compressed: std::collections::HashSet<u32> = packed
+        .values()
+        .flatten()
+        .map(|(_, object)| *object)
+        .collect();
+    for (stream, members) in packed {
+        if compressed.contains(&stream) {
+            return Err(anyhow!(
+                "object stream {stream} is itself in an object stream"
+            ));
+        }
+        let objects = read_object_stream(source, &containers, stream, &members, budget)
+            .with_context(|| format!("object stream {stream}"))?;
+        for (object, body) in objects {
+            data.push(b'\n');
+            let offset = u64::try_from(data.len())
+                .map_err(|_| anyhow!("the unpacked objects pass 2^64 bytes"))?;
+            data.extend_from_slice(format!("{object} 0 obj\n").as_bytes());
+            data.extend_from_slice(&body);
+            data.extend_from_slice(b"\nendobj\n");
+            in_use.insert(object, (offset, 0));
+        }
+    }
+    let xref = Xref::new(&data, in_use);
+    Ok((data, xref))
+}
+
+/// Reads object stream `stream` and returns the bodies of `members`, given
+/// as `(index, object number)`.
+///
+/// An object that holds a keyword only an indirect object or a stream may
+/// hold (`obj`, `endobj`, `stream`, `endstream`) is left out: an object in an
+/// object stream is never a stream, and written out such an object would end
+/// early. A reference to it then fails as one to an absent object.
+fn read_object_stream(
+    source: &[u8],
+    containers: &Xref,
+    stream: u32,
+    members: &[(u32, u32)],
+    budget: &mut DecodeBudget,
+) -> Result<Vec<(u32, Vec<u8>)>> {
+    let body = get_object(source, containers, stream)?;
+    let range = stream_data_range(source, containers, &body)?
+        .ok_or_else(|| anyhow!("it is not a stream"))?;
+    let dictionary = body
+        .get(..range.start)
+        .ok_or_else(|| anyhow!("it is not a stream"))?;
+    if !top_level_value_bytes(dictionary, b"/Type").is_some_and(|kind| name_is(&kind, b"/ObjStm")) {
+        return Err(anyhow!("it is not a /Type /ObjStm stream"));
+    }
+    let integer = |key: &[u8]| {
+        top_level_value_bytes(dictionary, key)
+            .and_then(|value| parse_usize(trim_pdf_whitespace(&value)))
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} is missing or not a number",
+                    String::from_utf8_lossy(key)
+                )
+            })
+    };
+    let count = integer(b"/N")?;
+    let first = integer(b"/First")?;
+    let raw = body
+        .get(range)
+        .ok_or_else(|| anyhow!("it is not a stream"))?;
+    let decoded = decode_stream(dictionary, raw, budget)?;
+    #[cfg(test)]
+    work::add(&work::OBJECT_STREAM_DECODES, 1);
+    let header = decoded.get(..first).ok_or_else(|| {
+        anyhow!(
+            "/First {first} is past the end of its {} decoded bytes",
+            decoded.len()
+        )
+    })?;
+    // `(object number, start in decoded)` per object, read from the header
+    // and never sized from /N, which only the header can back.
+    let mut starts: Vec<(u32, usize)> = Vec::new();
+    let mut cursor = 0;
+    while starts.len() < count {
+        let pair = (
+            next_syntax_token(header, &mut cursor),
+            next_syntax_token(header, &mut cursor),
+        );
+        let (Some(number), Some(offset)) = pair else {
+            return Err(anyhow!(
+                "/N claims {count} objects but its header lists {}",
+                starts.len()
+            ));
+        };
+        let (Some(number), Some(offset)) = (parse_u32(number.bytes), parse_usize(offset.bytes))
+        else {
+            return Err(anyhow!("its header is not pairs of numbers"));
+        };
+        let start = first
+            .checked_add(offset)
+            .filter(|start| *start <= decoded.len())
+            .ok_or_else(|| anyhow!("object {number} starts past the end of the stream"))?;
+        if starts
+            .last()
+            .is_some_and(|(_, previous)| start <= *previous)
+        {
+            return Err(anyhow!(
+                "its object offsets are not ascending: objects would overlap"
+            ));
+        }
+        starts.push((number, start));
+    }
+    let mut objects = Vec::new();
+    for &(index, object) in members {
+        let position = usize::try_from(index).unwrap_or(usize::MAX);
+        let Some(&(number, start)) = starts.get(position) else {
+            return Err(anyhow!(
+                "object {object} is at index {index}, but the stream holds {} objects",
+                starts.len()
+            ));
+        };
+        if number != object {
+            return Err(anyhow!(
+                "index {index} holds object {number}, not object {object}"
+            ));
+        }
+        let end = position
+            .checked_add(1)
+            .and_then(|next| starts.get(next))
+            .map_or(decoded.len(), |(_, next)| *next);
+        let bytes = decoded
+            .get(start..end)
+            .map(trim_pdf_whitespace)
+            .ok_or_else(|| anyhow!("object {object} lies outside the stream"))?;
+        let holds_keyword = syntax_tokens(bytes)
+            .iter()
+            .any(|token| matches!(token.bytes, b"obj" | b"endobj" | b"stream" | b"endstream"));
+        if !holds_keyword {
+            objects.push((object, bytes.to_vec()));
+        }
+    }
+    Ok(objects)
 }
 
 /// True when `startxref` points at a PDF 1.5+ cross-reference *stream*
@@ -1888,6 +2523,11 @@ fn subset_stream_data_range(
     Ok(Some(data_start..data_end))
 }
 
+/// The fixture builders the integration tests use.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod common;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2373,26 +3013,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_xref_rejects_compressed_xref_stream() {
-        // WHY: PDF 1.5+ files point startxref at an object stream (`N 0 obj`
-        // with /Type /XRef). A classic-table parser must fail loud — not
-        // return an empty map that would produce a corrupt subset.
-        let mut pdf = Vec::from(&b"%PDF-1.5\n"[..]);
-        let xref_obj_pos = pdf.len();
-        pdf.extend_from_slice(
-            b"5 0 obj\n<< /Type /XRef /Length 10 /W [1 2 1] /Size 1 >>\nstream\nxxxxxxxxxx\nendstream\nendobj\n",
-        );
-        pdf.extend_from_slice(format!("startxref\n{}\n%%EOF\n", xref_obj_pos).as_bytes());
-        let startxref = find_startxref(&pdf).unwrap();
-        let err = parse_xref(&pdf, startxref).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("compressed xref") || msg.contains("object stream"),
-            "unexpected error: {msg}"
-        );
-    }
-
-    #[test]
     fn test_looks_like_compressed_xref_detects_obj_header() {
         assert!(looks_like_compressed_xref(b"12 0 obj<< /Type /XRef >>"));
         assert!(!looks_like_compressed_xref(b"xref\n0 1\n"));
@@ -2489,5 +3109,41 @@ mod tests {
         let selection: Vec<usize> = (0..5_000).map(|index| 1 + index % 2).collect();
         PdfWriter::extract_pages_from_bytes(&small, &selection).expect("extracts");
         assert_eq!(work::take(&work::ATTRIBUTE_WALKS), 2);
+    }
+
+    /// WHY: a deflate stream can expand a thousandfold. Decoding must stop
+    /// once the budget the file's length sets is spent, not after the whole
+    /// stream is in memory.
+    #[test]
+    fn decoding_stops_at_a_budget_the_file_length_sets() {
+        let bomb = common::deflate(&vec![0u8; 8 << 20]);
+        let mut pdf = b"%PDF-1.5\n".to_vec();
+        let at = common::append_object(
+            &mut pdf,
+            1,
+            &common::stream("/Type /XRef /W [1 4 2] /Size 1 /Filter /FlateDecode", &bomb),
+        );
+        pdf.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+        work::take(&work::INFLATED_BYTES);
+        let error = Pdf::parse(&pdf).err().expect("a bomb is refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("more than"), "{message}");
+        let inflated = work::take(&work::INFLATED_BYTES);
+        let budget = 16 * pdf.len() + 64 * 1024;
+        assert!(
+            inflated > 0 && inflated <= budget + 1,
+            "{inflated} bytes inflated"
+        );
+    }
+
+    /// WHY: every object of an object stream is read from one decode of it,
+    /// so a stream of n objects costs one decode, not n.
+    #[test]
+    fn an_object_stream_is_decoded_once_for_all_its_objects() {
+        let pdf = common::compressed_document(50, common::Rows::Flate);
+        work::take(&work::OBJECT_STREAM_DECODES);
+        let output = PdfWriter::extract_pages_from_bytes(&pdf, &[1, 50]).expect("extracts");
+        assert_eq!(common::page_texts(&output), ["Page 1", "Page 50"]);
+        assert_eq!(work::take(&work::OBJECT_STREAM_DECODES), 1);
     }
 }
