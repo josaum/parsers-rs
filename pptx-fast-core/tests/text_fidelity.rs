@@ -524,3 +524,47 @@ fn modern_comments_are_read_with_author_date_and_replies() {
         ]
     );
 }
+
+fn modern(comments: &str) -> PptxDocument {
+    Deck {
+        slide: shape("<a:p><a:r><a:t>still here</a:t></a:r></a:p>").into_bytes(),
+        modern_comments: comments.as_bytes().to_vec(),
+        ..Deck::default()
+    }
+    .parse()
+}
+
+#[test]
+fn a_broken_modern_comments_part_costs_only_its_comments() {
+    // These parts were not read at all before, so a deck with a broken one
+    // parsed. It still must: the slide keeps its text and loses the comments.
+    // Not well-formed: a bare `&` in an attribute value fails the part.
+    let doc = modern(
+        r#"<p188:cm id="{1}" authorId="AT&T" created="2024-05-06T07:08:09"><p188:txBody><a:p><a:r><a:t>x</a:t></a:r></a:p></p188:txBody></p188:cm>"#,
+    );
+    assert_eq!(shape_texts(&doc), [["still here"]]);
+    assert!(doc.comments.is_empty());
+
+    // Cut off in the middle of a tag: what was complete is kept.
+    let doc = modern(
+        r#"<p188:cm id="{1}" authorId="{AAAA}" created="2024-05-06T07:08:09"><p188:txBody><a:p><a:r><a:t>x</a:t></a:r></a:p></p188:txBody></p188:cm><p188:cm id="{2}" auth"#,
+    );
+    assert_eq!(shape_texts(&doc), [["still here"]]);
+    assert_eq!(doc.comments[0].text.as_deref(), Some("x"));
+}
+
+#[test]
+fn modern_comment_text_is_the_body_and_nothing_else() {
+    let doc = modern(concat!(
+        // Author GUIDs are matched whatever their case.
+        r#"<p188:cm id="{1}" authorId="{aaaa}" created="2024-05-06T07:08:09">"#,
+        "<p188:txBody><a:bodyPr/><a:p/><a:p><a:r><a:t>body</a:t></a:r><a:br/><a:r><a:t>more</a:t></a:r></a:p></p188:txBody>",
+        // An extension list may carry DrawingML text; it is not the comment.
+        r#"<p188:extLst><p:ext xmlns:p="x" uri="{E}"><a:p><a:r><a:t>not the comment</a:t></a:r></a:p></p:ext></p188:extLst>"#,
+        "</p188:cm>",
+    ));
+    assert_eq!(doc.comments.len(), 1);
+    assert_eq!(doc.comments[0].author.as_deref(), Some("Grace & Co"));
+    // The leading empty paragraph is a line, as it is in a table cell.
+    assert_eq!(doc.comments[0].text.as_deref(), Some("\nbody\nmore"));
+}

@@ -243,6 +243,9 @@ pub struct Comment {
     /// A legacy comment carries its own index. A modern (threaded) comment is
     /// identified by a GUID, so its ID is its 1-based position in the part,
     /// replies included.
+    ///
+    /// The ID is not unique per slide, let alone per deck: a legacy index is
+    /// counted per author, and a modern position starts again in every part.
     pub id: u32,
     /// Author name from the comment authors list, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -617,7 +620,8 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
     let mut slides = Vec::new();
     let mut comments = Vec::new();
     // Read once, on the first slide that has modern comments.
-    let mut modern_authors: Option<HashMap<String, String>> = None;
+    // `Some(None)` is an author list that could not be read.
+    let mut modern_authors: Option<Option<HashMap<String, String>>> = None;
     for (id, rid) in slide_ids {
         if let Some(target) = presentation_rels.by_id.get(&rid) {
             let slide_path = resolve_part(&part_dir(&presentation_path), target);
@@ -661,34 +665,30 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
                 }
                 if let Some(comments_target) = slide_rels.by_type.get(REL_MODERN_COMMENTS) {
                     let comments_path = resolve_part(&part_dir(&slide_path), comments_target);
-                    if let Some(xml) =
-                        read_optional_part_bytes(&archive, &comments_path, options.max_inflate)?
-                    {
-                        let authors = match modern_authors.as_ref() {
-                            Some(authors) => authors,
-                            None => {
-                                // The fallback is where PowerPoint puts the part.
-                                let authors_path = presentation_rels
-                                    .by_type
-                                    .get(REL_MODERN_AUTHORS)
-                                    .map_or_else(
-                                        || "ppt/authors.xml".to_string(),
-                                        |target| {
-                                            resolve_part(&part_dir(&presentation_path), target)
-                                        },
-                                    );
-                                modern_authors.insert(parse_modern_comment_authors(
-                                    &archive,
-                                    &authors_path,
-                                    options.max_inflate,
-                                )?)
-                            }
-                        };
-                        let mut slide_comments = parse_modern_comments(&xml, authors)?;
-                        for comment in slide_comments.iter_mut() {
-                            comment.slide_id = id;
-                        }
-                        comments.extend(slide_comments);
+                    let authors = modern_authors.get_or_insert_with(|| {
+                        // The fallback is where PowerPoint puts the part.
+                        let authors_path = presentation_rels
+                            .by_type
+                            .get(REL_MODERN_AUTHORS)
+                            .map_or_else(
+                                || "ppt/authors.xml".to_string(),
+                                |target| resolve_part(&part_dir(&presentation_path), target),
+                            );
+                        parse_modern_comment_authors(&archive, &authors_path, options.max_inflate)
+                            .ok()
+                    });
+                    // A broken modern comments part, or a broken author list,
+                    // costs this slide its modern comments and nothing else:
+                    // the deck parsed before these parts were read at all.
+                    let slide_comments = authors.as_ref().and_then(|authors| {
+                        let xml =
+                            read_optional_part_bytes(&archive, &comments_path, options.max_inflate)
+                                .ok()??;
+                        parse_modern_comments(&xml, authors).ok()
+                    });
+                    for mut comment in slide_comments.unwrap_or_default() {
+                        comment.slide_id = id;
+                        comments.push(comment);
                     }
                 }
             }
@@ -1205,7 +1205,7 @@ fn parse_comments(xml: &[u8], authors: &HashMap<u32, String>) -> Result<Vec<Comm
     Ok(comments)
 }
 
-/// Reads the modern author list: author GUID to display name.
+/// Reads the modern author list: author GUID, in lower case, to display name.
 fn parse_modern_comment_authors(
     archive: &PptxArchive,
     path: &str,
@@ -1222,7 +1222,8 @@ fn parse_modern_comment_authors(
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 if local_name(e.name().as_ref()) == b"author" {
                     if let [Some(id), Some(name)] = attr_values(&reader, &e, [b"id", b"name"])? {
-                        authors.insert(id, name);
+                        // GUIDs are written in either case.
+                        authors.insert(id.to_ascii_lowercase(), name);
                     }
                 }
             }
@@ -1245,9 +1246,13 @@ fn parse_modern_comments(xml: &[u8], authors: &HashMap<String, String>) -> Resul
     let mut reader = xml_reader(Cursor::new(xml));
     let mut buf = Vec::new();
     let mut comments: Vec<Comment> = Vec::new();
-    // Indexes into `comments` of the open comment and, inside it, the open
-    // reply; text belongs to the innermost.
-    let mut open: Vec<usize> = Vec::new();
+    // The open comment and, inside it, the open reply: its index into
+    // `comments` and whether its body already holds a paragraph. Text belongs
+    // to the innermost.
+    let mut open: Vec<(usize, bool)> = Vec::new();
+    // Only the body (`txBody`) is the comment; extension lists carry
+    // DrawingML text of their own.
+    let mut in_body = false;
     let mut in_text = false;
 
     loop {
@@ -1260,31 +1265,41 @@ fn parse_modern_comments(xml: &[u8], authors: &HashMap<String, String>) -> Resul
                     let id = u32::try_from(comments.len() + 1).unwrap_or(u32::MAX);
                     comments.push(Comment {
                         id,
-                        author: author_id.and_then(|id| authors.get(&id).cloned()),
+                        author: author_id
+                            .and_then(|id| authors.get(&id.to_ascii_lowercase()).cloned()),
                         date,
                         text: None,
                         slide_id: 0,
                     });
                     if !self_closed {
-                        open.push(comments.len() - 1);
+                        open.push((comments.len() - 1, false));
                     }
                 }
-                b"p" | b"br" => {
-                    // A second paragraph, or a break, starts a new line.
-                    let text = open
-                        .last()
-                        .and_then(|index| comments.get_mut(*index))
-                        .and_then(|comment| comment.text.as_mut());
-                    if let Some(text) = text {
-                        text.push('\n');
+                b"txBody" => in_body = !self_closed,
+                // Paragraphs are lines, as in a table cell: every paragraph
+                // after the first starts on a new line, empty ones included.
+                b"p" if in_body => {
+                    if let Some((index, has_paragraph)) = open.last_mut() {
+                        if *has_paragraph {
+                            if let Some(comment) = comments.get_mut(*index) {
+                                comment.text.get_or_insert_with(String::new).push('\n');
+                            }
+                        }
+                        *has_paragraph = true;
                     }
                 }
-                b"t" => in_text = !self_closed,
+                b"br" if in_body => {
+                    let comment = open.last().and_then(|(index, _)| comments.get_mut(*index));
+                    if let Some(comment) = comment {
+                        comment.text.get_or_insert_with(String::new).push('\n');
+                    }
+                }
+                b"t" if in_body => in_text = !self_closed,
                 _ => {}
             },
             Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
                 if in_text {
-                    let comment = open.last().and_then(|index| comments.get_mut(*index));
+                    let comment = open.last().and_then(|(index, _)| comments.get_mut(*index));
                     if let (Some(comment), Some(value)) = (comment, character_data(&event)) {
                         comment
                             .text
@@ -1295,7 +1310,12 @@ fn parse_modern_comments(xml: &[u8], authors: &HashMap<String, String>) -> Resul
             }
             Ok(Event::End(e)) => match local_name(e.name().as_ref()) {
                 b"t" => in_text = false,
+                b"txBody" => {
+                    in_body = false;
+                    in_text = false;
+                }
                 b"cm" | b"reply" => {
+                    in_body = false;
                     in_text = false;
                     open.pop();
                 }
