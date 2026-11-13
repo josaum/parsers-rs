@@ -148,8 +148,30 @@ impl WmsClient {
     /// A document whose layers inherit more reference systems than
     /// [`MAX_INHERITED_CRS_BYTES`] allows is not an error: its later layers
     /// come back without the reference systems of their ancestors, and
-    /// nothing in the result says which. See [`parse_capabilities_xml`].
+    /// nothing in the result says which;
+    /// [`get_capabilities_with_report`](Self::get_capabilities_with_report)
+    /// does. See [`parse_capabilities_xml`].
     pub async fn get_capabilities(&self) -> Result<Vec<WmsLayer>, GeoError> {
+        parse_capabilities_xml(&self.capabilities_document().await?)
+    }
+
+    /// Fetch and parse `GetCapabilities` as
+    /// [`get_capabilities`](Self::get_capabilities) does, and say which
+    /// layers had their inherited reference systems cut.
+    ///
+    /// See [`parse_capabilities_xml_with_report`].
+    ///
+    /// # Errors
+    ///
+    /// As [`get_capabilities`](Self::get_capabilities).
+    pub async fn get_capabilities_with_report(&self) -> Result<WmsCapabilities, GeoError> {
+        parse_capabilities_xml_with_report(&self.capabilities_document().await?)
+    }
+
+    /// Fetches the `GetCapabilities` document, read within
+    /// [`MAX_CAPABILITIES_RESPONSE_BYTES`] and decoded in the character set
+    /// the response names.
+    async fn capabilities_document(&self) -> Result<String, GeoError> {
         let url = self.capabilities_url();
         let response = self
             .client
@@ -168,10 +190,7 @@ impl WmsClient {
             "WMS GetCapabilities",
         )
         .await?;
-        let xml = decode_body(content_type.as_deref(), &body);
-        drop(body);
-
-        parse_capabilities_xml(&xml)
+        Ok(decode_body(content_type.as_deref(), &body))
     }
 }
 
@@ -280,19 +299,72 @@ fn decode_body(content_type: Option<&str>, body: &[u8]) -> String {
 /// so a small document with many layers under a long list would grow into
 /// a very large result. The copies are limited to
 /// [`MAX_INHERITED_CRS_BYTES`] for the whole document, and inheritance of
-/// reference systems stops, silently, where that is spent. A layer whose
+/// reference systems stops where that is spent. A layer whose
 /// copy no longer fits is still returned, with its name, its title, the
 /// reference systems it declares itself and the bounding box it inherits,
 /// but without the reference systems of its ancestors; the layers in it
 /// inherit that shortened list. The result does not say which layers were
-/// cut short, so a caller cannot detect it today: a [`WmsLayer::crs_list`]
-/// shorter than that of the layers before it under the same parent is the
-/// only sign.
+/// cut short: [`parse_capabilities_xml_with_report`] reads the same layers
+/// and lists those.
 ///
 /// # Errors
 ///
 /// Returns [`GeoError::Xml`] when `xml` is not well-formed.
 pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
+    read_capabilities(xml, false).map(|capabilities| capabilities.layers)
+}
+
+/// Reads a WMS `GetCapabilities` document as [`parse_capabilities_xml`]
+/// does, and says which layers had their inherited reference systems cut.
+///
+/// [`WmsCapabilities::layers`] is what [`parse_capabilities_xml`] returns
+/// for the same document. [`WmsCapabilities::inherited_crs_cut`] lists,
+/// in document order, every layer whose [`WmsLayer::crs_list`] lacks
+/// reference systems of its ancestors because [`MAX_INHERITED_CRS_BYTES`]
+/// was spent: the layers that were refused their copy, and every layer
+/// inside one of them, since those inherit the shortened list.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Xml`] when `xml` is not well-formed.
+pub fn parse_capabilities_xml_with_report(xml: &str) -> Result<WmsCapabilities, GeoError> {
+    read_capabilities(xml, true)
+}
+
+/// The layers of a WMS `GetCapabilities` document, and the layers whose
+/// inherited reference systems were cut.
+///
+/// Returned by [`parse_capabilities_xml_with_report`] and
+/// [`WmsClient::get_capabilities_with_report`].
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct WmsCapabilities {
+    /// The named layers, as [`parse_capabilities_xml`] returns them.
+    pub layers: Vec<WmsLayer>,
+    /// The layers, in document order, whose [`WmsLayer::crs_list`] lacks
+    /// reference systems of their ancestors because
+    /// [`MAX_INHERITED_CRS_BYTES`] was spent; empty when none does.
+    pub inherited_crs_cut: Vec<LayerRef>,
+}
+
+/// A `<Layer>` of a capabilities document, as
+/// [`WmsCapabilities::inherited_crs_cut`] names it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LayerRef {
+    /// A layer with a name: the one in [`WmsCapabilities::layers`] with
+    /// this [`WmsLayer::name`]. A document may give two layers the same
+    /// name, and then this does not say which of them it is.
+    Named(String),
+    /// A layer without a name, a group, which is not in
+    /// [`WmsCapabilities::layers`]: its position among all the `<Layer>`
+    /// elements of the document, in the order they open, counting from 0.
+    Unnamed(usize),
+}
+
+/// What [`parse_capabilities_xml`] and
+/// [`parse_capabilities_xml_with_report`] do; `report` says whether the
+/// layers that were cut are listed.
+fn read_capabilities(xml: &str, report: bool) -> Result<WmsCapabilities, GeoError> {
     let mut reader = Reader::from_str(xml);
     // The reader does not trim: a value arrives in pieces (see `TextRun`),
     // and trimming each piece would close up `a &amp; b` to `a&b`. A `&` that
@@ -446,7 +518,7 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
         }
     }
 
-    Ok(resolve_inheritance(layers))
+    Ok(resolve_inheritance(layers, report))
 }
 
 /// Most bytes [`parse_capabilities_xml`] spends on the copies of inherited
@@ -461,9 +533,9 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
 /// counted for it: the layer keeps the reference systems it declares
 /// itself and still inherits its bounding box, and the layers in it
 /// inherit that shortened list. A later layer with a shorter list to
-/// inherit may still be given it. This is silent: the document is not
-/// refused, and nothing in a [`WmsLayer`] says its list was cut short, so
-/// a caller cannot detect it today.
+/// inherit may still be given it. The document is not refused, and nothing
+/// in a [`WmsLayer`] says its list was cut short;
+/// [`parse_capabilities_xml_with_report`] lists the layers that were.
 ///
 /// As a measure, under a root layer that lists 6000 `EPSG:` codes the
 /// first 340 layers are given the list and the ones after them are not.
@@ -480,8 +552,10 @@ pub const MAX_INHERITED_CRS_BYTES: usize = 64 * 1024 * 1024;
 /// reference system or a box after a child has closed.
 ///
 /// The records are resolved where they are: a second list of them would
-/// double what a document of many small layers costs.
-fn resolve_inheritance(mut layers: Vec<LayerRecord>) -> Vec<WmsLayer> {
+/// double what a document of many small layers costs. The layers whose
+/// inherited list was cut are listed only when `report` is set, so
+/// [`parse_capabilities_xml`] does not pay for copies of their names.
+fn resolve_inheritance(mut layers: Vec<LayerRecord>, report: bool) -> WmsCapabilities {
     let mut budget = MAX_INHERITED_CRS_BYTES;
     for at in 0..layers.len() {
         let (before, rest) = layers.split_at_mut(at);
@@ -510,13 +584,17 @@ fn resolve_inheritance(mut layers: Vec<LayerRecord>) -> Vec<WmsLayer> {
         if let Some(parent) = parent {
             // Charged before the copy is made. A list that does not fit is
             // not copied, and not looked at either.
-            let inherited: &[String] = match budget.checked_sub(parent.crs_bytes) {
+            let (inherited, refused): (&[String], bool) = match budget.checked_sub(parent.crs_bytes)
+            {
                 Some(left) => {
                     budget = left;
-                    &parent.crs_list
+                    (&parent.crs_list, false)
                 }
-                None => &[],
+                None => (&[], true),
             };
+            // Cut when refused its copy, or when the copy is of a list that
+            // was itself cut.
+            declared.crs_cut = refused || parent.crs_cut;
             declared.crs_list = merge_crs(inherited, own);
             declared.geographic = declared.geographic.or(parent.geographic);
             declared.bounding = declared.bounding.or(parent.bounding);
@@ -525,6 +603,11 @@ fn resolve_inheritance(mut layers: Vec<LayerRecord>) -> Vec<WmsLayer> {
         }
         declared.crs_bytes = copy_cost(&declared.crs_list);
     }
+    let inherited_crs_cut = if report {
+        cut_layers(&layers)
+    } else {
+        Vec::new()
+    };
     // Counted first: a list grown as it is filled is for a while held twice.
     let named = layers
         .iter()
@@ -538,7 +621,29 @@ fn resolve_inheritance(mut layers: Vec<LayerRecord>) -> Vec<WmsLayer> {
             .filter_map(|record| record.declared)
             .filter_map(|declared| declared.into_layer()),
     );
-    returned
+    WmsCapabilities {
+        layers: returned,
+        inherited_crs_cut,
+    }
+}
+
+/// The resolved `layers` whose inherited reference systems were cut, in
+/// the order they opened.
+fn cut_layers(layers: &[LayerRecord]) -> Vec<LayerRef> {
+    layers
+        .iter()
+        .enumerate()
+        .filter_map(|(at, record)| {
+            let declared = record.declared.as_deref()?;
+            declared.crs_cut.then(|| {
+                if declared.name.is_empty() {
+                    LayerRef::Unnamed(at)
+                } else {
+                    LayerRef::Named(declared.name.clone())
+                }
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -649,6 +754,9 @@ struct Declared {
     /// What a copy of `crs_list` counts for against
     /// [`MAX_INHERITED_CRS_BYTES`].
     crs_bytes: usize,
+    /// Whether `crs_list` lacks reference systems of the layer's ancestors
+    /// because the budget was spent, here or above.
+    crs_cut: bool,
     /// Geographic box: the layer's own, or once resolved the one it
     /// inherits.
     geographic: Option<BBox>,
@@ -1198,6 +1306,94 @@ mod tests {
         );
     }
 
+    /// The names of `layers`, as a report gives them.
+    fn named(layers: impl IntoIterator<Item = String>) -> Vec<LayerRef> {
+        layers.into_iter().map(LayerRef::Named).collect()
+    }
+
+    /// The report of a document is that of the layers
+    /// [`parse_capabilities_xml`] returns for it.
+    fn read_with_report(xml: &str) -> WmsCapabilities {
+        let capabilities = parse_capabilities_xml_with_report(xml).expect("capabilities");
+        let plain = parse_capabilities_xml(xml).expect("capabilities");
+        let summary = |layers: &[WmsLayer]| -> Vec<(String, Vec<String>, Option<BBox>)> {
+            layers
+                .iter()
+                .map(|layer| (layer.name.clone(), layer.crs_list.clone(), layer.bbox))
+                .collect()
+        };
+        assert_eq!(summary(&capabilities.layers), summary(&plain));
+        capabilities
+    }
+
+    /// Nothing cut, nothing reported.
+    #[test]
+    fn report_is_empty_when_no_inherited_list_is_cut() {
+        for xml in [
+            NESTED_CAPS.to_owned(),
+            SAMPLE_CAPS.to_owned(),
+            wide_capabilities(6000, 340),
+        ] {
+            let capabilities = read_with_report(&xml);
+            assert!(!capabilities.layers.is_empty());
+            assert_eq!(capabilities.inherited_crs_cut, []);
+        }
+    }
+
+    /// The cut used to be silent: under 6,000 reference systems the 341st
+    /// layer and the ones after it are named, and only they.
+    #[test]
+    fn report_names_the_layers_past_the_budget() {
+        for children in [341, 3000] {
+            let capabilities = read_with_report(&wide_capabilities(6000, children));
+            assert_eq!(capabilities.layers.len(), children);
+            assert_eq!(
+                capabilities.inherited_crs_cut,
+                named((340..children).map(|child| format!("l{child}")))
+            );
+        }
+    }
+
+    /// A layer inside a cut one inherits the shortened list, so it is
+    /// reported too, even where its own copy fitted. A group without a
+    /// name is reported by its position.
+    #[test]
+    fn report_names_the_layers_inside_a_cut_one() {
+        let mut xml = String::from("<C>");
+        for level in 0..3000 {
+            xml.push_str(&format!("<Layer><Name>n{level}</Name><CRS>c{level}</CRS>"));
+        }
+        xml.push_str(&"</Layer>".repeat(3000));
+        xml.push_str("</C>");
+        let capabilities = read_with_report(&xml);
+        let cut = capabilities
+            .layers
+            .iter()
+            .position(|layer| layer.crs_list.len() == 1 && layer.name != "n0")
+            .expect("a layer that was cut");
+        assert_eq!(
+            capabilities.inherited_crs_cut,
+            named((cut..3000).map(|level| format!("n{level}")))
+        );
+
+        // A root (0) with 670 children that fit (1 to 670), then a group
+        // (671) that does not, with a named layer (672) in it.
+        let long = "x".repeat(100_000);
+        let mut xml = format!("<C><Layer><CRS>{long}</CRS>");
+        xml.push_str(&"<Layer><Name>n</Name></Layer>".repeat(670));
+        xml.push_str(
+            "<Layer><Title>group</Title><CRS>g</CRS>\
+             <Layer><Name>inside</Name></Layer></Layer></Layer></C>",
+        );
+        let capabilities = read_with_report(&xml);
+        assert_eq!(capabilities.layers.len(), 671);
+        assert_eq!(capabilities.layers[670].crs_list, ["g"]);
+        assert_eq!(
+            capabilities.inherited_crs_cut,
+            [LayerRef::Unnamed(671), LayerRef::Named("inside".into())]
+        );
+    }
+
     #[test]
     fn inherited_reference_systems_within_the_budget_are_returned() {
         let layers = parse_capabilities_xml(&wide_capabilities(6000, 200)).expect("capabilities");
@@ -1398,6 +1594,18 @@ mod tests {
             "{result:?}"
         );
         assert!(!connected.load(Ordering::SeqCst));
+    }
+
+    /// The client reports the cut as the parser does.
+    #[tokio::test]
+    async fn get_capabilities_with_report_names_the_cut_layers() {
+        let xml = wide_capabilities(6000, 341);
+        let capabilities = local_wms(serve_once(ok_response(xml.as_bytes(), true)))
+            .get_capabilities_with_report()
+            .await
+            .expect("capabilities");
+        assert_eq!(capabilities.layers.len(), 341);
+        assert_eq!(capabilities.inherited_crs_cut, named(["l340".to_owned()]));
     }
 
     /// The response is still decoded in the character set it names.
