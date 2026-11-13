@@ -241,6 +241,34 @@ const MAX_SAMPLED_FUNCTION_INPUTS: usize = 8;
 /// [`RENDER_STACK_BYTES`] beyond [`STACK_BUDGET`].
 const MAX_CMAP_COMMENT_RUN: usize = 4_096;
 
+/// Least decoded bytes [`vet_page`] may look at, whatever the file.
+///
+/// The default document decode budget, so no file gets less room to be
+/// checked than a fresh document of default options had before the check
+/// was given an allowance of its own.
+const VET_DECODE_FLOOR: usize = 256 * 1024 * 1024;
+
+/// How many times the file's own decoded size [`vet_page`] may decode.
+///
+/// A stream whose filters are written in its own dictionary is decoded once
+/// per render; one whose filters are indirect is decoded on every path that
+/// reaches it. Four times the file's decoded size covers a stream reached
+/// on a few paths. The bytes are released as soon as a stream is scanned,
+/// so this bounds time, not memory.
+const VET_DECODE_FACTOR: usize = 4;
+
+/// Decoded bytes [`vet_page`] may look at for a file whose streams decode to
+/// `file_decoded_bytes` in all.
+///
+/// The check is overhead: it never takes from the document's decode budget,
+/// so a page the interpreter can render is not refused because the budget
+/// the render needs was nearly spent.
+pub(crate) fn vet_decode_allowance(file_decoded_bytes: usize) -> usize {
+    file_decoded_bytes
+        .saturating_mul(VET_DECODE_FACTOR)
+        .max(VET_DECODE_FLOOR)
+}
+
 /// What `vet_object` names in a refusal for objects reached from resources.
 const RESOURCE_OBJECTS: &str = "a colour space, function or shading";
 
@@ -683,13 +711,13 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
-    /// Counts `bytes` of decoded data against what the document's decode
-    /// budget still has. Nothing is taken from the budget itself.
+    /// Counts `bytes` of decoded data against the allowance this check was
+    /// given (see [`vet_decode_allowance`]).
     fn spend(&mut self, bytes: usize) -> Result<()> {
         self.decoded = self.decoded.saturating_add(bytes);
         if self.decoded > self.decode_allowance {
             return Err(refused(
-                "checking the page would decode more than the document's decode budget has left",
+                "checking the page would decode more than its vetting allowance",
             ));
         }
         Ok(())
@@ -1225,8 +1253,8 @@ fn decode_is_fixed(stream: &Stream<'_>) -> bool {
 ///
 /// `page` must be the very object handed to the interpreter afterwards, and
 /// this must run on the thread that will render it. `decode_allowance` is
-/// how many decoded bytes the check may look at; nothing is taken from the
-/// document's budget.
+/// how many decoded bytes the check may look at, from
+/// [`vet_decode_allowance`]; nothing is taken from the document's budget.
 ///
 /// # Errors
 ///

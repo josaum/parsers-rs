@@ -306,12 +306,6 @@ impl DecodedByteBudget {
         Ok(())
     }
 
-    /// Bytes the budget could still grant. Reading it spends nothing.
-    #[cfg(feature = "rasterize")]
-    fn available_bytes(&self) -> usize {
-        self.remaining.lock().map_or(0, |remaining| *remaining)
-    }
-
     fn charge_resource_bytes(&self, bytes: usize) -> Result<()> {
         let mut remaining = self
             .remaining
@@ -1062,6 +1056,10 @@ impl PdfDocument {
         let reserved_before_render = replay_bytes
             .and_then(|bytes| bytes.checked_add(self.bytes().len()))
             .ok_or_else(|| self.decoded_byte_budget.total_limit_error())?;
+        // The guard's decoding is overhead and is released as it goes: it
+        // gets an allowance of its own, sized from the file, so it never
+        // competes with the render for what the document budget has left.
+        let vet_allowance = render_guard::vet_decode_allowance(reserved_before_render);
         self.decoded_byte_budget
             .charge_resource_bytes(reserved_before_render)?;
 
@@ -1090,7 +1088,13 @@ impl PdfDocument {
                 .name("pdf-fast-render".to_string())
                 .stack_size(render_guard::RENDER_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    Self::interpret_on_render_stack(budget, pdf_bytes, page_object, dpi)
+                    Self::interpret_on_render_stack(
+                        budget,
+                        pdf_bytes,
+                        page_object,
+                        dpi,
+                        vet_allowance,
+                    )
                 })
                 .map_err(|error| {
                     anyhow!("interpreted render refused: no render thread ({error})")
@@ -1180,6 +1184,7 @@ impl PdfDocument {
         pdf_bytes: Vec<u8>,
         page_object: (u32, u16),
         dpi: f32,
+        vet_allowance: usize,
     ) -> Result<Option<Vec<u8>>> {
         use hayro::hayro_interpret::InterpreterSettings;
         use hayro::hayro_syntax::object::ObjectIdentifier;
@@ -1210,9 +1215,9 @@ impl PdfDocument {
         // depth guard of its own, and a stack overflow there aborts the
         // process. Vet the exact page object it is about to render, on its
         // own object model, so there is no second parser to disagree with
-        // it. The check may look at as much decoded data as the budget has
-        // left, and takes none of it.
-        render_guard::vet_page(page, budget.available_bytes())?;
+        // it. The check has a decode allowance of its own and takes nothing
+        // from the document's budget.
+        render_guard::vet_page(page, vet_allowance)?;
         let (width, height) = page.render_dimensions();
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return Ok(None);

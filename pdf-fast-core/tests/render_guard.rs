@@ -1031,6 +1031,36 @@ fn saved_graphics_states_add_up_across_nested_forms() {
     );
 }
 
+#[test]
+fn the_guards_own_decoding_never_refuses_a_page_whatever_the_document_budget() {
+    // A real file was refused once the guard also read font CMaps: its
+    // content streams alone took 99% of what the document budget had left
+    // after the render's own reserve. The guard's decoding is overhead and
+    // must not compete with the render for that budget.
+    let cmap = format!("{CMAP_BODY}{}", " ".repeat(2 * 1024 * 1024));
+    let bytes = type0_page(vec![(20, stream("/Type /CMap /CMapName /C", &cmap))]);
+    let mut rendered = 0;
+    for step in 1..=96 {
+        let options = ParseOptions {
+            max_total_decoded_bytes: step * 128 * 1024,
+            ..ParseOptions::default()
+        };
+        let Ok(document) = PdfDocument::from_slice(&bytes, options) else {
+            continue;
+        };
+        match document.page_rasterized_png_interpreted_checked(0, 72.0) {
+            Ok(Some(_)) => rendered += 1,
+            Ok(None) => {}
+            Err(error) => assert!(
+                !error.to_string().contains("interpreted render refused"),
+                "budget {} KiB: {error}",
+                step * 128
+            ),
+        }
+    }
+    assert!(rendered > 0, "no budget in the sweep rendered the page");
+}
+
 /// Runs the interpreter with no guard, on a thread with a chosen stack.
 ///
 /// Not a test: it exists to confirm that a fixture aborts the process and to
