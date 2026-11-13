@@ -1057,9 +1057,10 @@ impl PdfDocument {
             .and_then(|bytes| bytes.checked_add(self.bytes().len()))
             .ok_or_else(|| self.decoded_byte_budget.total_limit_error())?;
         // The guard's decoding is overhead and is released as it goes: it
-        // gets an allowance of its own, sized from the file, so it never
-        // competes with the render for what the document budget has left.
-        let vet_allowance = render_guard::vet_decode_allowance(reserved_before_render);
+        // gets an allowance of its own, the caller's configured limit rather
+        // than what is left of it, so it never competes with the render for
+        // the budget and never exceeds a limit the caller set.
+        let vet_allowance = self.decoded_byte_budget.max_total;
         self.decoded_byte_budget
             .charge_resource_bytes(reserved_before_render)?;
 

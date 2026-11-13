@@ -246,34 +246,6 @@ const MAX_SAMPLED_FUNCTION_INPUTS: usize = 8;
 /// [`RENDER_STACK_BYTES`] beyond [`STACK_BUDGET`].
 const MAX_CMAP_COMMENT_RUN: usize = 4_096;
 
-/// Least decoded bytes [`vet_page`] may look at, whatever the file.
-///
-/// The default document decode budget, so no file gets less room to be
-/// checked than a fresh document of default options had before the check
-/// was given an allowance of its own.
-const VET_DECODE_FLOOR: usize = 256 * 1024 * 1024;
-
-/// How many times the file's own decoded size [`vet_page`] may decode.
-///
-/// A stream whose filters are written in its own dictionary is decoded once
-/// per render; one whose filters are indirect is decoded on every path that
-/// reaches it. Four times the file's decoded size covers a stream reached
-/// on a few paths. The bytes are released as soon as a stream is scanned,
-/// so this bounds time, not memory.
-const VET_DECODE_FACTOR: usize = 4;
-
-/// Decoded bytes [`vet_page`] may look at for a file whose streams decode to
-/// `file_decoded_bytes` in all.
-///
-/// The check is overhead: it never takes from the document's decode budget,
-/// so a page the interpreter can render is not refused because the budget
-/// the render needs was nearly spent.
-pub(crate) fn vet_decode_allowance(file_decoded_bytes: usize) -> usize {
-    file_decoded_bytes
-        .saturating_mul(VET_DECODE_FACTOR)
-        .max(VET_DECODE_FLOOR)
-}
-
 /// Fewest pixels an image may have whatever the render size: 256 megapixels.
 ///
 /// The interpreter converts an image to 8-bit RGB, three bytes a pixel, in
@@ -331,6 +303,17 @@ fn cell_pixels(dict: &Dict<'_>) -> u64 {
         }
     };
     side(&b"XStep"[..], 0, 2).saturating_mul(side(&b"YStep"[..], 1, 3))
+}
+
+/// A dictionary's keys in byte order.
+///
+/// `Dict::keys` follows a hash map whose order changes from process to
+/// process. Walking in a fixed order makes the walk, and so the reason given
+/// for a page that breaks two bounds, the same in every run.
+fn sorted_keys<'a>(dict: &Dict<'a>) -> Vec<Name<'a>> {
+    let mut keys: Vec<Name<'a>> = dict.keys().collect();
+    keys.sort_unstable();
+    keys
 }
 
 /// What `vet_object` names in a refusal for objects reached from resources.
@@ -714,8 +697,8 @@ impl<'a> Walk<'a> {
             }
             _ => return Ok(Vec::new()),
         };
-        Ok(dict
-            .keys()
+        Ok(sorted_keys(&dict)
+            .into_iter()
             .filter(|key| !matches!(&**key, b"Resources" | b"Parent" | b"G" | b"UseCMap"))
             .filter_map(|key| dict.get::<Object<'a>>(key))
             .filter(nested)
@@ -815,13 +798,15 @@ impl<'a> Walk<'a> {
     }
 
     /// Counts `bytes` of decoded data against the allowance this check was
-    /// given (see [`vet_decode_allowance`]).
+    /// given: the caller's configured decode limit (see [`vet_page`]).
     fn spend(&mut self, bytes: usize) -> Result<()> {
         self.decoded = self.decoded.saturating_add(bytes);
         if self.decoded > self.decode_allowance {
-            return Err(refused(
-                "checking the page would decode more than its vetting allowance",
-            ));
+            return Err(refused(&format!(
+                "checking the page would decode more than the configured decode limit of {} \
+                 bytes (stopped after decoding {} bytes)",
+                self.decode_allowance, self.decoded
+            )));
         }
         Ok(())
     }
@@ -996,7 +981,7 @@ impl<'a> Walk<'a> {
         let font_resources = own_resources(&font);
         let procedures = font.get::<Dict<'_>>(&b"CharProcs"[..]).unwrap_or_default();
         let mut cost = GLYPH_COST;
-        for glyph in procedures.keys() {
+        for glyph in sorted_keys(&procedures) {
             self.count()?;
             let Some(procedure) = procedures.get::<Stream<'a>>(glyph) else {
                 continue;
@@ -1117,7 +1102,7 @@ impl<'a> Walk<'a> {
                 }
                 let font_resources = own_resources(&font);
                 let procedures = font.get::<Dict<'_>>(&b"CharProcs"[..]).unwrap_or_default();
-                for glyph in procedures.keys() {
+                for glyph in sorted_keys(&procedures) {
                     self.count()?;
                     if let Some(inner) = procedures.get::<Stream<'a>>(glyph) {
                         let own = vec![own_resources(inner.dict()), font_resources.clone()];
@@ -1366,8 +1351,10 @@ fn decode_is_fixed(stream: &Stream<'_>) -> bool {
 ///
 /// `page` must be the very object handed to the interpreter afterwards, and
 /// this must run on the thread that will render it. `decode_allowance` is
-/// how many decoded bytes the check may look at, from
-/// [`vet_decode_allowance`]; nothing is taken from the document's budget.
+/// how many decoded bytes the check may look at: the caller's configured
+/// decode limit, not what is left of it, so the check never competes with
+/// the render for the budget and a caller who lowers the limit lowers the
+/// check's work too. Nothing is taken from the document's budget.
 /// `image_pixels` is the most pixels one image may declare, from
 /// [`image_pixel_budget`].
 ///

@@ -1148,6 +1148,148 @@ fn a_tiling_cell_larger_than_the_render_may_hold_is_refused() {
     assert_renders("8 nested tiling cells", &tiling_pattern(8));
 }
 
+/// A page showing text in `count` Type 0 fonts that share one CMap of
+/// `cmap_bytes` of Flate-compressed text, object 99.
+fn many_compressed_cmaps(count: u32, cmap_bytes: usize) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder
+        .write_all(format!("{CMAP_BODY}{}", " ".repeat(cmap_bytes)).as_bytes())
+        .expect("compresses");
+    let packed = encoder.finish().expect("compresses");
+    let mut fonts = String::new();
+    let mut content = String::from("BT ");
+    let mut rest = Vec::new();
+    for index in 0..count {
+        let font = 100 + 2 * index;
+        fonts.push_str(&format!("/F{index} {font} 0 R "));
+        content.push_str(&format!("/F{index} 12 Tf <01> Tj "));
+        rest.push((
+            font,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding 99 0 R \
+                 /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                 /FontDescriptor << /Type /FontDescriptor /FontName /X /Flags 4 \
+                 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+                 /CapHeight 700 /StemV 80 >> >>] >>"
+                .as_bytes()
+                .to_vec(),
+        ));
+    }
+    let mut cmap = format!(
+        "<< /Type /CMap /Filter /FlateDecode /Length {} >>\nstream\n",
+        packed.len()
+    )
+    .into_bytes();
+    cmap.extend_from_slice(&packed);
+    cmap.extend_from_slice(b"\nendstream");
+    rest.push((99, cmap));
+    content.push_str("ET");
+    one_page(
+        &format!("/Resources << /Font << {fonts}>> >>"),
+        &content,
+        rest,
+    )
+}
+
+#[test]
+fn the_guard_decodes_no_more_than_the_callers_decode_limit() {
+    // The file decodes to about 128 KiB, within the caller's 1 MiB limit,
+    // but the guard reads the shared CMap once per font: 8 MiB in all. It
+    // must stop at the caller's limit and refuse.
+    let limit = 1024 * 1024;
+    let options = ParseOptions {
+        max_total_decoded_bytes: limit,
+        ..ParseOptions::default()
+    };
+    let document =
+        PdfDocument::from_slice(&many_compressed_cmaps(64, 128 * 1024), options).expect("parses");
+    let error = match document.page_rasterized_png_interpreted_checked(0, 72.0) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("the guard decoded past the caller's 1 MiB limit"),
+    };
+    let decoded: usize = error
+        .split("after decoding ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|number| number.parse().ok())
+        .unwrap_or_else(|| panic!("no decoded-byte count in: {error}"));
+    // One CMap past the limit at most: each stream is counted once decoded.
+    assert!(decoded <= limit + 1024 * 1024, "decoded {decoded} bytes");
+}
+
+/// A page whose colour spaces break two bounds at once: `/A` nests 100
+/// `/Indexed` spaces, `/B` has a 16-input sampled tint transform.
+fn two_broken_colour_spaces() -> Vec<u8> {
+    let mut rest = Vec::new();
+    for level in 0..100u32 {
+        rest.push((
+            20 + level,
+            format!("[/Indexed {} 0 R 0 <00>]", 21 + level).into_bytes(),
+        ));
+    }
+    rest.push((120, b"/DeviceGray".to_vec()));
+    rest.push((
+        200,
+        stream(
+            &format!(
+                "/FunctionType 0 /Domain [{}] /Range [0 1] /Size [{}] /BitsPerSample 8",
+                "0 1 ".repeat(16),
+                "2 ".repeat(16)
+            ),
+            &"A".repeat(1 << 16),
+        ),
+    ));
+    one_page(
+        "/Resources << /ColorSpace << /A 20 0 R /B [/Separation /X /DeviceGray 200 0 R] >> >>",
+        "0 0 10 10 re f",
+        rest,
+    )
+}
+
+#[test]
+fn a_page_breaking_two_bounds_gives_the_same_reason_in_every_process() {
+    const CHILD: &str = "RENDER_GUARD_REASON_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let reason = match interpreted(&two_broken_colour_spaces()) {
+            Err(error) => error.to_string(),
+            Ok(_) => "accepted".to_string(),
+        };
+        println!("REASON {reason}");
+        return;
+    }
+    // Dictionary keys come back in hash-map order, which changes between
+    // processes, so the check runs in fresh processes.
+    let exe = std::env::current_exe().expect("test binary");
+    let mut reasons = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        let output = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "a_page_breaking_two_bounds_gives_the_same_reason_in_every_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("runs the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let reason = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once("REASON ")
+                    .map(|(_, reason)| reason.to_string())
+            })
+            .unwrap_or_else(|| panic!("no reason reported: {stdout}"));
+        reasons.insert(reason);
+    }
+    assert_eq!(
+        reasons.len(),
+        1,
+        "reasons differ between processes: {reasons:?}"
+    );
+}
+
 /// Runs the interpreter with no guard, on a thread with a chosen stack.
 ///
 /// Not a test: it exists to confirm that a fixture aborts the process and to
