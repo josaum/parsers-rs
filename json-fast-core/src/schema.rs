@@ -998,7 +998,7 @@ fn apply_object<'v>(
 
     evaluated.merge(&check_combinators(value, obj, path, ctx, findings));
 
-    check_unevaluated(value, obj, path, ctx, &evaluated, findings);
+    check_unevaluated(value, obj, path, ctx, &mut evaluated, findings);
 
     evaluated
 }
@@ -1138,7 +1138,14 @@ fn check_numeric(n: f64, obj: &Map<String, Value>, path: &str, findings: &mut Ve
         if m > 0.0 && m.is_finite() {
             let quotient = n / m;
             let epsilon = 1e-9 * quotient.abs().max(1.0);
-            if (quotient - quotient.round()).abs() > epsilon {
+            let off = if quotient.is_finite() {
+                (quotient - quotient.round()).abs() > epsilon
+            } else {
+                // The division overflowed; the remainder is still exact.
+                let remainder = (n % m).abs();
+                remainder > 1e-9 * m && m - remainder > 1e-9 * m
+            };
+            if off {
                 findings.push(Finding::error(
                     path,
                     format!("{n} is not a multiple of {m}"),
@@ -1817,18 +1824,21 @@ fn check_unevaluated<'v>(
     obj: &Map<String, Value>,
     path: &mut String,
     ctx: &mut Ctx<'_, 'v>,
-    evaluated_total: &Evaluated<'v>,
+    evaluated_total: &mut Evaluated<'v>,
     findings: &mut Vec<Finding>,
 ) {
     if let Some(subschema) = obj.get("unevaluatedProperties") {
         if let Some(map) = value.as_object() {
-            for key in map.keys() {
+            for (key, member) in map {
                 if !evaluated_total.props.contains(key.as_str()) {
                     let saved = path.len();
                     path.push('/');
                     path.push_str(key);
-                    applying(&map[key], subschema, path, ctx, findings);
+                    applying(member, subschema, path, ctx, findings);
                     path.truncate(saved);
+                    // This keyword has now evaluated the property, which
+                    // an enclosing `unevaluatedProperties` must see.
+                    evaluated_total.props.insert(key.as_str());
                 }
             }
         }
@@ -1843,6 +1853,7 @@ fn check_unevaluated<'v>(
                     push_index(path, i);
                     applying(item, subschema, path, ctx, findings);
                     path.truncate(saved);
+                    evaluated_total.items.insert(i);
                 }
             }
         }
@@ -2851,6 +2862,42 @@ mod tests {
         assert_eq!(hash_value(&json!(-0.0)), hash_value(&json!(0)));
         let items = Value::Array((0..20_000).map(near_max).collect());
         assert_eq!(validate(&items, &json!({"uniqueItems": true})), []);
+    }
+
+    /// Ported from the official JSON Schema test suite (`unevaluatedProperties`
+    /// and `unevaluatedItems`, the "nested unevaluated..." cases).
+    #[test]
+    fn nested_unevaluated_keywords_mark_what_they_accept() {
+        let cases = [
+            json!({"type": "object", "properties": {"foo": {"type": "string"}},
+                "allOf": [{"unevaluatedProperties": true}],
+                "unevaluatedProperties": {"type": "string", "maxLength": 2}}),
+            json!({"type": "object", "properties": {"foo": {"type": "string"}},
+                "allOf": [{"unevaluatedProperties": true}], "unevaluatedProperties": false}),
+            json!({"type": "object",
+                "allOf": [{"properties": {"foo": {"type": "string"}}, "unevaluatedProperties": true}],
+                "unevaluatedProperties": false}),
+        ];
+        for schema in &cases {
+            assert!(passes(r#"{"foo":"foo"}"#, schema), "{schema}");
+            assert!(passes(r#"{"foo":"foo","bar":"bar"}"#, schema), "{schema}");
+        }
+        let items = json!({"allOf": [{"prefixItems": [{"type": "string"}]}, {"unevaluatedItems": true}],
+            "unevaluatedItems": false});
+        assert!(passes(r#"["foo"]"#, &items));
+        assert!(passes(r#"["foo", 42, true]"#, &items));
+        // The inner keyword rejecting is still a failure.
+        let inner_false = json!({"properties": {"foo": true},
+            "allOf": [{"unevaluatedProperties": false}], "unevaluatedProperties": true});
+        assert!(fails(r#"{"foo":"foo"}"#, &inner_false));
+    }
+
+    #[test]
+    fn multiple_of_survives_a_quotient_that_overflows() {
+        let schema = json!({"type": "integer", "multipleOf": 0.123456789});
+        assert!(fails("1e308", &schema));
+        assert!(passes("1e308", &json!({"multipleOf": 1e300})));
+        assert!(passes("7.5", &json!({"multipleOf": 2.5})));
     }
 
     #[test]
