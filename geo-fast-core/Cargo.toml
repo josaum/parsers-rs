@@ -22,7 +22,7 @@ http = ["dep:reqwest", "dep:tokio", "dep:encoding_rs"]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 byteorder = "1"
-tiff = "0.9"
+tiff = "0.11"
 quick-xml = "0.41"
 
 # reqwest 0.13 changed its default TLS backend from native-tls to rustls. The
