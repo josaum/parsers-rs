@@ -1,6 +1,6 @@
 {
   "name": "pdf-fast-write-node",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Sovereign PDF page subsetter with native Rust core (no external deps)",
   "main": "index.js",
   "types": "index.d.ts",

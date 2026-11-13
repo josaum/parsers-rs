@@ -1,6 +1,6 @@
 [package]
 name = "web-fast-core"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 authors.workspace = true
 description = "Deterministic, side-effect-free HTML parser with Arrow support"

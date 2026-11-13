@@ -1,6 +1,6 @@
 [package]
 name = "json-fast-flight"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 authors.workspace = true
 description = "Arrow Flight server that streams JSON / JSONL files as Apache Arrow RecordBatches"

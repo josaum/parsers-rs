@@ -1,6 +1,6 @@
 {
   "name": "xsd-fast-node",
-  "version": "0.2.8",
+  "version": "0.3.0",
   "description": "High-performance XSD validation and Arrow schema N-API bindings, full parity with the Rust core",
   "main": "index.js",
   "types": "index.d.ts",

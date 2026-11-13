@@ -1,6 +1,6 @@
 [package]
 name = "pdf-fast-py"
-version = "0.2.8"
+version = "0.2.9"
 edition.workspace = true
 authors.workspace = true
 description = "Python bindings for pdf-fast-core"

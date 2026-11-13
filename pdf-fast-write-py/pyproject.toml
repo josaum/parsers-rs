@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pdf-fast-write"
-version = "0.2.3"
+version = "0.2.4"
 description = "Sovereign PDF page subsetter powered by Rust (no external deps)"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
