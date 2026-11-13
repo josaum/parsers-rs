@@ -541,37 +541,57 @@ impl SchemaModel {
     }
 }
 
-/// Most that inheritance folding may copy in one schema set, in budget units.
+/// Most that the folds a schema is wrong without may copy in one schema
+/// set, in budget units.
 ///
 /// A unit is one copied particle, attribute, enumeration value or
 /// simple-content type, or [`TEXT_BYTES_PER_NODE`] bytes of the text they
 /// own; see [`CopyCost`].
 ///
-/// Folding is eager: every derived type receives its own copy of each
-/// ancestor's content, and an inline type that extends a named type receives
-/// a copy that can itself hold inline extensions. A schema of a few kilobytes
-/// can therefore ask for billions of copies (six inline extensions of the
-/// enclosing type, nested sixteen levels deep, is 6^16), and a base holding
-/// one large enumeration is copied whole into every type derived from it.
+/// Folding is eager: every derived type receives its own copy of the
+/// content of each of its bases, and an inline type that extends a named
+/// type receives a copy that can itself hold inline extensions. A schema of
+/// a few hundred kilobytes can therefore ask for far more than it holds:
+/// two thousand types that each extend one base of a hundred elements copy
+/// two hundred thousand particles, and a base holding one large enumeration
+/// is copied whole into every type derived from it.
 ///
-/// The limit is a bound on memory. A schema set that spends all of it peaks
-/// at about 130 MiB of process memory when the copies are plain element
-/// particles, about 120 MiB for inline types with attributes, and about
-/// 70 MiB for long names or values (the three shapes measured, on a 64-bit
-/// build, loading included). Changing what a unit charges needs those
-/// measurements repeated.
+/// This budget pays for the folds that were always made: the nearest
+/// [`REQUIRED_CHAIN_LINKS`] bases of a type, at a nesting below
+/// [`REQUIRED_FOLD_DEPTH`], recursion apart. A schema set that asks for
+/// more of those than the budget holds is refused with a `resource_limit`
+/// error. Everything else folding does (unrolling a recursive type, deeper
+/// nesting, bases further up a chain) is paid from [`MAX_OPTIONAL_NODES`]
+/// and never refuses a schema.
+///
+/// The limit is a bound on memory. A schema set that spends all of this
+/// budget and none of the other peaks at about 130 MiB of process memory
+/// when the copies are plain element particles (132 MiB measured), about
+/// 120 MiB for inline types with attributes, and about 70 MiB for long
+/// names or values (on a 64-bit build, loading included). One that spends
+/// both budgets peaks at about 200 MiB for plain element particles (196 MiB
+/// measured, of which the schema itself is 10 MiB); that is the size to plan
+/// for, since the two budgets are spent independently. A schema that is
+/// refused can peak higher while it is being read: the largest seen is
+/// 332 MiB, for a 4.6 MiB schema file. Changing what a unit charges needs
+/// these measurements repeated.
 const MAX_INHERITED_NODES: usize = 1 << 18;
 
 /// Most that the folds a schema can do without may copy in one schema set,
 /// in the units of [`MAX_INHERITED_NODES`].
 ///
-/// A fold is one a schema can do without when it unrolls a recursive type
-/// or lies at [`REQUIRED_FOLD_DEPTH`] or deeper. Such folds are paid from
-/// this pool and never from the one that required folds use, so they cannot
-/// make a required fold fail; when the pool is empty they are left out
-/// without an error. It is as large as the required budget, so the two
-/// together bound the folded model at twice what [`MAX_INHERITED_NODES`]
-/// describes.
+/// A fold is one a schema can do without when it unrolls a recursive type,
+/// lies at [`REQUIRED_FOLD_DEPTH`] or deeper, or brings in a base further
+/// up a chain than [`REQUIRED_CHAIN_LINKS`]. Such folds are paid from this
+/// pool and never from the one that required folds use, so they cannot
+/// make a required fold fail; when the pool is empty, or the type being
+/// resolved has used its [`MAX_OPTIONAL_NODES_PER_TYPE`], they are left out
+/// without an error. Types are resolved in the order they are declared, so
+/// the pool goes to the first types that ask for it.
+///
+/// It bounds memory as [`MAX_INHERITED_NODES`] does and is the same size:
+/// a folded model holds at most the copies of both, 2^19 units, on top of
+/// the schema as written. The measured peaks are given there.
 const MAX_OPTIONAL_NODES: usize = MAX_INHERITED_NODES;
 
 /// Most that the folds a schema can do without may copy inside one named
