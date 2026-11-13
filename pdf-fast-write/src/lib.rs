@@ -378,9 +378,12 @@ impl Pdf {
             // An object cut short must never be written as if it were whole.
             let syntax_end = stream_data_range(&self.data, &self.xref, &raw)?
                 .map_or(raw.len(), |stream| stream.start);
+            let syntax = raw
+                .get(..syntax_end)
+                .ok_or_else(|| anyhow!("object {} has no syntax before its stream", old_obj))?;
             // The source's own structure is never page content: copied, it
             // would carry every offset and object number of the source.
-            if let Some(kind) = top_level_value_bytes(&raw[..syntax_end], b"/Type")
+            if let Some(kind) = top_level_value_bytes(syntax, b"/Type")
                 .filter(|kind| name_is(kind, b"/XRef") || name_is(kind, b"/ObjStm"))
             {
                 return Err(anyhow!(
@@ -389,7 +392,7 @@ impl Pdf {
                     String::from_utf8_lossy(&kind)
                 ));
             }
-            if !delimiters_balance(&raw[..syntax_end]) {
+            if !delimiters_balance(syntax) {
                 return Err(anyhow!(
                     "object {} is cut short or malformed: a dictionary or array in it is not closed",
                     old_obj
@@ -1055,7 +1058,7 @@ fn read_xref_stream_at(
         .and_then(|width| width.checked_add(third_width))
         .filter(|width| *width > 0)
         .ok_or_else(|| anyhow!("/W gives rows of no bytes"))?;
-    let rows = decoded.len() / row_width;
+    let rows = decoded.len().checked_div(row_width).unwrap_or(0);
     let subsections = xref_subsections(dictionary)?;
     let claimed = subsections
         .iter()
@@ -1276,8 +1279,8 @@ fn undo_png_predictor(parameters: &[u8], decoded: Vec<u8>) -> Result<Vec<u8>> {
                 0 => 0,
                 1 => left,
                 2 => up,
-                // The mean of two bytes, without leaving u8.
-                3 => left / 2 + up / 2 + (left & up & 1),
+                // The mean of two bytes, rounded down.
+                3 => left.midpoint(up),
                 4 => paeth(left, up, upper_left),
                 _ => return Err(anyhow!("PNG predictor row type {kind} is unknown")),
             };
@@ -1294,12 +1297,12 @@ fn undo_png_predictor(parameters: &[u8], decoded: Vec<u8>) -> Result<Vec<u8>> {
 /// The PNG Paeth predictor (RFC 2083, 6.6).
 fn paeth(left: u8, up: u8, upper_left: u8) -> u8 {
     let (a, b, c) = (i16::from(left), i16::from(up), i16::from(upper_left));
-    // Bytes are at most 255, so none of this leaves i16.
-    let estimate = a + b - c;
+    // Bytes are at most 255, so none of this saturates.
+    let estimate = a.saturating_add(b).saturating_sub(c);
     let (to_left, to_up, to_upper_left) = (
-        (estimate - a).abs(),
-        (estimate - b).abs(),
-        (estimate - c).abs(),
+        estimate.saturating_sub(a).saturating_abs(),
+        estimate.saturating_sub(b).saturating_abs(),
+        estimate.saturating_sub(c).saturating_abs(),
     );
     if to_left <= to_up && to_left <= to_upper_left {
         left
