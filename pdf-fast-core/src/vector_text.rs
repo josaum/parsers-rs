@@ -251,10 +251,90 @@ pub(crate) enum DrawableFont {
     },
 }
 
+/// Deepest nesting of Type 3 glyph procedures: a glyph whose procedure shows
+/// text, whose glyphs' procedures show text, and so on.
+///
+/// A glyph procedure that shows text is legal and rare, and what it shows is
+/// ordinary glyphs: real fonts stop at the second level. Four leaves room
+/// for anything a producer has a reason to write. Each level costs two stack
+/// frames, and a page reaches a glyph through as many as
+/// [`MAX_FORM_XOBJECT_DEPTH`](crate::MAX_FORM_XOBJECT_DEPTH) nested forms, so
+/// raising this deepens the worst case the small-stack tests measure. A
+/// procedure past the limit is skipped; the rest of the page is still read.
+const MAX_GLYPH_PROCEDURE_DEPTH: usize = 4;
+
+/// Bytes of glyph procedure one content stream may execute from inside
+/// another glyph procedure.
+///
+/// A procedure shown once per byte of a string, itself showing a long
+/// string, multiplies: without a cap, a few kilobytes of content ask for
+/// billions of procedure runs. Procedures run directly by the stream's own
+/// text are not counted. Every nested run is charged its procedure's length,
+/// because each run reads the procedure again, so a page of sixteen thousand
+/// composite glyphs with one-kilobyte parts fits and a larger one does not.
+///
+/// The count is kept per content stream, forms it invokes included. Once it
+/// is spent, text shown inside a glyph procedure still advances but draws
+/// nothing for the rest of that stream, and the checked extraction functions
+/// return an error naming this limit instead of an incomplete result.
+const MAX_NESTED_GLYPH_PROCEDURE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The nested glyph procedure budget of a content stream was spent.
+#[derive(Debug)]
+struct GlyphProcedureBudgetExceeded;
+
+impl std::fmt::Display for GlyphProcedureBudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Type 3 glyph procedures nested in other glyph procedures exceed \
+             {MAX_NESTED_GLYPH_PROCEDURE_BYTES} bytes in one content stream"
+        )
+    }
+}
+
+impl std::error::Error for GlyphProcedureBudgetExceeded {}
+
+/// Bytes of Type 3 glyph procedure executed so far in this process.
+static GLYPH_PROCEDURE_BYTES_READ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes of Type 3 glyph procedure executed so far in this process.
+///
+/// A test hook: the difference across a call is the work that call spent
+/// reading glyph procedures, which a wall-clock time cannot pin.
+#[doc(hidden)]
+pub fn glyph_procedure_bytes_read() -> u64 {
+    GLYPH_PROCEDURE_BYTES_READ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A Type 3 glyph procedure about to be executed.
+struct GlyphProcedure {
+    /// Glyph name in the font's `/CharProcs`.
+    name: String,
+    /// The procedure's content stream.
+    bytes: std::sync::Arc<[u8]>,
+}
+
+/// Advance of one character code in glyph space, before the font size.
+fn glyph_advance(font: &DrawableFont, code: u8) -> f32 {
+    match font {
+        DrawableFont::Type3(type3) => type3.width(code),
+        DrawableFont::TrueType(program) => program.advance_units(code as u32).unwrap_or(0.0),
+        DrawableFont::Cff { program, encoding } => encoding
+            .as_ref()
+            .and_then(|e| e.decode_byte(code))
+            .and_then(|name| program.glyph_id(name))
+            .and_then(|index| program.advance_units(index))
+            .unwrap_or(0.0),
+    }
+}
+
 /// Where one glyph's outline comes from.
 enum GlyphSource {
-    /// A Type 3 glyph: a content stream to execute.
-    Stream(Vec<u8>),
+    /// A Type 3 glyph: a content stream to execute, or `None` for one that
+    /// is not to be executed where the parser now is.
+    Stream(Option<GlyphProcedure>),
     /// A TrueType glyph: already-parsed points in font units.
     Outline(crate::truetype::GlyphOutline),
 }
@@ -406,6 +486,19 @@ struct VectorTextExtractor {
     /// Active indirect Form objects, used to reject cycles and bound nested
     /// traversal before materializing another stream.
     form_stack: Vec<(u32, u16)>,
+    /// Names of the Type 3 glyphs whose procedures are being executed,
+    /// outermost first, used to refuse a procedure that is already running
+    /// and to bound nesting by [`MAX_GLYPH_PROCEDURE_DEPTH`].
+    ///
+    /// The name is enough to identify a procedure here. A procedure runs
+    /// with no resources, so a `Tf` inside one selects nothing: every glyph
+    /// on the path belongs to the one font selected outside it.
+    glyph_path: Vec<String>,
+    /// Set once [`MAX_NESTED_GLYPH_PROCEDURE_BYTES`] has been reached.
+    glyph_budget_spent: bool,
+    /// Bytes of glyph procedure executed from inside another one, bounded by
+    /// [`MAX_NESTED_GLYPH_PROCEDURE_BYTES`].
+    nested_glyph_bytes: usize,
 
     /// Text object state, live only between `BT` and `ET`.
     ///
@@ -463,6 +556,9 @@ impl VectorTextExtractor {
             in_type3_glyph: false,
             type3_ctm: IDENTITY,
             form_stack: Vec::new(),
+            glyph_path: Vec::new(),
+            nested_glyph_bytes: 0,
+            glyph_budget_spent: false,
             text_matrix: IDENTITY,
             text_line_matrix: IDENTITY,
             drawable: None,
@@ -1100,7 +1196,47 @@ impl VectorTextExtractor {
     /// glyph's own `m`/`l`/`c`/`f` operators run through the ordinary path
     /// handling below. That is what the rasterizer does, and it means the
     /// outline arrives in page space with no separate transform stage.
+    /// Whether a glyph procedure may be executed where the parser now is.
+    ///
+    /// Refuses one that is already on the path of running procedures (a
+    /// glyph that shows itself, directly or through others), one that would
+    /// nest past [`MAX_GLYPH_PROCEDURE_DEPTH`], and any nested one once the
+    /// stream has used [`MAX_NESTED_GLYPH_PROCEDURE_BYTES`]. Without the
+    /// first two the recursion follows the input and overflows the stack.
+    /// Every check costs the same whatever the procedure's length.
+    fn glyph_procedure_may_run(&mut self, name: &str, procedure_len: usize) -> bool {
+        if self.glyph_path.is_empty() {
+            return true;
+        }
+        if self.glyph_budget_spent
+            || self.glyph_path.len() >= MAX_GLYPH_PROCEDURE_DEPTH
+            || self.glyph_path.iter().any(|running| running == name)
+        {
+            return false;
+        }
+        let used = self.nested_glyph_bytes.saturating_add(procedure_len);
+        if used > MAX_NESTED_GLYPH_PROCEDURE_BYTES {
+            self.glyph_budget_spent = true;
+            return false;
+        }
+        self.nested_glyph_bytes = used;
+        true
+    }
+
     fn show_text(&mut self, bytes: &[u8]) {
+        if self.glyph_budget_spent && !self.glyph_path.is_empty() {
+            // The budget for text inside glyph procedures is spent: nothing
+            // more is drawn there, but the text still advances as it would
+            // have, so whatever follows keeps its position.
+            if let Some(font) = &self.drawable {
+                let advance: f32 = bytes.iter().map(|&code| glyph_advance(font, code)).sum();
+                self.text_matrix = compose(
+                    [1.0, 0.0, 0.0, 1.0, advance * self.font_size, 0.0],
+                    self.text_matrix,
+                );
+            }
+            return;
+        }
         let Some(font) = self.drawable.clone() else {
             return;
         };
@@ -1118,7 +1254,16 @@ impl VectorTextExtractor {
                     let Some(proc_bytes) = type3.char_proc(name) else {
                         continue;
                     };
-                    (GlyphSource::Stream(proc_bytes.to_vec()), type3.font_matrix)
+                    // A procedure that is already running, nested too deep,
+                    // or past the page's budget is skipped; the glyph still
+                    // advances the text.
+                    let procedure =
+                        self.glyph_procedure_may_run(name, proc_bytes.len())
+                            .then(|| GlyphProcedure {
+                                name: name.to_owned(),
+                                bytes: std::sync::Arc::from(proc_bytes),
+                            });
+                    (GlyphSource::Stream(procedure), type3.font_matrix)
                 }
                 DrawableFont::TrueType(program) => {
                     let Some(index) = program.glyph_index(code as u32) else {
@@ -1172,9 +1317,16 @@ impl VectorTextExtractor {
             // A CharProc is a content stream. A failure inside one glyph must
             // not abandon the page: skip that glyph and keep the rest, which is
             // the same choice the `Do` path makes for an unreadable form.
-            match &outline {
-                GlyphSource::Stream(bytes) => {
-                    let _ = self.parse_stream_ctx(bytes, None);
+            match outline {
+                GlyphSource::Stream(None) => {}
+                GlyphSource::Stream(Some(procedure)) => {
+                    GLYPH_PROCEDURE_BYTES_READ.fetch_add(
+                        procedure.bytes.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.glyph_path.push(procedure.name);
+                    let _ = self.parse_stream_ctx(&procedure.bytes, None);
+                    self.glyph_path.pop();
                 }
                 GlyphSource::Outline(parsed) => {
                     // Font units, y-up, straight into the pending contours the
@@ -1208,18 +1360,7 @@ impl VectorTextExtractor {
 
             // Advance the text matrix by the glyph width, in text space:
             // Tm = translate(w * size, 0) · Tm.
-            let advance = match &font {
-                DrawableFont::Type3(type3) => type3.width(code),
-                DrawableFont::TrueType(program) => {
-                    program.advance_units(code as u32).unwrap_or(0.0)
-                }
-                DrawableFont::Cff { program, encoding } => encoding
-                    .as_ref()
-                    .and_then(|e| e.decode_byte(code))
-                    .and_then(|name| program.glyph_id(name))
-                    .and_then(|index| program.advance_units(index))
-                    .unwrap_or(0.0),
-            } * self.font_size;
+            let advance = glyph_advance(&font, code) * self.font_size;
             self.text_matrix = compose([1.0, 0.0, 0.0, 1.0, advance, 0.0], self.text_matrix);
         }
     }
@@ -1326,8 +1467,13 @@ pub fn check_first_cm_matches(stream: &[u8], target: Matrix) -> bool {
 /// Extract vector glyph runs for a single PDF page, sorted top-to-bottom and
 /// left-to-right (4-unit row buckets, x within bucket). Empty if no content
 /// streams or no glyph geometry was emitted.
+///
+/// A page that spends the glyph procedure cap keeps the runs read up to
+/// that point; [`extract_page_vector_text_runs_checked`] reports it instead.
 pub fn extract_page_vector_text_runs(doc: &PdfDocument, page: &PdfPage) -> Vec<GlyphRun> {
-    extract_page_vector_text_runs_checked(doc, page).unwrap_or_default()
+    page_vector_text_runs(doc, page)
+        .map(|(runs, _)| runs)
+        .unwrap_or_default()
 }
 
 /// Checked page-level vector extraction. Unlike
@@ -1337,12 +1483,23 @@ pub fn extract_page_vector_text_runs_checked(
     doc: &PdfDocument,
     page: &PdfPage,
 ) -> Result<Vec<GlyphRun>> {
+    let (runs, glyph_budget_spent) = page_vector_text_runs(doc, page)?;
+    if glyph_budget_spent {
+        return Err(anyhow::anyhow!(GlyphProcedureBudgetExceeded));
+    }
+    Ok(runs)
+}
+
+/// Reads a page's runs, and whether any content stream spent the glyph
+/// procedure cap (its later nested glyph text is then missing).
+fn page_vector_text_runs(doc: &PdfDocument, page: &PdfPage) -> Result<(Vec<GlyphRun>, bool)> {
     let mut all_runs = Vec::new();
+    let mut glyph_budget_spent = false;
 
     // Re-implemented to fetch streams similar to page_content_streams_for_raster
     let streams = doc.page_content_streams_for_raster(page)?;
     if streams.is_empty() {
-        return Ok(all_runs);
+        return Ok((all_runs, glyph_budget_spent));
     }
 
     let page_ctm = detect_page_ctm(&streams[0]);
@@ -1367,6 +1524,7 @@ pub fn extract_page_vector_text_runs_checked(
             depth: 0,
         };
         extractor.parse_stream_ctx(&stream, Some(&ctx))?;
+        glyph_budget_spent |= extractor.glyph_budget_spent;
         all_runs.extend(extractor.runs);
     }
 
@@ -1381,7 +1539,7 @@ pub fn extract_page_vector_text_runs_checked(
             .then_with(|| a.page_x.total_cmp(&b.page_x))
     });
 
-    Ok(all_runs)
+    Ok((all_runs, glyph_budget_spent))
 }
 
 /// Resolve a glyph through the shape catalog, or `None` when the catalog is not

@@ -1127,6 +1127,413 @@ fn entries_for_objects_the_scan_never_saw_are_not_kept() {
     assert!(kept <= 3, "{kept} entries kept for a three-object file");
 }
 
+/// Runs `parse` on a thread with a stack of `stack_bytes`.
+fn run_on_stack<F>(stack_bytes: usize, parse: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(stack_bytes)
+        .spawn(parse)
+        .expect("spawn reduced-stack thread")
+        .join()
+        .expect("parser panicked on a reduced stack");
+}
+
+/// Parses one object nested `levels` turns deep on a `stack_bytes` stack.
+fn parse_nested_object(open: &[u8], close: &[u8], levels: usize, closed: bool, stack_bytes: usize) {
+    let mut document = b"%PDF-1.7\n1 0 obj\n".to_vec();
+    if closed {
+        document.extend(smoke::nested(open, b"1", close, levels));
+        document.extend_from_slice(b"\nendobj\n");
+    } else {
+        // Cut off after the last opening delimiter, as the fuzzer found it.
+        document.extend(smoke::nested(open, b"", b"", levels));
+    }
+    run_on_stack(stack_bytes, move || {
+        exercise_text(&document, ParseOptions::default());
+    });
+}
+
+/// Reads a content stream of arrays nested `levels` deep on a `stack_bytes`
+/// stack.
+fn read_nested_content(levels: usize, closed: bool, stack_bytes: usize) {
+    let close: &[u8] = if closed { b"]" } else { b"" };
+    let mut payloads = Payloads::seed();
+    payloads.content = smoke::nested(b"[", b"(x)", close, levels);
+    payloads.content.extend_from_slice(b" TJ");
+    let document = document(&payloads);
+    run_on_stack(stack_bytes, move || {
+        exercise_text(&document, tight_options());
+        exercise_tables(&document, tight_options());
+    });
+}
+
+/// The shapes the object parser is given, with how many turns of each reach
+/// its 128-level limit: the last shape opens two containers a turn.
+const NESTED_OBJECT_SHAPES: [(&[u8], &[u8], usize); 3] = [
+    (b"[", b"]", 128),
+    (b"<< /A ", b" >>", 128),
+    (b"[ << /A ", b" >> ]", 64),
+];
+
+/// Nesting far past the limits, on half the small stack.
+///
+/// Passing on the small stack says the parsers fit; it does not say by how
+/// much. When both parsers recursed, these inputs needed over three quarters
+/// of that stack in an unoptimized macOS build, which passed here and
+/// overflowed now and then on Windows, where frames are larger. Neither
+/// parser recurses now, and a refused input builds no value: on macOS this
+/// passes on 24 KiB. A quarter of the small stack (64 KiB) was still too
+/// little for an unoptimized Windows build, whose fixed cost is higher, so
+/// the margin asserted is half. A parser that goes back to following input
+/// depth on the call stack fails here on every platform.
+#[test]
+fn refused_nesting_leaves_half_the_small_stack_unused() {
+    let _serial = serial();
+    let stack_bytes = smoke::SMALL_STACK_BYTES / 2;
+    for (open, close, _) in NESTED_OBJECT_SHAPES {
+        for closed in [true, false] {
+            parse_nested_object(open, close, 200_000, closed, stack_bytes);
+        }
+    }
+    for closed in [true, false] {
+        read_nested_content(200_000, closed, stack_bytes);
+    }
+}
+
+/// Nesting at the limits and one level under them, on half the small stack.
+///
+/// These inputs are accepted, so the whole nested value is built and then
+/// walked and dropped, and dropping does recurse once per level. Where the
+/// value sits matters: one inside a page's `/Resources` is also copied on
+/// the way to every reader, and copying once recursed too, at several times
+/// the cost of dropping. So the value is placed there as well as in an
+/// object of its own. Raising either limit shows up here.
+#[test]
+fn nesting_at_the_limit_leaves_half_the_small_stack_unused() {
+    let _serial = serial();
+    let stack_bytes = smoke::SMALL_STACK_BYTES / 2;
+    for (open, close, at_limit) in NESTED_OBJECT_SHAPES {
+        for levels in [at_limit, at_limit - 1] {
+            for closed in [true, false] {
+                parse_nested_object(open, close, levels, closed, stack_bytes);
+            }
+        }
+    }
+    // Two dictionaries enclose the array, so 126 levels reach the limit.
+    for levels in [126, 125] {
+        let mut page =
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Deep ".to_vec();
+        page.extend(smoke::nested(b"[", b"1", b"]", levels));
+        page.extend_from_slice(b" /Font << /F1 5 0 R >> >> >>");
+        let document = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+            page,
+            stream("", b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET 0 0 m 100 0 l S"),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ]);
+        run_on_stack(stack_bytes, move || {
+            exercise_text(&document, ParseOptions::default());
+            exercise_tables(&document, ParseOptions::default());
+        });
+    }
+    // The content tokenizer accepts 128 levels of arrays.
+    for levels in [128, 127] {
+        for closed in [true, false] {
+            read_nested_content(levels, closed, stack_bytes);
+        }
+    }
+}
+
+// ── Type 3 glyph procedures ─────────────────────────────────────────────────
+
+/// A one-page document with Type 3 fonts `/T0`, `/T1`, … and forms `/Fm0`,
+/// `/Fm1`, ….
+///
+/// Each font is given as its glyph procedures, named `a`, `b`, … and shown by
+/// the codes of those letters. The page, every font and every form share one
+/// resource dictionary naming all the fonts, all the forms and a Type 1 font
+/// `/H`, so any stream can select or invoke any of them.
+fn type3_document(content: &[u8], fonts: &[Vec<Vec<u8>>], forms: &[Vec<u8>]) -> Vec<u8> {
+    let first_font = 6;
+    let first_form = first_font + fonts.len();
+    let mut next_procedure = first_form + forms.len();
+    let mut resources = String::from("<< /Font << /H 5 0 R");
+    for index in 0..fonts.len() {
+        resources.push_str(&format!(" /T{index} {} 0 R", first_font + index));
+    }
+    resources.push_str(" >> /XObject <<");
+    for index in 0..forms.len() {
+        resources.push_str(&format!(" /Fm{index} {} 0 R", first_form + index));
+    }
+    resources.push_str(" >> >>");
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        format!("<< /Type /Page /Parent 2 0 R /Resources {resources} /Contents 4 0 R >>")
+            .into_bytes(),
+        stream("", content),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    ];
+    let mut procedures = Vec::new();
+    for glyphs in fonts {
+        let mut names = String::new();
+        let mut char_procs = String::new();
+        for (index, procedure) in glyphs.iter().enumerate() {
+            let name = char::from(b'a' + u8::try_from(index).expect("at most 26 glyphs"));
+            names.push_str(&format!(" /{name}"));
+            char_procs.push_str(&format!(" /{name} {next_procedure} 0 R"));
+            next_procedure += 1;
+            procedures.push(stream("", procedure));
+        }
+        objects.push(
+            format!(
+                "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 700] \
+                 /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs <<{char_procs} >> \
+                 /Encoding << /Type /Encoding /Differences [97{names}] >> \
+                 /FirstChar 97 /LastChar {} /Widths [{}] /Resources {resources} >>",
+                96 + glyphs.len(),
+                "500 ".repeat(glyphs.len()),
+            )
+            .into_bytes(),
+        );
+    }
+    for form in forms {
+        objects.push(stream(
+            &format!("/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources {resources}"),
+            form,
+        ));
+    }
+    objects.extend(procedures);
+    pdf(&objects)
+}
+
+/// A glyph procedure that draws a box.
+const BOX_GLYPH: &[u8] = b"500 0 d0 0 0 m 400 0 l 400 700 l 0 700 l h f";
+
+/// Reads `document` the way a consumer does, on the harness's small stack.
+fn read_on_small_stack(document: Vec<u8>) {
+    smoke::run_on_small_stack(move || {
+        exercise_text(&document, ParseOptions::default());
+    });
+}
+
+/// A glyph whose procedure shows the glyph itself, two glyphs that show each
+/// other, and five that show each other in a ring. The procedure ran again
+/// for every level with nothing to stop it, so each of these overflowed the
+/// stack and aborted the process.
+///
+/// A cycle has to stay inside one font and use no `Tf`: a glyph procedure is
+/// run with no resources, so a font selected inside one selects nothing and a
+/// form invoked inside one is not found.
+#[test]
+fn a_type3_glyph_that_shows_itself_is_not_followed() {
+    let _serial = serial();
+    read_on_small_stack(type3_document(
+        b"BT /T0 10 Tf (a) Tj ET",
+        &[vec![b"500 0 d0 (a) Tj".to_vec()]],
+        &[],
+    ));
+    read_on_small_stack(type3_document(
+        b"BT /T0 10 Tf (a) Tj ET",
+        &[vec![b"500 0 d0 BT (a) Tj ET".to_vec()]],
+        &[],
+    ));
+    read_on_small_stack(type3_document(
+        b"BT /T0 10 Tf (ab) Tj ET",
+        &[vec![
+            b"500 0 d0 (b) Tj".to_vec(),
+            b"500 0 d0 (a) Tj".to_vec(),
+        ]],
+        &[],
+    ));
+    // Five glyphs in a ring, longer than the nesting that is followed.
+    let ring = (*b"bcdea")
+        .map(|next| format!("500 0 d0 ({}) Tj", char::from(next)).into_bytes())
+        .to_vec();
+    read_on_small_stack(type3_document(b"BT /T0 10 Tf (abcde) Tj ET", &[ring], &[]));
+}
+
+/// The deepest path a page can take: as many nested forms as are followed,
+/// the innermost showing a glyph whose procedure shows the next glyph, and so
+/// on through all twenty-six. Glyph nesting is cut off after a few levels, so
+/// this fits in half the small stack; raising either limit shows up here.
+#[test]
+fn nested_forms_and_glyph_procedures_leave_half_the_small_stack_unused() {
+    let _serial = serial();
+    let mut glyphs: Vec<Vec<u8>> = (1..26u8)
+        .map(|next| format!("500 0 d0 ({}) Tj", char::from(b'a' + next)).into_bytes())
+        .collect();
+    glyphs.push(BOX_GLYPH.to_vec());
+    // Eight forms are followed; a ninth would be refused and end the page.
+    let mut forms: Vec<Vec<u8>> = (1..8)
+        .map(|next| format!("q /Fm{next} Do Q").into_bytes())
+        .collect();
+    forms.push(b"BT /T0 10 Tf (a) Tj ET".to_vec());
+    let document = type3_document(b"/Fm0 Do", &[glyphs], &forms);
+    run_on_stack(smoke::SMALL_STACK_BYTES / 2, move || {
+        exercise_text(&document, ParseOptions::default());
+    });
+}
+
+/// Bytes of glyph procedure the reader executes for one pass over
+/// `document`, and whether that pass was refused for exceeding a limit.
+fn glyph_procedure_work(document: &[u8]) -> (u64, bool) {
+    let document = parse(document, ParseOptions::default()).expect("document parses");
+    let before = pdf_fast_core::vector_text::glyph_procedure_bytes_read();
+    let refused = document.vector_glyph_descriptors_checked(8).is_err();
+    let after = pdf_fast_core::vector_text::glyph_procedure_bytes_read();
+    (after - before, refused)
+}
+
+/// The cap on glyph procedure executed inside other glyph procedures.
+const NESTED_GLYPH_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A glyph shown three thousand times whose procedure shows another three
+/// thousand times, three levels deep: twenty-seven billion procedure runs
+/// from ten kilobytes of content. The reader stops at its cap on nested
+/// procedures and says so, having read the cap plus one procedure for each
+/// glyph the page itself shows.
+#[test]
+fn nested_type3_glyph_procedures_do_not_multiply_without_bound() {
+    let _serial = serial();
+    let shown = |glyph: u8| {
+        let mut procedure = b"500 0 d0 (".to_vec();
+        procedure.extend(std::iter::repeat_n(glyph, 3_000));
+        procedure.extend_from_slice(b") Tj");
+        procedure
+    };
+    let mut content = b"BT /T0 10 Tf (".to_vec();
+    content.extend(std::iter::repeat_n(b'a', 3_000));
+    content.extend_from_slice(b") Tj ET");
+    let document = type3_document(
+        &content,
+        &[vec![shown(b'b'), shown(b'c'), BOX_GLYPH.to_vec()]],
+        &[],
+    );
+    let (work, refused) = glyph_procedure_work(&document);
+    assert!(refused, "the nested procedure cap is reported");
+    let page_level = 3_000 * shown(b'b').len() as u64;
+    assert!(
+        work <= NESTED_GLYPH_BYTES + page_level,
+        "read {work} bytes of glyph procedure"
+    );
+}
+
+/// A glyph whose procedure shows itself a hundred thousand times. Each show
+/// is refused, and refusing must not cost the procedure's length: the reader
+/// compared the whole procedure every time, which made this quadratic. The
+/// procedure is read once.
+#[test]
+fn refusing_a_self_showing_glyph_costs_nothing_per_show() {
+    let _serial = serial();
+    let mut procedure = b"500 0 d0 (".to_vec();
+    procedure.extend(std::iter::repeat_n(b'a', 100_000));
+    procedure.extend_from_slice(b") Tj");
+    let length = procedure.len() as u64;
+    let document = type3_document(b"BT /T0 10 Tf (a) Tj ET", &[vec![procedure]], &[]);
+    let (work, refused) = glyph_procedure_work(&document);
+    assert!(!refused, "a cycle is skipped, not an error");
+    assert_eq!(work, length);
+}
+
+/// A box glyph padded to a kilobyte, and a composite glyph that shows it.
+fn composite_font() -> Vec<Vec<u8>> {
+    let mut part = BOX_GLYPH.to_vec();
+    part.resize(1_024, b' ');
+    vec![part, b"500 0 d0 (a) Tj".to_vec()]
+}
+
+/// Pages of five and eight thousand composite glyphs keep every outline. A
+/// cap small enough to stop these dropped the glyphs past it without a word.
+#[test]
+fn a_page_of_composite_type3_glyphs_keeps_every_outline() {
+    let _serial = serial();
+    for shows in [5_000, 8_000] {
+        let mut content = b"BT /T0 10 Tf 72 700 Td (".to_vec();
+        content.extend(std::iter::repeat_n(b'b', shows));
+        content.extend_from_slice(b") Tj ET");
+        let document = type3_document(&content, &[composite_font()], &[]);
+        assert_eq!(text_and_outline_count(&document).1, shows);
+    }
+}
+
+/// Composite glyphs whose part is a megabyte long spend the nested procedure
+/// cap before the honest glyphs after them are reached. The checked reader
+/// reports the limit; it does not hand back a page with glyphs missing.
+/// The unchecked reader returns the glyphs it reached.
+#[test]
+fn a_spent_glyph_procedure_cap_is_an_error_not_missing_glyphs() {
+    let _serial = serial();
+    let mut heavy = BOX_GLYPH.to_vec();
+    heavy.resize(1024 * 1024, b' ');
+    let fonts = vec![vec![heavy, b"500 0 d0 (a) Tj".to_vec()], composite_font()];
+    let mut content = b"BT /T0 10 Tf 72 700 Td (".to_vec();
+    content.extend(std::iter::repeat_n(b'b', 20));
+    content.extend_from_slice(b") Tj /T1 10 Tf (bbbbbbbbbb) Tj ET");
+    let document = type3_document(&content, &fonts, &[]);
+    let document = parse(&document, ParseOptions::default()).expect("document parses");
+    let error = document
+        .vector_glyph_descriptors_checked(8)
+        .expect_err("the cap is reported");
+    assert!(
+        format!("{error:#}").contains("glyph procedures nested"),
+        "{error:#}"
+    );
+    // The reader that reports nothing keeps what it read before the cap,
+    // as it did when there was no cap; it does not hand back an empty page.
+    let pages = document.pages();
+    let page = pages.first().expect("the document has a page");
+    let kept = pdf_fast_core::extract_page_vector_text_runs(&document, page);
+    assert!(!kept.is_empty(), "the unchecked reader dropped the page");
+}
+
+/// What the glyph reader finds in `document`: the semantic text, and how many
+/// glyph outlines it draws.
+fn text_and_outline_count(document: &[u8]) -> (String, usize) {
+    let document = parse(document, ParseOptions::default()).expect("document parses");
+    let text: Vec<String> = document
+        .semantic_text_runs()
+        .into_iter()
+        .map(|run| run.text)
+        .collect();
+    let outlines = document
+        .vector_glyph_descriptors_checked(8)
+        .expect("glyph descriptors")
+        .iter()
+        .map(Vec::len)
+        .sum();
+    (text.join("|"), outlines)
+}
+
+/// Bounding glyph procedures must not change what honest fonts produce: a
+/// Type 3 font of plain outlines, and one whose glyph draws text one level
+/// down, in its own font and after selecting another. The expected values
+/// are what the reader produced before the bound existed.
+#[test]
+fn legitimate_type3_fonts_read_as_before() {
+    let _serial = serial();
+    let plain = type3_document(
+        b"BT /T0 12 Tf 72 700 Td (aab) Tj ET",
+        &[vec![BOX_GLYPH.to_vec(), BOX_GLYPH.to_vec()]],
+        &[],
+    );
+    assert_eq!(text_and_outline_count(&plain), (String::from("aab"), 3));
+    let nested = type3_document(
+        b"BT /T0 12 Tf 72 700 Td (abc) Tj ET",
+        &[vec![
+            BOX_GLYPH.to_vec(),
+            b"500 0 d0 (a) Tj 0 0 m 200 0 l 200 300 l h f".to_vec(),
+            b"500 0 d0 BT /H 8 Tf (x) Tj ET 0 0 m 300 0 l 300 300 l h f".to_vec(),
+        ]],
+        &[],
+    );
+    assert_eq!(text_and_outline_count(&nested), (String::from("abc"), 3));
+}
+
 // ── Seed sanity ─────────────────────────────────────────────────────────────
 
 /// The seed has to reach the readers it claims to; a seed whose streams fail

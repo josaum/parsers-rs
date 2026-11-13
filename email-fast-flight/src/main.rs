@@ -25,9 +25,9 @@ use clap::Parser;
 use email_fast_core::arrow::{emails_schema, emails_to_record_batch};
 use email_fast_core::{parse_email, ParseOptions};
 use flight_ipc_config::{
-    capability_json, do_put_unsupported, parse_writer_policies_for_process, FlightIpcDirection,
-    FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction, ParserRoute,
-    CAPABILITY_ACTION,
+    capability_json, do_put_unsupported, parse_writer_policies_for_process,
+    root_relative_error_text, FlightIpcDirection, FlightIpcObservationGuard,
+    FlightRequestAuthVerifier, FlightRpcAction, ParserRoute, CAPABILITY_ACTION,
 };
 use futures::StreamExt;
 use futures::{stream, Stream};
@@ -99,23 +99,10 @@ impl EmailFlightService {
         self.auth_verifier.verify_metadata(request.metadata())
     }
 
+    /// The regular file below the root that `path` names; every other
+    /// path gets the one shared `NotFound`.
     fn resolve_path(&self, path: &str) -> Result<PathBuf, Status> {
-        let full_path = self.root.join(path);
-
-        // Security: ensure path is within root
-        let canonical = full_path
-            .canonicalize()
-            .map_err(|e| Status::invalid_argument(format!("Invalid path: {}", e)))?;
-        let root_canonical = self
-            .root
-            .canonicalize()
-            .map_err(|e| Status::internal(format!("Root path error: {}", e)))?;
-
-        if !canonical.starts_with(&root_canonical) {
-            return Err(Status::permission_denied("Path outside root directory"));
-        }
-
-        Ok(canonical)
+        flight_ipc_config::resolve_path(&self.root, Path::new(path))
     }
 
     fn list_email_files(&self, dir: &Path) -> Result<Vec<PathBuf>, Status> {
@@ -165,8 +152,9 @@ impl FlightService for EmailFlightService {
 
     async fn poll_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
+        self.authorize(&request)?;
         Err(Status::unimplemented(POLL_FLIGHT_INFO_UNSUPPORTED))
     }
 
@@ -233,11 +221,7 @@ impl FlightService for EmailFlightService {
         let descriptor = request.into_inner();
         let path = descriptor.path.join("/");
 
-        let full_path = self.resolve_path(&path)?;
-
-        if !full_path.exists() {
-            return Err(Status::not_found(format!("File not found: {}", path)));
-        }
+        self.resolve_path(&path)?;
 
         let endpoint = FlightEndpoint {
             ticket: Some(Ticket {
@@ -293,8 +277,14 @@ impl FlightService for EmailFlightService {
 
         let full_path = self.resolve_path(&path)?;
 
-        let email = parse_email(&full_path, self.options)
-            .map_err(|e| Status::internal(format!("Failed to parse email: {}", e)))?;
+        // The parser names the file by its path on the server; the answer
+        // names it by its path below the root.
+        let email = parse_email(&full_path, self.options).map_err(|e| {
+            Status::internal(root_relative_error_text(
+                &format!("Failed to parse email: {}", e),
+                &self.root,
+            ))
+        })?;
         let batch = emails_to_record_batch(std::slice::from_ref(&email))
             .map_err(|e| Status::internal(format!("Arrow encode: {}", e)))?;
         let schema = std::sync::Arc::new(emails_schema());
@@ -310,15 +300,19 @@ impl FlightService for EmailFlightService {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        // The bearer is checked first: an unauthenticated caller learns
+        // nothing about the server, not even that it is read-only.
+        self.authorize(&request)?;
         Err(do_put_unsupported())
     }
 
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        self.authorize(&request)?;
         Err(Status::unimplemented("DoExchange not implemented"))
     }
 
@@ -455,8 +449,10 @@ mod read_only_flight_contract_tests {
     use futures::StreamExt;
 
     fn capability_test_service() -> EmailFlightService {
+        // A directory that exists: a root that cannot be resolved is an
+        // internal error, not a missing file.
         EmailFlightService::new(
-            PathBuf::new(),
+            std::env::temp_dir(),
             ParseOptions::default(),
             required_auth_verifier(),
         )
@@ -544,6 +540,147 @@ mod read_only_flight_contract_tests {
         let Err(error) = FlightService::get_flight_info(&service, request).await else {
             panic!("missing test file must reach path validation");
         };
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "../../flight-ipc-config/test-support/wire.rs"]
+mod flight_wire_test_support;
+
+#[cfg(all(test, unix))]
+mod wire_parity_tests {
+    //! What a Flight client sees from this server, pinned as text in
+    //! `tests/wire_transcript.txt`.
+    //!
+    //! The transcript was captured from the server while it still carried its
+    //! own copy of the Flight skeleton, so a change to any answer in it is a
+    //! change in behaviour, not in structure. Unix only: the probes include a
+    //! symbolic link and a backslash in a file name.
+    use super::*;
+    use crate::flight_auth_test_support::required_auth_verifier;
+    use crate::flight_wire_test_support::Wire;
+
+    const EXPECTED: &str = include_str!("../tests/wire_transcript.txt");
+
+    const FIXTURE: &[u8] = b"From: Ada <ada@example.com>\r\n\
+To: Bob <bob@example.com>\r\n\
+Subject: Wire test\r\n\
+Date: Mon, 01 Jan 2024 10:00:00 +0000\r\n\
+Message-ID: <wire-1@example.com>\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Hello from the wire test.\r\n";
+
+    fn service(root: &Path) -> EmailFlightService {
+        EmailFlightService::new(
+            root.to_path_buf(),
+            ParseOptions::default(),
+            required_auth_verifier(),
+        )
+        .expect("service")
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_root_is_answered_like_a_missing_one() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).expect("directories");
+        let mut wire = Wire::start(service(&root), base.path()).await;
+        wire.assert_outside_paths_look_missing(base.path(), "eml")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn every_rpc_answers_as_it_did_before_the_shared_server() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("directories");
+        std::fs::write(root.join("mail.eml"), FIXTURE).expect("fixture");
+        std::fs::write(root.join("sub").join("Upper.EML"), FIXTURE).expect("nested");
+        std::fs::write(root.join("notes.txt"), b"not a message").expect("other file");
+        std::fs::write(base.path().join("outside.eml"), FIXTURE).expect("outside");
+        std::os::unix::fs::symlink(base.path().join("outside.eml"), root.join("link.eml"))
+            .expect("symlink");
+        let outside = base.path().join("outside.eml");
+        let outside = outside.to_string_lossy();
+
+        let mut wire = Wire::start(service(&root), base.path()).await;
+
+        wire.handshake(false).await;
+        wire.handshake(true).await;
+        wire.list_flights(false).await;
+        wire.list_flights(true).await;
+
+        wire.get_flight_info("mail.eml", false).await;
+        for path in [
+            "mail.eml",
+            "mail.eml?batch=1",
+            "sub/Upper.EML",
+            "sub\\Upper.EML",
+            "notes.txt",
+            "sub",
+            "missing.eml",
+            "../outside.eml",
+            "link.eml",
+            outside.as_ref(),
+            "",
+        ] {
+            wire.get_flight_info(path, true).await;
+        }
+        wire.get_flight_info_parts(&["sub", "Upper.EML"], true)
+            .await;
+        wire.get_flight_info_parts(&["sub", "..", "mail.eml"], true)
+            .await;
+        wire.get_flight_info_cmd(b"mail.eml", true).await;
+        wire.get_flight_info_cmd(b"", true).await;
+
+        wire.poll_flight_info("mail.eml", false).await;
+        wire.poll_flight_info("mail.eml", true).await;
+
+        wire.get_schema("mail.eml", false).await;
+        wire.get_schema("mail.eml", true).await;
+        wire.get_schema("missing.eml", true).await;
+
+        wire.do_get(b"mail.eml", false).await;
+        for ticket in [
+            "mail.eml",
+            "mail.eml?batch=1",
+            "sub/Upper.EML",
+            "sub\\Upper.EML",
+            "notes.txt",
+            "sub",
+            "missing.eml",
+            "../outside.eml",
+            "sub/../mail.eml",
+            "link.eml",
+            outside.as_ref(),
+            "",
+        ] {
+            wire.do_get(ticket.as_bytes(), true).await;
+        }
+        wire.do_get(b"\xff", true).await;
+
+        wire.do_put(false).await;
+        wire.do_put(true).await;
+
+        wire.do_exchange_path("mail.eml", false).await;
+        wire.do_exchange_path("mail.eml", true).await;
+        wire.do_exchange("no message", Vec::new(), true).await;
+
+        wire.do_action_lengths(CAPABILITY_ACTION, "", false).await;
+        wire.do_action_lengths(CAPABILITY_ACTION, "", true).await;
+        wire.do_action("unknown", "", true, true).await;
+        wire.list_actions(false).await;
+        wire.list_actions(true).await;
+        wire.path_probes(&root, base.path(), "eml").await;
+
+        assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
     }
 }

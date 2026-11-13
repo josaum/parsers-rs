@@ -110,6 +110,7 @@ impl SchemaSet {
             reference_reported: false,
             roots: 0,
             outside_text_reported: false,
+            namespaces: Vec::new(),
         };
         ctx.validate_document(xml)?;
         Ok(ctx.errors)
@@ -159,7 +160,22 @@ struct ValidationContext<'m> {
     roots: usize,
     /// Whether the one finding for character data outside the root was recorded.
     outside_text_reported: bool,
+    /// Prefix declarations of the open elements, innermost last.
+    namespaces: Vec<PrefixBinding>,
 }
+
+/// One `xmlns:prefix` declaration in scope.
+struct PrefixBinding {
+    /// Length of the element path when the declaring element was opened.
+    depth: usize,
+    /// The declared prefix.
+    prefix: Vec<u8>,
+    /// Whether it is bound to the XML Schema instance namespace.
+    is_instance: bool,
+}
+
+/// The XML Schema instance namespace, which `nil` belongs to.
+const XSI_NAMESPACE: &[u8] = b"http://www.w3.org/2001/XMLSchema-instance";
 
 /// What one content model declares, arranged for lookup by child name.
 ///
@@ -209,9 +225,10 @@ impl<'m> ValidationContext<'m> {
                     self.count_root();
                     self.report_undeclared_root(&local);
                     self.check_attribute_references(e);
+                    self.open_namespaces(e);
 
                     let xsd_type = self.resolve_child_type(&local);
-                    let nil = says_nil(e) && self.child_is_nillable(&local);
+                    let nil = says_nil(e, &self.namespaces) && self.child_is_nillable(&local);
 
                     if let Some(parent) = self.type_stack.last_mut() {
                         *parent.child_counts.entry(local).or_insert(0) += 1;
@@ -234,9 +251,11 @@ impl<'m> ValidationContext<'m> {
                     self.count_root();
                     self.report_undeclared_root(&local);
                     self.check_attribute_references(e);
+                    self.open_namespaces(e);
 
                     let xsd_type = self.resolve_child_type(&local);
-                    let nil = says_nil(e) && self.child_is_nillable(&local);
+                    let nil = says_nil(e, &self.namespaces) && self.child_is_nillable(&local);
+                    self.close_namespaces();
 
                     if let Some(parent) = self.type_stack.last_mut() {
                         *parent.child_counts.entry(local).or_insert(0) += 1;
@@ -304,6 +323,7 @@ impl<'m> ValidationContext<'m> {
                             }
                         }
                     }
+                    self.close_namespaces();
                     self.path.pop();
 
                     if self.errors.len() >= self.opts.max_errors {
@@ -328,6 +348,38 @@ impl<'m> ValidationContext<'m> {
             self.report_ill_formed_rest(&mut reader, &mut buf);
         }
         Ok(())
+    }
+
+    /// Records the prefixes the element just opened declares.
+    ///
+    /// Called with the element already on the path. Only `xmlns:prefix`
+    /// declarations are kept: `nil` is an attribute, and an attribute without
+    /// a prefix is in no namespace whatever the default namespace is.
+    fn open_namespaces(&mut self, start: &BytesStart<'_>) {
+        let depth = self.path.len();
+        for attribute in start.attributes().with_checks(false).flatten() {
+            if let Some(prefix) = attribute.key.as_ref().strip_prefix(b"xmlns:") {
+                self.namespaces.push(PrefixBinding {
+                    depth,
+                    prefix: prefix.to_vec(),
+                    is_instance: attribute.value.as_ref() == XSI_NAMESPACE,
+                });
+            }
+        }
+    }
+
+    /// Forgets the prefixes declared by the element being closed.
+    ///
+    /// Called with the element still on the path.
+    fn close_namespaces(&mut self) {
+        let depth = self.path.len();
+        while self
+            .namespaces
+            .last()
+            .is_some_and(|binding| binding.depth >= depth)
+        {
+            self.namespaces.pop();
+        }
     }
 
     /// Reads the rest of a document whose findings reached the limit.
@@ -797,15 +849,22 @@ impl<'m> ValidationContext<'m> {
             if self.errors.len() >= self.opts.max_errors {
                 return;
             }
-            // A nested model group (typically a choice) is handled as a union:
-            // its branches count toward the parent only as the group's own.
+            // A nested model group is checked as a whole. A choice is a
+            // union: its branches count toward the parent only as the
+            // group's own. A sequence kept as a group has its own occurrence:
+            // left out whole it is complete when optional, and once any of
+            // its children is present its required ones are required.
             let (child_name, occ) = match &particle.element {
                 ElementRef::Inline(decl) => (decl.name.local.as_str(), decl.occurrence),
                 ElementRef::Ref(qn) => (qn.local.as_str(), particle.occurrence),
                 ElementRef::Group(group) => {
                     let selected = self.group_branch_count(group, child_counts);
                     branch_total += selected;
-                    if particle.occurrence.min >= 1 && selected == 0 {
+                    // A choice with no branch has nothing to name as
+                    // missing; any other group reports its own required
+                    // children below.
+                    let is_choice_group = matches!(**group, ContentModel::Choice(_));
+                    if is_choice_group && particle.occurrence.min >= 1 && selected == 0 {
                         self.push_error(
                             ValidationSeverity::Error,
                             "required choice group has no selected branch".to_string(),
@@ -917,17 +976,26 @@ impl<'m> ValidationContext<'m> {
 
 /// Whether a start tag carries `xsi:nil` with a true value.
 ///
-/// Any prefixed `nil` attribute is taken for it; an unprefixed `nil` is the
-/// document's own attribute. Duplicate checking is skipped: it is quadratic
-/// in the number of attributes.
-fn says_nil(start: &BytesStart<'_>) -> bool {
+/// The attribute is `nil` under a prefix that `namespaces`, the declarations
+/// in scope with the element's own included, binds to the XML Schema instance
+/// namespace. A `nil` under any other prefix, under a prefix that is not
+/// declared, or without a prefix is the document's own attribute. Duplicate
+/// checking is skipped: it is quadratic in the number of attributes.
+fn says_nil(start: &BytesStart<'_>, namespaces: &[PrefixBinding]) -> bool {
     start
         .attributes()
         .with_checks(false)
         .flatten()
         .any(|attribute| {
-            attribute.key.as_ref().ends_with(b":nil")
-                && matches!(attribute.value.as_ref().trim_ascii(), b"true" | b"1")
+            let Some(prefix) = attribute.key.as_ref().strip_suffix(b":nil") else {
+                return false;
+            };
+            matches!(attribute.value.as_ref().trim_ascii(), b"true" | b"1")
+                && namespaces
+                    .iter()
+                    .rev()
+                    .find(|binding| binding.prefix == prefix)
+                    .is_some_and(|binding| binding.is_instance)
         })
 }
 

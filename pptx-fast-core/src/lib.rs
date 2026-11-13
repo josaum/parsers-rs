@@ -111,6 +111,26 @@ impl Default for ParseOptions {
     }
 }
 
+/// The entries of `map` in key order.
+///
+/// A `HashMap` iterates in an order that changes from one process to the
+/// next, so anything written from one (JSON, NDJSON, Arrow rows) goes
+/// through here: the same input must give the same bytes every time.
+pub(crate) fn sorted_entries<V>(map: &HashMap<String, V>) -> Vec<(&String, &V)> {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    entries
+}
+
+/// Serializes a map with its keys in order; see [`sorted_entries`].
+fn serialize_sorted_map<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    V: Serialize,
+{
+    serializer.collect_map(sorted_entries(map))
+}
+
 /// Document metadata from core, app, and custom properties.
 ///
 /// Corresponds to `docProps/core.xml`, `docProps/app.xml`, and
@@ -118,10 +138,13 @@ impl Default for ParseOptions {
 #[derive(Debug, Serialize, Default)]
 pub struct Metadata {
     /// Dublin Core properties (title, creator, subject, etc.).
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub core: HashMap<String, String>,
     /// Application properties (Application, AppVersion, etc.).
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub app: HashMap<String, String>,
     /// Custom document properties defined by the user.
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub custom: HashMap<String, String>,
 }
 

@@ -27,9 +27,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
-    capability_json, descriptor_to_request, do_put_unsupported, parse_writer_policies_for_process,
-    ticket_to_request, FlightIpcDirection, FlightIpcObservationGuard, FlightQuery,
-    FlightRequestAuthVerifier, FlightRpcAction, ParserRoute, CAPABILITY_ACTION,
+    capability_json, descriptor_path_and_query, do_put_unsupported, parse_query,
+    parse_writer_policies_for_process, resolve_path, root_relative_status, ticket_path_and_query,
+    FlightIpcDirection, FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction,
+    ParserRoute, CAPABILITY_ACTION,
 };
 
 /// Everything that differs between two servers built on [`TableFlightService`].
@@ -74,6 +75,42 @@ pub trait TableParser: Send + Sync + 'static {
     ) -> anyhow::Result<()>
     where
         F: FnMut(RecordBatch) -> anyhow::Result<()>;
+
+    /// Whether GetSchema looks at its descriptor. A server with one schema
+    /// for every file can answer without it, and then answers for a file
+    /// that does not exist as well.
+    const GET_SCHEMA_READS_DESCRIPTOR: bool = true;
+
+    /// Apply a request's raw query string (empty when there is none) to the
+    /// table choice and to this request's copy of the options. It runs before
+    /// the path is looked up, so a malformed query is reported first.
+    ///
+    /// The default understands `table`, `batch`/`batch_size` and
+    /// `max_inflate`, and ignores every other key.
+    fn apply_query(
+        query: &str,
+        table: &mut Option<String>,
+        parse_options: &mut Self::ParseOptions,
+        arrow_options: &mut Self::ArrowOptions,
+    ) -> Result<(), Status> {
+        let query = parse_query(query)?;
+        if let Some(batch_size) = query.batch_size {
+            Self::set_batch_size(arrow_options, batch_size);
+        }
+        if let Some(max_inflate) = query.max_inflate {
+            Self::set_max_inflate(parse_options, max_inflate);
+        }
+        *table = query.table;
+        Ok(())
+    }
+}
+
+/// One request after its query has been applied and its path looked up.
+struct Resolved<P: TableParser> {
+    path: PathBuf,
+    table: String,
+    parse_options: P::ParseOptions,
+    arrow_options: P::ArrowOptions,
 }
 
 /// The Flight service itself. The fields are public so a binary's tests can
@@ -104,6 +141,86 @@ impl<P: TableParser> Clone for TableFlightService<P> {
 impl<P: TableParser> TableFlightService<P> {
     fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
         self.auth_verifier.verify_metadata(request.metadata())
+    }
+
+    /// Query first, then the path, then the table name: the order in which
+    /// a request with several faults has always been answered.
+    fn resolve(&self, path: &Path, query: &str) -> Result<Resolved<P>, Status> {
+        let mut table = None;
+        let mut parse_options = self.parse_options;
+        let mut arrow_options = self.arrow_options.clone();
+        P::apply_query(query, &mut table, &mut parse_options, &mut arrow_options)?;
+        let path = resolve_path(&self.root, path)?;
+        if let Some(table) = table.as_deref() {
+            if !P::list_tables().contains(&table) {
+                return Err(Status::invalid_argument("unknown table"));
+            }
+        }
+        Ok(Resolved {
+            path,
+            table: table.unwrap_or_else(|| P::DEFAULT_TABLE.to_string()),
+            parse_options,
+            arrow_options,
+        })
+    }
+
+    fn resolve_descriptor(&self, descriptor: &FlightDescriptor) -> Result<Resolved<P>, Status> {
+        let (path, query) = descriptor_path_and_query(descriptor)?;
+        self.resolve(&path, &query)
+    }
+
+    fn resolve_ticket(&self, ticket: &Ticket) -> Result<Resolved<P>, Status> {
+        let (path, query) = ticket_path_and_query(ticket)?;
+        self.resolve(Path::new(path), query)
+    }
+
+    /// Parse the file on its own thread and stream the batches of one table.
+    fn stream(
+        &self,
+        request: Resolved<P>,
+        observation: FlightIpcObservationGuard,
+    ) -> Result<Response<BoxStream<'static, Result<FlightData, Status>>>, Status> {
+        let Resolved {
+            path,
+            table,
+            parse_options,
+            arrow_options,
+        } = request;
+        let schema =
+            P::schema_for_table(&table).ok_or_else(|| Status::invalid_argument("unknown table"))?;
+
+        let (tx, rx) =
+            mpsc::channel::<std::result::Result<arrow_array::RecordBatch, FlightError>>(2);
+
+        std::thread::spawn(move || {
+            let result =
+                P::parse_table_batches(&path, parse_options, arrow_options, &table, |batch| {
+                    tx.blocking_send(Ok(batch))
+                        .map_err(|_| anyhow!("flight client dropped"))?;
+                    Ok(())
+                });
+            if let Err(err) = result {
+                let io_err = std::io::Error::other(err);
+                let _ = tx.blocking_send(Err(FlightError::from_external_error(Box::new(io_err))));
+            }
+        });
+
+        let batch_stream = ReceiverStream::new(rx);
+        let write_options = self.write_options.clone();
+        let flight_stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .with_options(write_options)
+            .build(batch_stream);
+
+        // A parser names the file by its path on the server; the caller
+        // only ever sees it the way the ticket spelled it.
+        let root = self.root.clone();
+        let output = crate::observe_flight_stream(
+            flight_stream
+                .map(move |res| res.map_err(|err| root_relative_status(to_status(err), &root))),
+            observation,
+        );
+        Ok(Response::new(output))
     }
 }
 
@@ -266,11 +383,11 @@ impl<P: TableParser> FlightService for TableFlightService<P> {
     ) -> Result<Response<FlightInfo>, Status> {
         self.authorize(&request)?;
         let descriptor = request.into_inner();
-        let (_path, query) = descriptor_to_request(&self.root, &descriptor)?;
-        ensure_query_supported::<P>(&query)?;
-        let table = query.table.as_deref().unwrap_or(P::DEFAULT_TABLE);
+        let Resolved {
+            path: _path, table, ..
+        } = self.resolve_descriptor(&descriptor)?;
         let schema =
-            P::schema_for_table(table).ok_or_else(|| Status::invalid_argument("unknown table"))?;
+            P::schema_for_table(&table).ok_or_else(|| Status::invalid_argument("unknown table"))?;
         let ticket = Ticket::new(path_to_ticket(&self.root, &_path));
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
         let mut info = FlightInfo::new()
@@ -286,8 +403,9 @@ impl<P: TableParser> FlightService for TableFlightService<P> {
 
     async fn poll_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
+        self.authorize(&request)?;
         Err(Status::unimplemented("poll_flight_info"))
     }
 
@@ -296,12 +414,13 @@ impl<P: TableParser> FlightService for TableFlightService<P> {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
         self.authorize(&request)?;
-        let descriptor = request.into_inner();
-        let (_path, query) = descriptor_to_request(&self.root, &descriptor)?;
-        ensure_query_supported::<P>(&query)?;
-        let table = query.table.as_deref().unwrap_or(P::DEFAULT_TABLE);
+        let table = if P::GET_SCHEMA_READS_DESCRIPTOR {
+            self.resolve_descriptor(&request.into_inner())?.table
+        } else {
+            P::DEFAULT_TABLE.to_string()
+        };
         let schema =
-            P::schema_for_table(table).ok_or_else(|| Status::invalid_argument("unknown table"))?;
+            P::schema_for_table(&table).ok_or_else(|| Status::invalid_argument("unknown table"))?;
         let options = IpcWriteOptions::default();
         let schema_ipc = arrow_flight::SchemaAsIpc::new(schema.as_ref(), &options);
         let result = SchemaResult::try_from(schema_ipc).map_err(to_status)?;
@@ -318,56 +437,17 @@ impl<P: TableParser> FlightService for TableFlightService<P> {
             FlightIpcDirection::Read,
             FlightRpcAction::DoGet,
         );
-        let ticket = request.into_inner();
-        let (path, query) = ticket_to_request(&self.root, &ticket)?;
-        ensure_query_supported::<P>(&query)?;
-        let table = query
-            .table
-            .as_deref()
-            .unwrap_or(P::DEFAULT_TABLE)
-            .to_string();
-
-        let mut parse_options = self.parse_options;
-        let mut arrow_options = self.arrow_options.clone();
-        apply_query_overrides::<P>(&query, &mut parse_options, &mut arrow_options)?;
-
-        let schema =
-            P::schema_for_table(&table).ok_or_else(|| Status::invalid_argument("unknown table"))?;
-
-        let (tx, rx) =
-            mpsc::channel::<std::result::Result<arrow_array::RecordBatch, FlightError>>(2);
-
-        std::thread::spawn(move || {
-            let result =
-                P::parse_table_batches(&path, parse_options, arrow_options, &table, |batch| {
-                    tx.blocking_send(Ok(batch))
-                        .map_err(|_| anyhow!("flight client dropped"))?;
-                    Ok(())
-                });
-            if let Err(err) = result {
-                let io_err = std::io::Error::other(err);
-                let _ = tx.blocking_send(Err(FlightError::from_external_error(Box::new(io_err))));
-            }
-        });
-
-        let batch_stream = ReceiverStream::new(rx);
-        let write_options = self.write_options.clone();
-        let flight_stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .with_options(write_options)
-            .build(batch_stream);
-
-        let output = crate::observe_flight_stream(
-            flight_stream.map(|res| res.map_err(to_status)),
-            observation,
-        );
-        Ok(Response::new(output))
+        let request = self.resolve_ticket(&request.into_inner())?;
+        self.stream(request, observation)
     }
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        // The bearer is checked first: an unauthenticated caller learns
+        // nothing about the server, not even that it is read-only.
+        self.authorize(&request)?;
         Err(do_put_unsupported())
     }
 
@@ -393,58 +473,16 @@ impl<P: TableParser> FlightService for TableFlightService<P> {
             while let Ok(Some(_)) = inbound.message().await {}
         });
 
-        let (path, query) = if let Some(descriptor) = first.flight_descriptor {
-            descriptor_to_request(&self.root, &descriptor)?
+        let request = if let Some(descriptor) = first.flight_descriptor {
+            self.resolve_descriptor(&descriptor)?
         } else if !first.app_metadata.is_empty() {
-            let ticket = Ticket::new(first.app_metadata);
-            ticket_to_request(&self.root, &ticket)?
+            self.resolve_ticket(&Ticket::new(first.app_metadata))?
         } else {
             return Err(Status::invalid_argument(
                 "exchange requires descriptor or app_metadata path",
             ));
         };
-
-        ensure_query_supported::<P>(&query)?;
-        let table = query
-            .table
-            .as_deref()
-            .unwrap_or(P::DEFAULT_TABLE)
-            .to_string();
-
-        let mut parse_options = self.parse_options;
-        let mut arrow_options = self.arrow_options.clone();
-        apply_query_overrides::<P>(&query, &mut parse_options, &mut arrow_options)?;
-
-        let schema =
-            P::schema_for_table(&table).ok_or_else(|| Status::invalid_argument("unknown table"))?;
-
-        let (tx, rx) =
-            mpsc::channel::<std::result::Result<arrow_array::RecordBatch, FlightError>>(2);
-        std::thread::spawn(move || {
-            let result =
-                P::parse_table_batches(&path, parse_options, arrow_options, &table, |batch| {
-                    tx.blocking_send(Ok(batch))
-                        .map_err(|_| anyhow!("flight client dropped"))?;
-                    Ok(())
-                });
-            if let Err(err) = result {
-                let io_err = std::io::Error::other(err);
-                let _ = tx.blocking_send(Err(FlightError::from_external_error(Box::new(io_err))));
-            }
-        });
-
-        let batch_stream = ReceiverStream::new(rx);
-        let write_options = self.write_options.clone();
-        let flight_stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .with_options(write_options)
-            .build(batch_stream);
-
-        let output = crate::observe_flight_stream(
-            flight_stream.map(|res| res.map_err(to_status)),
-            observation,
-        );
-        Ok(Response::new(output))
+        self.stream(request, observation)
     }
 
     async fn do_action(
@@ -538,29 +576,6 @@ fn has_parser_extension<P: TableParser>(path: &Path) -> bool {
         None => return false,
     };
     P::EXTENSIONS.contains(&ext.as_str())
-}
-
-fn ensure_query_supported<P: TableParser>(query: &FlightQuery) -> Result<(), Status> {
-    if let Some(table) = query.table.as_deref() {
-        if !P::list_tables().contains(&table) {
-            return Err(Status::invalid_argument("unknown table"));
-        }
-    }
-    Ok(())
-}
-
-fn apply_query_overrides<P: TableParser>(
-    query: &FlightQuery,
-    parse_options: &mut P::ParseOptions,
-    arrow_options: &mut P::ArrowOptions,
-) -> Result<(), Status> {
-    if let Some(batch_size) = query.batch_size {
-        P::set_batch_size(arrow_options, batch_size);
-    }
-    if let Some(max_inflate) = query.max_inflate {
-        P::set_max_inflate(parse_options, max_inflate);
-    }
-    Ok(())
 }
 
 fn to_status(err: impl std::fmt::Display) -> Status {

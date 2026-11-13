@@ -14,7 +14,7 @@ use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 use rawzip::{CompressionMethod, ZipArchive, ZipArchiveEntryWayfinder, ZipSliceArchive};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read};
 use std::ops::Deref;
@@ -81,7 +81,9 @@ struct EntryMeta {
 #[derive(Debug)]
 pub struct OoxmlArchive {
     archive: ZipSliceArchive<ArchiveStorage>,
-    entries: HashMap<String, EntryMeta>,
+    /// Ordered by name, so [`OoxmlArchive::part_names`] is sorted without
+    /// sorting on each call.
+    entries: BTreeMap<String, EntryMeta>,
     inflate_budget: SharedInflateBudget,
 }
 
@@ -143,7 +145,11 @@ impl OoxmlArchive {
         self.entries.contains_key(name)
     }
 
-    /// Central-directory part names, in hash order.
+    /// Central-directory part names, sorted byte by byte.
+    ///
+    /// A caller that walks the parts meets them in the same order every
+    /// time, so what it collects, and which part it reports a failure for,
+    /// does not vary from one process to the next.
     pub fn part_names(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
     }
@@ -529,8 +535,8 @@ fn local_name(name: &[u8]) -> &[u8] {
     }
 }
 
-fn build_index(archive: &ZipSliceArchive<ArchiveStorage>) -> Result<HashMap<String, EntryMeta>> {
-    let mut map = HashMap::new();
+fn build_index(archive: &ZipSliceArchive<ArchiveStorage>) -> Result<BTreeMap<String, EntryMeta>> {
+    let mut map = BTreeMap::new();
     let mut seen: u64 = 0;
     for entry_result in archive.entries() {
         let entry = entry_result.map_err(|err| anyhow!("read zip entry: {err}"))?;
