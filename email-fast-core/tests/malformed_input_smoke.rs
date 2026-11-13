@@ -519,21 +519,26 @@ fn unended_encoded_words(count: usize) -> String {
     " =?a?=x".repeat(count)
 }
 
-/// `mailparse` searches such a line once per word, and each step of each
-/// search walks the line from its start: 600 words took half a minute in an
-/// unoptimized build, and 4,000 would take hours. The line is refused
-/// wherever `mailparse` would decode it: in a header this crate asks for, in
-/// the `Content-Type` it reads while splitting the message, and in the
-/// headers of a part.
+/// `mailparse` walks a header line from its start for every `=?` and `?=`
+/// it examines, and searches a line of unended words once per word: 300 of
+/// those took 3.7 s in an unoptimized build, and 4,000 would take hours.
+/// Such lines are refused wherever `mailparse` would decode them: in a
+/// header this crate asks for, in the `Content-Type` it reads while
+/// splitting the message, and in the headers of a part.
 #[test]
 fn header_lines_that_are_costly_to_decode_are_refused() {
-    let words = unended_encoded_words(4_000);
+    let unended = unended_encoded_words(4_000);
+    let nested =
+        String::from_utf8(smoke::nested(b"=?UTF-8?Q?", b"x", b"?=", 100_000)).expect("ASCII");
+    let adjacent = " =?UTF-8?Q?x?=".repeat(100_000);
     let cases = [
-        format!("Subject:{words}\r\n\r\nbody\r\n"),
-        format!("Content-Type: text/plain;{words}\r\n\r\nbody\r\n"),
+        format!("Subject:{unended}\r\n\r\nbody\r\n"),
+        format!("Subject: {nested}\r\n\r\nbody\r\n"),
+        format!("Subject:{adjacent}\r\n\r\nbody\r\n"),
+        format!("Content-Type: text/plain;{unended}\r\n\r\nbody\r\n"),
         format!(
             "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\
-             Content-Disposition: inline;{words}\r\n\r\ntext\r\n--b--\r\n"
+             Content-Disposition: inline;{unended}\r\n\r\ntext\r\n--b--\r\n"
         ),
     ];
     for message in cases {
@@ -546,6 +551,23 @@ fn header_lines_that_are_costly_to_decode_are_refused() {
             "refusing took {:?}",
             started.elapsed()
         );
+    }
+}
+
+/// An unfolded `To:` of 2,000 properly encoded recipients is ordinary work
+/// for `mailparse` (a few milliseconds optimized), with or without a raw
+/// non-ASCII character on the line, and base64 padding (`==?=`) does not
+/// count as the start of a word.
+#[test]
+fn a_long_unfolded_recipient_line_still_parses() {
+    let recipients = "=?UTF-8?B?eA==?= <a@example.com>, ".repeat(2_000);
+    for first in ["J <j@example.com>", "J\u{e9} <j@example.com>"] {
+        let message = format!("To: {recipients}{first}\r\nSubject: s\r\n\r\nbody\r\n");
+        let email = parse_eml_bytes(message.as_bytes(), ParseOptions::default())
+            .expect("a long recipient line parses");
+        assert_eq!(email.to.len(), 2_001, "{first}");
+        assert_eq!(email.to[0].name.as_deref(), Some("x"));
+        assert_eq!(email.to[0].address, "a@example.com");
     }
 }
 
