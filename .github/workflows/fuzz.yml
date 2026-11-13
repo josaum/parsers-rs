@@ -88,22 +88,24 @@ jobs:
   miri:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    # The digit scan test makes about 175,000 calls, and the interpreter is
-    # some hundreds of times slower than the machine.
-    timeout-minutes: 120
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the dated nightly with Miri
         run: rustup toolchain install "$NIGHTLY" --profile minimal --component miri --component rust-src
-      # The runner is x86_64, so these interpret the SSE2 scans; the NEON
-      # twins are interpreted by naming an aarch64 target.
+      # Each crate has a test of its scan small enough for the interpreter
+      # (tests/digit_scan.rs, tests/obj_marker_scan.rs); the larger unit tests
+      # would take it most of an hour. The runner is x86_64, so the first
+      # command of each pair interprets the SSE2 scan and the second, by
+      # naming an aarch64 target, the NEON one. The AVX2 digit scan is not
+      # interpreted: it is chosen at run time, and Miri reports no AVX2.
       - name: The digit scan of xlsx-fast-core
         run: |
           set -euo pipefail
-          cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --lib find_first_digit
-          cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --lib find_first_digit --target aarch64-unknown-linux-gnu
+          cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --test digit_scan
+          cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --test digit_scan --target aarch64-unknown-linux-gnu
       - name: The object marker scan of pdf-fast-core
         run: |
           set -euo pipefail

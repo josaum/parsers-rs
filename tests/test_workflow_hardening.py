@@ -695,7 +695,20 @@ def assert_fuzz_contract(fuzz: str, ci: str | None = None, release: str | None =
         assert job_value(blocks[name], "if") == "github.event_name != 'pull_request'"
         assert len(re.findall(r"^\s*(?:- )?if:", blocks[name], re.MULTILINE)) == 1
     assert "--component miri" in blocks["miri"]
-    assert len(re.findall(r'cargo "\+\$NIGHTLY" miri test --locked ', blocks["miri"])) == 4
+    # Each interpreted test exists, and runs for both instruction sets.
+    interpreted = re.findall(
+        r'cargo "\+\$NIGHTLY" miri test --locked -p (\S+) --test (\S+)( --target aarch64-unknown-linux-gnu)?$',
+        blocks["miri"],
+        re.MULTILINE,
+    )
+    assert len(interpreted) == 4 and len(set(interpreted)) == 4
+    assert blocks["miri"].count("miri test") == 4
+    for crate, test, _ in interpreted:
+        assert (ROOT / crate / "tests" / f"{test}.rs").is_file(), f"{crate}: no test named {test}"
+    assert {(crate, test) for crate, test, _ in interpreted} == {
+        ("xlsx-fast-core", "digit_scan"),
+        ("pdf-fast-core", "obj_marker_scan"),
+    }
     assert '        run: cargo "+$MSRV" check --workspace --locked\n' in blocks["msrv"]
 
 
@@ -1100,6 +1113,8 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_fuzz_contract, FUZZ, "  msrv:\n    if: github.event_name != 'pull_request'\n", "  msrv:\n    if: false\n"),
         (assert_fuzz_contract, FUZZ, "    timeout-minutes: 60\n", "    timeout-minutes: 60\n    continue-on-error: true\n"),
         (assert_fuzz_contract, FUZZ, "  miri:\n", "  rust:\n"),
+        (assert_fuzz_contract, FUZZ, "--test digit_scan --target aarch64-unknown-linux-gnu", "--test digit_scan"),
+        (assert_fuzz_contract, FUZZ, "--test obj_marker_scan\n", "--test absent\n"),
         (assert_installers_are_pinned, FUZZ, "cargo install cargo-fuzz --locked --version 0.13.2", "cargo install cargo-fuzz"),
         (assert_every_job_has_a_timeout, FUZZ, "    timeout-minutes: 60\n", ""),
         (assert_least_privilege, FUZZ, "permissions:\n  contents: read", "permissions:\n  contents: write"),
