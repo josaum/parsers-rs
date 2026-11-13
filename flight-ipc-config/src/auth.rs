@@ -888,33 +888,44 @@ UqpDbPztzm7Q5NrtrIeIedhgEcgdviEF9vZoXGVQRj+NOxoxsp0jQA90
         }
     }
 
-    /// Signs `claim` with the test HS256 secret under a hand-written header.
-    fn sign_hs256_with_header(claim: &CanonicalPythonAccessClaim, header: &str) -> String {
+    /// Signs `claim` with an HS256 `secret` under a hand-written header.
+    fn sign_hs256_with_header(
+        claim: &CanonicalPythonAccessClaim,
+        header: &str,
+        secret: &[u8],
+    ) -> String {
         let valid = sign_hs256(claim, b"test-only-secret");
         let signing_input = format!("{header}.{}", claims_segment(&valid));
         let signature = jsonwebtoken::crypto::sign(
             signing_input.as_bytes(),
-            &EncodingKey::from_secret(b"test-only-secret"),
+            &EncodingKey::from_secret(secret),
             Algorithm::HS256,
         )
         .unwrap();
         format!("{signing_input}.{signature}")
     }
 
-    /// jsonwebtoken 10 reads unregistered header parameters as strings, so a
-    /// header with any other value there fails to decode. jsonwebtoken 11
-    /// accepts any JSON value; this pins the refusal until that is decided.
+    /// An unregistered header parameter may hold any JSON value; it does not
+    /// stand in for any check. jsonwebtoken 10 refused a non-string one while
+    /// decoding the header, a quirk of its string-only map that 11 dropped.
     #[test]
-    fn tokens_whose_header_has_a_non_string_extra_parameter_are_refused() {
-        let claim = canonical_python_claim(now_secs());
+    fn a_signed_token_with_a_non_string_header_parameter_is_accepted() {
         // `{"alg":"HS256","typ":"JWT","ver":"1"}`, base64url without padding.
-        let string_extra =
-            sign_hs256_with_header(&claim, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsInZlciI6IjEifQ");
-        verifier().verify_metadata(&bearer(&string_extra)).unwrap();
+        const STRING_VER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsInZlciI6IjEifQ";
         // `{"alg":"HS256","typ":"JWT","ver":1}`, base64url without padding.
-        let number_extra =
-            sign_hs256_with_header(&claim, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsInZlciI6MX0");
-        assert!(verifier().verify_metadata(&bearer(&number_extra)).is_err());
+        const NUMBER_VER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsInZlciI6MX0";
+        let claim = canonical_python_claim(now_secs());
+
+        let string_extra = sign_hs256_with_header(&claim, STRING_VER, b"test-only-secret");
+        verifier().verify_metadata(&bearer(&string_extra)).unwrap();
+        let number_extra = sign_hs256_with_header(&claim, NUMBER_VER, b"test-only-secret");
+        verifier().verify_metadata(&bearer(&number_extra)).unwrap();
+
+        // The same header does not excuse a signature from another key.
+        let wrong_signature = sign_hs256_with_header(&claim, NUMBER_VER, b"another-secret");
+        assert!(verifier()
+            .verify_metadata(&bearer(&wrong_signature))
+            .is_err());
     }
 
     #[test]

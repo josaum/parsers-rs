@@ -960,13 +960,6 @@ def assert_dependabot_contract(dependabot: str) -> None:
         cargo,
         re.MULTILINE,
     ), "tiny-skia 0.12 and later must be ignored until its rendering change is accepted"
-    # jsonwebtoken 11 accepts tokens whose header 10.3 refused; the Flight
-    # servers keep 10 until that is decided.
-    assert re.search(
-        r'^      - dependency-name: "jsonwebtoken"\n        versions:\n          - ">=11"$',
-        cargo,
-        re.MULTILINE,
-    ), "jsonwebtoken 11 and later must be ignored until its wider header acceptance is decided"
     # mailparse 0.18 splits MIME parts differently, and email-fast-core's
     # nesting and header-cost guards replay 0.15's search; it waits for both.
     assert re.search(
@@ -1381,8 +1374,6 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_dependabot_contract, DEPENDABOT, '"napi-derive"\n        versions:\n          - ">=3"', '"napi-derive"\n        versions:\n          - ">=3.1"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "tiny-skia"\n', '      - dependency-name: "tiny-skia-path"\n'),
         (assert_dependabot_contract, DEPENDABOT, '          - ">=0.12"', '          - ">=0.13"'),
-        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "jsonwebtoken"\n        versions:\n          - ">=11"\n', ""),
-        (assert_dependabot_contract, DEPENDABOT, '"jsonwebtoken"\n        versions:\n          - ">=11"', '"jsonwebtoken"\n        versions:\n          - ">=12"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "mailparse"\n        versions:\n          - ">=0.16"\n', ""),
         (assert_dependabot_contract, DEPENDABOT, '"mailparse"\n        versions:\n          - ">=0.16"', '"mailparse"\n        versions:\n          - ">=0.19"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "arrow*"\n', '      - dependency-name: "arrow"\n'),

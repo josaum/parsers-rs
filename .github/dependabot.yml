@@ -72,21 +72,6 @@ updates:
       - dependency-name: "arrow*"
         versions:
           - ">=59"
-      # jsonwebtoken 11 reads a token header's unregistered parameters as any
-      # JSON value; 10.3 read them as strings only. A correctly signed token
-      # whose header carries a number, list or object there (`"ver":1`) was
-      # refused by the Flight servers and 11 accepts it: on 2026-11-13
-      # flight-ipc-config's
-      # `tokens_whose_header_has_a_non_string_extra_parameter_are_refused`
-      # failed on 11.1.0. Nothing else from 10.4 to 11.1 changes how a token
-      # is checked here (algorithms, exp, nbf, aud, iss, leeway and the
-      # `aws_lc_rs` backend are as before), and the six Flight wire
-      # transcripts did not move. Unblocked by a decision to accept such
-      # headers (that test then goes), or by `AuthConfig::validate_bearer`
-      # refusing them itself.
-      - dependency-name: "jsonwebtoken"
-        versions:
-          - ">=11"
       # mailparse 0.18 splits a message differently: it drops the line break
       # before each MIME boundary from the part above it, finds a boundary
       # that ends the message (0.15 missed it), treats every `multipart*`
