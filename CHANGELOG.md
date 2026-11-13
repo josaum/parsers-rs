@@ -4,6 +4,44 @@ Changes a consumer of the wheels, Node packages, crates or Flight servers
 can observe. Each release also has generated notes listing every pull
 request.
 
+## Unreleased
+
+### Changed output
+
+- **json:** a `$ref` or `$dynamicRef` that resolves to nothing is now an
+  error naming the reference, so the document is not accepted, even under
+  `not` or beside a passing `anyOf` branch. It used to be a warning and was
+  skipped, which accepted the value. Nothing is fetched, so a remote
+  reference fails this way unless its document is supplied to the new
+  `json_fast_core::schema::validate_with_resources`, or to the new optional
+  `resources` argument of `json_fast.validate` (Python, keyword-only, a dict
+  from URI to schema text) and of `validate` in `json-fast-node` (a trailing
+  plain object from URI to schema text; anything else throws a `TypeError`).
+  Both bindings take the documents in URI order, so when two claim one URI
+  through `$id` the first by URI order wins, and a document that does not
+  parse raises an error naming its URI. References to the JSON Schema
+  meta-schemas (`json_fast_core::schema::WELL_KNOWN_META_SCHEMAS`) stay a
+  warning and are skipped.
+- **json:** an `$id` or anchor inside `enum`, `const`, `default`,
+  `examples` or an unknown keyword no longer identifies a schema. Two
+  resources with one URI: the first in document order is used, with a
+  warning. Under a draft-04/06/07 `$schema`, an object holding `$ref` sets
+  no base URI and no anchor, except the document root, whose `$id` names
+  the document in every dialect.
+- **json:** validation stops with an error when resolving `$id`s and
+  references needs more than 16 bytes of URI text per byte of schema text
+  (plus 1 MiB), as a long base URI under many relative `$id`s would. A
+  fragment-only reference (`#...`) is charged its fragment only.
+
+### Fixed
+
+- **json:** `$id` base URIs (RFC 3986, including embedded resources),
+  `$anchor` scoped to its resource, and `$dynamicRef`/`$dynamicAnchor` with
+  the 2020-12 dynamic scope are resolved; `unevaluatedProperties` and
+  `unevaluatedItems` see through `$dynamicRef`. The JSON Schema Test Suite's
+  2020-12 core cases go from 1,239 to 1,299 of 1,300. This closes the json
+  known gap listed under v2026.11.13.
+
 ## v2026.11.13
 
 Every crate's patch version moves. The headline is hardening against

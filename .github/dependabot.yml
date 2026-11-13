@@ -34,6 +34,61 @@ updates:
       - dependency-name: "pyo3*"
         versions:
           - ">=0.30"
+      # napi-derive 3 generates code only the napi 3 runtime accepts, so the
+      # two move together or not at all. The workspace keeps napi 2 because
+      # the consumer shells load the `.node` files it builds (Cargo.toml says
+      # why). A trial on 2026-11-13 found nine of the ten Node crates compile
+      # on napi 3 unchanged; geo-fast-node reads typed arrays through
+      # `JsUnknown`, `JsTypedArray` and `JsObject`, which napi 3 removes, and
+      # needs that reader rewritten. Unblocked when the consumer shells accept
+      # a napi 3 build and that rewrite lands with scripts/smoke-node.mjs and
+      # scripts/check-node-types.mjs passing.
+      - dependency-name: "napi"
+        versions:
+          - ">=3"
+      - dependency-name: "napi-derive"
+        versions:
+          - ">=3"
+      # tiny-skia 0.12 rasterizes differently: on 2026-11-13, 12 of the 2551
+      # PNGs pdf-fast-core's tests render came out changed (a two-pixel strip
+      # that 0.11 left white is light grey, 239 of 255), so
+      # `page_rasterized_png` would no longer return the same bytes for the
+      # same page. Unblocked by a review that accepts the new rendering, with
+      # a before-and-after pixel comparison of the raster tests in the
+      # upgrade's pull request.
+      - dependency-name: "tiny-skia"
+        versions:
+          - ">=0.12"
+      # Arrow is pinned to the version the consumers use (Cargo.toml says
+      # why), and flight-ipc-config reports it to them as
+      # CAPABILITY_ARROW_VERSION, so a new major is the consumers' move first.
+      # A trial of 60.1.0 on 2026-11-13 (`cargo check` with the CI Arrow
+      # features) compiles everywhere; pdf-fast-py's
+      # `ArrowArrayStreamReader` is deprecated, which `-D warnings` turns
+      # into an error. Unblocked when the consumers take the new major: move
+      # the five pins, CAPABILITY_ARROW_VERSION and README.md together, rename
+      # that reader, and show the schema snapshots and pyarrow interop pass.
+      # The `arrow-major` group above stays, so that upgrade arrives whole.
+      - dependency-name: "arrow*"
+        versions:
+          - ">=59"
+      # mailparse 0.18 splits a message differently: it drops the line break
+      # before each MIME boundary from the part above it, finds a boundary
+      # that ends the message (0.15 missed it), treats every `multipart*`
+      # type as multipart, splits Content-Type parameters around quoted
+      # semicolons and refuses nesting past 100 levels. On 2026-11-13, 8 of
+      # 14 real .eml files parsed to different JSON (`body` in all 8,
+      # `attachments` in 2), as did 3394 of the 23797 parses email-fast-core's
+      # tests make (`body`, `attachments`, `to`, `cc`, `from`), and
+      # `mime_depth_walk_agrees_with_mailparse` failed: the crate's nesting
+      # walk (`find_bytes`) replays 0.15's boundary search, quirk included,
+      # and its header-cost bound was measured on 0.15. Unblocked by
+      # re-deriving the walk and re-measuring the bound against the new
+      # version, and a review that accepts the new output, with a
+      # before-and-after JSON comparison in the upgrade's pull request.
+      - dependency-name: "mailparse"
+        versions:
+          - ">=0.16"
 
   - package-ecosystem: cargo
     # The repository doctors: a package outside the workspace, with its own

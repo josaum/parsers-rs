@@ -25,3 +25,6 @@ serde_json = { workspace = true }
 [dev-dependencies]
 jsonwebtoken = { workspace = true }
 tempfile = "3.10"
+
+[lints]
+workspace = true

@@ -47,10 +47,16 @@ assert not any(issue["severity"] == "error" for issue in issues)
 
 The package also exposes focused JSON-RPC, JSON:API, JWT, and JSON-LD helpers.
 JSON Schema validation covers the draft-07 through 2020-12 constraint keywords
-(validation, applicator and unevaluated vocabularies, local `$ref`, boolean
-schemas, and a bounded `format` assertion set). Dynamic refs, remote refs,
-unknown formats, and unknown keywords are surfaced as warnings, never silent
-passes. BSON, JSON5, and HJSON remain out of scope. Parse and validation
+(validation, applicator and unevaluated vocabularies, `$ref` and `$dynamicRef`
+with `$id` base URIs and anchors, boolean schemas, and a bounded `format`
+assertion set). A reference that does not resolve inside the schema, including
+any remote one (nothing is fetched), is an error, so the document is not
+accepted, unless `validate(..., resources={uri: schema_text})` supplies the
+document; references to the JSON Schema meta-schemas stay warnings. Supplied
+documents are taken in URI order, so when two claim one URI through `$id` the
+first by URI order wins; one that does not parse raises `RuntimeError` naming
+its URI. Unknown formats and unknown keywords are surfaced as warnings, never
+silent passes. BSON, JSON5, and HJSON remain out of scope. Parse and validation
 failures remain caller-visible rather than yielding a partial result.
 
 ## Verify

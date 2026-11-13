@@ -212,9 +212,21 @@ def test_deprecated_c_data_pointers_import_or_release(pdf_path: str) -> None:
         array_ptr, schema_ptr = call()
         imported = MODULE._import_record_batch_from_c(array_ptr, schema_ptr)
         assert imported.schema.names
+        # Importing freed the pair, so a second release is refused.
+        with pytest.raises(ValueError):
+            MODULE.release_arrow_c_data(array_ptr, schema_ptr)
     # Pointers that are not imported are freed through the release helper.
     array_ptr, schema_ptr = calls[0]()
     assert MODULE.release_arrow_c_data(array_ptr, schema_ptr) is None
+    with pytest.raises(ValueError):
+        MODULE.release_arrow_c_data(array_ptr, schema_ptr)
+
+
+def test_releasing_pointers_this_module_did_not_issue_frees_nothing() -> None:
+    # Two made-up integers used to be passed to Box::from_raw.
+    for array_ptr, schema_ptr in [(1, 2), (0x1000, 0x2000), (0, 0)]:
+        with pytest.raises(ValueError):
+            MODULE.release_arrow_c_data(array_ptr, schema_ptr)
 
 
 def test_fast_pdf_page_scanner_reuses_one_open_document(pdf_path: str) -> None:
@@ -398,6 +410,37 @@ def test_a_page_out_of_range_raises(pdf_path: str) -> None:
             call()
     with pytest.raises((OverflowError, TypeError)):
         scanner.page_table_layout_arrow_ipc(-1)
+
+
+def test_ocr_arrow_batches_with_missing_or_mistyped_columns_are_refused(
+    pdf_path: str, tmp_path: Path
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    only_text = pa.record_batch([pa.array(["x"])], names=["text"])
+    text_x = pa.record_batch([pa.array(["x"]), pa.array([1.0])], names=["text", "px_x"])
+    mistyped = pa.record_batch(
+        [pa.array(["x"]), pa.array(["1"]), pa.array([1.0]), pa.array([2.0])],
+        names=["text", "px_x", "px_y", "px_height"],
+    )
+    # The `scan_*` forms check the batch before they open the document, so a
+    # path that does not exist still reports the column.
+    absent = str(tmp_path / "absent.pdf")
+    scanner = MODULE.PdfScanner(pdf_path)
+    calls = [
+        lambda batch: MODULE.parse_pdf_page_table_from_ocr_arrow_ipc(pdf_path, 0, batch),
+        lambda batch: MODULE.parse_pdf_page_table_layout_from_ocr_arrow_ipc(pdf_path, 0, batch),
+        lambda batch: MODULE.parse_pdf_page_table_from_ocr_arrow_ipc(absent, 0, batch),
+        lambda batch: MODULE.parse_pdf_page_table_layout_from_ocr_arrow_ipc(absent, 0, batch),
+        lambda batch: scanner.page_table_from_ocr_arrow_ipc(0, batch),
+        lambda batch: scanner.page_table_layout_from_ocr_arrow_ipc(0, batch),
+    ]
+    for call in calls:
+        with pytest.raises(ValueError, match="missing required column 'px_x'"):
+            call(only_text)
+        with pytest.raises(ValueError, match="missing required column 'px_y'"):
+            call(text_x)
+        with pytest.raises(ValueError, match="column 'px_x' must be Float32 or Float64"):
+            call(mistyped)
 
 
 def test_malformed_ocr_runs_raise(pdf_path: str) -> None:

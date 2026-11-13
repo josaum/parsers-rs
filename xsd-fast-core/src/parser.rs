@@ -96,6 +96,14 @@ pub struct SchemaSet {
 
 impl SchemaSet {
     /// Load a schema from disk, following `xs:include` / `xs:import` relative paths.
+    ///
+    /// Each schema file is memory-mapped read-only while it is parsed and
+    /// unmapped before this returns. No schema file may be modified or
+    /// truncated, by this process or any other, while the call runs. Nothing
+    /// here can enforce that: a truncated file makes reads of the mapping
+    /// fault (`SIGBUS` on Unix), and a modified one changes the bytes being
+    /// parsed. Read the files yourself and use [`Self::load_bytes`] when
+    /// another writer may touch them.
     pub fn load(path: impl AsRef<Path>, options: ParseOptions) -> Result<Self> {
         let path = path
             .as_ref()
@@ -246,7 +254,15 @@ impl Loader {
         };
         let file =
             std::fs::File::open(&canon).with_context(|| format!("open: {}", canon.display()))?;
-        // Safety: file is not modified while mapped; XSD files are small.
+        // SAFETY: `Mmap::map` is unsafe because the mapping is only sound
+        // while no one modifies or truncates the file, and no code here can
+        // enforce that: a truncated schema makes reads of the mapping fault
+        // (`SIGBUS` on Unix), a modified one changes the bytes being parsed.
+        // `SchemaSet::load`, the one public entry point that reads schemas
+        // from disk, states the contract that the caller must not let those
+        // files change while they are parsed. Within this process the mapping
+        // is read-only and never written through; `load_file` parses it and
+        // drops it before `SchemaSet::load` returns.
         let mmap =
             unsafe { Mmap::map(&file) }.with_context(|| format!("mmap: {}", canon.display()))?;
         self.charge_schema_bytes(mmap.len())?;

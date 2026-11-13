@@ -7,7 +7,10 @@ mod smoke;
 
 mod common;
 
-use common::{build, page, revision, simple_document, stream, text_stream, Revision};
+use common::{
+    build, compressed_document, page, revision, simple_document, stream, text_stream, Revision,
+    Rows,
+};
 use pdf_fast_core::{ParseOptions, PdfDocument};
 use pdf_fast_write::PdfWriter;
 
@@ -87,7 +90,12 @@ fn extract_and_read_back(source: &[u8]) {
 
 #[test]
 fn the_seed_documents_are_extracted() {
-    for seed in [revised_document(), simple_document(3)] {
+    for seed in [
+        revised_document(),
+        simple_document(3),
+        compressed_document(3, Rows::Raw),
+        compressed_document(3, Rows::FlateUp),
+    ] {
         let output = PdfWriter::extract_pages_from_bytes(&seed, &[2, 1, 1])
             .unwrap_or_else(|error| panic!("seed extracts: {error:#}"));
         let document = PdfDocument::from_slice(&output, ParseOptions::default()).expect("opens");
@@ -97,7 +105,14 @@ fn the_seed_documents_are_extracted() {
 
 #[test]
 fn mutated_documents_never_panic_and_always_read_back() {
-    let seeds = [revised_document(), simple_document(3)];
+    // The unfiltered compressed seed lets mutations reach the parsing of
+    // cross-reference and object streams instead of dying in inflate.
+    let seeds = [
+        revised_document(),
+        simple_document(3),
+        compressed_document(3, Rows::Raw),
+        compressed_document(3, Rows::FlateUp),
+    ];
     smoke::assert_no_panics(
         "pdf-fast-write source",
         &seeds,
@@ -156,6 +171,12 @@ fn hostile_structures_are_bounded_on_a_small_stack() {
         kids_cycle,
         huge_subsection,
         page(2, 4, "").repeat(1_000),
+        String::from_utf8_lossy(&compressed_document(2, Rows::Raw))
+            .replace("/Index [", "/Index [0 4294967295 ")
+            .into_bytes(),
+        String::from_utf8_lossy(&compressed_document(2, Rows::Raw))
+            .replace("/W [1 4 2]", "/W [8 8 8]")
+            .into_bytes(),
     ];
     for case in cases {
         smoke::run_on_small_stack(move || extract_and_read_back(&case));

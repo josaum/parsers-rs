@@ -7,7 +7,7 @@
 //! |-----------------|-------------------------|-------|
 //! | JSON (6 types)  | [`parse`], [`parse_value`], [`stringify()`], [`types`] | SIMD via sonic-rs |
 //! | JSONL / NDJSON  | [`jsonl`]               | line-delimited streaming |
-//! | JSON Schema     | [`schema`]              | draft-07 through 2020-12 constraint keywords, local `$ref`, allocation-free walk |
+//! | JSON Schema     | [`schema`]              | draft-07 through 2020-12 constraint keywords, `$ref`/`$dynamicRef` with `$id` base URIs, fail-closed on unresolvable references |
 //! | JSON-RPC 2.0    | [`jsonrpc`]             | request / response envelopes |
 //! | JSON:API        | [`jsonapi`]             | resource envelope (`data` XOR `errors`) |
 //! | JWK / JWT       | [`jwt`]                 | header/payload split + base64url decode (no crypto) |
@@ -90,6 +90,10 @@ pub struct JsonLimits {
     /// Maximum non-blank records in one JSONL batch.
     pub max_records: usize,
     /// Maximum conservative retained bytes for parsed values.
+    ///
+    /// Estimated before parsing as the input length plus 64 bytes per token,
+    /// an upper bound on what the parsed values hold. Even `[]` counts as
+    /// 66 bytes, so a limit below that refuses every document.
     pub max_retained_bytes: usize,
     /// Maximum bytes in one returned Arrow IPC stream.
     pub max_ipc_bytes: usize,
@@ -274,12 +278,20 @@ use std::path::Path;
 /// value owns its own storage, so the mapping is dropped on return.
 ///
 /// Resource limits apply before the parse, exactly as for [`parse_with_limits`].
+///
+/// The file must not be modified or truncated, by this process or any other,
+/// while the call runs. Nothing here can enforce that: a truncated file makes
+/// reads of the mapping fault (`SIGBUS` on Unix), and a modified one changes
+/// the bytes being parsed. Read the file yourself and parse the bytes when
+/// another writer may touch it.
 #[cfg(feature = "mmap")]
 pub fn parse_file(path: impl AsRef<Path>) -> Result<serde_json::Value> {
     parse_file_with_limits(path, &JsonLimits::default())
 }
 
 /// [`parse_file`] after enforcing explicit resource limits.
+///
+/// The file must not change while the call runs, as for [`parse_file`].
 #[cfg(feature = "mmap")]
 pub fn parse_file_with_limits(
     path: impl AsRef<Path>,
@@ -288,9 +300,14 @@ pub fn parse_file_with_limits(
     let path = path.as_ref();
     let file = std::fs::File::open(path)
         .map_err(|e| JsonError::Structure(format!("cannot open {}: {e}", path.display())))?;
-    // SAFETY: the mapping is read-only and lives until the parse completes;
-    // the mapping itself holds the file handle. Concurrent truncation of the
-    // file is the caller's hazard, as with any mmap consumer.
+    // SAFETY: `Mmap::map` is unsafe because the mapping is only sound while
+    // no one modifies or truncates the file, which no code here can enforce:
+    // truncation makes reads fault (`SIGBUS` on Unix), modification changes
+    // the bytes under `input`. The crate states that contract on this
+    // function and on `parse_file`: the caller must not let the file change
+    // during the call. Within this process the mapping is read-only, never
+    // written through, and dropped before this returns; the parsed value owns
+    // its own storage.
     let map = unsafe { memmap2::Mmap::map(&file) }
         .map_err(|e| JsonError::Structure(format!("cannot map {}: {e}", path.display())))?;
     let input = std::str::from_utf8(&map)
@@ -301,7 +318,11 @@ pub fn parse_file_with_limits(
 
 /// Validate a JSON file against a schema by memory-mapping the document
 /// (feature `mmap`). Equivalent to [`schema::validate`] with the file's
-/// content parsed under default resource limits.
+/// content parsed under default resource limits, including its fail-closed
+/// handling of references that do not resolve (an error, formerly a
+/// warning).
+///
+/// The file must not change while the call runs, as for [`parse_file`].
 #[cfg(feature = "mmap")]
 pub fn validate_file(path: impl AsRef<Path>, schema: &str) -> Result<Vec<schema::Finding>> {
     let doc = parse_file(path)?;

@@ -306,12 +306,6 @@ impl DecodedByteBudget {
         Ok(())
     }
 
-    /// Bytes the budget could still grant. Reading it spends nothing.
-    #[cfg(feature = "rasterize")]
-    fn available_bytes(&self) -> usize {
-        self.remaining.lock().map_or(0, |remaining| *remaining)
-    }
-
     fn charge_resource_bytes(&self, bytes: usize) -> Result<()> {
         let mut remaining = self
             .remaining
@@ -488,6 +482,17 @@ pub struct PdfDocument {
 
 impl PdfDocument {
     /// Parse a PDF from a file path using memory mapping when possible.
+    ///
+    /// The file is mapped read-only and the mapping lives as long as the
+    /// returned document; when it cannot be mapped, it is read into memory
+    /// instead.
+    ///
+    /// The file must not be modified or truncated, by this process or any
+    /// other, while the document is alive. Nothing here can enforce that: a
+    /// truncated file makes reads of the mapping fault (`SIGBUS` on Unix), and
+    /// a modified one changes the bytes under the parsed document. Copy the
+    /// file first, or parse it with `PdfDocument::from_bytes`, when another
+    /// writer may touch it.
     #[cfg(feature = "mmap")]
     pub fn open(path: impl AsRef<Path>, options: ParseOptions) -> Result<Self> {
         let path = path.as_ref();
@@ -495,6 +500,12 @@ impl PdfDocument {
             File::open(path).with_context(|| format!("open file: {}", path.display()))?;
         ensure_file_within_document_limit(&file, options.max_document_bytes)
             .with_context(|| format!("preflight PDF file: {}", path.display()))?;
+        // SAFETY: `Mmap::map` is unsafe because the mapping is only sound
+        // while no one modifies or truncates the file, which no code here can
+        // enforce. The crate states that contract on this function: the
+        // caller must not let the file change while the document lives.
+        // Within this process the mapping is read-only and is never written
+        // through; it is owned by the document and unmapped when it drops.
         let storage = if let Ok(mmap) = unsafe { Mmap::map(&file) } {
             PdfStorage::Mmap(mmap)
         } else {
@@ -1062,6 +1073,11 @@ impl PdfDocument {
         let reserved_before_render = replay_bytes
             .and_then(|bytes| bytes.checked_add(self.bytes().len()))
             .ok_or_else(|| self.decoded_byte_budget.total_limit_error())?;
+        // The guard's decoding is overhead and is released as it goes: it
+        // gets an allowance of its own, the caller's configured limit rather
+        // than what is left of it, so it never competes with the render for
+        // the budget and never exceeds a limit the caller set.
+        let vet_allowance = self.decoded_byte_budget.max_total;
         self.decoded_byte_budget
             .charge_resource_bytes(reserved_before_render)?;
 
@@ -1090,7 +1106,13 @@ impl PdfDocument {
                 .name("pdf-fast-render".to_string())
                 .stack_size(render_guard::RENDER_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    Self::interpret_on_render_stack(budget, pdf_bytes, page_object, dpi)
+                    Self::interpret_on_render_stack(
+                        budget,
+                        pdf_bytes,
+                        page_object,
+                        dpi,
+                        vet_allowance,
+                    )
                 })
                 .map_err(|error| {
                     anyhow!("interpreted render refused: no render thread ({error})")
@@ -1180,6 +1202,7 @@ impl PdfDocument {
         pdf_bytes: Vec<u8>,
         page_object: (u32, u16),
         dpi: f32,
+        vet_allowance: usize,
     ) -> Result<Option<Vec<u8>>> {
         use hayro::hayro_interpret::InterpreterSettings;
         use hayro::hayro_syntax::object::ObjectIdentifier;
@@ -1210,15 +1233,27 @@ impl PdfDocument {
         // depth guard of its own, and a stack overflow there aborts the
         // process. Vet the exact page object it is about to render, on its
         // own object model, so there is no second parser to disagree with
-        // it. The check may look at as much decoded data as the budget has
-        // left, and takes none of it.
-        render_guard::vet_page(page, budget.available_bytes())?;
+        // it. The check has a decode allowance of its own and takes nothing
+        // from the document's budget.
         let (width, height) = page.render_dimensions();
+        let scale = dpi / 72.0;
+        // Pixels the page renders to, for the image bound; a size that is not
+        // a positive finite number counts as none and leaves the floor.
+        let page_pixels = f64::from(width * scale) * f64::from(height * scale);
+        let page_pixels = if page_pixels.is_finite() && page_pixels > 0.0 {
+            page_pixels as u64
+        } else {
+            0
+        };
+        render_guard::vet_page(
+            page,
+            vet_allowance,
+            render_guard::image_pixel_budget(page_pixels),
+        )?;
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return Ok(None);
         }
 
-        let scale = dpi / 72.0;
         let px_width = (width * scale) as u16;
         let px_height = (height * scale) as u16;
         if px_width == 0 || px_height == 0 {
@@ -7529,10 +7564,18 @@ fn find_obj_markers_simd_x86_64(bytes: &[u8], offsets: &mut Vec<usize>) -> usize
     };
 
     let mut cursor = 0usize;
+    // SAFETY: the intrinsic needs SSE2, which is part of the x86_64 baseline
+    // this function is compiled for. It touches no memory.
     let target = unsafe { _mm_set1_epi8(b'o' as i8) };
     while cursor + 16 <= bytes.len() {
+        // SAFETY: SSE2 is baseline on x86_64. The loop condition
+        // `cursor + 16 <= bytes.len()` keeps the 16 bytes read from
+        // `bytes[cursor..]` inside the slice, and `_mm_loadu_si128` is the
+        // unaligned load, so the cast pointer needs no alignment.
         let chunk = unsafe { _mm_loadu_si128(bytes[cursor..].as_ptr() as *const __m128i) };
+        // SAFETY: SSE2 is baseline on x86_64; register-only, no memory access.
         let matches = unsafe { _mm_cmpeq_epi8(chunk, target) };
+        // SAFETY: SSE2 is baseline on x86_64; register-only, no memory access.
         let mut bitmask = unsafe { _mm_movemask_epi8(matches) } as u32;
         while bitmask != 0 {
             let trailing = bitmask.trailing_zeros() as usize;
@@ -7552,11 +7595,21 @@ fn find_obj_markers_simd_aarch64(bytes: &[u8], offsets: &mut Vec<usize>) -> usiz
     use std::arch::aarch64::{uint8x16_t, vceqq_u8, vdupq_n_u8, vld1q_u8, vst1q_u8};
 
     let mut cursor = 0usize;
+    // SAFETY: the intrinsic needs NEON, which is part of the aarch64 baseline
+    // this function is compiled for. It touches no memory.
     let target = unsafe { vdupq_n_u8(b'o') };
     while cursor + 16 <= bytes.len() {
+        // SAFETY: NEON is baseline on aarch64. The loop condition
+        // `cursor + 16 <= bytes.len()` keeps the 16 bytes read from
+        // `bytes[cursor..]` inside the slice; `vld1q_u8` has no alignment
+        // requirement.
         let chunk = unsafe { vld1q_u8(bytes[cursor..].as_ptr()) };
+        // SAFETY: NEON is baseline on aarch64; register-only, no memory access.
         let matches: uint8x16_t = unsafe { vceqq_u8(chunk, target) };
         let mut lanes = [0u8; 16];
+        // SAFETY: NEON is baseline on aarch64. `lanes` is a live, writable
+        // `[u8; 16]`, exactly the 16 bytes `vst1q_u8` stores, and the store
+        // has no alignment requirement.
         unsafe { vst1q_u8(lanes.as_mut_ptr(), matches) };
         let mut bitmask = 0u32;
         for (index, lane) in lanes.iter().enumerate() {
