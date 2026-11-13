@@ -31,7 +31,9 @@
 //! Page numbers are 1-based. The output has the pages in the order given; a
 //! page named twice appears twice. A number outside the document, an empty
 //! selection, or more than 8,388,607 entries is an error and nothing is
-//! written.
+//! written. Each repeat of a page is another copy of its page dictionary
+//! (content streams and resources are shared); a selection whose repeats
+//! need more than 16 MiB of such copies is an error too.
 //!
 //! ## What is and is not copied
 //!
@@ -55,8 +57,16 @@
 //! with a page destination, a form field shared across pages) is refused
 //! rather than written with the other page pulled in.
 //!
-//! Callers that must not pass on active content should check the selected
-//! pages for annotations before extracting; this crate does not remove them.
+//! Callers that must not pass on active content can ask for the page content
+//! alone: [`ExtractOptions::page_content_only`] leaves out each selected
+//! page's `/Annots`, `/AA`, `/Metadata`, `/PieceInfo` and `/Thumb` with what
+//! only they refer to. The default copies them.
+//!
+//! ## Malformed sources
+//!
+//! An object ends at its `endobj` or where the next object in the
+//! cross-reference table starts, whichever comes first. Names are compared
+//! after decoding `#xx` escapes, so `/Encr#79pt` is `/Encrypt`.
 //!
 //! ## Quick Start
 //!
@@ -118,11 +128,61 @@ impl PdfWriter {
     /// Prefer this on upload / queue paths that already hold the source in
     /// memory so callers avoid a redundant disk round-trip.
     pub fn extract_pages_from_bytes(data: &[u8], pages: &[usize]) -> Result<Vec<u8>> {
+        Self::extract_pages_from_bytes_with(data, pages, &ExtractOptions::new())
+    }
+
+    /// Extract specific pages (1-based) from in-memory PDF bytes, with options.
+    ///
+    /// With [`ExtractOptions::new`] this is [`Self::extract_pages_from_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source cannot be read as a classic-xref,
+    /// unencrypted PDF, when the selection is empty, names a page outside
+    /// the document or is too long, or when a selected page refers to an
+    /// unselected one.
+    pub fn extract_pages_from_bytes_with(
+        data: &[u8],
+        pages: &[usize],
+        options: &ExtractOptions,
+    ) -> Result<Vec<u8>> {
         let pdf = Pdf::parse(data)?;
-        let subset = pdf.build_subset(pages)?;
+        let subset = pdf.build_subset(pages, options)?;
         let mut out = Vec::new();
         subset.write(&mut out)?;
         Ok(out)
+    }
+}
+
+/// How [`PdfWriter::extract_pages_from_bytes_with`] copies the selected pages.
+///
+/// The default copies everything a page dictionary refers to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtractOptions {
+    page_content_only: bool,
+}
+
+impl ExtractOptions {
+    /// Returns the default options: a page is copied with all it refers to.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets whether only what draws a page is copied.
+    ///
+    /// When on, these entries are left out of every selected page dictionary,
+    /// together with the objects only they refer to: `/Annots` (links, form
+    /// fields, comments, file attachments and their actions), `/AA` (page
+    /// actions, which may run JavaScript), `/Metadata`, `/PieceInfo` and
+    /// `/Thumb`. Content streams and `/Resources` are copied unchanged, so
+    /// metadata attached to an image or a form inside the resources stays.
+    ///
+    /// A page whose annotations point at an unselected page is refused by
+    /// default; with this option it is extracted, since the annotations are
+    /// not copied.
+    pub fn page_content_only(mut self, on: bool) -> Self {
+        self.page_content_only = on;
+        self
     }
 }
 
@@ -133,7 +193,7 @@ struct Pdf {
     /// The raw bytes of the source PDF.
     data: Vec<u8>,
     /// Object number → (offset in data, generation)
-    xref: HashMap<u32, (u64, u16)>,
+    xref: Xref,
     /// Trailer dictionary (retained for future incremental-update support)
     #[allow(dead_code)]
     trailer: HashMap<String, String>,
@@ -191,7 +251,7 @@ impl Pdf {
         })
     }
 
-    fn build_subset(&self, pages: &[usize]) -> Result<SubsetPdf> {
+    fn build_subset(&self, pages: &[usize], options: &ExtractOptions) -> Result<SubsetPdf> {
         // Validate page numbers (1-based)
         for &page in pages {
             if page == 0 || page > self.page_objs.len() {
@@ -222,8 +282,30 @@ impl Pdf {
         // dependencies; its /Parent is replaced with the new Pages node.
         let mut visited = std::collections::HashSet::new();
         let mut inherited = HashMap::new();
+        // The dictionary of each selected page as it will be copied.
+        let mut page_bodies: HashMap<u32, Vec<u8>> = HashMap::new();
         for &page in &selected {
-            collect_page_dependencies(&self.data, &self.xref, page, self.pages_obj, &mut visited)?;
+            let body = match page_bodies.entry(page) {
+                std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let body = get_object(&self.data, &self.xref, page)?;
+                    slot.insert(if options.page_content_only {
+                        // Left out before anything is followed, so what only
+                        // these entries refer to is never collected.
+                        without_page_extras(&body)
+                    } else {
+                        body
+                    })
+                }
+            };
+            collect_page_dependencies(
+                &self.data,
+                &self.xref,
+                page,
+                body,
+                self.pages_obj,
+                &mut visited,
+            )?;
             let attributes =
                 effective_page_attributes(&self.data, &self.xref, page, self.pages_obj)?;
             for (_, value) in &attributes {
@@ -267,7 +349,10 @@ impl Pdf {
                 out.objects.push(Vec::new());
                 continue;
             }
-            let raw = get_object(&self.data, &self.xref, old_obj)?;
+            let raw = match page_bodies.remove(&old_obj) {
+                Some(body) => body,
+                None => get_object(&self.data, &self.xref, old_obj)?,
+            };
             let remapped = remap_refs(&self.data, &self.xref, &raw, &id_map)?;
             out.objects.push(remapped);
         }
@@ -298,9 +383,19 @@ impl Pdf {
         // dictionary; the copies share content streams and resources.
         let mut listed = std::collections::HashSet::new();
         let mut kids = String::new();
+        let mut repeated_bytes: usize = 0;
         for &page in &selected {
             let mut kid = id_map[&page];
             if !listed.insert(page) {
+                // Checked before the copy is made, so a refusal costs nothing.
+                repeated_bytes =
+                    repeated_bytes.saturating_add(out.objects[(kid - 1) as usize].len());
+                if repeated_bytes > MAX_REPEATED_PAGE_BYTES {
+                    return Err(anyhow!(
+                        "the repeated pages need more than {} bytes of page dictionary                          copies; select fewer repeats",
+                        MAX_REPEATED_PAGE_BYTES
+                    ));
+                }
                 let copy = out.objects[(kid - 1) as usize].clone();
                 out.objects.push(copy);
                 kid = u32::try_from(out.objects.len())
@@ -459,7 +554,39 @@ fn find_startxref(data: &[u8]) -> Result<u64> {
 
 /// Parsed cross-reference table: object number → `(byte offset, generation)`,
 /// plus the trailer key/value dictionary.
-type ParsedXref = (HashMap<u32, (u64, u16)>, HashMap<String, String>);
+type ParsedXref = (Xref, HashMap<String, String>);
+
+/// The objects in use: object number → `(byte offset, generation)`, and the
+/// offsets at which they start.
+#[derive(Debug, Default)]
+struct Xref {
+    entries: HashMap<u32, (u64, u16)>,
+    /// Every offset in `entries`, ascending and without repeats.
+    starts: Vec<u64>,
+}
+
+impl Xref {
+    fn new(entries: HashMap<u32, (u64, u16)>) -> Self {
+        let mut starts: Vec<u64> = entries.values().map(|(offset, _)| *offset).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        Self { entries, starts }
+    }
+
+    /// Returns the offset of the first object that starts after `offset`.
+    fn next_start(&self, offset: u64) -> Option<u64> {
+        let index = self.starts.partition_point(|start| *start <= offset);
+        self.starts.get(index).copied()
+    }
+}
+
+impl std::ops::Deref for Xref {
+    type Target = HashMap<u32, (u64, u16)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
 
 /// One cross-reference section: object number → `Some((offset, generation))`
 /// for an object in use or `None` for one the section marks free, plus the
@@ -471,6 +598,15 @@ type ParsedSection = (HashMap<u32, Option<(u64, u16)>>, HashMap<String, String>)
 /// Every selected page is at least one object in the output, and a PDF holds
 /// at most 8,388,607 indirect objects (ISO 32000-1, Annex C).
 const MAX_SELECTED_PAGES: usize = 8_388_607;
+
+/// Most bytes the extra copies of repeated pages may take.
+///
+/// A page selected again is written as another copy of its dictionary, so
+/// the output grows by the size of that dictionary for every repeat. Page
+/// dictionaries are a few hundred bytes; 16 MiB allows tens of thousands of
+/// repeats of an ordinary page and stops a large dictionary from being
+/// multiplied into gigabytes.
+const MAX_REPEATED_PAGE_BYTES: usize = 16 * 1024 * 1024;
 
 fn parse_xref(data: &[u8], start: u64) -> Result<ParsedXref> {
     // Sections are read newest first, so the first entry seen for an object
@@ -509,7 +645,7 @@ fn parse_xref(data: &[u8], start: u64) -> Result<ParsedXref> {
         .into_iter()
         .filter_map(|(object, entry)| entry.map(|entry| (object, entry)))
         .collect();
-    Ok((in_use, latest_trailer.unwrap_or_default()))
+    Ok((Xref::new(in_use), latest_trailer.unwrap_or_default()))
 }
 
 fn parse_xref_section(data: &[u8], start: u64) -> Result<ParsedSection> {
@@ -680,7 +816,7 @@ struct SyntaxToken<'a> {
     bytes: &'a [u8],
 }
 
-fn get_object(data: &[u8], xref: &HashMap<u32, (u64, u16)>, obj_num: u32) -> Result<Vec<u8>> {
+fn get_object(data: &[u8], xref: &Xref, obj_num: u32) -> Result<Vec<u8>> {
     let (offset, generation) = xref
         .get(&obj_num)
         .ok_or_else(|| anyhow!("object {} not in xref", obj_num))?;
@@ -689,8 +825,22 @@ fn get_object(data: &[u8], xref: &HashMap<u32, (u64, u16)>, obj_num: u32) -> Res
         .and_then(|offset| data.get(offset..))
         .ok_or_else(|| anyhow!("object {} xref offset is outside the file", obj_num))?;
     let header_end = object_header_end(slice, obj_num, *generation)?;
-    let body = &slice[header_end..];
-    let end_pos = find_object_end(data, xref, body, obj_num)?;
+    // An object ends where the next one starts. Looking for `endobj` past
+    // that point would hand an object that lacks one the rest of the file,
+    // and a file of such objects an output that grows with its square.
+    let next_object = xref
+        .next_start(*offset)
+        .and_then(|next| usize::try_from(next - *offset).ok())
+        .filter(|next| *next < slice.len())
+        .map(|next| next.max(header_end));
+    let body = &slice[header_end..next_object.unwrap_or(slice.len())];
+    let end_pos = match find_object_end(data, xref, body) {
+        Ok(end_pos) => end_pos,
+        // No `endobj` before the next object: this one ends there.
+        Err(MissingEnd::NoEndobj) if next_object.is_some() => body.len(),
+        Err(MissingEnd::NoEndobj) => return Err(anyhow!("no 'endobj' for object {}", obj_num)),
+        Err(MissingEnd::Stream(error)) => return Err(error),
+    };
     Ok(trim_pdf_whitespace(&body[..end_pos]).to_vec())
 }
 
@@ -700,7 +850,7 @@ fn get_object(data: &[u8], xref: &HashMap<u32, (u64, u16)>, obj_num: u32) -> Res
 /// The object is not parsed as a general object: doing so would look for a
 /// stream in it and resolve that stream's `/Length` in turn, which never ends
 /// when a malformed file makes a length refer to a stream.
-fn indirect_integer(data: &[u8], xref: &HashMap<u32, (u64, u16)>, obj_num: u32) -> Result<usize> {
+fn indirect_integer(data: &[u8], xref: &Xref, obj_num: u32) -> Result<usize> {
     let (offset, generation) = xref
         .get(&obj_num)
         .ok_or_else(|| anyhow!("object {} not in xref", obj_num))?;
@@ -762,7 +912,7 @@ fn object_header_end(slice: &[u8], object: u32, generation: u16) -> Result<usize
 
 fn stream_data_range(
     data: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
+    xref: &Xref,
     body: &[u8],
 ) -> Result<Option<std::ops::Range<usize>>> {
     let mut cursor = 0;
@@ -805,12 +955,11 @@ fn stream_data_range(
     Ok(Some(data_start..data_end))
 }
 
-fn stream_length(
-    data: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
-    tokens: &[SyntaxToken<'_>],
-) -> Result<usize> {
-    let Some(index) = tokens.iter().rposition(|token| token.bytes == b"/Length") else {
+fn stream_length(data: &[u8], xref: &Xref, tokens: &[SyntaxToken<'_>]) -> Result<usize> {
+    let Some(index) = tokens
+        .iter()
+        .rposition(|token| name_is(token.bytes, b"/Length"))
+    else {
         return Err(anyhow!("stream dictionary missing /Length"));
     };
     let reference = tokens
@@ -839,13 +988,21 @@ fn skip_pdf_eol(body: &[u8], offset: usize) -> usize {
     }
 }
 
+/// Why [`find_object_end`] found no end.
+enum MissingEnd {
+    /// The object's stream could not be read.
+    Stream(anyhow::Error),
+    /// No `endobj` keyword follows the object.
+    NoEndobj,
+}
+
 fn find_object_end(
     data: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
+    xref: &Xref,
     body: &[u8],
-    obj_num: u32,
-) -> Result<usize> {
-    let search_from = if let Some(stream) = stream_data_range(data, xref, body)? {
+) -> std::result::Result<usize, MissingEnd> {
+    let stream = stream_data_range(data, xref, body).map_err(MissingEnd::Stream)?;
+    let search_from = if let Some(stream) = stream {
         let after_stream = skip_pdf_eol(body, stream.end);
         after_stream + b"endstream".len()
     } else {
@@ -855,7 +1012,7 @@ fn find_object_end(
     std::iter::from_fn(|| next_syntax_token(body, &mut cursor))
         .find(|token| token.bytes == b"endobj")
         .map(|token| token.start)
-        .ok_or_else(|| anyhow!("no 'endobj' for object {}", obj_num))
+        .ok_or(MissingEnd::NoEndobj)
 }
 
 fn syntax_tokens(bytes: &[u8]) -> Vec<SyntaxToken<'_>> {
@@ -955,6 +1112,38 @@ fn is_pdf_delimiter(byte: Option<u8>) -> bool {
     })
 }
 
+/// Returns whether the token is the name `name`, given with its slash.
+///
+/// A name may spell any of its characters as `#` and two hexadecimal digits
+/// (ISO 32000-1, 7.3.5), so `/P#61ge` is the name `/Page`.
+fn name_is(token: &[u8], name: &[u8]) -> bool {
+    if !token.contains(&b'#') || token.first() != Some(&b'/') {
+        return token == name;
+    }
+    let hex = |byte: Option<&u8>| byte.and_then(|byte| char::from(*byte).to_digit(16));
+    let mut expected = name.iter().copied();
+    let mut index = 0;
+    while index < token.len() {
+        let high = hex(token.get(index + 1));
+        let low = hex(token.get(index + 2));
+        let byte = match (token[index], high, low) {
+            (b'#', Some(high), Some(low)) => {
+                index += 3;
+                // Two hexadecimal digits are at most 255.
+                (high * 16 + low) as u8
+            }
+            (byte, _, _) => {
+                index += 1;
+                byte
+            }
+        };
+        if expected.next() != Some(byte) {
+            return false;
+        }
+    }
+    expected.next().is_none()
+}
+
 fn parse_u32(bytes: &[u8]) -> Option<u32> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
@@ -990,7 +1179,7 @@ fn syntax_references(bytes: &[u8]) -> Vec<PdfRef> {
         .collect()
 }
 
-fn validate_reference(xref: &HashMap<u32, (u64, u16)>, reference: PdfRef) -> Result<()> {
+fn validate_reference(xref: &Xref, reference: PdfRef) -> Result<()> {
     let Some((_, actual_generation)) = xref.get(&reference.object) else {
         return Err(anyhow!(
             "referenced object {} is absent from xref",
@@ -1020,8 +1209,10 @@ fn parse_obj_ref(s: &str) -> Result<u32> {
 }
 
 fn find_dict_value<'a>(dict: &'a str, key: &str) -> Option<&'a str> {
-    let pos = find_top_level_dict_key(dict, key)?;
-    let rest = dict[pos + key.len()..].trim_start();
+    // The key may be spelled with `#xx` escapes, so skip the token found,
+    // not the length of the plain spelling.
+    let found = find_top_level_dict_key(dict, key)?;
+    let rest = dict[found.end..].trim_start();
     if rest.is_empty() {
         return None;
     }
@@ -1054,7 +1245,7 @@ fn find_dict_value<'a>(dict: &'a str, key: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-fn find_top_level_dict_key(dict: &str, key: &str) -> Option<usize> {
+fn find_top_level_dict_key(dict: &str, key: &str) -> Option<std::ops::Range<usize>> {
     let bytes = dict.as_bytes();
     let tokens = syntax_tokens(bytes);
     let target_depth = usize::from(tokens.first().is_some_and(|token| token.bytes == b"<<"));
@@ -1068,8 +1259,8 @@ fn find_top_level_dict_key(dict: &str, key: &str) -> Option<usize> {
             depth = depth.saturating_sub(1);
             continue;
         }
-        if depth == target_depth && token.bytes == key.as_bytes() {
-            return Some(token.start);
+        if depth == target_depth && name_is(token.bytes, key.as_bytes()) {
+            return Some(token.start..token.end);
         }
     }
     None
@@ -1082,7 +1273,7 @@ fn find_top_level_dict_key(dict: &str, key: &str) -> Option<usize> {
 /// one node listed under two parents) is an error: such a structure is not a
 /// tree, and expanding it yields a page list out of all proportion to the
 /// file.
-fn walk_pages(data: &[u8], xref: &HashMap<u32, (u64, u16)>, pages_obj: u32) -> Result<Vec<u32>> {
+fn walk_pages(data: &[u8], xref: &Xref, pages_obj: u32) -> Result<Vec<u32>> {
     let mut pages = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut pending = vec![pages_obj];
@@ -1095,7 +1286,10 @@ fn walk_pages(data: &[u8], xref: &HashMap<u32, (u64, u16)>, pages_obj: u32) -> R
         }
         let node = get_object(data, xref, node_obj)?;
         let node = object_text(&node);
-        if find_dict_value(&node, "/Type").unwrap_or("") == "/Page" {
+        if name_is(
+            find_dict_value(&node, "/Type").unwrap_or("").as_bytes(),
+            b"/Page",
+        ) {
             pages.push(node_obj);
             continue;
         }
@@ -1122,9 +1316,9 @@ fn walk_pages(data: &[u8], xref: &HashMap<u32, (u64, u16)>, pages_obj: u32) -> R
     Ok(pages)
 }
 
-fn is_page_object(data: &[u8], xref: &HashMap<u32, (u64, u16)>, object: u32) -> Result<bool> {
+fn is_page_object(data: &[u8], xref: &Xref, object: u32) -> Result<bool> {
     let body = get_object(data, xref, object)?;
-    Ok(top_level_value_bytes(&body, b"/Type").as_deref() == Some(b"/Page"))
+    Ok(top_level_value_bytes(&body, b"/Type").is_some_and(|value| name_is(&value, b"/Page")))
 }
 
 fn find_in_array(dict: &str, key: &str) -> Option<String> {
@@ -1137,7 +1331,7 @@ fn find_in_array(dict: &str, key: &str) -> Option<String> {
         match token.bytes {
             b"<<" => depth += 1,
             b">>" => depth = depth.saturating_sub(1),
-            _ if depth == target_depth && token.bytes == key.as_bytes() => {
+            _ if depth == target_depth && name_is(token.bytes, key.as_bytes()) => {
                 key_index = Some(index);
                 break;
             }
@@ -1168,7 +1362,7 @@ fn find_in_array(dict: &str, key: &str) -> Option<String> {
 
 fn collect_refs(
     data: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
+    xref: &Xref,
     obj_num: u32,
     visited: &mut std::collections::HashSet<u32>,
 ) -> Result<()> {
@@ -1194,17 +1388,17 @@ fn collect_refs(
 
 fn collect_page_dependencies(
     data: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
+    xref: &Xref,
     page_obj: u32,
+    page: &[u8],
     old_pages_root: u32,
     visited: &mut std::collections::HashSet<u32>,
 ) -> Result<()> {
     if !visited.insert(page_obj) {
         return Ok(());
     }
-    let page = get_object(data, xref, page_obj)?;
-    let parent = dictionary_reference(&page, b"/Parent")?;
-    for syntax in syntax_segments(data, xref, &page)? {
+    let parent = dictionary_reference(page, b"/Parent")?;
+    for syntax in syntax_segments(data, xref, page)? {
         for reference in syntax_references(syntax) {
             validate_reference(xref, reference)?;
             // The page tree above the page is rebuilt, never copied: following
@@ -1225,7 +1419,7 @@ const INHERITABLE_PAGE_KEYS: &[&[u8]] = &[b"/Resources", b"/MediaBox", b"/CropBo
 
 fn effective_page_attributes(
     data: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
+    xref: &Xref,
     page_obj: u32,
     pages_root: u32,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -1264,7 +1458,7 @@ fn effective_page_attributes(
 
 fn collect_value_references(
     data: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
+    xref: &Xref,
     value: &[u8],
     visited: &mut std::collections::HashSet<u32>,
 ) -> Result<()> {
@@ -1277,7 +1471,7 @@ fn collect_value_references(
 
 fn materialize_page_attributes(
     data: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
+    xref: &Xref,
     page: &[u8],
     attributes: &[(Vec<u8>, Vec<u8>)],
     id_map: &HashMap<u32, u32>,
@@ -1286,6 +1480,13 @@ fn materialize_page_attributes(
     let parent = format!("{} 0 R", pages_root);
     let mut page = replace_top_level_value(page, b"/Parent", parent.as_bytes())
         .ok_or_else(|| anyhow!("selected page has no direct /Parent to rewrite"))?;
+    // A page type spelled with `#xx` escapes is valid, but simpler readers
+    // compare the raw bytes; the output names it plainly.
+    if top_level_value_bytes(&page, b"/Type").is_some_and(|value| value != b"/Page") {
+        if let Some(plain) = replace_top_level_value(&page, b"/Type", b"/Page") {
+            page = plain;
+        }
+    }
     for (key, value) in attributes {
         if top_level_value_range(&page, key).is_none() {
             let value = remap_refs(data, xref, value, id_map)?;
@@ -1320,13 +1521,43 @@ fn top_level_value_bytes(dict: &[u8], key: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn top_level_value_range(dict: &[u8], key: &[u8]) -> Option<std::ops::Range<usize>> {
+    top_level_entry(dict, key).map(|(_, value)| value)
+}
+
+/// Entries [`ExtractOptions::page_content_only`] leaves out of a page.
+const PAGE_EXTRA_KEYS: &[&[u8]] = &[b"/Annots", b"/AA", b"/Metadata", b"/PieceInfo", b"/Thumb"];
+
+/// Returns the page dictionary without the entries in [`PAGE_EXTRA_KEYS`].
+fn without_page_extras(page: &[u8]) -> Vec<u8> {
+    let mut page = page.to_vec();
+    for &key in PAGE_EXTRA_KEYS {
+        // A key can be given more than once; readers differ on which one
+        // they use, so every one is removed. Each round removes at least the
+        // key, so the loop ends.
+        while let Some((key_start, value)) = top_level_entry(&page, key) {
+            // A key at the very end of the dictionary has no value: what
+            // follows it is the dictionary's own `>>`, which must stay.
+            let end = if page.get(value.clone()) == Some(b">>".as_slice()) {
+                value.start
+            } else {
+                value.end
+            };
+            // The space keeps the tokens on either side apart.
+            page.splice(key_start..end, *b" ");
+        }
+    }
+    page
+}
+
+/// Returns where a top-level `key` starts and the range of its value.
+fn top_level_entry(dict: &[u8], key: &[u8]) -> Option<(usize, std::ops::Range<usize>)> {
     let tokens = syntax_tokens(dict);
     let mut depth: usize = 0;
     for (index, token) in tokens.iter().enumerate() {
         match token.bytes {
             b"<<" => depth += 1,
             b">>" => depth = depth.saturating_sub(1),
-            _ if depth == 1 && token.bytes == key => {
+            _ if depth == 1 && name_is(token.bytes, key) => {
                 let value = tokens.get(index + 1)?;
                 let end = match value.bytes {
                     b"[" => matching_token_end(&tokens, index + 1, b"[", b"]")?,
@@ -1336,7 +1567,7 @@ fn top_level_value_range(dict: &[u8], key: &[u8]) -> Option<std::ops::Range<usiz
                         .and_then(|marker| (marker.bytes == b"R").then_some(marker.end))
                         .unwrap_or(value.end),
                 };
-                return Some(value.start..end);
+                return Some((token.start, value.start..end));
             }
             _ => {}
         }
@@ -1385,11 +1616,7 @@ fn dictionary_reference(obj: &[u8], key: &[u8]) -> Result<Option<PdfRef>> {
         .and_then(|value| syntax_references(value).into_iter().next()))
 }
 
-fn syntax_segments<'a>(
-    data: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
-    obj: &'a [u8],
-) -> Result<Vec<&'a [u8]>> {
+fn syntax_segments<'a>(data: &[u8], xref: &Xref, obj: &'a [u8]) -> Result<Vec<&'a [u8]>> {
     if let Some(stream) = stream_data_range(data, xref, obj)? {
         Ok(vec![&obj[..stream.start], &obj[stream.end..]])
     } else {
@@ -1397,12 +1624,7 @@ fn syntax_segments<'a>(
     }
 }
 
-fn remap_refs(
-    data: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
-    obj: &[u8],
-    id_map: &HashMap<u32, u32>,
-) -> Result<Vec<u8>> {
+fn remap_refs(data: &[u8], xref: &Xref, obj: &[u8], id_map: &HashMap<u32, u32>) -> Result<Vec<u8>> {
     let mut result = Vec::with_capacity(obj.len());
     if let Some(stream) = stream_data_range(data, xref, obj)? {
         remap_refs_in_syntax(&obj[..stream.start], xref, id_map, &mut result)?;
@@ -1416,7 +1638,7 @@ fn remap_refs(
 
 fn remap_refs_in_syntax(
     syntax: &[u8],
-    xref: &HashMap<u32, (u64, u16)>,
+    xref: &Xref,
     id_map: &HashMap<u32, u32>,
     result: &mut Vec<u8>,
 ) -> Result<()> {
@@ -1517,7 +1739,7 @@ fn subset_stream_data_range(
     };
     let length_index = tokens
         .iter()
-        .rposition(|token| token.bytes == b"/Length")
+        .rposition(|token| name_is(token.bytes, b"/Length"))
         .ok_or_else(|| anyhow!("output stream dictionary missing /Length"))?;
     let length = if let Some(reference) = tokens
         .get(length_index + 1..length_index + 4)

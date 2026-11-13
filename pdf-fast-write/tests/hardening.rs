@@ -464,3 +464,222 @@ fn one_page_under_a_nested_page_tree_is_extracted_alone() {
         "the sibling page came along"
     );
 }
+
+/// WHY: a PDF name may spell any character as `#xx`, so `/Encr#79pt` is
+/// `/Encrypt` and `/P#61ge` is `/Page`. Comparing the raw bytes let an
+/// encrypted source through and lost the pages of a document.
+#[test]
+fn names_spelled_with_hex_escapes_are_recognised() {
+    let objects = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_vec()),
+        (3, page(2, 4, "")),
+        (4, text_stream("Secret")),
+        (
+            5,
+            b"<< /Filter /Standard /V 1 /R 2 /O (o) /U (u) /P -44 >>".to_vec(),
+        ),
+    ];
+    for name in ["/Encr#79pt", "/#45ncrypt", "/#45#6e#63#72#79#70#74"] {
+        let source = Revision {
+            objects: objects.clone(),
+            freed: Vec::new(),
+            trailer: format!("/Root 1 0 R {name} 5 0 R"),
+        };
+        let error = extract(&build(&[source]), &[1]).expect_err("encrypted source");
+        assert!(error.to_lowercase().contains("encrypt"), "{name}: {error}");
+    }
+
+    let escaped = |body: &[u8], from: &str, to: &str| {
+        String::from_utf8_lossy(body).replace(from, to).into_bytes()
+    };
+    let pdf = build(&[revision(
+        vec![
+            (1, b"<< /Type /Catalog /P#61ges 2 0 R >>".to_vec()),
+            (
+                2,
+                b"<< /Type /Pages /Count 2 /K#69ds [3 0 R 5 0 R] /Medi#61Box [0 0 200 200] >>"
+                    .to_vec(),
+            ),
+            (3, escaped(&page(2, 4, ""), "/Type /Page", "/Type /P#61ge")),
+            (4, text_stream("First")),
+            (5, escaped(&page(2, 6, ""), "/Parent", "/P#61rent")),
+            (6, text_stream("Second")),
+        ],
+        1,
+    )]);
+    let both = extract(&pdf, &[2, 1]).expect("extracts");
+    assert_eq!(page_texts(&both), ["Second", "First"]);
+    let one = extract(&pdf, &[2]).expect("extracts");
+    assert_eq!(page_texts(&one), ["Second"]);
+    assert!(!String::from_utf8_lossy(&one).contains("First"));
+}
+
+/// Returns a source whose `count` array objects have no `endobj` of their
+/// own: only the last one is closed.
+fn objects_sharing_one_endobj(count: u32) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    let mut add = |pdf: &mut Vec<u8>, text: String| {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(text.as_bytes());
+    };
+    add(
+        &mut pdf,
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+    );
+    add(
+        &mut pdf,
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_string(),
+    );
+    add(
+        &mut pdf,
+        format!(
+            "3 0 obj\n{}\nendobj\n",
+            String::from_utf8_lossy(&page(2, 4, "/X 5 0 R"))
+        ),
+    );
+    let mut contents = b"4 0 obj\n".to_vec();
+    contents.extend_from_slice(&text_stream("Shown"));
+    contents.extend_from_slice(b"\nendobj\n");
+    add(&mut pdf, String::from_utf8_lossy(&contents).into_owned());
+    for number in 5..5 + count {
+        add(&mut pdf, format!("{number} 0 obj\n[{} 0 R]\n", number + 1));
+    }
+    add(&mut pdf, format!("{} 0 obj\n[]\nendobj\n", 5 + count));
+    let xref_at = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+    );
+    for offset in &offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+/// WHY: an object ends where the next one starts. Reading each up to the
+/// next `endobj` anywhere in the file copied the rest of the file once per
+/// object, so the output grew with the square of the source.
+#[test]
+fn an_object_without_endobj_ends_where_the_next_object_starts() {
+    let pdf = objects_sharing_one_endobj(600);
+    let source_len = pdf.len();
+    let output = within_seconds(60, move || extract(&pdf, &[1])).expect("extracts");
+    assert!(
+        output.len() <= 2 * source_len,
+        "{} bytes out of a {source_len} byte source",
+        output.len()
+    );
+    assert_eq!(page_texts(&output), ["Shown"]);
+}
+
+/// WHY: a page selected again is written as another copy of its dictionary.
+/// With a large dictionary and a long selection the output was the product
+/// of the two, a hundred megabytes from a hundred kilobytes.
+#[test]
+fn repeating_a_large_page_dictionary_is_bounded() {
+    let big = format!("/Big ({})", "a".repeat(100_000));
+    let pdf = build(&[revision(
+        vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_vec()),
+            (3, page(2, 4, &big)),
+            (4, text_stream("Big")),
+        ],
+        1,
+    )]);
+    assert_eq!(
+        page_texts(&extract(&pdf, &[1, 1, 1]).expect("a few copies")),
+        ["Big", "Big", "Big"]
+    );
+    let error = extract(&pdf, &[1; 1000]).expect_err("a hundred megabytes of copies");
+    assert!(error.contains("repeated"), "{error}");
+    // Small pages may still be repeated many times.
+    let small = simple_document(1);
+    assert_eq!(
+        page_texts(&extract(&small, &[1; 5000]).expect("extracts")).len(),
+        5000
+    );
+}
+
+/// WHY: a page's annotations, actions and metadata are copied with it by
+/// default. A caller that must not pass on active content can ask for the
+/// page content alone.
+#[test]
+fn page_content_only_leaves_out_annotations_actions_and_metadata() {
+    use pdf_fast_write::ExtractOptions;
+    let document = |dangling: &str| {
+        let extra = format!(
+            "/Annots [7 0 R 8 0 R{dangling}] /AA << /O << /S /JavaScript /JS (PAGEAAJS) >> >> \
+                 /Metadata 9 0 R /PieceInfo << /App << /Private (PIECEMARK) >> >> /Thumb 10 0 R \
+                 /#41A << /C << /S /JavaScript /JS (ESCAPEDAAJS) >> >> /Annots [8 0 R]"
+        );
+        build(&[revision(
+        vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 2 /Kids [3 0 R 5 0 R] >>".to_vec()),
+            (3, page(2, 4, &extra)),
+            (4, text_stream("Kept")),
+            (5, page(2, 6, "")),
+            (6, text_stream("Other")),
+            (
+                7,
+                b"<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /A << /S /URI /URI (http://URIMARK.example) >> >>".to_vec(),
+            ),
+            (
+                8,
+                b"<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 9 9] /FS << /Type /Filespec /F (a.bin) /EF << /F 11 0 R >> >> /A << /S /JavaScript /JS (ANNOTJS) >> >>".to_vec(),
+            ),
+            (9, stream("/Type /Metadata /Subtype /XML", b"XMPMARK")),
+            (10, stream("/Width 1 /Height 1", b"THUMBMARK")),
+            (11, stream("/Type /EmbeddedFile", b"ATTACHMARK")),
+        ],
+        1,
+    )])
+    };
+    let pdf = document(" 12 0 R");
+    let markers = [
+        "PAGEAAJS",
+        "PIECEMARK",
+        "ESCAPEDAAJS",
+        "URIMARK",
+        "ANNOTJS",
+        "XMPMARK",
+        "THUMBMARK",
+        "ATTACHMARK",
+        "/Annots",
+        "/AA",
+        "/Metadata",
+        "/PieceInfo",
+        "/Thumb",
+        "JavaScript",
+    ];
+    // Object 12 does not exist, so the default extraction refuses the page;
+    // without the annotations nothing refers to it.
+    assert!(extract(&pdf, &[1]).is_err());
+    let options = ExtractOptions::new().page_content_only(true);
+    let output = PdfWriter::extract_pages_from_bytes_with(&pdf, &[1, 1], &options)
+        .expect("extracts the page content");
+    assert_eq!(page_texts(&output), ["Kept", "Kept"]);
+    let text = String::from_utf8_lossy(&output);
+    for marker in markers {
+        assert!(!text.contains(marker), "{marker} is in the output");
+    }
+
+    // The default keeps what belongs to the page.
+    let kept = document("");
+    let output = PdfWriter::extract_pages_from_bytes_with(&kept, &[1], &ExtractOptions::new())
+        .expect("extracts");
+    let text = String::from_utf8_lossy(&output);
+    for marker in ["PAGEAAJS", "URIMARK", "ANNOTJS", "XMPMARK", "ATTACHMARK"] {
+        assert!(text.contains(marker), "{marker} is not in the output");
+    }
+    assert_eq!(output, extract(&kept, &[1]).expect("extracts"));
+}
