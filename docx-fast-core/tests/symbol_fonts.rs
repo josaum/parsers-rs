@@ -95,15 +95,25 @@ fn a_dingbat_code_without_a_unicode_character_keeps_what_is_stored() {
         sym("Wingdings", "0026"),
         run(wingdings, "a\u{F0FF}\u{FF}b"),
         run(wingdings, "a&amp;\u{F026}b"),
+        // Both ways of writing each code in `w:char`, and a font that comes
+        // from a style and not from the run.
+        sym("Wingdings", "00FF"),
+        sym("Wingdings", "F026"),
+        r#"<w:p><w:pPr><w:pStyle w:val="Dings"/></w:pPr><w:r><w:t>&amp;</w:t></w:r></w:p>"#
+            .to_string(),
     ]
     .concat();
+    let styles = r#"<w:style w:type="paragraph" w:styleId="Dings"><w:rPr><w:rFonts w:ascii="Wingdings" w:hAnsi="Wingdings"/></w:rPr></w:style>"#;
     assert_eq!(
-        paragraphs(&parse(&body, "")),
+        paragraphs(&parse(&body, styles)),
         [
             "\u{F0FF}",
             "&",
             "\u{264B}\u{F0FF}\u{FF}\u{264C}",
-            "\u{264B}&\u{F026}\u{264C}"
+            "\u{264B}&\u{F026}\u{264C}",
+            "\u{FF}",
+            "\u{F026}",
+            "&"
         ]
     );
 }
