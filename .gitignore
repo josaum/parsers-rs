@@ -30,3 +30,6 @@ __pycache__/
 /.leio-code/exports/
 /.leio-code/*.lock
 /.leio-code/sessions/
+
+# local mcts wheel build output
+/dist-mcts/

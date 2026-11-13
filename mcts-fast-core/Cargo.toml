@@ -1,0 +1,25 @@
+[package]
+name = "mcts-fast-core"
+version = "0.2.0"
+edition.workspace = true
+authors.workspace = true
+description = "Arena-based PUCT MCTS with embedding-guided simulation for ontology/KB navigation"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["mcts", "puct", "embeddings", "search"]
+categories = ["algorithms", "science"]
+
+[lib]
+name = "mcts_fast_core"
+path = "src/lib.rs"
+
+[dependencies]
+rand = "0.8"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "mcts-fast-py"
+version = "0.2.0"
+edition.workspace = true
+authors.workspace = true
+description = "Python bindings for mcts-fast-core (arena-based PUCT MCTS with embedding-guided simulation)"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "mcts_fast_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+mcts-fast-core = { path = "../mcts-fast-core" }
+pyo3 = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = "0.29.3"
+
+[lints]
+workspace = true

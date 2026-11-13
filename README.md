@@ -8,7 +8,7 @@ Every published wheel and Node tarball is bound by `release-manifest.json` and `
 
 ---
 
-## Workspace Catalog (42 Crates)
+## Workspace Catalog (44 Crates)
 
 A crate belongs in `parsers-rs` when it provides a deterministic, side-effect-free parser, a generic format writer, or a shared Arrow IPC / Flight transport contract with zero dependencies on any downstream consumer.
 
@@ -25,6 +25,7 @@ A crate belongs in `parsers-rs` when it provides a deterministic, side-effect-fr
 | **Email** | `email-fast-core` (`0.2.11`) | `email-fast-py` (`email_fast`) | `email-fast-node` | `email-fast-flight` (`0.2.5`) | Read-only EML (RFC 5322), OLE/CFB `.msg`, and `mbox` extraction with bounded attachment budgets and Arrow IPC |
 | **Geospatial** | `geo-fast-core` (`0.2.5`) | `geo-fast-py` (`geo_fast`) | `geo-fast-node` | — | GeoParquet, Shapefile, FlatGeobuf, GeoJSON, GeoTIFF, SAR, thermal, hyperspectral, WMS/WFS, and GeoArrow IPC |
 | **Ontology** | `ontology-fast-core` (`0.1.5`) | `ontology-fast-py` (`ontology_fast`) | — | — | Canonical Turtle/RDF reading and indexed triple store with strict memory and triple-count budgets |
+| **MCTS / Search** | `mcts-fast-core` (`0.2.0`) | `mcts-fast-py` (`mcts_fast_py`) | — | — | Arena-based PUCT Monte Carlo Tree Search with embedding-guided simulation for ontology/KB navigation |
 | **Web / HTML** | `web-fast-core` (`0.1.5`) | — | — | — | Deterministic, side-effect-free HTML5 DOM & table extraction with Apache Arrow record batches |
 | **OOXML ZIP** | `ooxml-archive` (`0.1.8`) | — | — | — | Shared OOXML ZIP reader, aggregate `max_inflate` decompression bomb guard, and relationship resolution |
 | **Flight Config** | `flight-ipc-config` (`0.1.4`) | — | — | — | Shared Arrow Flight IPC compression (`LZ4`/`ZSTD`), JWT bearer authentication, and transport configuration |
@@ -151,13 +152,13 @@ To keep `parsers-rs` a clean, shared foundation rather than a component coupled 
 
 ---
 
-## Release Matrix & Provenance (84 Artifacts)
+## Release Matrix & Provenance (88 Artifacts)
 
-Every tagged release (`vYYYY.MM.DD`) builds and publishes **84 binary artifacts** after the reusable CI verification workflow passes:
+Every tagged release (`vYYYY.MM.DD`) builds and publishes **88 binary artifacts** after the reusable CI verification workflow passes:
 
 | Artifact Family | Count | Targets |
 | :--- | :--- | :--- |
-| **Python Wheels (`cp38-abi3`)** | **44** (11 crates × 4 targets) | `aarch64-apple-darwin` (`macosx_11_0_arm64`)<br>`x86_64-unknown-linux-gnu` (`manylinux_2_17_x86_64`)<br>`aarch64-unknown-linux-gnu` (`manylinux_2_17_aarch64`)<br>`x86_64-pc-windows-msvc` (`win_amd64`) |
+| **Python Wheels (`cp38-abi3`)** | **48** (12 crates × 4 targets) | `aarch64-apple-darwin` (`macosx_11_0_arm64`)<br>`x86_64-unknown-linux-gnu` (`manylinux_2_17_x86_64`)<br>`aarch64-unknown-linux-gnu` (`manylinux_2_17_aarch64`)<br>`x86_64-pc-windows-msvc` (`win_amd64`) |
 | **Node-API Tarballs (`napi-2`)** | **40** (10 crates × 4 targets) | `darwin-arm64` (`aarch64-apple-darwin`)<br>`linux-x64-gnu` (`x86_64-unknown-linux-gnu`)<br>`linux-arm64-gnu` (`aarch64-unknown-linux-gnu`)<br>`win32-x64-msvc` (`x86_64-pc-windows-msvc`) |
 
 ### Release Integrity Gates
@@ -167,7 +168,7 @@ Every tagged release (`vYYYY.MM.DD`) builds and publishes **84 binary artifacts*
 - **Single Authoritative CycloneDX SBOM per Wheel**:
   `scripts/inject_sbom.py` generates and embeds exactly one CycloneDX SBOM (`<dist-info>/sboms/core.json`) per wheel corresponding to its Rust core/writer crate, strips any stray SBOMs, and recomputes `RECORD` SHA-256 digests and byte sizes.
 - **Complete Matrix & Native Header Verification**:
-  `scripts/release_manifest.py --out dist --require-complete` verifies that all 84 artifacts are present without duplicates, checks that every `.so`, `.pyd`, and `.node` binary matches its target's native `ELF64`, `Mach-O ARM64`, or `PE32+ AMD64` machine header, refuses dirty git trees, and writes `dist/release-manifest.json` and `dist/SHA256SUMS`.
+  `scripts/release_manifest.py --out dist --require-complete` verifies that all 88 artifacts are present without duplicates, checks that every `.so`, `.pyd`, and `.node` binary matches its target's native `ELF64`, `Mach-O ARM64`, or `PE32+ AMD64` machine header, refuses dirty git trees, and writes `dist/release-manifest.json` and `dist/SHA256SUMS`.
 
 ---
 
@@ -179,7 +180,7 @@ Every tagged release (`vYYYY.MM.DD`) builds and publishes **84 binary artifacts*
 # Format check
 cargo fmt --all --check
 
-# Lint all 42 crates and all targets (default and Arrow feature sets)
+# Lint all 44 crates and all targets (default and Arrow feature sets)
 RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked
 RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked \
   --features docx-fast-core/arrow,xlsx-fast-core/arrow,pptx-fast-core/arrow,pdf-fast-core/arrow,email-fast-core/arrow,json-fast-core/arrow,xsd-fast-core/arrow,web-fast-core/arrow
