@@ -64,21 +64,26 @@ fn build_options(
 #[pyfunction]
 #[pyo3(signature = (path, decode_dates=None, include_formulas=None, raw_values=None, max_inflate=None))]
 fn parse_xlsx_json_py(
+    py: Python<'_>,
     path: &Bound<'_, PyAny>,
     decode_dates: Option<bool>,
     include_formulas: Option<bool>,
     raw_values: Option<bool>,
     max_inflate: Option<usize>,
 ) -> PyResult<String> {
-    let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
-    let workbook = parse_xlsx(fs_path(path)?, options)
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    serde_json::to_string(&workbook).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    let path_fs = fs_path(path)?;
+    py.detach(|| -> PyResult<String> {
+        let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
+        let workbook =
+            parse_xlsx(path_fs, options).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        serde_json::to_string(&workbook).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    })
 }
 
 #[pyfunction]
 #[pyo3(signature = (path, out_path, decode_dates=None, include_formulas=None, raw_values=None, max_inflate=None))]
 fn parse_xlsx_ndjson_py(
+    py: Python<'_>,
     path: &Bound<'_, PyAny>,
     out_path: &Bound<'_, PyAny>,
     decode_dates: Option<bool>,
@@ -86,29 +91,39 @@ fn parse_xlsx_ndjson_py(
     raw_values: Option<bool>,
     max_inflate: Option<usize>,
 ) -> PyResult<()> {
-    let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
-    parse_xlsx_to_ndjson(fs_path(path)?, fs_path(out_path)?, options)
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    let path_fs = fs_path(path)?;
+    let out_path_fs = fs_path(out_path)?;
+    py.detach(|| -> PyResult<()> {
+        let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
+        parse_xlsx_to_ndjson(path_fs, out_path_fs, options)
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    })
 }
 
 #[pyfunction]
 #[pyo3(signature = (bytes, decode_dates=None, include_formulas=None, raw_values=None, max_inflate=None))]
 fn parse_xlsx_bytes_py(
+    py: Python<'_>,
     bytes: &[u8],
     decode_dates: Option<bool>,
     include_formulas: Option<bool>,
     raw_values: Option<bool>,
     max_inflate: Option<usize>,
 ) -> PyResult<String> {
-    let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
-    let workbook = xlsx_fast_core::parse_xlsx_bytes(bytes.to_vec(), options)
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    serde_json::to_string(&workbook).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    py.detach(|| -> PyResult<String> {
+        let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
+        let workbook = xlsx_fast_core::parse_xlsx_bytes(bytes.to_vec(), options)
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        serde_json::to_string(&workbook).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    })
 }
 
 #[pyfunction]
 #[pyo3(signature = (path, out_path, decode_dates=None, include_formulas=None, raw_values=None, max_inflate=None, batch_size=None))]
+// The GIL token and the keyword options are one argument each to Python.
+#[allow(clippy::too_many_arguments)]
 fn parse_xlsx_arrow_ipc_py(
+    py: Python<'_>,
     path: &Bound<'_, PyAny>,
     out_path: &Bound<'_, PyAny>,
     decode_dates: Option<bool>,
@@ -117,13 +132,17 @@ fn parse_xlsx_arrow_ipc_py(
     max_inflate: Option<usize>,
     batch_size: Option<usize>,
 ) -> PyResult<usize> {
-    let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
-    let arrow_options = ArrowOptions {
-        batch_size: batch_size.unwrap_or(16_384),
-        ..ArrowOptions::default()
-    };
-    parse_xlsx_to_arrow_ipc(fs_path(path)?, fs_path(out_path)?, options, arrow_options)
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    let path_fs = fs_path(path)?;
+    let out_path_fs = fs_path(out_path)?;
+    py.detach(|| -> PyResult<usize> {
+        let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
+        let arrow_options = ArrowOptions {
+            batch_size: batch_size.unwrap_or(16_384),
+            ..ArrowOptions::default()
+        };
+        parse_xlsx_to_arrow_ipc(path_fs, out_path_fs, options, arrow_options)
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    })
 }
 
 #[pymodule]

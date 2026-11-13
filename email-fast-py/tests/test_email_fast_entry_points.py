@@ -173,3 +173,131 @@ def test_the_aggregate_budget_is_reachable_from_python(eml_path: str) -> None:
     """
     parsed = email_fast.parse_eml(eml_path, max_total_attachment_bytes=1024)
     assert parsed["subject"] == "entry point smoke"
+
+
+def test_parse_mbox_bytes_returns_every_message_in_order() -> None:
+    box = (
+        b"From sender@example.com Mon Sep 21 00:00:00 2026\n"
+        + EML
+        + b"\nFrom sender@example.com Mon Sep 21 00:01:00 2026\n"
+        + EML.replace(b"entry point smoke", b"second message")
+    )
+    messages = email_fast.parse_mbox_bytes(box)
+    assert [m["subject"] for m in messages] == ["entry point smoke", "second message"]
+    assert email_fast.parse_mbox_bytes(b"") == []
+    assert email_fast.parse_mbox_bytes(box, include_raw_headers=True)[0]["subject"]
+    with pytest.raises(TypeError):
+        email_fast.parse_mbox_bytes("not bytes")
+
+
+def test_parse_email_bytes_forwards_the_aggregate_budget() -> None:
+    """The wrapper dropped `max_total_attachment_bytes`; it must reach the core."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(email_fast.parse_email_bytes))
+    forwarded = {kw.arg for node in ast.walk(tree) if isinstance(node, ast.Call) for kw in node.keywords}
+    assert "max_total_attachment_bytes" in forwarded
+    assert email_fast.parse_email_bytes(EML, format="eml", max_total_attachment_bytes=1)["subject"]
+
+
+def test_errors_for_missing_files_and_unknown_byte_formats(tmp_path: Path) -> None:
+    missing = str(tmp_path / "missing.eml")
+    for call in (email_fast.parse_email, email_fast.parse_eml, email_fast.parse_email_json):
+        with pytest.raises(RuntimeError):
+            call(missing)
+    with pytest.raises(RuntimeError):
+        email_fast.parse_mbox_ndjson(missing, str(tmp_path / "o"))
+    with pytest.raises(RuntimeError):
+        email_fast.parse_mbox_arrow(missing, str(tmp_path / "o"))
+    with pytest.raises(ValueError, match="unsupported email byte format"):
+        email_fast.parse_email_bytes(EML, format="mbox")
+
+
+def test_parse_mbox_arrow_output_is_readable_by_pyarrow(mbox_path: str, tmp_path: Path) -> None:
+    ipc = pytest.importorskip("pyarrow.ipc")
+    out = tmp_path / "box.arrow"
+    assert email_fast.parse_mbox_arrow(mbox_path, str(out)) == 1
+    with open(out, "rb") as handle:
+        try:
+            table = ipc.open_file(handle).read_all()
+        except Exception:
+            handle.seek(0)
+            table = ipc.open_stream(handle).read_all()
+    assert table.num_rows == 1 and "subject" in table.schema.names
+
+
+def test_two_threads_parse_at_once() -> None:
+    import threading
+
+    results = [None, None]
+
+    def work(slot: int) -> None:
+        results[slot] = email_fast.parse_email_bytes(EML, format="eml")
+
+    threads = [threading.Thread(target=work, args=(slot,)) for slot in (0, 1)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert results[0] == results[1] and results[0]["subject"] == "entry point smoke"
+
+
+SNAPSHOT_TYPES = {
+    "Utf8": "string", "LargeUtf8": "large_string", "Boolean": "bool", "Binary": "binary",
+    "UInt8": "uint8", "UInt16": "uint16", "UInt32": "uint32", "UInt64": "uint64",
+    "Int8": "int8", "Int16": "int16", "Int32": "int32", "Int64": "int64",
+    "Float32": "float", "Float64": "double", "Date32": "date32[day]",
+    "Timestamp(Microsecond, None)": "timestamp[us]",
+    "Timestamp(Millisecond, None)": "timestamp[ms]",
+    "List(Field { data_type: Int32, nullable: true })": "list<item: int32>",
+}
+
+
+def assert_matches_schema_snapshot(schema, core_crate: str, snapshot: str) -> None:
+    """The schema pyarrow read is the one the core crate's snapshot freezes."""
+    import re
+
+    path = Path(__file__).resolve().parents[2] / core_crate / "tests" / "schema_snapshots" / snapshot
+    if not path.is_file():
+        pytest.skip(f"no schema snapshot at {path} (tests run outside the repository)")
+    expected = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(r"(.+?): (.+)\(nullable=(true|false)\)", line.strip())
+        if match:
+            expected.append((match.group(1), match.group(2), match.group(3) == "true"))
+    assert expected, f"{path} holds no fields"
+    assert schema.names == [name for name, _, _ in expected]
+    for field, (name, rust_type, nullable) in zip(schema, expected):
+        assert rust_type in SNAPSHOT_TYPES, f"{name}: no pyarrow spelling known for {rust_type}"
+        assert str(field.type) == SNAPSHOT_TYPES[rust_type], name
+        assert field.nullable is nullable, name
+
+
+def test_parse_mbox_arrow_matches_the_core_schema_snapshot(mbox_path: str, tmp_path: Path) -> None:
+    ipc = pytest.importorskip("pyarrow.ipc")
+    out = tmp_path / "box.arrow"
+    email_fast.parse_mbox_arrow(mbox_path, str(out))
+    with open(out, "rb") as handle:
+        try:
+            schema = ipc.open_file(handle).schema
+        except Exception:
+            handle.seek(0)
+            schema = ipc.open_stream(handle).schema
+    assert_matches_schema_snapshot(schema, "email-fast-core", "emails.snap")
+
+
+def test_the_wheel_ships_type_information_that_matches_the_module() -> None:
+    import ast
+    import inspect
+
+    package_dir = Path(email_fast.__file__).parent
+    assert (package_dir / "py.typed").is_file()
+    declared = {
+        node.name: [a.arg for a in node.args.args + node.args.kwonlyargs]
+        for node in ast.parse((package_dir / "__init__.pyi").read_text(encoding="utf-8")).body
+        if isinstance(node, ast.FunctionDef)
+    }
+    assert set(declared) == set(email_fast.__all__)
+    for name, params in declared.items():
+        assert params == list(inspect.signature(getattr(email_fast, name)).parameters), name
