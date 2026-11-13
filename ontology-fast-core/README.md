@@ -17,7 +17,7 @@ truncated.
 | `statements` | 2,000,000 distinct statements | `OntologyLimits::max_statements` |
 | `nesting_depth` | 10,000 brackets inside one another | `MAX_NESTING_DEPTH` (fixed) |
 | `triple_term_depth` | 32 triple terms `<<( ... )>>` inside one another | `MAX_TRIPLE_TERM_DEPTH` (fixed) |
-| `term_bytes` | the larger of 256 MiB and 32 bytes per source byte | `TERM_BYTES_FLOOR`, `TERM_BYTES_PER_SOURCE_BYTE` (fixed) |
+| `term_bytes` | the larger of 256 MiB and 64 bytes per source byte; `parse_turtle` and `parse_turtle_terms` only | `TERM_BYTES_FLOOR`, `TERM_BYTES_PER_SOURCE_BYTE` (fixed) |
 
 `nesting_depth` counts `[`, `(`, `<<` and `{|` that are open at once. Earlier
 releases had no such limit: a document nested deeper than 10,000 levels used to
@@ -32,9 +32,17 @@ exists because a prefixed name is a few bytes that expand to a whole namespace:
 without it, one megabyte-long namespace and a few hundred names cost more than
 a gigabyte, and a few hundred thousand did not finish. `parse_turtle` applies
 the same ceiling to the text it renders, since a long prefix name expands a
-short IRI the same way. Authored ontologies expand five to ten times, so only
-a document under 8 MiB whose terms pass 256 MiB, or a larger one that expands
-more than 32 times, is affected.
+short IRI the same way. `declared_prefixes` is not charged: it keeps no term,
+and its peak resident memory is the document plus about 3 MiB (12 MiB for a
+9 MiB document that expands 37 times, 23 MiB for a 20 MiB one).
+
+Measured expansion: 63 real Turtle files expand at most 4.73 times (median
+2.86). The worst ordinary shape known is one subject with one long object list
+of prefixed names under a namespace of about 120 bytes, which expands 37 to 39
+times. So only a document under 4 MiB whose terms pass 256 MiB, or a larger one
+that expands more than 64 times, is refused. The budget bounds the text the
+parser copies, not resident memory, which depends on how much of that text is
+distinct; the table below has measured peaks.
 
 ### What the limits cost in memory
 
@@ -46,6 +54,8 @@ Peak resident memory, release build, default limits, measured on macOS/arm64:
 | the same, with the prefix rebound at the end so nothing abbreviates | 777 MiB | 267 MiB |
 | 3 MB: a collection of 1,000,000 `[]` (refused, `statements`) | 795 MiB | 1291 MiB |
 | 2 MB: a collection of 1,000,000 `1` (refused, `statements`) | 483 MiB | 950 MiB |
+| 9 MiB: one object list under a 120-byte namespace, expands 37 times | 445 MiB | 648 MiB |
+| 16 MiB: the same under a 203-byte namespace, expands 60 times (just inside `term_bytes`) | 845 MiB | 1438 MiB |
 
 The collection rows are the price of the statement budget, not of expansion:
 each item is two statements, and a row of the term view owns three strings.

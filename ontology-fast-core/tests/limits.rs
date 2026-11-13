@@ -235,7 +235,7 @@ fn refuses_term_bytes(outcome: &Result<usize, OntologyError>, source_bytes: usiz
 }
 
 #[test]
-fn text_expanded_far_beyond_the_source_is_refused_by_every_entry_point() {
+fn text_expanded_far_beyond_the_source_is_refused_where_terms_are_kept() {
     // One megabyte of namespace, written once, is copied into every term that
     // uses it: about a megabyte of source expands to several hundred.
     let long = "x".repeat(1024 * 1024);
@@ -258,20 +258,56 @@ fn text_expanded_far_beyond_the_source_is_refused_by_every_entry_point() {
     for n in 0..120 {
         based.push_str(&format!("<s{n}> <p{n}> <o{n}> .\n"));
     }
-    for (shape, text) in [
-        ("distinct", distinct),
-        ("repeated", repeated),
-        ("listed", listed),
-        ("based", based),
+    for (shape, text, declared) in [
+        ("distinct", distinct, 1),
+        ("repeated", repeated, 1),
+        ("listed", listed, 0),
+        ("based", based, 0),
     ] {
         for (name, entry) in ENTRIES {
             let outcome = entry(text.as_bytes(), OntologyLimits::default());
+            if name == "declared_prefixes" {
+                // It keeps no term, so term text over the parsing budget is
+                // nothing it has to refuse.
+                assert_eq!(outcome, Ok(declared), "{name} on the {shape} document");
+                continue;
+            }
             assert!(
                 refuses_term_bytes(&outcome, text.len()),
                 "{name} on the {shape} document: {:?}",
                 outcome.map_err(|error| error.to_string())
             );
         }
+    }
+}
+
+#[test]
+fn a_long_object_list_under_an_ordinary_namespace_reads() {
+    // The worst ordinary shape known: one subject, one object list of
+    // prefixed names, a namespace of about 120 bytes. Every item repeats the
+    // subject and the predicate in full, so 9 MiB expand about 37 times, past
+    // the 256 MiB floor and past 32 bytes per source byte.
+    let namespace = format!("http://data.example.org/{}/", "catalogue/".repeat(9));
+    let mut text = format!("@prefix x: <{namespace}> .\nx:s x:p x:o");
+    let mut items = 1;
+    while text.len() < 9 * 1024 * 1024 {
+        text.push_str(&format!(", x:{items}"));
+        items += 1;
+    }
+    text.push_str(" .\n");
+    let expanded = items * 3 * (namespace.len() + 1);
+    assert!(expanded > TERM_BYTES_FLOOR && expanded > 32 * text.len());
+    for (name, entry) in ENTRIES {
+        let expected = if name == "declared_prefixes" {
+            1
+        } else {
+            items
+        };
+        assert_eq!(
+            entry(text.as_bytes(), OntologyLimits::default()),
+            Ok(expected),
+            "{name}"
+        );
     }
 }
 

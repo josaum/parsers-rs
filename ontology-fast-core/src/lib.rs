@@ -142,13 +142,26 @@ pub const TERM_BYTES_FLOOR: usize = 256 * 1024 * 1024;
 /// ```
 ///
 /// bytes; the statement that passes it is refused with
-/// [`OntologyError::ResourceLimit`] naming `term_bytes`, by every entry point.
-/// [`parse_turtle`] holds the text it renders to the same budget, since a
-/// long prefix name expands a short IRI just as a long namespace expands a
-/// short name. Authored ontologies expand five to ten times (the 50 MB
-/// benchmark document: about six), and a document under 8 MiB is held by the
-/// floor alone.
-pub const TERM_BYTES_PER_SOURCE_BYTE: usize = 32;
+/// [`OntologyError::ResourceLimit`] naming `term_bytes`, by [`parse_turtle`]
+/// and [`parse_turtle_terms`]. [`parse_turtle`] holds the text it renders to
+/// the same budget, since a long prefix name expands a short IRI just as a
+/// long namespace expands a short name. [`declared_prefixes`] is not charged:
+/// it keeps no term, each statement is dropped as soon as it is read, and its
+/// memory is the parser's working state however far the document expands.
+///
+/// Measured expansion: 63 real Turtle files expand at most 4.73 times
+/// (median 2.86), and the 50 MB benchmark document about six. The worst
+/// ordinary shape known is one subject with one long object list of prefixed
+/// names under a namespace of about 120 bytes (`x:s x:p x:o, x:0, x:1, ...`),
+/// which expands 37 to 39 times because every item repeats the subject and
+/// the predicate in full. Sixty-four leaves that shape room and still refuses
+/// the megabyte-long namespace, which expands hundreds of thousands of times.
+/// A document under 4 MiB is held by the floor alone.
+///
+/// What it bounds is the text the parser copies, not resident memory: the
+/// views deduplicate, so the peak depends on how much of that text is
+/// distinct (see the README for measured peaks at the ceiling).
+pub const TERM_BYTES_PER_SOURCE_BYTE: usize = 64;
 
 /// Fail-closed resource budget for one parse.
 #[derive(Clone, Copy, Debug)]
@@ -510,7 +523,8 @@ pub fn parse_turtle(
     let mut terms = StagedTerms::default();
     let mut staged: Vec<[u32; 3]> = Vec::new();
     let mut staged_seen: HashSet<[u32; 3]> = HashSet::new();
-    let prefixes = read_default_graph(source, limits, |quad, blank_labels| {
+    let term_budget = term_byte_budget(source.len());
+    let prefixes = read_default_graph(source, limits, Some(term_budget), |quad, blank_labels| {
         // Subject before object: blank nodes are numbered by first appearance,
         // and both views must meet them in the same order.
         let subject = match &quad.subject {
@@ -542,7 +556,6 @@ pub fn parse_turtle(
     // term is mapped to the first term with its text, and the rows are
     // deduplicated again only when such a pair exists.
     let abbreviator = Abbreviator::new(&prefixes);
-    let term_budget = term_byte_budget(source.len());
     let rendered = terms.render(&abbreviator, term_budget)?;
     let mut first_with_text: HashMap<&str, u32> = HashMap::with_capacity(rendered.len());
     let mut folded = false;
@@ -629,7 +642,8 @@ pub fn parse_turtle_terms(
     let mut triples: Vec<TripleTerms> = Vec::new();
     let mut strings: RowStrings = RowStrings::default();
     let mut seen: HashSet<[u32; 6]> = HashSet::new();
-    read_default_graph(source, limits, |quad, blank_labels| {
+    let term_budget = term_byte_budget(source.len());
+    read_default_graph(source, limits, Some(term_budget), |quad, blank_labels| {
         let subject = match &quad.subject {
             NamedOrBlankNode::NamedNode(node) => node.as_str(),
             NamedOrBlankNode::BlankNode(node) => blank_labels.label(node.as_str()),
@@ -675,16 +689,16 @@ pub fn parse_turtle_terms(
 /// # Errors
 ///
 /// Returns [`OntologyError::ResourceLimit`] when `source` exceeds
-/// `limits.max_source_bytes`, [`MAX_NESTING_DEPTH`],
-/// [`MAX_TRIPLE_TERM_DEPTH`] or the expanded-text
-/// allowance ([`TERM_BYTES_PER_SOURCE_BYTE`]), and [`OntologyError::Syntax`]
-/// when the document does not parse: a table read from half a document would
-/// be a guess.
+/// `limits.max_source_bytes`, [`MAX_NESTING_DEPTH`] or
+/// [`MAX_TRIPLE_TERM_DEPTH`], and [`OntologyError::Syntax`] when the document
+/// does not parse: a table read from half a document would be a guess. The
+/// expanded-text allowance ([`TERM_BYTES_PER_SOURCE_BYTE`]) does not apply:
+/// no term is kept, so there is no term text to hold to a budget.
 pub fn declared_prefixes(
     source: &[u8],
     limits: OntologyLimits,
 ) -> Result<BTreeMap<String, String>, OntologyError> {
-    read_default_graph(source, limits, |_, _| Ok(()))
+    read_default_graph(source, limits, None, |_, _| Ok(()))
 }
 
 /// Drive the Turtle parser over `source`, handing each default-graph quad on.
@@ -692,9 +706,13 @@ pub fn declared_prefixes(
 /// The one parse loop under both views: the source budget, syntax errors, the
 /// named-graph refusal and blank node labelling cannot drift apart. Returns
 /// the prefix table the parser holds at the end of the document.
+///
+/// `term_budget` is the expanded term text the document may ask for, for a
+/// caller that keeps terms; `None` counts nothing.
 fn read_default_graph(
     source: &[u8],
     limits: OntologyLimits,
+    term_budget: Option<usize>,
     mut visit: impl FnMut(&Quad, &mut BlankLabels) -> Result<(), OntologyError>,
 ) -> Result<BTreeMap<String, String>, OntologyError> {
     if source.len() > limits.max_source_bytes {
@@ -726,7 +744,6 @@ fn read_default_graph(
         None => {}
     }
     let mut blank_labels = BlankLabels::for_document(source);
-    let term_budget = term_byte_budget(source.len());
     let mut term_bytes = 0_usize;
     let mut parser = TurtleParser::new().for_slice(source);
     // `by_ref`: the parser is read again after the last triple, for the
@@ -735,8 +752,10 @@ fn read_default_graph(
         let triple = triple.map_err(|error| OntologyError::Syntax(error.to_string()))?;
         // Counted before the statement is looked at: a repeated statement is
         // retained nowhere, but the parser has still made its copies.
-        term_bytes = term_bytes.saturating_add(triple_term_bytes(&triple));
-        enforce_term_budget(term_bytes, term_budget)?;
+        if let Some(budget) = term_budget {
+            term_bytes = term_bytes.saturating_add(triple_term_bytes(&triple));
+            enforce_term_budget(term_bytes, budget)?;
+        }
         // Turtle has no graph syntax, so every statement is in the default
         // graph; `OntologyError::NamedGraph` stays for a future quad format.
         let quad = triple.in_graph(GraphName::DefaultGraph);
