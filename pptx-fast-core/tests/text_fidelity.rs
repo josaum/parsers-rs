@@ -646,8 +646,8 @@ fn indented_property_parts_read_like_compact_ones() {
 }
 
 // An element with no content, written across lines, holds only the
-// indentation of its end tag. That is layout, not a value, in every property
-// part; spaces with no line break are still a value.
+// indentation of its end tag. That is layout, not a value, in the core and
+// app property parts; spaces with no line break are still a value.
 #[test]
 fn a_property_holding_only_a_line_break_has_no_value() {
     let deck = Deck {
