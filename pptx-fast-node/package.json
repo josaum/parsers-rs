@@ -1,6 +1,6 @@
 {
   "name": "pptx-fast-node",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "High-performance PowerPoint (.pptx) parser with native Rust core",
   "main": "index.js",
   "types": "index.d.ts",

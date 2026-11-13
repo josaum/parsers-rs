@@ -116,7 +116,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "email-fast-core"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "base64",
