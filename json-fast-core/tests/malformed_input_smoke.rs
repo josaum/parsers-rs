@@ -175,17 +175,26 @@ fn a_raised_nesting_limit_still_refuses_a_million_levels() {
             assert!(jsonl::parse_many_with_limits::<Value>(text, &raised).is_err());
         });
     }
-    // A modest raise still works.
-    let modest = JsonLimits {
-        max_nesting_depth: 80,
-        ..JsonLimits::default()
-    };
-    let text = "[".repeat(80) + &"]".repeat(80);
+    // A raise works up to the ceiling; one level more is this crate's own
+    // limit error, which names the limit and echoes none of the input.
+    let ceiling = json_fast_core::MAX_SUPPORTED_NESTING_DEPTH;
     std::thread::Builder::new()
-        .stack_size(MAIN_THREAD_STACK_BYTES * 4)
+        .stack_size(MAIN_THREAD_STACK_BYTES * 8)
         .spawn(move || {
-            assert!(json_fast_core::parse_value(&text).is_err());
-            assert!(json_fast_core::parse_value_with_limits(&text, &modest).is_ok());
+            for (open, body, close) in [("[", "1", "]"), ("{\"a\":", "1", "}")] {
+                let nest = |depth: usize| open.repeat(depth) + body + &close.repeat(depth);
+                assert!(json_fast_core::parse_value(&nest(ceiling)).is_err());
+                assert!(json_fast_core::parse_value_with_limits(&nest(ceiling), &raised).is_ok());
+                let error = json_fast_core::parse_value_with_limits(&nest(ceiling + 1), &raised)
+                    .expect_err("past the ceiling");
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "resource_limit: nesting_depth: observed {} exceeds limit {ceiling}",
+                        ceiling + 1
+                    )
+                );
+            }
         })
         .expect("spawn")
         .join()

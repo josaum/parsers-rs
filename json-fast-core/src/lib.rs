@@ -56,13 +56,14 @@ pub const DEFAULT_MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_NESTING_DEPTH: usize = 64;
 /// Deepest nesting any caller-supplied [`JsonLimits`] can allow.
 ///
-/// The parse recurses once per array/object level and cannot be given a
-/// depth limit of its own, so a caller who raised `max_nesting_depth` far
-/// enough got a stack overflow instead of an error (100 nested arrays
-/// already overflow a 2 MiB stack in an unoptimized build). A limit above
-/// this ceiling is treated as this ceiling. 512 levels need about 1 MiB of
-/// stack in an optimized build, going by the 128 KiB measured for 64.
-pub const MAX_SUPPORTED_NESTING_DEPTH: usize = 512;
+/// The parsing backend recurses once per array/object level and refuses
+/// input more than 128 levels deep with an error of its own that quotes the
+/// input. A `max_nesting_depth` above this ceiling is treated as this
+/// ceiling, so deeper input is always this crate's `resource_limit` error
+/// and the backend's limit is never reached. 128 levels is the most the
+/// backend parses; an unoptimized build needs a large stack to get there
+/// (63 nested objects already take 2 to 4 MiB).
+pub const MAX_SUPPORTED_NESTING_DEPTH: usize = 128;
 /// Default maximum lexical JSON tokens.
 pub const DEFAULT_MAX_TOKENS: usize = 1_000_000;
 /// Default maximum physical lines in one JSONL input.
