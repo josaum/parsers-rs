@@ -44,6 +44,79 @@ A crate belongs in `parsers-rs` when it provides a deterministic, side-effect-fr
 
 ---
 
+## Limits and guarantees
+
+The limits each parser enforces on its input, with the default and the name
+that holds it in the source. A limit that is a `ParseOptions` / `JsonLimits`
+field can be changed by the caller; a `const` cannot.
+
+| Crate | Limit | Default | Source |
+|-------|-------|---------|--------|
+| `ooxml-archive` | Bytes inflated across one archive view | 128 MiB | `DEFAULT_MAX_INFLATE`, `ooxml-archive/src/lib.rs` |
+| `docx-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `docx-fast-core/src/lib.rs` |
+| | Nested table depth | 32 | `MAX_TABLE_DEPTH` |
+| | `basedOn` style links followed | 64 | `MAX_STYLE_CHAIN` |
+| `xlsx-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `xlsx-fast-core/src/lib.rs` |
+| | Text bytes in one Arrow batch | 64 MiB | `MAX_BATCH_TEXT_BYTES`, `xlsx-fast-core/src/arrow.rs` |
+| `pptx-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `pptx-fast-core/src/lib.rs` |
+| `email-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `email-fast-core/src/lib.rs` |
+| | One attachment / all attachments | 100 MiB / 100 MiB | `ParseOptions::max_attachment_size`, `max_total_attachment_bytes` |
+| | MIME nesting depth | 32 | `MAX_MIME_DEPTH` |
+| | Header-decoding work per message | 3,000,000,000 characters walked | `MAX_HEADER_DECODE_COST` |
+| | Multipart boundary length | 200 bytes | `MAX_BOUNDARY_LEN` |
+| `json-fast-core` | Input size | 8 MiB | `DEFAULT_MAX_INPUT_BYTES`, `json-fast-core/src/lib.rs` |
+| | Nesting depth | 64 | `DEFAULT_MAX_NESTING_DEPTH` |
+| | Tokens | 1,000,000 | `DEFAULT_MAX_TOKENS` |
+| | JSONL lines / records | 100,000 / 100,000 | `DEFAULT_MAX_LINES`, `DEFAULT_MAX_RECORDS` |
+| | Retained bytes / Arrow IPC bytes | 64 MiB / 64 MiB | `DEFAULT_MAX_RETAINED_BYTES`, `DEFAULT_MAX_IPC_BYTES` |
+| | JSON Schema `$ref` hops | 32 | `MAX_REF_DEPTH`, `json-fast-core/src/schema.rs` |
+| `xsd-fast-core` | Schema bytes, root plus includes | 32 MiB | `DEFAULT_MAX_SCHEMA_BYTES`, `xsd-fast-core/src/parser.rs` |
+| | One `schemaLocation` value | 4 KiB | `DEFAULT_MAX_SCHEMA_LOCATION_BYTES` |
+| | Included or imported files | 64 | `ParseOptions::max_includes` |
+| | Include chain depth | 32 | `MAX_INCLUDE_NESTING` |
+| | Nesting of type-bearing constructs | 64 | `MAX_NESTING_DEPTH` |
+| | Validation findings reported | 100 | `ValidateOptions::max_errors`, `xsd-fast-core/src/validator.rs` |
+| `web-fast-core` | Input size | 32 MiB | `ParseOptions::max_input_bytes`, `web-fast-core/src/lib.rs` |
+| | Emitted nodes | 250,000 | `ParseOptions::max_nodes` |
+| | Emitted text | 32 MiB | `ParseOptions::max_text_bytes` |
+| `geo-fast-core` | GeoJSON nesting depth | 32 | `MAX_NESTING_DEPTH`, `geo-fast-core/src/geojson.rs` |
+| | GeoTIFF decoded bytes per input byte | 8 uncompressed, 32,768 compressed | `UNCOMPRESSED_EXPANSION`, `COMPRESSED_EXPANSION`, `geo-fast-core/src/geotiff.rs` |
+| | GeoTIFF band data returned | the larger of 4 bytes per input byte and twice the `tiff` decoder's buffer cap | `BAND_BYTES_PER_INPUT_BYTE`, `BAND_BYTES_PER_DECODED_BYTE`, `max_band_bytes` |
+
+`pdf-fast-core` has limits of its own; they are documented next to the
+constants in that crate and are not repeated here.
+
+**What is tested.** Every core crate has `tests/malformed_input_smoke.rs`: a
+deterministic, fixed-seed byte mutator over valid seed documents
+(`tools/mutation_smoke.rs`) that fails on any panic, runs under an allocator
+that aborts past 1 GiB of live memory (`ALLOCATION_CAP_BYTES`), and feeds
+deeply nested inputs to the parser on a 256 KiB thread stack
+(`SMALL_STACK_BYTES`). The workspace tests run on Linux, macOS and Windows on
+every pull request (`rust` and `rust-platforms` in `.github/workflows/ci.yml`).
+Coverage-guided libFuzzer targets live in the `fuzz/` directory of each of
+those crates except `pdf-fast-core` and `ontology-fast-core`, start from the
+same seed documents, and run on a schedule in `.github/workflows/fuzz.yml`,
+together with Miri over the tests of the `unsafe` SIMD scans and a build on
+the minimum supported Rust version.
+
+**What is not guaranteed.**
+
+- The limits bound memory and recursion. They do not bound wall-clock time,
+  except where a constant above says so (`MAX_HEADER_DECODE_COST`,
+  `MAX_BOUNDARY_LEN`): a large input within its limits takes time in
+  proportion to its size.
+- On malformed input the goal is an error or a partial result, never a panic,
+  stack overflow or unbounded allocation. What a parser extracts from a
+  damaged file is not specified and may change between versions.
+- Fuzzing and mutation testing find bugs; they do not prove there are none.
+- No sandboxing and no constant-time behaviour. A caller that parses hostile
+  files should still isolate the process and set its own time limit.
+- The minimum supported Rust version is the `rust-version` in `Cargo.toml`
+  (1.94); releases are built with the toolchain pinned in
+  `rust-toolchain.toml`.
+
+---
+
 ## Sovereign Boundary Rules
 
 To keep `parsers-rs` a clean, shared foundation rather than a component coupled to any single product:
