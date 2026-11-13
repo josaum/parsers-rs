@@ -706,6 +706,78 @@ fn page_content_only_refuses_an_entry_it_cannot_remove() {
     assert!(format!("{error:#}").contains("/AA"), "{error:#}");
 }
 
+/// Returns a two-page document whose cross-reference table also lists the
+/// offsets `strays` returns, given the real offsets and the body length, as
+/// objects in use.
+fn document_with_stray_entries(strays: impl FnOnce(&[usize], usize) -> Vec<usize>) -> Vec<u8> {
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Count 2 /Kids [3 0 R 5 0 R] >>".to_vec(),
+        page(2, 4, ""),
+        text_stream("Page 1"),
+        page(2, 6, ""),
+        text_stream("Page 2"),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_at = pdf.len();
+    let strays = strays(&offsets, xref_at);
+    offsets.extend(strays);
+    let mut table = format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1);
+    for offset in &offsets {
+        table.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    table.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+        offsets.len() + 1
+    ));
+    pdf.extend_from_slice(table.as_bytes());
+    pdf
+}
+
+/// WHY: an xref offset bounds the object before it only when an object
+/// header stands there. A stray in-use entry pointing into a page dictionary
+/// used to cut the page off mid-entry, and the cut page was written as a
+/// success: no `/Contents`, no `/MediaBox`, no closing `>>`.
+#[test]
+fn a_stray_entry_inside_a_page_dictionary_does_not_cut_the_page() {
+    let whole = extract(&document_with_stray_entries(|_, _| Vec::new()), &[1]).expect("extracts");
+    let pdf = document_with_stray_entries(|offsets, _| vec![offsets[2] + 40]);
+    let output = extract(&pdf, &[1]).expect("extracts");
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("/Contents"), "{text}");
+    assert!(text.contains("/MediaBox"), "{text}");
+    assert_eq!(output, whole, "the page is copied whole");
+    assert_eq!(page_texts(&output), ["Page 1"]);
+}
+
+/// WHY: the same stray entry inside a content stream made the stream look
+/// longer than its object, and a source that used to extract was refused.
+#[test]
+fn a_stray_entry_inside_a_content_stream_does_not_stop_extraction() {
+    let whole = extract(&document_with_stray_entries(|_, _| Vec::new()), &[1]).expect("extracts");
+    let pdf = document_with_stray_entries(|offsets, _| vec![offsets[3] + 40]);
+    assert_eq!(extract(&pdf, &[1]).expect("extracts"), whole);
+}
+
+/// WHY: a table may hold any number of stray entries; one at every offset of
+/// the file must leave every object whole.
+#[test]
+fn a_million_stray_entries_at_every_offset_leave_the_objects_whole() {
+    let whole =
+        extract(&document_with_stray_entries(|_, _| Vec::new()), &[1, 2]).expect("extracts");
+    let pdf = document_with_stray_entries(|_, len| (0..1_000_000).map(|n| n % len).collect());
+    let output = extract(&pdf, &[1, 2]).expect("extracts");
+    assert_eq!(output, whole);
+    assert_eq!(page_texts(&output), ["Page 1", "Page 2"]);
+}
+
 /// WHY: the refusal of too many repeats is read by callers; its text had a
 /// run of spaces in it from a string continued without a backslash.
 #[test]

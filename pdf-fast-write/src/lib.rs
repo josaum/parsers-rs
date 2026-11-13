@@ -356,6 +356,15 @@ impl Pdf {
                 Some(body) => body,
                 None => get_object(&self.data, &self.xref, old_obj)?,
             };
+            // An object cut short must never be written as if it were whole.
+            let syntax_end = stream_data_range(&self.data, &self.xref, &raw)?
+                .map_or(raw.len(), |stream| stream.start);
+            if !delimiters_balance(&raw[..syntax_end]) {
+                return Err(anyhow!(
+                    "object {} is cut short or malformed: a dictionary or array in it is not closed",
+                    old_obj
+                ));
+            }
             let remapped = remap_refs(&self.data, &self.xref, &raw, &id_map)?;
             out.objects.push(remapped);
         }
@@ -560,6 +569,33 @@ fn find_startxref(data: &[u8]) -> Result<u64> {
 /// plus the trailer key/value dictionary.
 type ParsedXref = (Xref, HashMap<String, String>);
 
+/// Most bytes read at an offset to decide whether an object header is there.
+///
+/// `N G obj` with the largest object and generation numbers takes 20 bytes;
+/// the rest allows for extra white space. The bound keeps the check of a
+/// table with millions of entries proportional to the table.
+const HEADER_WINDOW_BYTES: usize = 64;
+
+/// Counters the unit tests read to bound work without timing it.
+#[cfg(test)]
+mod work {
+    use std::cell::Cell;
+    use std::thread::LocalKey;
+
+    thread_local! {
+        /// Bytes handed to the header check while building an [`super::Xref`].
+        pub(super) static HEADER_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add(counter: &'static LocalKey<Cell<usize>>, amount: usize) {
+        counter.with(|count| count.set(count.get() + amount));
+    }
+
+    pub(super) fn take(counter: &'static LocalKey<Cell<usize>>) -> usize {
+        counter.with(|count| count.replace(0))
+    }
+}
+
 /// The objects in use: object number → `(byte offset, generation)`, and the
 /// offsets at which they start.
 #[derive(Debug, Default)]
@@ -570,8 +606,27 @@ struct Xref {
 }
 
 impl Xref {
-    fn new(entries: HashMap<u32, (u64, u16)>) -> Self {
-        let mut starts: Vec<u64> = entries.values().map(|(offset, _)| *offset).collect();
+    /// Builds the table from the entries of `data`'s cross-reference sections.
+    ///
+    /// An offset bounds the object before it only when the entry's own
+    /// `N G obj` header stands there. A stray entry pointing into the middle
+    /// of another object would otherwise cut that object short.
+    fn new(data: &[u8], entries: HashMap<u32, (u64, u16)>) -> Self {
+        let mut starts: Vec<u64> = entries
+            .iter()
+            .filter(|(object, (offset, generation))| {
+                usize::try_from(*offset)
+                    .ok()
+                    .and_then(|offset| data.get(offset..))
+                    .is_some_and(|slice| {
+                        let window = &slice[..slice.len().min(HEADER_WINDOW_BYTES)];
+                        #[cfg(test)]
+                        work::add(&work::HEADER_BYTES, window.len());
+                        object_header_end(window, **object, *generation).is_ok()
+                    })
+            })
+            .map(|(_, (offset, _))| *offset)
+            .collect();
         starts.sort_unstable();
         starts.dedup();
         Self { entries, starts }
@@ -649,7 +704,7 @@ fn parse_xref(data: &[u8], start: u64) -> Result<ParsedXref> {
         .into_iter()
         .filter_map(|(object, entry)| entry.map(|entry| (object, entry)))
         .collect();
-    Ok((Xref::new(in_use), latest_trailer.unwrap_or_default()))
+    Ok((Xref::new(data, in_use), latest_trailer.unwrap_or_default()))
 }
 
 fn parse_xref_section(data: &[u8], start: u64) -> Result<ParsedSection> {
@@ -1017,6 +1072,31 @@ fn find_object_end(
         .find(|token| token.bytes == b"endobj")
         .map(|token| token.start)
         .ok_or(MissingEnd::NoEndobj)
+}
+
+/// Returns whether every `<<` and `[` in `syntax` is closed, in order.
+fn delimiters_balance(syntax: &[u8]) -> bool {
+    let mut open: Vec<u8> = Vec::new();
+    let mut index = 0;
+    while let Some(token) = next_syntax_token(syntax, &mut index) {
+        let closed = match token.bytes {
+            b"<<" => {
+                open.push(b'<');
+                continue;
+            }
+            b"[" => {
+                open.push(b'[');
+                continue;
+            }
+            b">>" => b'<',
+            b"]" => b'[',
+            _ => continue,
+        };
+        if open.pop() != Some(closed) {
+            return false;
+        }
+    }
+    open.is_empty()
 }
 
 fn syntax_tokens(bytes: &[u8]) -> Vec<SyntaxToken<'_>> {
@@ -2295,5 +2375,47 @@ mod tests {
     fn test_looks_like_compressed_xref_detects_obj_header() {
         assert!(looks_like_compressed_xref(b"12 0 obj<< /Type /XRef >>"));
         assert!(!looks_like_compressed_xref(b"xref\n0 1\n"));
+    }
+
+    /// WHY: every xref entry is checked for an object header. The check reads
+    /// a bounded window, so a table whose entries all point into one long
+    /// token costs the size of the table, not the table times the file.
+    #[test]
+    fn header_checks_read_a_bounded_window_per_entry() {
+        const ENTRIES: u32 = 20_000;
+        let mut data = b"/".to_vec();
+        data.resize(200_000, b'A');
+        let entries: HashMap<u32, (u64, u16)> = (0..ENTRIES)
+            .map(|object| (object + 1, (u64::from(object) * 10, 0)))
+            .collect();
+        work::take(&work::HEADER_BYTES);
+        let xref = Xref::new(&data, entries);
+        assert!(xref.starts.is_empty());
+        let read = work::take(&work::HEADER_BYTES);
+        assert!(
+            read <= HEADER_WINDOW_BYTES * ENTRIES as usize,
+            "{read} bytes read for {ENTRIES} entries"
+        );
+    }
+
+    /// WHY: whatever makes an object end early, a dictionary that is not
+    /// closed must be an error, never a file written as if it were whole.
+    #[test]
+    fn an_object_cut_short_is_refused_not_written() {
+        let data = make_minimal_pdf();
+        let mut pdf = Pdf::parse(&data).expect("parses");
+        // A bound inside the first page dictionary, as an unchecked stray
+        // xref entry would give.
+        let inside_page = pdf.xref[&3].0 + 40;
+        pdf.xref.starts.push(inside_page);
+        pdf.xref.starts.sort_unstable();
+        let error = pdf
+            .build_subset(&[1], &ExtractOptions::new())
+            .err()
+            .expect("a truncated page is refused");
+        assert!(error.to_string().contains("is not closed"), "{error}");
+        assert!(delimiters_balance(b"<< /A [1 2 (]) <5d> ] /B << >> >>"));
+        assert!(!delimiters_balance(b"<< /A [1 2 >>"));
+        assert!(!delimiters_balance(b"<< /A 1 >> >>"));
     }
 }
