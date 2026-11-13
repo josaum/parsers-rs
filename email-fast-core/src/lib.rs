@@ -389,6 +389,11 @@ pub fn parse_eml(path: impl AsRef<Path>, options: ParseOptions) -> Result<Email>
 
 /// Parse EML from bytes
 pub fn parse_eml_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
+    // `mailparse` decodes some header lines in more than linear time, and it
+    // decodes `Content-*` headers on its own while it splits the message, so
+    // the cost is bounded before it sees a single header.
+    header_decode_cost(bytes, MAX_HEADER_DECODE_COST)
+        .map_err(|refusal| anyhow!("Failed to parse email: {refusal}"))?;
     // `mailparse` recurses once per nested multipart, so the depth is checked
     // before it sees the message.
     if mime_nesting_exceeds(bytes, MAX_MIME_DEPTH) {
@@ -530,6 +535,17 @@ pub fn parse_mbox(
 ///   such a mailbox and deliver all of it as one message; the price is that
 ///   an unquoted body line beginning with `From ` splits its message.
 ///
+/// # Quoted `From ` lines
+///
+/// In a mailbox split by the dated rule, a line that begins with `>From `
+/// is delivered as `From `, and `>>From ` as `>From `: one `>` is removed
+/// from a line made of `>` characters followed by `From `. This is the
+/// mboxrd convention, in which the writer adds one `>` to every such line so
+/// that no body line can pass for a separator, and the reader takes it off
+/// again. A mailbox written in the mboxo convention quotes only `From ` and
+/// leaves a body's own `>From ` alone, so such a line loses its `>` here.
+/// Lines are left as written in a mailbox split at every `From ` line.
+///
 /// # Errors
 ///
 /// Returns an error if the reader fails or `callback` returns one. A message
@@ -595,6 +611,9 @@ pub fn parse_mbox_reader(
             if !current_message.is_empty() {
                 current_message.push(b'\n');
             }
+            if separators == Some(SeparatorRule::Dated) {
+                line = unquote_from_line(line);
+            }
             current_message.extend_from_slice(line);
         }
     }
@@ -608,6 +627,19 @@ pub fn parse_mbox_reader(
     }
 
     Ok(count)
+}
+
+/// Removes one level of mboxrd quoting from `line`.
+///
+/// A line of one or more `>` followed by `From ` loses its first `>`; any
+/// other line is returned as it is.
+fn unquote_from_line(line: &[u8]) -> &[u8] {
+    let quotes = line.iter().take_while(|byte| **byte == b'>').count();
+    if quotes > 0 && line[quotes..].starts_with(b"From ") {
+        &line[1..]
+    } else {
+        line
+    }
 }
 
 /// How one mailbox marks where its messages start.
@@ -923,6 +955,272 @@ fn mime_nesting_depth(raw: &[u8], limit: usize) -> Option<usize> {
         }
     }
     Some(deepest)
+}
+
+/// Most work [`header_decode_cost`] lets the headers of one message ask of
+/// `mailparse`, in characters walked.
+///
+/// Measured on `mailparse` 0.15 in an optimized build: a header line of
+/// 1,000 encoded-words that are opened and never ended costs 2.3e9 and takes
+/// 0.68 s to decode, which is about 3.4e9 per second. The bound is therefore
+/// about one second of decoding per read of the costliest header accepted
+/// (this crate has a header read up to four times), and some fifty times
+/// that in an unoptimized build. Mail is nowhere near it: an unfolded line
+/// of 2,000 properly encoded recipients (68 KB) costs 1.4e8.
+const MAX_HEADER_DECODE_COST: u64 = 3_000_000_000;
+
+/// Longest multipart boundary accepted, in bytes.
+///
+/// `mailparse` looks for a boundary by comparing it at every position of the
+/// body, so splitting a message costs its size times the boundary's length:
+/// a 900-byte boundary over 5 MB took 1.4 s in an optimized build. RFC 2046
+/// allows 70 characters; this leaves room for writers that go over.
+const MAX_BOUNDARY_LEN: usize = 200;
+
+/// Returns the work `mailparse` 0.15 does to decode the headers of `raw`.
+///
+/// `mailparse` looks for encoded-words (`=?charset?B?text?=`) one physical
+/// line of a header value at a time. For every `=?`, and for every `?=` it
+/// tries as that word's end, it checks a neighboring character by walking
+/// the line from its first character. A word whose `?=` is not followed by a
+/// delimiter is not ended there, so the search goes on to the next `?=`;
+/// when no `?=` ends the word, the next `=?` starts the same search again.
+/// A line of `n` such words therefore costs `n * n` checks of up to the
+/// line's length each, where a line of `n` proper words costs `2 * n`.
+///
+/// The cost is counted by replaying that search on every header value
+/// ([`header_line_decode_cost`]), so a header costs here what it costs
+/// there. The headers read are those at the start of `raw` and those after
+/// every multipart delimiter line, up to the next empty line, as in
+/// `mailparse`. A delimiter line is one that begins with `--` and a boundary
+/// that a `Content-Type` header read earlier declares; other lines that
+/// begin with `--` (a signature separator, a forwarded-message banner) are
+/// body text. Every header `mailparse` decodes is read here; a few it does
+/// not decode are read too, since a boundary stays in force to the end of
+/// the message and a closing delimiter counts as one. This has to happen
+/// before `mailparse` sees the message, because it decodes the `Content-*`
+/// headers of every part on its own.
+///
+/// # Errors
+///
+/// Returns an error once the cost passes `limit`, or if a multipart
+/// `Content-Type` declares a boundary longer than [`MAX_BOUNDARY_LEN`].
+fn header_decode_cost(raw: &[u8], limit: u64) -> Result<u64> {
+    let mut scan = HeaderScan {
+        cost: 0,
+        limit,
+        delimiters: Vec::new(),
+        block_has_content_type: false,
+    };
+    let mut in_headers = true;
+    // Where the header being read began; it ends at the next line that is
+    // not a continuation line.
+    let mut header_start: Option<usize> = None;
+    let mut pos = 0;
+    while pos < raw.len() {
+        let line_end = raw[pos..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(raw.len(), |at| pos + at);
+        let line = &raw[pos..line_end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if in_headers {
+            let continues = header_start.is_some() && matches!(line.first(), Some(b' ' | b'\t'));
+            if !continues {
+                if let Some(start) = header_start.take() {
+                    scan.header(&raw[start..pos])?;
+                }
+                if line.is_empty() {
+                    in_headers = false;
+                } else {
+                    header_start = Some(pos);
+                }
+            }
+        } else {
+            in_headers = line.starts_with(b"--")
+                && scan
+                    .delimiters
+                    .iter()
+                    .any(|delimiter| line.starts_with(delimiter));
+            scan.block_has_content_type = false;
+        }
+        pos = line_end + 1;
+    }
+    if let Some(start) = header_start {
+        scan.header(&raw[start..])?;
+    }
+    Ok(scan.cost)
+}
+
+/// The running state of [`header_decode_cost`].
+struct HeaderScan {
+    /// Characters `mailparse` walks for the headers read so far.
+    cost: u64,
+    /// The cost at which the scan gives up.
+    limit: u64,
+    /// `--` and each boundary a `Content-Type` header has declared so far.
+    delimiters: Vec<Vec<u8>>,
+    /// Whether the header block being read already had a `Content-Type`.
+    /// `mailparse` uses the first one of a block, so only that one can
+    /// declare a boundary.
+    block_has_content_type: bool,
+}
+
+impl HeaderScan {
+    /// Adds the cost of one header: its first line and continuation lines.
+    ///
+    /// The value is cut out, decoded and split into lines the way
+    /// `mailparse` does it, because the positions it examines depend on
+    /// each of those steps.
+    fn header(&mut self, header: &[u8]) -> Result<()> {
+        let first_line_end = header
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(header.len());
+        // A header with no colon on its first line has no value.
+        let Some(colon) = header[..first_line_end]
+            .iter()
+            .position(|byte| *byte == b':')
+        else {
+            return Ok(());
+        };
+        let mut value = &header[colon + 1..];
+        while let [b' ', rest @ ..] = value {
+            value = rest;
+        }
+        while let [rest @ .., b'\r' | b'\n'] = value {
+            value = rest;
+        }
+        if value.windows(2).any(|pair| pair == b"=?") {
+            self.add_value_cost(value)?;
+        }
+        if !self.block_has_content_type && header[..colon].eq_ignore_ascii_case(b"Content-Type") {
+            self.block_has_content_type = true;
+            self.declare_boundary(header)?;
+        }
+        Ok(())
+    }
+
+    /// Records the boundary a `Content-Type` header declares, if any.
+    ///
+    /// The header is handed to `mailparse` itself, so the boundary is the
+    /// one it will search for, whatever folding, quoting or encoding the
+    /// header uses. Its decoding cost is already counted and within the
+    /// limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a multipart boundary is longer than
+    /// [`MAX_BOUNDARY_LEN`].
+    fn declare_boundary(&mut self, header: &[u8]) -> Result<()> {
+        let Ok((parsed, _)) = mailparse::parse_header(header) else {
+            return Ok(());
+        };
+        let content_type = mailparse::parse_content_type(&parsed.get_value());
+        if let Some(boundary) = content_type.params.get("boundary") {
+            if content_type.mimetype.starts_with("multipart/") && boundary.len() > MAX_BOUNDARY_LEN
+            {
+                return Err(anyhow!(
+                    "multipart boundary longer than {MAX_BOUNDARY_LEN} bytes"
+                ));
+            }
+            self.delimiters.push(format!("--{boundary}").into_bytes());
+        }
+        Ok(())
+    }
+
+    /// Adds the cost of decoding one header value that holds a `=?`.
+    fn add_value_cost(&mut self, value: &[u8]) -> Result<()> {
+        // Valid UTF-8 is read as such and anything else as Latin-1.
+        let text: std::borrow::Cow<'_, str> = match std::str::from_utf8(value) {
+            Ok(text) => text.into(),
+            Err(_) => value
+                .iter()
+                .map(|byte| char::from(*byte))
+                .collect::<String>()
+                .into(),
+        };
+        for line in text.lines().map(str::trim_start) {
+            let left = self.limit.saturating_sub(self.cost);
+            self.cost = self
+                .cost
+                .saturating_add(header_line_decode_cost(line, left));
+            if self.cost > self.limit {
+                return Err(anyhow!("header encoded-words too costly to decode"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Returns the characters `mailparse` walks to find the encoded-words of
+/// one line of a header value, or some number above `limit` once the count
+/// passes it.
+///
+/// This replays `mailparse`'s search. Each `=?` costs a check of the
+/// character before it. One that follows a delimiter opens a word, which
+/// costs a check after each `?=` up to the first that is followed by a
+/// delimiter or the line's end; the search then resumes after that word.
+/// When no `?=` ends the word, the search has run to the end of the line
+/// for nothing and resumes just after the `=?`.
+///
+/// A check walks the line from its start to the character examined.
+/// `mailparse` takes a byte offset for that character's index, so on a line
+/// with multi-byte characters it examines a later character than the one
+/// next to the word, or none at all; the replay does the same.
+fn header_line_decode_cost(line: &str, limit: u64) -> u64 {
+    let offsets =
+        |marker: &str| -> Vec<usize> { line.match_indices(marker).map(|(at, _)| at).collect() };
+    let starts = offsets("=?");
+    if starts.is_empty() {
+        return 0;
+    }
+    let ends = offsets("?=");
+    let chars: Vec<char> = line.chars().collect();
+    let cost = std::cell::Cell::new(0u64);
+    // Examines the character whose index is the byte offset `at`, as
+    // `mailparse` does; a missing character counts as a delimiter.
+    let is_delimiter = |at: usize| -> bool {
+        cost.set(
+            cost.get()
+                .saturating_add(at.saturating_add(1).min(chars.len()) as u64),
+        );
+        chars
+            .get(at)
+            .is_none_or(|ch| ch.is_whitespace() || matches!(ch, '"' | '(' | ')' | '<' | '>' | ','))
+    };
+
+    let mut search_from = 0;
+    let mut failed_scans = 0u64;
+    for &start in &starts {
+        if start < search_from {
+            continue;
+        }
+        let word = start + "=?".len();
+        // A word at the very start of the line needs nothing before it.
+        let opens = start.checked_sub(1).is_none_or(&is_delimiter);
+        search_from = word;
+        if !opens {
+            continue;
+        }
+        let first_end = ends.partition_point(|end| *end < word);
+        let mut ended = false;
+        for &end in &ends[first_end..] {
+            let after = end + "?=".len();
+            if is_delimiter(after) {
+                search_from = after;
+                ended = true;
+                break;
+            }
+        }
+        if !ended {
+            failed_scans = failed_scans.saturating_add((line.len() - word) as u64);
+        }
+        if cost.get().saturating_add(failed_scans) > limit {
+            break;
+        }
+    }
+    cost.get().saturating_add(failed_scans)
 }
 
 /// Finds `key` in `data` at or after `start`, as `mailparse` does.
@@ -1384,15 +1682,23 @@ const RAW_TEXT_ELEMENTS: [&str; 2] = ["script", "style"];
 /// Converts an HTML body to plain text.
 ///
 /// Tags are removed, the content of `<script>` and `<style>` elements and of
-/// comments is dropped, `<br>`, `<br/>`, `<p>` and `</p>` become line breaks,
-/// and character references are decoded. This is a single pass over the
-/// text, not an HTML parser: it does not build a tree or lay out blocks.
+/// comments is dropped, and character references are decoded. The start and
+/// end tags of `br`, `p`, `div`, `tr`, `li`, `h1` to `h6` and `blockquote`
+/// become line breaks, and each `td` or `th` start tag becomes a tab, so the
+/// cells of a table row are tab-separated. Tag names are matched without
+/// regard to case and end at whitespace or `/`, so `<BR />` and
+/// `<p class="x">` count. A `>` inside a quoted attribute value does not end
+/// its tag. This is a single pass over the text, not an HTML parser: it does
+/// not build a tree or lay out blocks.
 fn html_to_text(html: &str) -> String {
     let mut text = String::with_capacity(html.len());
     let mut rest = html;
     // Set once a search for `>` has failed: no later tag can be closed
     // either, and searching again for each `<` would cost quadratic time.
     let mut no_closing_bracket = false;
+    // Set once a tag's quoted value ran to the end of the text. Quotes are
+    // not honored after that, or every later tag could repeat that scan.
+    let mut unclosed_quote = false;
     while let Some(open) = rest.find('<') {
         text.push_str(&rest[..open]);
         let tag = &rest[open..];
@@ -1434,8 +1740,13 @@ fn html_to_text(html: &str) -> String {
 
         let closing = if no_closing_bracket {
             None
-        } else {
+        } else if unclosed_quote {
             tag.find('>')
+        } else {
+            tag_end(tag).or_else(|| {
+                unclosed_quote = true;
+                tag.find('>')
+            })
         };
         match closing {
             // `<` with nothing to close it, or the empty `<>`, is text.
@@ -1445,8 +1756,8 @@ fn html_to_text(html: &str) -> String {
                 rest = &tag[1..];
             }
             Some(end) => {
-                if matches!(&tag[1..end], "br" | "br/" | "p" | "/p") {
-                    text.push('\n');
+                if let Some(separator) = tag_separator(&tag[1..end]) {
+                    text.push(separator);
                 }
                 rest = &tag[end + 1..];
             }
@@ -1457,6 +1768,72 @@ fn html_to_text(html: &str) -> String {
     // escaped `&lt;b&gt;` survives as the literal text `<b>` instead of being
     // stripped as markup.
     decode_html_entities(&text)
+}
+
+/// Finds the `>` that ends the tag at the start of `tag`, skipping any `>`
+/// inside a single- or double-quoted attribute value.
+///
+/// A quote character opens a value only when it directly follows `=`,
+/// spaces aside; anywhere else (`<a title=don't>`) it is an ordinary
+/// character. Returns `None` when the text ends first, inside a quoted
+/// value or not.
+fn tag_end(tag: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut after_equals = false;
+    for (at, byte) in tag.bytes().enumerate() {
+        match quote {
+            Some(open) if byte == open => quote = None,
+            Some(_) => {}
+            None if byte == b'>' => return Some(at),
+            None if after_equals && matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None => {}
+        }
+        if !byte.is_ascii_whitespace() {
+            after_equals = quote.is_none() && byte == b'=';
+        }
+    }
+    None
+}
+
+/// Returns the text a tag stands for, given what is between its `<` and `>`.
+///
+/// A line break for the start or end tag of an element that begins a new
+/// line, a tab for the start of a table cell, nothing for any other tag.
+fn tag_separator(inside: &str) -> Option<char> {
+    /// Elements whose start and end each begin a new line of text.
+    const LINE_ELEMENTS: [&str; 12] = [
+        "br",
+        "p",
+        "div",
+        "tr",
+        "li",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "blockquote",
+    ];
+    /// Table cells, which a tab keeps apart within their row.
+    const CELL_ELEMENTS: [&str; 2] = ["td", "th"];
+
+    let (is_end_tag, after_slash) = match inside.strip_prefix('/') {
+        Some(after_slash) => (true, after_slash),
+        None => (false, inside),
+    };
+    let name_len = after_slash
+        .find(|ch: char| ch.is_ascii_whitespace() || ch == '/')
+        .unwrap_or(after_slash.len());
+    let name = &after_slash[..name_len];
+    let is_one_of = |names: &[&str]| names.iter().any(|known| name.eq_ignore_ascii_case(known));
+    if is_one_of(&LINE_ELEMENTS) {
+        Some('\n')
+    } else if !is_end_tag && is_one_of(&CELL_ELEMENTS) {
+        Some('\t')
+    } else {
+        None
+    }
 }
 
 /// Returns the element name if `tag` opens a `<script>` or `<style>` element.
@@ -2221,8 +2598,197 @@ mod malformed_input_unit_tests {
         assert_eq!(html_to_text("<b>bold</b> < <i>i</i>"), "bold < i");
         assert_eq!(
             html_to_text("<P>one<br>two<br/>three</p>"),
-            "one\ntwo\nthree\n"
+            "\none\ntwo\nthree\n"
         );
+    }
+
+    #[test]
+    fn html_to_text_breaks_lines_at_block_tags_whatever_their_spelling() {
+        assert_eq!(
+            html_to_text("a<br />b<BR>c<p class=\"x\">e</P>f<div>g</div>"),
+            "a\nb\nc\ne\nf\ng\n"
+        );
+        assert_eq!(
+            html_to_text("<h1>T</h1><ul><li>one<li>two</ul><blockquote>q</blockquote>"),
+            "\nT\n\none\ntwo\nq\n"
+        );
+        // Cells are tab-separated and rows are lines.
+        assert_eq!(
+            html_to_text("<table><tr><th>a</th><th>b</th></tr><TR><TD>1<td>2</tr></table>"),
+            "\n\ta\tb\n\n\t1\t2\n"
+        );
+        // Names that only begin like a block tag are not one.
+        assert_eq!(html_to_text("a<president>b<pre>c<tdx>d"), "abcd");
+    }
+
+    #[test]
+    fn html_to_text_keeps_a_quoted_bracket_inside_its_tag() {
+        assert_eq!(html_to_text("<img alt=\"1 > 0\">after"), "after");
+        assert_eq!(html_to_text("<a title='a > b' href=\"x\">link</a>"), "link");
+        // A quote character opens a value only right after `=`; an
+        // apostrophe elsewhere in a tag is just a character.
+        assert_eq!(
+            html_to_text("<a title=don't>link</a> text <b>isn't</b> more"),
+            "link text isn't more"
+        );
+        assert_eq!(html_to_text("<a title = \"a > b\">link</a>"), "link");
+        // A quote that never closes does not swallow the rest of the text.
+        assert_eq!(html_to_text("<a title=\"x>one</a> <b>two</b>"), "one two");
+        // Many unclosed quotes are still one pass.
+        let hostile = "<img alt=\"".repeat(100_000);
+        assert_eq!(html_to_text(&hostile), hostile);
+        let closed = format!("{}>", "<a \"> ".repeat(100_001));
+        let _ = html_to_text(&closed);
+    }
+
+    #[test]
+    fn header_line_decode_cost_replays_the_checks_mailparse_makes() {
+        let cost = |line: &str| header_line_decode_cost(line, u64::MAX);
+        // No encoded-word, no cost.
+        assert_eq!(cost("plain ?= text"), 0);
+        // One word at the start of the line: nothing is checked before it,
+        // and the character after its `?=` (index 13, the line's end) is.
+        assert_eq!(cost("=?UTF-8?Q?a?="), 13);
+        // Two proper words: the second also has the space before it checked.
+        assert_eq!(cost("=?UTF-8?Q?a?= =?UTF-8?Q?b?="), 14 + 14 + 27);
+        // The `=?` inside base64 padding lies within the word and is passed
+        // over.
+        assert_eq!(cost("=?UTF-8?B?eA==?="), 16);
+        // Words that never end are searched for once per `=?`, and each
+        // failed search runs to the end of the line.
+        let unended = "=?a?=x ".repeat(100);
+        let ended = "=?a?= x ".repeat(100);
+        assert!(cost(&unended) > 20 * cost(&ended));
+        // A raw non-ASCII character does not turn proper words into costly
+        // ones: the cost stays linear in the number of words.
+        let proper = "=?UTF-8?Q?x?= <a@example.com>, ".repeat(500);
+        let wide = format!("J\u{e9} <j@example.com>, {proper}");
+        assert!(
+            cost(&wide) < 4 * cost(&proper),
+            "{} {}",
+            cost(&wide),
+            cost(&proper)
+        );
+        assert!(cost(&proper) < 4 * 1_000 * proper.len() as u64);
+        // The count stops soon after the limit.
+        let hostile = " =?a?=x".repeat(100_000);
+        assert!(header_line_decode_cost(&hostile, 1_000) > 1_000);
+    }
+
+    #[test]
+    fn header_decode_cost_reads_part_headers_only_after_a_declared_boundary() {
+        let costly = " =?a?=x".repeat(50);
+        let line_cost = header_line_decode_cost(costly.trim_start(), u64::MAX);
+        let cost =
+            |message: String| header_decode_cost(message.as_bytes(), u64::MAX).expect("no limit");
+        // Lines that begin with `--` in a body are text, and so is what
+        // follows them.
+        for dashes in ["-- ", "-----Original Message-----", "-- SQL comment", "--b"] {
+            assert_eq!(
+                cost(format!(
+                    "Subject: x\n\nbody\n{dashes}\nSubject:{costly}\n\n"
+                )),
+                0,
+                "{dashes}"
+            );
+        }
+        // The boundary may be quoted, folded or declared by a part.
+        for content_type in [
+            "Content-Type: multipart/mixed; boundary=\"b c\"",
+            "Content-Type: multipart/mixed;\n boundary=\"b c\"",
+            "content-type: multipart/mixed; BOUNDARY=\"b c\"",
+        ] {
+            assert_eq!(
+                cost(format!(
+                    "{content_type}\n\n--b c\nSubject:{costly}\n\ntext\n"
+                )),
+                line_cost,
+                "{content_type}"
+            );
+        }
+        assert_eq!(
+            cost(format!(
+                "Content-Type: multipart/mixed; boundary=a\n\n--a\n\
+                 Content-Type: multipart/alternative; boundary=b\n\n--b\n\
+                 Subject:{costly}\n\ntext\n--b--\n--a--\n"
+            )),
+            line_cost
+        );
+    }
+
+    #[test]
+    fn header_decode_cost_counts_header_lines_only() {
+        let costly = " =?a?=x".repeat(50);
+        let line_cost = header_line_decode_cost(costly.trim_start(), u64::MAX);
+        assert!(line_cost > 0);
+        let cost =
+            |message: String| header_decode_cost(message.as_bytes(), u64::MAX).expect("no limit");
+
+        // A body line is not decoded, so it is not counted.
+        assert_eq!(cost(format!("Subject: x\r\n\r\nSubject:{costly}\r\n")), 0);
+        // The headers of the message and of each part are, continuation
+        // lines included.
+        assert_eq!(cost(format!("Subject:{costly}\r\n\r\nbody\r\n")), line_cost);
+        assert_eq!(
+            cost(format!(
+                "Subject: x\r\n{costly}\r\n{costly}\r\n\r\nbody\r\n"
+            )),
+            2 * line_cost
+        );
+        assert_eq!(
+            cost(format!(
+                "Content-Type: multipart/mixed; boundary=b\n\npreamble\n--b\nSubject:{costly}\n\ntext\n--b--\n"
+            )),
+            line_cost
+        );
+        assert!(header_decode_cost(
+            format!("Subject:{costly}\r\n\r\n").as_bytes(),
+            line_cost - 1
+        )
+        .is_err());
+    }
+
+    fn mbox_bodies(mailbox: &str) -> Vec<String> {
+        let mut bodies = Vec::new();
+        parse_mbox_reader(
+            std::io::Cursor::new(mailbox.as_bytes()),
+            ParseOptions::default(),
+            |email| {
+                bodies.push(email.body.text.unwrap_or_default());
+                Ok(())
+            },
+        )
+        .expect("mailbox parses");
+        bodies
+    }
+
+    #[test]
+    fn mbox_with_dated_separators_unquotes_from_lines_by_one_level() {
+        let bodies = mbox_bodies(
+            "From a@example.com Mon Jan 15 14:30:00 2024\n\
+             Subject: one\n\n\
+             >From the start\n\
+             >>From a reply\n\
+             > From spaced\n\
+             >Fromage\n\
+             a >From inside\n\
+             From b@example.com Mon Jan 15 14:31:00 2024\n\
+             Subject: two\n\n\
+             >From here\n",
+        );
+        assert_eq!(
+            bodies,
+            [
+                "From the start\n>From a reply\n> From spaced\n>Fromage\na >From inside",
+                "From here",
+            ]
+        );
+    }
+
+    #[test]
+    fn mbox_split_at_every_from_line_leaves_quoted_lines_alone() {
+        let bodies = mbox_bodies("From a@example.com\nSubject: one\n\n>From the start\n");
+        assert_eq!(bodies, [">From the start"]);
     }
 
     #[test]

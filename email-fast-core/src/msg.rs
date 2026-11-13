@@ -36,6 +36,9 @@ const TAG_BODY: &str = "1000";
 const TAG_BODY_HTML: &str = "1013";
 const TAG_INTERNET_MESSAGE_ID: &str = "1035";
 const TAG_DISPLAY_NAME: &str = "3001";
+const TAG_ADDRESS_TYPE: &str = "3002";
+const TAG_EMAIL_ADDRESS: &str = "3003";
+const TAG_SMTP_ADDRESS: &str = "39FE";
 const TAG_ATTACH_DATA_BIN: &str = "3701";
 const TAG_ATTACH_FILENAME: &str = "3704";
 const TAG_ATTACH_LONG_FILENAME: &str = "3707";
@@ -44,6 +47,8 @@ const TAG_ATTACH_CONTENT_ID: &str = "3712";
 
 /// Name prefix of the storage that holds one attachment (MS-OXMSG 2.2.2).
 const ATTACHMENT_STORAGE_PREFIX: &str = "__attach_version1.0_";
+/// Name prefix of the storage that holds one recipient (MS-OXMSG 2.2.1).
+const RECIPIENT_STORAGE_PREFIX: &str = "__recip_version1.0_";
 /// Name of the stream holding an object's fixed-length properties (MS-OXMSG 2.4).
 const PROPERTY_STREAM_NAME: &str = "__properties_version1.0";
 /// Pseudo-tag under which the root property stream is carried with the
@@ -53,6 +58,9 @@ const TAG_PROPERTY_STREAM: &str = "__properties";
 /// Size of the property stream header of a top-level message: 8 reserved
 /// bytes, four 4-byte counters, 8 reserved bytes (MS-OXMSG 2.4.1.1).
 const TOP_LEVEL_PROPERTY_HEADER_LEN: usize = 32;
+/// Size of the property stream header of a recipient or attachment object:
+/// 8 reserved bytes (MS-OXMSG 2.4.1.3).
+const NESTED_PROPERTY_HEADER_LEN: usize = 8;
 /// Size of one property stream entry: tag, flags, 8-byte value (MS-OXMSG 2.4.2).
 const PROPERTY_ENTRY_LEN: usize = 16;
 /// `PidTagMessageCodepage` as PtypInteger32: the code page of the message's
@@ -61,6 +69,24 @@ const PROP_MESSAGE_CODEPAGE: u32 = 0x3FFD_0003;
 /// `PidTagInternetCodepage` as PtypInteger32: the code page of the body
 /// streams, including the binary HTML body.
 const PROP_INTERNET_CODEPAGE: u32 = 0x3FDE_0003;
+/// `PidTagClientSubmitTime` as PtypTime: when the sender submitted the message.
+const PROP_CLIENT_SUBMIT_TIME: u32 = 0x0039_0040;
+/// `PidTagMessageDeliveryTime` as PtypTime: when the message was delivered.
+const PROP_MESSAGE_DELIVERY_TIME: u32 = 0x0E06_0040;
+/// `PidTagRecipientType` as PtypInteger32, in a recipient's property stream.
+const PROP_RECIPIENT_TYPE: u32 = 0x0C15_0003;
+/// The bits of `PidTagRecipientType` that hold the type; the bits above them
+/// are status flags (MS-OXOMSG 2.2.3.1).
+const RECIPIENT_TYPE_MASK: u32 = 0x0000_000F;
+/// `PidTagRecipientType` values for carbon-copy and blind-carbon-copy
+/// recipients. `0` is the originator, and anything else is a primary one.
+const RECIPIENT_TYPE_ORIGINATOR: u32 = 0;
+const RECIPIENT_TYPE_CC: u32 = 2;
+const RECIPIENT_TYPE_BCC: u32 = 3;
+/// FILETIME ticks (100 ns) in one second.
+const FILETIME_TICKS_PER_SECOND: u64 = 10_000_000;
+/// Seconds from the FILETIME epoch (1601-01-01 UTC) to the Unix epoch.
+const FILETIME_UNIX_EPOCH_SECONDS: i64 = 11_644_473_600;
 
 pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
     if bytes.len() < HEADER_SIZE || bytes[..8] != OLE_SIGNATURE {
@@ -70,6 +96,7 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Ema
     let MessageStreams {
         root: streams,
         attachments: attach_storages,
+        recipients: recipient_storages,
     } = file.message_streams()?;
     if streams.iter().all(|s| s.tag == TAG_PROPERTY_STREAM) {
         return Err(anyhow!(
@@ -79,10 +106,14 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Ema
 
     let property_stream = first_binary(&streams, TAG_PROPERTY_STREAM);
     let message_codepage = property_stream
-        .and_then(|props| fixed_u32_property(props, PROP_MESSAGE_CODEPAGE))
+        .and_then(|props| {
+            fixed_u32_property(props, TOP_LEVEL_PROPERTY_HEADER_LEN, PROP_MESSAGE_CODEPAGE)
+        })
         .and_then(encoding_for_codepage);
     let internet_codepage = property_stream
-        .and_then(|props| fixed_u32_property(props, PROP_INTERNET_CODEPAGE))
+        .and_then(|props| {
+            fixed_u32_property(props, TOP_LEVEL_PROPERTY_HEADER_LEN, PROP_INTERNET_CODEPAGE)
+        })
         .and_then(encoding_for_codepage);
     // Strings follow the message code page and body streams the internet
     // one; each stands in for the other when only one was written.
@@ -98,7 +129,9 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Ema
     let from_name = first_string(&streams, TAG_SENDER_NAME);
     let to_raw = first_string(&streams, TAG_DISPLAY_TO);
     let cc_raw = first_string(&streams, TAG_DISPLAY_CC);
-    let mut body_text = first_string_with(&streams, TAG_BODY, body_encoding);
+    // The plain body is a string property like the others, so it follows
+    // the message code page; the HTML body follows the internet one.
+    let mut body_text = first_string(&streams, TAG_BODY);
     let body_html = first_string_with(&streams, TAG_BODY_HTML, body_encoding).or_else(|| {
         first_binary(&streams, TAG_BODY_HTML)
             .map(|b| {
@@ -142,8 +175,43 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Ema
             .unwrap_or_default()
     };
 
-    let to = parse_addr_list(to_raw);
-    let cc = parse_addr_list(cc_raw);
+    // The recipient storages carry each recipient's type, name and address.
+    // The display strings are names only, so they are read just for a
+    // message whose storages name nobody.
+    let (mut to, mut cc, mut bcc) = (Vec::new(), Vec::new(), Vec::new());
+    for recipient in &recipient_storages {
+        let Some((kind, address)) = recipient_address(recipient, string_encoding) else {
+            continue;
+        };
+        let list = match kind {
+            RECIPIENT_TYPE_ORIGINATOR => continue,
+            RECIPIENT_TYPE_CC => &mut cc,
+            RECIPIENT_TYPE_BCC => &mut bcc,
+            _ => &mut to,
+        };
+        // Writers list a recipient again with status flags set on its type;
+        // one entry per name and address is kept, the first.
+        let listed = list.iter().any(|known: &EmailAddress| {
+            known.name == address.name && known.address == address.address
+        });
+        if !listed {
+            list.push(address);
+        }
+    }
+    // No storages, or storages that name nobody: the display strings are
+    // all there is.
+    if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+        to = parse_addr_list(to_raw);
+        cc = parse_addr_list(cc_raw);
+    }
+    let date = property_stream.and_then(|props| {
+        [PROP_CLIENT_SUBMIT_TIME, PROP_MESSAGE_DELIVERY_TIME]
+            .into_iter()
+            .find_map(|tag| {
+                fixed_u64_property(props, TOP_LEVEL_PROPERTY_HEADER_LEN, tag)
+                    .and_then(filetime_to_utc)
+            })
+    });
 
     let mut attachments = Vec::new();
     let mut total_attachment_bytes = 0usize;
@@ -189,9 +257,9 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Ema
         reply_to: None,
         to,
         cc,
-        bcc: vec![],
+        bcc,
         subject,
-        date: None,
+        date,
         body: EmailBody {
             text: body_text,
             html: body_html,
@@ -263,6 +331,8 @@ struct MessageStreams {
     root: Vec<PropStream>,
     /// One entry per `__attach_version1.0_#*` storage, in directory order.
     attachments: Vec<Vec<PropStream>>,
+    /// One entry per `__recip_version1.0_#*` storage, in directory order.
+    recipients: Vec<Vec<PropStream>>,
 }
 
 /// Marks the sectors one chain has visited, and is reused from chain to chain.
@@ -391,11 +461,14 @@ impl<'a> CfbFile<'a> {
         self.message_streams().map(|message| message.root)
     }
 
-    /// Collects the property streams of the message and of its attachments.
+    /// Collects the property streams of the message, its recipients and its
+    /// attachments.
     ///
-    /// Only the root storage and the attachment storages directly under it are
-    /// read. Other storages (recipients, named properties, embedded messages)
-    /// are not entered, so their streams cannot pass for the message's own.
+    /// Only the root storage and the recipient and attachment storages
+    /// directly under it are read. Other storages (named properties, embedded
+    /// messages) are not entered, so their streams cannot pass for the
+    /// message's own. The walk is two levels deep and each level is iterated
+    /// with an explicit stack ([`Self::siblings_in_order`]); nothing recurses.
     fn message_streams(&self) -> Result<MessageStreams> {
         let Some(root) = self.directory.first() else {
             return Err(anyhow!("MSG CFB: empty directory"));
@@ -421,10 +494,14 @@ impl<'a> CfbFile<'a> {
             let entry = &self.directory[idx];
             if entry.obj_type == TYPE_STREAM {
                 message.root.extend(self.prop_stream(entry, &mut reader)?);
-            } else if entry.obj_type == TYPE_STORAGE
-                && entry.child != NOSTREAM
-                && entry.name.starts_with(ATTACHMENT_STORAGE_PREFIX)
-            {
+            } else if entry.obj_type == TYPE_STORAGE && entry.child != NOSTREAM {
+                let group = if entry.name.starts_with(ATTACHMENT_STORAGE_PREFIX) {
+                    &mut message.attachments
+                } else if entry.name.starts_with(RECIPIENT_STORAGE_PREFIX) {
+                    &mut message.recipients
+                } else {
+                    continue;
+                };
                 let mut streams = Vec::new();
                 for child_idx in self.siblings_in_order(entry.child, &mut visited)? {
                     let child = &self.directory[child_idx];
@@ -432,7 +509,7 @@ impl<'a> CfbFile<'a> {
                         streams.extend(self.prop_stream(child, &mut reader)?);
                     }
                 }
-                message.attachments.push(streams);
+                group.push(streams);
             }
         }
         Ok(message)
@@ -554,7 +631,9 @@ fn load_fat(data: &[u8], sector_size: usize, first_difat: u32) -> Result<Vec<u32
     let mut is_fat_sector = vec![false; sectors];
     let mut fat_sectors: Vec<u32> = Vec::new();
     let mut add_fat_sector = |sect: u32| -> Result<()> {
-        if sect == FREESECT {
+        // An unused slot holds FREESECT; some writers fill the slots after
+        // the last FAT sector with ENDOFCHAIN instead.
+        if sect == FREESECT || sect == ENDOFCHAIN {
             return Ok(());
         }
         let slot = is_fat_sector
@@ -685,9 +764,12 @@ fn read_fat_chain_len(
         if sect == FATSECT || sect == DIFSECT {
             return Err(anyhow!("MSG CFB: FAT points at metadata sector"));
         }
-        let raw = sector_slice(data, sector_size, sect)?;
-        let take = (max_len - out.len()).min(raw.len());
-        out.extend_from_slice(&raw[..take]);
+        // Only the bytes the stream still needs are asked of the sector, so
+        // a file whose last sector is cut short after the end of its
+        // stream's data still reads. A chain of unknown length asks for
+        // whole sectors.
+        let want = (max_len - out.len()).min(sector_size);
+        out.extend_from_slice(sector_prefix(data, sector_size, sect, want)?);
         if out.len() == max_len {
             break;
         }
@@ -740,10 +822,19 @@ fn fat_next(fat: &[u32], sect: u32) -> Result<u32> {
 }
 
 fn sector_slice(data: &[u8], sector_size: usize, sect: u32) -> Result<&[u8]> {
+    sector_prefix(data, sector_size, sect, sector_size)
+}
+
+/// Returns the first `len` bytes of sector `sect`; `len` is at most
+/// `sector_size`.
+///
+/// Fails if the file ends before those bytes do. The file's last sector may
+/// be shorter than a sector as long as it holds the bytes asked for.
+fn sector_prefix(data: &[u8], sector_size: usize, sect: u32, len: usize) -> Result<&[u8]> {
     (sect as usize)
         .checked_mul(sector_size)
         .and_then(|rel| rel.checked_add(first_sector_offset(sector_size)))
-        .and_then(|off| Some(off..off.checked_add(sector_size)?))
+        .and_then(|off| Some(off..off.checked_add(len.min(sector_size))?))
         .and_then(|range| data.get(range))
         .ok_or_else(|| anyhow!("MSG CFB: sector {sect} truncated"))
 }
@@ -824,19 +915,98 @@ fn first_string_with(
         .and_then(|stream| decode_prop(&stream.bytes, &stream.kind, ansi_encoding))
 }
 
-/// Finds a 4-byte fixed-length property in a top-level property stream.
+/// Finds the entry of a fixed-length property in a property stream.
 ///
+/// `header_len` is the length of the stream's header, which depends on the
+/// object the stream belongs to: [`TOP_LEVEL_PROPERTY_HEADER_LEN`] for the
+/// message, [`NESTED_PROPERTY_HEADER_LEN`] for a recipient or an attachment.
 /// `tag` is the full property tag (property ID in the high word, property
 /// type in the low word), stored little-endian at the start of each entry
 /// with the value in the entry's last eight bytes.
-fn fixed_u32_property(property_stream: &[u8], tag: u32) -> Option<u32> {
+fn fixed_property(
+    property_stream: &[u8],
+    header_len: usize,
+    tag: u32,
+) -> Option<&[u8; PROPERTY_ENTRY_LEN]> {
     property_stream
-        .get(TOP_LEVEL_PROPERTY_HEADER_LEN..)?
+        .get(header_len..)?
         .as_chunks::<PROPERTY_ENTRY_LEN>()
         .0
         .iter()
         .find(|entry| u32_le(entry.as_slice(), 0).ok() == Some(tag))
+}
+
+/// Finds a 4-byte fixed-length property; see [`fixed_property`].
+fn fixed_u32_property(property_stream: &[u8], header_len: usize, tag: u32) -> Option<u32> {
+    fixed_property(property_stream, header_len, tag)
         .and_then(|entry| u32_le(entry.as_slice(), 8).ok())
+}
+
+/// Finds an 8-byte fixed-length property; see [`fixed_property`].
+fn fixed_u64_property(property_stream: &[u8], header_len: usize, tag: u32) -> Option<u64> {
+    fixed_property(property_stream, header_len, tag)
+        .and_then(|entry| u64_le(entry.as_slice(), 8).ok())
+}
+
+/// Converts a PtypTime value (a FILETIME) to a UTC timestamp.
+///
+/// The result is cut to whole seconds, which is the precision of the `Date`
+/// header the EML path reads. A time before 1970 or after 2200 is not when
+/// a message was sent: zero is how writers leave the property unset, and
+/// other such values are uninitialized or damaged. They give `None`.
+fn filetime_to_utc(ticks: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+    /// 2200-01-01 00:00:00 UTC in Unix seconds.
+    const LATEST_PLAUSIBLE_UNIX_SECONDS: i64 = 7_258_118_400;
+
+    let seconds = i64::try_from(ticks / FILETIME_TICKS_PER_SECOND)
+        .ok()?
+        .checked_sub(FILETIME_UNIX_EPOCH_SECONDS)?;
+    if !(0..LATEST_PLAUSIBLE_UNIX_SECONDS).contains(&seconds) {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(seconds, 0)
+}
+
+/// Reads one recipient storage: its `PidTagRecipientType` and its address.
+///
+/// The address is `PidTagSmtpAddress` when the storage has one, otherwise
+/// `PidTagEmailAddress` when `PidTagAddressType` says it is an SMTP address;
+/// an address of another type (an Exchange distinguished name, a fax number)
+/// is not an e-mail address and is left out. A recipient with a display name
+/// but no SMTP address keeps the name and an empty address, as a sender
+/// without an address does. Returns `None` for a storage with neither.
+///
+/// The type is the low bits of the property, without the status flags; a
+/// recipient whose storage does not state one counts as a primary recipient.
+fn recipient_address(
+    streams: &[PropStream],
+    ansi_encoding: Option<&'static Encoding>,
+) -> Option<(u32, EmailAddress)> {
+    /// `PidTagRecipientType` of a primary ("To") recipient.
+    const RECIPIENT_TYPE_TO: u32 = 1;
+
+    let string = |tag: &str| first_string_with(streams, tag, ansi_encoding);
+    let name = string(TAG_DISPLAY_NAME);
+    let address = string(TAG_SMTP_ADDRESS).or_else(|| {
+        string(TAG_ADDRESS_TYPE)
+            .filter(|kind| kind.eq_ignore_ascii_case("SMTP"))
+            .and_then(|_| string(TAG_EMAIL_ADDRESS))
+    });
+    if name.is_none() && address.is_none() {
+        return None;
+    }
+    let kind = first_binary(streams, TAG_PROPERTY_STREAM)
+        .and_then(|props| {
+            fixed_u32_property(props, NESTED_PROPERTY_HEADER_LEN, PROP_RECIPIENT_TYPE)
+        })
+        .map_or(RECIPIENT_TYPE_TO, |kind| kind & RECIPIENT_TYPE_MASK);
+    Some((
+        kind,
+        EmailAddress {
+            name,
+            address: address.unwrap_or_default(),
+        },
+    ))
 }
 
 /// Maps a Windows code page identifier to its decoder.
@@ -885,15 +1055,29 @@ fn encoding_for_codepage(codepage: u32) -> Option<&'static Encoding> {
 
 /// Decodes a non-Unicode (PtypString8 or binary body) value.
 ///
-/// Valid UTF-8 is taken as UTF-8, since writers that ignore the declared code
-/// page almost always emit UTF-8. Otherwise the declared code page decides,
-/// and windows-1252 is the last resort: it maps every byte, so nothing
-/// degrades to U+FFFD the way a UTF-8 lossy read does.
+/// A declared multi-byte code page decides. Bytes in such a code page are
+/// often valid UTF-8 as well (`D0 BB D0 BB` is two Chinese characters in
+/// code page 936 and two Cyrillic letters in UTF-8), so the bytes cannot be
+/// asked which they are.
+///
+/// Under a declared single-byte code page, bytes that are valid UTF-8 with
+/// at least one multi-byte sequence are taken as UTF-8: writers do store
+/// UTF-8 there, and text in a single-byte code page is almost never valid
+/// multi-byte UTF-8 by accident. Anything else decodes with the code page.
+///
+/// Without a declared code page (none written, or one this reader has no
+/// decoder for), and with code page 65001, valid UTF-8 is taken as UTF-8 and
+/// windows-1252 is the last resort: it maps every byte, so nothing degrades
+/// to U+FFFD the way a UTF-8 lossy read does.
 fn decode_ansi(bytes: &[u8], declared: Option<&'static Encoding>) -> String {
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        return text.to_string();
-    }
     match declared {
+        Some(encoding)
+            if encoding.is_single_byte()
+                && !bytes.is_ascii()
+                && std::str::from_utf8(bytes).is_ok() =>
+        {
+            String::from_utf8_lossy(bytes).into_owned()
+        }
         Some(encoding) if encoding != encoding_rs::UTF_8 => {
             encoding.decode_without_bom_handling(bytes).0.into_owned()
         }
@@ -1415,16 +1599,82 @@ mod cfb_hardening_tests {
         assert!(!subject.contains(char::REPLACEMENT_CHARACTER));
     }
 
+    /// GBK for two Chinese characters; the same bytes are valid UTF-8 for
+    /// two Cyrillic letters.
+    const GBK_THANKS: [u8; 5] = [0xD0, 0xBB, 0xD0, 0xBB, 0x00];
+
     #[test]
-    fn ansi_strings_that_are_valid_utf8_stay_utf8_despite_the_code_page() {
+    fn a_declared_code_page_decides_even_when_the_bytes_are_valid_utf8() {
         let email = parse_fixture(&[
             (
                 "__properties_version1.0",
-                property_stream(&[(PROP_MESSAGE_CODEPAGE, 1252)]),
+                property_stream(&[(PROP_MESSAGE_CODEPAGE, 936)]),
             ),
-            ("__substg1.0_0037001E", "Olá € 日本".as_bytes().to_vec()),
+            ("__substg1.0_0037001E", GBK_THANKS.to_vec()),
+            ("__substg1.0_1000001E", GBK_THANKS.to_vec()),
         ]);
-        assert_eq!(email.subject.as_deref(), Some("Olá € 日本"));
+        assert_eq!(email.subject.as_deref(), Some("\u{8c22}\u{8c22}"));
+        assert_eq!(email.body.text.as_deref(), Some("\u{8c22}\u{8c22}"));
+    }
+
+    /// Writers do put UTF-8 in an ANSI string under a single-byte code
+    /// page. Text in such a code page is almost never valid multi-byte
+    /// UTF-8 by accident, so there UTF-8 is believed.
+    #[test]
+    fn utf8_in_an_ansi_string_wins_over_a_single_byte_code_page() {
+        for codepage in [1252, 1251, 28592, 874] {
+            let email = parse_fixture(&[
+                (
+                    "__properties_version1.0",
+                    property_stream(&[(PROP_MESSAGE_CODEPAGE, codepage)]),
+                ),
+                (
+                    "__substg1.0_0037001E",
+                    "Ol\u{e1} \u{20ac}".as_bytes().to_vec(),
+                ),
+            ]);
+            assert_eq!(
+                email.subject.as_deref(),
+                Some("Ol\u{e1} \u{20ac}"),
+                "{codepage}"
+            );
+        }
+    }
+
+    /// The ANSI body is a string like the subject: it follows the message
+    /// code page even when the internet code page says something else.
+    #[test]
+    fn the_ansi_body_follows_the_message_code_page() {
+        let email = parse_fixture(&[
+            (
+                "__properties_version1.0",
+                property_stream(&[(PROP_MESSAGE_CODEPAGE, 936), (PROP_INTERNET_CODEPAGE, 1252)]),
+            ),
+            ("__substg1.0_0037001E", GBK_THANKS.to_vec()),
+            ("__substg1.0_1000001E", GBK_THANKS.to_vec()),
+        ]);
+        assert_eq!(email.subject.as_deref(), Some("\u{8c22}\u{8c22}"));
+        assert_eq!(email.body.text.as_deref(), Some("\u{8c22}\u{8c22}"));
+    }
+
+    #[test]
+    fn ansi_strings_that_are_valid_utf8_stay_utf8_without_a_usable_code_page() {
+        let text = "Ol\u{e1} \u{20ac} \u{65e5}\u{672c}";
+        // No code page, code page 65001, and one this reader cannot decode.
+        for properties in [
+            None,
+            Some(property_stream(&[(PROP_MESSAGE_CODEPAGE, 65001)])),
+            Some(property_stream(&[(PROP_MESSAGE_CODEPAGE, 12345)])),
+        ] {
+            let mut streams = vec![("__substg1.0_0037001E", text.as_bytes().to_vec())];
+            if let Some(properties) = properties {
+                streams.push(("__properties_version1.0", properties));
+            }
+            assert_eq!(parse_fixture(&streams).subject.as_deref(), Some(text));
+        }
+        // The bytes that are Chinese under code page 936 are Cyrillic here.
+        let email = parse_fixture(&[("__substg1.0_0037001E", GBK_THANKS.to_vec())]);
+        assert_eq!(email.subject.as_deref(), Some("\u{43b}\u{43b}"));
     }
 
     #[test]
@@ -1527,6 +1777,333 @@ mod cfb_hardening_tests {
         assert_eq!(email.subject.as_deref(), Some("Version 4 subject"));
         assert_eq!(email.body.text.as_deref(), Some(sample_body().trim()));
         assert_eq!(email.attachments[0].size, sample_attachment().len());
+    }
+
+    /// Builds a property stream with a `header_len`-byte header and 8-byte
+    /// property values.
+    fn property_stream_u64(header_len: usize, properties: &[(u32, u64)]) -> Vec<u8> {
+        let mut stream = vec![0u8; header_len];
+        for (tag, value) in properties {
+            stream.extend_from_slice(&tag.to_le_bytes());
+            stream.extend_from_slice(&0x0000_0006u32.to_le_bytes());
+            stream.extend_from_slice(&value.to_le_bytes());
+        }
+        stream
+    }
+
+    /// 2024-01-15 14:30:00 UTC as a FILETIME.
+    const SAMPLE_FILETIME: u64 = 133_498_026_000_000_000;
+
+    fn utc(text: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .expect("test timestamp parses")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn date_is_the_client_submit_time() {
+        let email = parse_fixture(&[
+            (
+                "__properties_version1.0",
+                property_stream_u64(
+                    TOP_LEVEL_PROPERTY_HEADER_LEN,
+                    &[
+                        // Delivered a minute after it was submitted, with a
+                        // fraction of a second the date does not keep.
+                        (PROP_MESSAGE_DELIVERY_TIME, SAMPLE_FILETIME + 600_000_000),
+                        (PROP_CLIENT_SUBMIT_TIME, SAMPLE_FILETIME + 1_234_567),
+                    ],
+                ),
+            ),
+            ("__substg1.0_0037001F", utf16_le("s")),
+        ]);
+        assert_eq!(email.date, Some(utc("2024-01-15T14:30:00Z")));
+    }
+
+    #[test]
+    fn date_falls_back_to_the_delivery_time() {
+        let email = parse_fixture(&[
+            (
+                "__properties_version1.0",
+                property_stream_u64(
+                    TOP_LEVEL_PROPERTY_HEADER_LEN,
+                    &[
+                        (PROP_CLIENT_SUBMIT_TIME, 0),
+                        (PROP_MESSAGE_DELIVERY_TIME, SAMPLE_FILETIME + 600_000_000),
+                    ],
+                ),
+            ),
+            ("__substg1.0_0037001F", utf16_le("s")),
+        ]);
+        assert_eq!(email.date, Some(utc("2024-01-15T14:31:00Z")));
+    }
+
+    #[test]
+    fn a_time_outside_the_plausible_range_is_no_date() {
+        let parse = |submit: u64, delivery: u64| {
+            parse_fixture(&[
+                (
+                    "__properties_version1.0",
+                    property_stream_u64(
+                        TOP_LEVEL_PROPERTY_HEADER_LEN,
+                        &[
+                            (PROP_CLIENT_SUBMIT_TIME, submit),
+                            (PROP_MESSAGE_DELIVERY_TIME, delivery),
+                        ],
+                    ),
+                ),
+                ("__substg1.0_0037001F", utf16_le("s")),
+            ])
+            .date
+        };
+        // Unset, before 1970 (here 1601 and 1969), and far in the future.
+        let year_1969 = (FILETIME_UNIX_EPOCH_SECONDS as u64 - 1) * FILETIME_TICKS_PER_SECOND;
+        for ticks in [0, 1, year_1969, u64::MAX, u64::MAX / 2] {
+            assert_eq!(parse(ticks, 0), None, "{ticks}");
+            // The delivery time stands in for an unusable submit time.
+            assert_eq!(
+                parse(ticks, SAMPLE_FILETIME),
+                Some(utc("2024-01-15T14:30:00Z")),
+                "{ticks}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recipient_listed_twice_appears_once() {
+        let mut streams = vec![("__substg1.0_0037001F", utf16_le("s"))];
+        // The same recipient as a plain one and as a flagged copy, then
+        // another one, then the first again.
+        let names = [
+            "__recip_version1.0_#00000000",
+            "__recip_version1.0_#00000001",
+            "__recip_version1.0_#00000002",
+            "__recip_version1.0_#00000003",
+        ];
+        let paths: Vec<(String, String, String)> = names
+            .iter()
+            .map(|storage| {
+                (
+                    format!("{storage}/__properties_version1.0"),
+                    format!("{storage}/__substg1.0_3001001F"),
+                    format!("{storage}/__substg1.0_39FE001F"),
+                )
+            })
+            .collect();
+        let who = [
+            (1, "Maria", "maria@example.com"),
+            (0x1000_0001, "Maria", "maria@example.com"),
+            (1, "Ana", "ana@example.com"),
+            (1, "Maria", "maria@example.com"),
+        ];
+        for ((properties, name, address), (kind, display, smtp)) in paths.iter().zip(who) {
+            streams.push((properties.as_str(), recipient_type(kind)));
+            streams.push((name.as_str(), utf16_le(display)));
+            streams.push((address.as_str(), utf16_le(smtp)));
+        }
+        let email = parse_fixture(&streams);
+        assert_eq!(
+            pairs(&email.to),
+            [
+                (Some("Maria"), "maria@example.com"),
+                (Some("Ana"), "ana@example.com"),
+            ]
+        );
+    }
+
+    #[test]
+    fn display_strings_stand_in_when_no_recipient_storage_names_anyone() {
+        let email = parse_fixture(&[
+            ("__substg1.0_0037001F", utf16_le("s")),
+            ("__substg1.0_0E04001F", utf16_le("Maria Souza")),
+            ("__substg1.0_0E03001F", utf16_le("Carlos")),
+            (
+                "__recip_version1.0_#00000000/__properties_version1.0",
+                recipient_type(1),
+            ),
+            (
+                "__recip_version1.0_#00000001/__substg1.0_0FFF0102",
+                vec![1, 2, 3],
+            ),
+        ]);
+        assert_eq!(pairs(&email.to), [(None, "Maria Souza")]);
+        assert_eq!(pairs(&email.cc), [(None, "Carlos")]);
+    }
+
+    /// The display name and address of each entry, for comparison.
+    fn pairs(list: &[EmailAddress]) -> Vec<(Option<&str>, &str)> {
+        list.iter()
+            .map(|entry| (entry.name.as_deref(), entry.address.as_str()))
+            .collect()
+    }
+
+    fn recipient_type(kind: u32) -> Vec<u8> {
+        property_stream_u64(
+            NESTED_PROPERTY_HEADER_LEN,
+            &[(PROP_RECIPIENT_TYPE, u64::from(kind))],
+        )
+    }
+
+    #[test]
+    fn recipients_come_from_the_recipient_storages() {
+        let email = parse_fixture(&[
+            ("__substg1.0_0037001F", utf16_le("s")),
+            // The display strings name people only; they must not be used.
+            ("__substg1.0_0E04001F", utf16_le("Maria Souza; Fax; Ana")),
+            ("__substg1.0_0E03001F", utf16_le("Carlos")),
+            // To, with an Exchange address and the SMTP address beside it.
+            (
+                "__recip_version1.0_#00000000/__properties_version1.0",
+                recipient_type(1),
+            ),
+            (
+                "__recip_version1.0_#00000000/__substg1.0_3001001F",
+                utf16_le("Maria Souza"),
+            ),
+            (
+                "__recip_version1.0_#00000000/__substg1.0_3002001F",
+                utf16_le("EX"),
+            ),
+            (
+                "__recip_version1.0_#00000000/__substg1.0_3003001F",
+                utf16_le("/O=EXAMPLE/CN=RECIPIENTS/CN=MARIA"),
+            ),
+            (
+                "__recip_version1.0_#00000000/__substg1.0_39FE001F",
+                utf16_le("maria@example.com"),
+            ),
+            // Cc, with status flags above the type and an SMTP e-mail address.
+            (
+                "__recip_version1.0_#00000001/__properties_version1.0",
+                recipient_type(0x1000_0002),
+            ),
+            (
+                "__recip_version1.0_#00000001/__substg1.0_3001001F",
+                utf16_le("Carlos"),
+            ),
+            (
+                "__recip_version1.0_#00000001/__substg1.0_3002001F",
+                utf16_le("smtp"),
+            ),
+            (
+                "__recip_version1.0_#00000001/__substg1.0_3003001F",
+                utf16_le("carlos@example.com"),
+            ),
+            // Bcc.
+            (
+                "__recip_version1.0_#00000002/__properties_version1.0",
+                recipient_type(3),
+            ),
+            (
+                "__recip_version1.0_#00000002/__substg1.0_39FE001F",
+                utf16_le("hidden@example.com"),
+            ),
+            // To, whose only address is not an e-mail address.
+            (
+                "__recip_version1.0_#00000003/__properties_version1.0",
+                recipient_type(1),
+            ),
+            (
+                "__recip_version1.0_#00000003/__substg1.0_3001001F",
+                utf16_le("Fax"),
+            ),
+            (
+                "__recip_version1.0_#00000003/__substg1.0_3002001F",
+                utf16_le("FAX"),
+            ),
+            (
+                "__recip_version1.0_#00000003/__substg1.0_3003001F",
+                utf16_le("+55 11 5555-0100"),
+            ),
+            // No type stated: a primary recipient.
+            (
+                "__recip_version1.0_#00000004/__substg1.0_39FE001F",
+                utf16_le("ana@example.com"),
+            ),
+            // The originator is not a recipient, and an empty storage names
+            // nobody.
+            (
+                "__recip_version1.0_#00000005/__properties_version1.0",
+                recipient_type(0),
+            ),
+            (
+                "__recip_version1.0_#00000005/__substg1.0_39FE001F",
+                utf16_le("sender@example.com"),
+            ),
+            (
+                "__recip_version1.0_#00000006/__properties_version1.0",
+                recipient_type(1),
+            ),
+        ]);
+        assert_eq!(
+            pairs(&email.to),
+            [
+                (Some("Maria Souza"), "maria@example.com"),
+                (Some("Fax"), ""),
+                (None, "ana@example.com"),
+            ]
+        );
+        assert_eq!(pairs(&email.cc), [(Some("Carlos"), "carlos@example.com")]);
+        assert_eq!(pairs(&email.bcc), [(None, "hidden@example.com")]);
+    }
+
+    #[test]
+    fn display_strings_name_the_recipients_of_a_message_without_storages() {
+        let email = parse_fixture(&[
+            ("__substg1.0_0037001F", utf16_le("s")),
+            (
+                "__substg1.0_0E04001F",
+                utf16_le("Maria Souza; b@example.com"),
+            ),
+            ("__substg1.0_0E03001F", utf16_le("Carlos")),
+        ]);
+        assert_eq!(
+            pairs(&email.to),
+            [(None, "Maria Souza"), (None, "b@example.com")]
+        );
+        assert_eq!(pairs(&email.cc), [(None, "Carlos")]);
+        assert!(email.bcc.is_empty());
+    }
+
+    /// Some writers fill the header's unused FAT sector slots with
+    /// ENDOFCHAIN rather than FREESECT; other readers accept that.
+    #[test]
+    fn unused_header_difat_slots_may_hold_endofchain() {
+        let mut bytes = write_ministream_cfb(&sample_message_streams());
+        let fat_sectors = u32_le(&bytes, 0x2C).expect("header") as usize;
+        for slot in fat_sectors..109 {
+            let off = 0x4C + slot * 4;
+            bytes[off..off + 4].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
+        }
+
+        let email = parse_msg_bytes(&bytes, ParseOptions::default()).expect("parses");
+
+        assert_eq!(email.subject.as_deref(), Some("Version 4 subject"));
+        assert_eq!(email.attachments[0].size, sample_attachment().len());
+    }
+
+    /// The fixture's last sector holds the end of the attachment and then
+    /// padding. A file cut inside the padding has all of its data; one cut
+    /// inside the data does not.
+    #[test]
+    fn a_short_final_sector_is_accepted_when_the_stream_data_is_complete() {
+        let whole = write_ministream_cfb(&sample_message_streams());
+        let padding = 512 - sample_attachment().len() % 512;
+        let options = ParseOptions {
+            extract_attachment_content: true,
+            ..ParseOptions::default()
+        };
+
+        let cut_in_padding = &whole[..whole.len() - padding];
+        let email = parse_msg_bytes(cut_in_padding, options).expect("complete data parses");
+        assert_eq!(
+            email.attachments[0].decode_content(),
+            Some(sample_attachment())
+        );
+
+        let cut_in_data = &whole[..whole.len() - padding - 1];
+        let err = parse_msg_bytes(cut_in_data, options).expect_err("missing data is an error");
+        assert!(err.to_string().contains("truncated"), "{err}");
     }
 
     #[test]

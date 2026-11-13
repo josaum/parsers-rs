@@ -320,6 +320,28 @@ fn seeds_parse_cleanly() {
     assert_eq!(msg.attachments.len(), 2);
     assert_eq!(msg.attachments[0].filename, "relatório.pdf");
     assert_eq!(msg.attachments[1].size, 5000);
+    assert_eq!(
+        msg.date.map(|date| date.to_rfc3339()).as_deref(),
+        Some("2024-01-15T14:30:00+00:00")
+    );
+    // Recipients come from the recipient storages, not the display strings:
+    // the first has an SMTP address, the second an address of no stated type.
+    let recipients = |list: &[email_fast_core::EmailAddress]| -> Vec<(Option<String>, String)> {
+        list.iter()
+            .map(|entry| (entry.name.clone(), entry.address.clone()))
+            .collect()
+    };
+    assert_eq!(
+        recipients(&msg.to),
+        [(
+            Some("Maria Souza".to_string()),
+            "maria@example.com".to_string()
+        )]
+    );
+    assert_eq!(
+        recipients(&msg.cc),
+        [(Some("Carlos".to_string()), String::new())]
+    );
 
     let mut subjects = Vec::new();
     let count = parse_mbox_reader(
@@ -447,12 +469,12 @@ fn deep_nesting_inside_headers_and_html_is_bounded_on_a_small_stack() {
             b"\r\n\r\nbody\r\n".to_vec(),
         ]
         .concat(),
-        // Nested encoded-words. Kept short: `mailparse` decodes a header
-        // line in time quadratic in its encoded-word count, so a long one
-        // would turn this stack test into a timing test.
+        // Nested encoded-words. `mailparse` decodes such a line in time
+        // quadratic in its encoded-word count; the parser refuses the line
+        // before `mailparse` sees it.
         [
             b"Subject: ".to_vec(),
-            smoke::nested(b"=?UTF-8?Q?", b"x", b"?=", 300),
+            smoke::nested(b"=?UTF-8?Q?", b"x", b"?=", 100_000),
             b"\r\n\r\nbody\r\n".to_vec(),
         ]
         .concat(),
@@ -489,6 +511,128 @@ fn deep_nesting_inside_headers_and_html_is_bounded_on_a_small_stack() {
     for message in cases {
         smoke::run_on_small_stack(move || parse_eml_both_ways(&message));
     }
+}
+
+/// A header line of `count` encoded-words that are opened and never ended:
+/// each `?=` is followed by a letter, not by a delimiter.
+fn unended_encoded_words(count: usize) -> String {
+    " =?a?=x".repeat(count)
+}
+
+/// `mailparse` walks a header line from its start for every `=?` and `?=`
+/// it examines, and searches a line of unended words once per word: 300 of
+/// those took 3.7 s in an unoptimized build, and 4,000 would take hours.
+/// Such lines are refused wherever `mailparse` would decode them: in a
+/// header this crate asks for, in the `Content-Type` it reads while
+/// splitting the message, and in the headers of a part.
+#[test]
+fn header_lines_that_are_costly_to_decode_are_refused() {
+    let unended = unended_encoded_words(4_000);
+    let nested =
+        String::from_utf8(smoke::nested(b"=?UTF-8?Q?", b"x", b"?=", 100_000)).expect("ASCII");
+    let adjacent = " =?UTF-8?Q?x?=".repeat(100_000);
+    let cases = [
+        format!("Subject:{unended}\r\n\r\nbody\r\n"),
+        format!("Subject: {nested}\r\n\r\nbody\r\n"),
+        format!("Subject:{adjacent}\r\n\r\nbody\r\n"),
+        format!("Content-Type: text/plain;{unended}\r\n\r\nbody\r\n"),
+        format!(
+            "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\
+             Content-Disposition: inline;{unended}\r\n\r\ntext\r\n--b--\r\n"
+        ),
+    ];
+    for message in cases {
+        let started = std::time::Instant::now();
+        let err = parse_eml_bytes(message.as_bytes(), ParseOptions::default())
+            .expect_err("a costly header line must be refused");
+        assert!(err.to_string().contains("too costly"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "refusing took {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// Body text is never costed as a header, whatever line precedes it: only a
+/// delimiter line of a declared boundary starts a part's headers.
+#[test]
+fn body_lines_after_a_dash_line_are_not_costed_as_headers() {
+    let words = unended_encoded_words(4_000);
+    for dashes in ["-- ", "-----Original Message-----", "-- a comment"] {
+        let message = format!("Subject: s\r\n\r\nhello\r\n{dashes}\r\nX:{words}\r\n\r\n");
+        let email = parse_eml_bytes(message.as_bytes(), ParseOptions::default())
+            .expect("body text is not a header");
+        assert_eq!(email.subject.as_deref(), Some("s"), "{dashes}");
+    }
+}
+
+/// `mailparse` searches a multipart body for its boundary in time
+/// proportional to body size times boundary length (a 900-dash boundary
+/// over 5 MB took 1.4 s optimized). RFC 2046 allows 70 characters; a
+/// boundary far past that is refused, at any nesting level.
+#[test]
+fn an_overlong_multipart_boundary_is_refused() {
+    let long = "-".repeat(900);
+    let cases = [
+        format!("Content-Type: multipart/mixed; boundary=\"{long}\"\r\n\r\n--{long}\r\n\r\ntext\r\n"),
+        format!(
+            "Content-Type: multipart/mixed; boundary=a\r\n\r\n--a\r\n\
+             Content-Type: multipart/alternative;\r\n boundary={long}\r\n\r\n--{long}\r\n\r\ntext\r\n--a--\r\n"
+        ),
+    ];
+    for message in cases {
+        let err = parse_eml_bytes(message.as_bytes(), ParseOptions::default())
+            .expect_err("an overlong boundary must be refused");
+        assert!(err.to_string().contains("boundary longer than"), "{err}");
+    }
+
+    // The longest boundary the standard allows, and some slack, still parse.
+    for len in [70, 200] {
+        let boundary = "b".repeat(len);
+        let message = format!(
+            "Content-Type: multipart/mixed; boundary={boundary}\r\n\r\n--{boundary}\r\n\r\ntext\r\n--{boundary}--\r\n"
+        );
+        let email = parse_eml_bytes(message.as_bytes(), ParseOptions::default()).expect("parses");
+        assert_eq!(
+            email.body.text.as_deref().map(str::trim),
+            Some("text"),
+            "{len}"
+        );
+    }
+}
+
+/// An unfolded `To:` of 2,000 properly encoded recipients is ordinary work
+/// for `mailparse` (a few milliseconds optimized), with or without a raw
+/// non-ASCII character on the line, and base64 padding (`==?=`) does not
+/// count as the start of a word.
+#[test]
+fn a_long_unfolded_recipient_line_still_parses() {
+    let recipients = "=?UTF-8?B?eA==?= <a@example.com>, ".repeat(2_000);
+    for first in ["J <j@example.com>", "J\u{e9} <j@example.com>"] {
+        let message = format!("To: {recipients}{first}\r\nSubject: s\r\n\r\nbody\r\n");
+        let email = parse_eml_bytes(message.as_bytes(), ParseOptions::default())
+            .expect("a long recipient line parses");
+        assert_eq!(email.to.len(), 2_001, "{first}");
+        assert_eq!(email.to[0].name.as_deref(), Some("x"));
+        assert_eq!(email.to[0].address, "a@example.com");
+    }
+}
+
+/// The bound is on cost, not on the number of encoded-words: properly ended
+/// words still decode, on one long unfolded line or folded one per line.
+#[test]
+fn many_proper_encoded_words_in_a_header_still_decode() {
+    let unfolded = format!("Subject:{}\r\n\r\nbody\r\n", " =?UTF-8?Q?x?=".repeat(500));
+    let email = parse_eml_bytes(unfolded.as_bytes(), ParseOptions::default()).expect("parses");
+    assert_eq!(email.subject, Some("x".repeat(500)));
+
+    let folded = format!(
+        "Subject:{} end\r\n\r\nbody\r\n",
+        " =?UTF-8?Q?x?=\r\n".repeat(5_000)
+    );
+    let email = parse_eml_bytes(folded.as_bytes(), ParseOptions::default()).expect("parses");
+    assert_eq!(email.subject, Some(format!("{} end", "x".repeat(5_000))));
 }
 
 // ------------------------------------------------------ MSG regressions ----
