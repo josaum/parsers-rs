@@ -1116,6 +1116,38 @@ fn images_declaring_more_pixels_than_the_render_may_decode_are_refused() {
     assert_renders("a 4 x 4 inline image", &declared_inline_image(4, 4));
 }
 
+/// A page filled with one tiling pattern whose 1 x 1 cell repeats every
+/// `step` units.
+fn sparse_tiling(step: u32) -> Vec<u8> {
+    one_page(
+        "/Resources << /Pattern << /P 10 0 R >> >>",
+        "/Pattern cs /P scn 0 0 100 100 re f",
+        vec![(
+            10,
+            stream(
+                &format!(
+                    "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                     /BBox [0 0 1 1] /XStep {step} /YStep {step} /Resources << >>"
+                ),
+                "0 0 1 1 re f",
+            ),
+        )],
+    )
+}
+
+#[test]
+fn a_tiling_cell_larger_than_the_render_may_hold_is_refused() {
+    // The interpreter sizes a cell's renderer from its step, not the page:
+    // this one was 8,000 x 8,000 pixels at 72 dpi, 287 MB at peak, and
+    // 2.95 GB at 300 dpi.
+    assert_refused(
+        "a 1 x 1 cell repeating every 8,000 units",
+        &sparse_tiling(8_000),
+    );
+    assert_renders("a 1 x 1 cell repeating every 2 units", &sparse_tiling(2));
+    assert_renders("8 nested tiling cells", &tiling_pattern(8));
+}
+
 /// Runs the interpreter with no guard, on a thread with a chosen stack.
 ///
 /// Not a test: it exists to confirm that a fixture aborts the process and to

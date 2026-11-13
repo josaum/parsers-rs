@@ -70,14 +70,16 @@
 //!   and JPEG) were not traced. Each may size its buffers from the
 //!   codestream's own header rather than the dictionary.
 //! * **Memory and time.** Every soft mask gets a renderer the size of the
-//!   one it is drawn in, and every tiling cell one sized by its `/XStep`
-//!   and `/YStep` at the cell's scale, which is not the page's: up to
-//!   65,535 pixels a side, so a single small pattern can ask for gigabytes.
+//!   one it is drawn in, and how many soft masks a page uses is not bounded.
 //!   Each saved graphics state copies the clip paths in force, and the
 //!   number of those is not bounded.
 //!
 //! Bounded beyond recursion: the pixels an image XObject, its soft mask or
-//! an inline image declares, by [`image_pixel_budget`]; the interpreter's
+//! an inline image declares, and the pixels of the tiling cell renderers
+//! held at once along one path of nested patterns, each by
+//! [`image_pixel_budget`] (a cell is sized by `cell_pixels`, at the largest
+//! scale the interpreter allows, since the transform is not known before
+//! rendering); the interpreter's
 //! saved-state stack, by [`MAX_SAVED_STATES`]; a sampled function's table, by
 //! [`MAX_SAMPLED_FUNCTION_ENTRIES`], and its cost per evaluation, which
 //! doubles with each input, by [`MAX_SAMPLED_FUNCTION_INPUTS`]. Every font a
@@ -303,6 +305,34 @@ fn declared_pixels(dict: &Dict<'_>) -> u64 {
     side(&b"W"[..], &b"Width"[..]).saturating_mul(side(&b"H"[..], &b"Height"[..]))
 }
 
+/// Largest renderer, in pixels, the interpreter can make for one tiling
+/// cell, whatever the transform it is drawn with.
+///
+/// Mirrors the cell sizing in `hayro` 0.5.0's renderer: the cell's scale on
+/// each axis is clamped to between 1 and 3,000 pixels across its `/BBox`,
+/// and the renderer is `/XStep` and `/YStep` at that scale, cast to `u16`.
+/// The transform in force is not known before rendering, so the largest
+/// scale is assumed: a cell whose step is its box size counts as 3,000 by
+/// 3,000 pixels however small it is drawn, and one whose step is k times
+/// its box as 3,000·k a side, up to 65,535.
+fn cell_pixels(dict: &Dict<'_>) -> u64 {
+    let side = |step: &[u8], low: usize, high: usize| -> u64 {
+        let step = f64::from(dict.get::<f32>(step).unwrap_or(0.0)).abs();
+        let extent = dict
+            .get::<[f32; 4]>(&b"BBox"[..])
+            .and_then(|bbox| Some(f64::from(*bbox.get(high)?) - f64::from(*bbox.get(low)?)))
+            .map_or(0.0, f64::abs);
+        let pixels = (step * 3000.0 / extent).round();
+        if pixels.is_nan() {
+            0
+        } else {
+            // A saturating cast, as the interpreter's own.
+            pixels.min(f64::from(u16::MAX)) as u64
+        }
+    };
+    side(&b"XStep"[..], 0, 2).saturating_mul(side(&b"YStep"[..], 1, 3))
+}
+
 /// What `vet_object` names in a refusal for objects reached from resources.
 const RESOURCE_OBJECTS: &str = "a colour space, function or shading";
 
@@ -460,6 +490,9 @@ struct Child<'a> {
     /// the child is entered, so a stream naming many children holds one
     /// chain, not one per child.
     own: Dict<'a>,
+    /// Pixels of every tiling cell renderer held while this stream runs,
+    /// its own included.
+    cells: u64,
 }
 
 /// One content stream in one context, part-way through being vetted.
@@ -480,6 +513,8 @@ struct Frame<'a> {
     /// Stack the deepest glyph procedure of a Type 3 font selected here
     /// needs, when one is selected.
     glyphs: Option<u32>,
+    /// Pixels of every tiling cell renderer held while this stream runs.
+    cells: u64,
     /// Graphics states the interpreter may hold saved inside this stream:
     /// its own deepest nesting on top of every stream's above it.
     saves: usize,
@@ -758,6 +793,17 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
+    /// Refuses tiling cell renderers, held at once along one path, that
+    /// together have more than [`image_pixel_budget`] pixels.
+    fn check_cell_pixels(&self, pixels: u64) -> Result<()> {
+        if pixels > self.image_pixels {
+            return Err(refused(
+                "a tiling pattern's cells need more pixels than this render may hold",
+            ));
+        }
+        Ok(())
+    }
+
     fn count_object(&mut self) -> Result<()> {
         self.objects += 1;
         if self.objects > MAX_VETTED_OBJECTS {
@@ -809,6 +855,7 @@ impl<'a> Walk<'a> {
             target: None,
             glyphs: None,
             saves: saves_above.saturating_add(child.scan.saves),
+            cells: child.cells,
         };
         check_saves(frame.saves)?;
         self.vet_resource_objects(&frame.resources)?;
@@ -868,6 +915,13 @@ impl<'a> Walk<'a> {
         // The stream's dictionary carries objects of its own, such as a
         // transparency group's colour space.
         self.vet_object(Object::Dict(stream.dict().clone()), RESOURCE_OBJECTS)?;
+        // A tiling cell renders into a renderer of its own, held while the
+        // cell's content runs, beneath every cell it is nested in.
+        let cells = match route {
+            Route::Pattern => frame.cells.saturating_add(cell_pixels(stream.dict())),
+            Route::Form | Route::SoftMask => frame.cells,
+        };
+        self.check_cell_pixels(cells)?;
         let Some(scan) = self.scan(stream)? else {
             return Ok(());
         };
@@ -887,6 +941,7 @@ impl<'a> Walk<'a> {
             stream: stream_id(stream),
             scan,
             own: own_resources(stream.dict()),
+            cells,
         });
         Ok(())
     }
@@ -1035,6 +1090,7 @@ impl<'a> Walk<'a> {
             for name in &scan.patterns {
                 let pattern = find(&chain, b"Pattern", name).ok_or_else(outside)?;
                 if let Some(cell) = pattern.into_stream() {
+                    self.check_cell_pixels(cell_pixels(cell.dict()))?;
                     let own = vec![own_resources(cell.dict())];
                     targets.push((cell, own, PATTERN_COST));
                 }
@@ -1360,6 +1416,7 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize, image_pixels: u
                 stream: page_id,
                 scan: page_scan,
                 own: Dict::empty(),
+                cells: 0,
             },
             page.resources().clone(),
             PAGE_COST,
@@ -1399,6 +1456,7 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize, image_pixels: u
                 stream: stream_id(&appearance),
                 scan,
                 own: Dict::empty(),
+                cells: 0,
             },
             own,
             PAGE_COST.saturating_add(FORM_COST),
