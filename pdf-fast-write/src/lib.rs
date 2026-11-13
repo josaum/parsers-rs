@@ -65,8 +65,12 @@
 //! ## Malformed sources
 //!
 //! An object ends at its `endobj` or where the next object in the
-//! cross-reference table starts, whichever comes first. Names are compared
-//! after decoding `#xx` escapes, so `/Encr#79pt` is `/Encrypt`.
+//! cross-reference table starts, whichever comes first. A table entry counts
+//! as the start of an object only when an `N G obj` header for it stands at
+//! its offset; a stray entry pointing anywhere else is ignored. An object
+//! that is to be copied and has a dictionary or array left open is an error:
+//! nothing cut short is written. Names are compared after decoding `#xx`
+//! escapes, so `/Encr#79pt` is `/Encrypt`.
 //!
 //! ## Quick Start
 //!
