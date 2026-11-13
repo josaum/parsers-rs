@@ -28,3 +28,19 @@ cargo test -p email-fast-py
 ```
 
 Licensed under either of MIT ([LICENSE](LICENSE)) or Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your option.
+## An mbox mailbox from bytes
+
+```python
+import email_fast
+
+mailbox = (
+    b"From sender@example.com Mon Sep 21 00:00:00 2026\n"
+    b"From: sender@example.com\nTo: recipient@example.com\nSubject: first\n\nbody\n"
+)
+messages = email_fast.parse_mbox_bytes(mailbox)
+print([m["subject"] for m in messages])   # ['first']
+```
+
+`parse_mbox_bytes` takes the same keyword options as `parse_email_bytes`
+and returns one dict per message, in mailbox order. A message that does not
+parse is skipped.
