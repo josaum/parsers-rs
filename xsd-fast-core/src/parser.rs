@@ -735,10 +735,8 @@ fn parse_particles(
                     }
                 }
                 "sequence" => {
-                    // A nested sequence is order-equivalent to inlining its
-                    // particles, so flatten it into the parent.
                     let inner = parse_particles(reader, ns_map, "sequence", depth + 1)?;
-                    particles.extend(inner);
+                    push_nested_sequence(&attrs, inner, &mut particles);
                 }
                 "choice" => {
                     // A nested choice is a discriminated union; preserve it
@@ -1043,6 +1041,29 @@ fn push_choice_group(
         occurrence: parse_occurrence(attrs),
         element: ElementRef::Group(Box::new(ContentModel::Choice(branches))),
     });
+}
+
+/// Appends what a nested `<xs:sequence>` holds.
+///
+/// A sequence that occurs exactly once is order-equivalent to its particles
+/// written in the parent, and is flattened into it. With any other
+/// occurrence it is kept as one group particle: an optional sequence may be
+/// left out whole, required children included, which its particles written
+/// in the parent could not say.
+fn push_nested_sequence(
+    attrs: &HashMap<String, String>,
+    inner: Vec<Particle>,
+    particles: &mut Vec<Particle>,
+) {
+    let occurrence = parse_occurrence(attrs);
+    if occurrence == OccurrenceConstraint::default() {
+        particles.extend(inner);
+    } else {
+        particles.push(Particle {
+            occurrence,
+            element: ElementRef::Group(Box::new(ContentModel::Sequence(inner))),
+        });
+    }
 }
 
 /// Appends the declaration for an `<xs:attribute>`, if it has a name.

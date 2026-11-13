@@ -849,15 +849,22 @@ impl<'m> ValidationContext<'m> {
             if self.errors.len() >= self.opts.max_errors {
                 return;
             }
-            // A nested model group (typically a choice) is handled as a union:
-            // its branches count toward the parent only as the group's own.
+            // A nested model group is checked as a whole. A choice is a
+            // union: its branches count toward the parent only as the
+            // group's own. A sequence kept as a group has its own occurrence:
+            // left out whole it is complete when optional, and once any of
+            // its children is present its required ones are required.
             let (child_name, occ) = match &particle.element {
                 ElementRef::Inline(decl) => (decl.name.local.as_str(), decl.occurrence),
                 ElementRef::Ref(qn) => (qn.local.as_str(), particle.occurrence),
                 ElementRef::Group(group) => {
                     let selected = self.group_branch_count(group, child_counts);
                     branch_total += selected;
-                    if particle.occurrence.min >= 1 && selected == 0 {
+                    // A choice with no branch has nothing to name as
+                    // missing; any other group reports its own required
+                    // children below.
+                    let is_choice_group = matches!(**group, ContentModel::Choice(_));
+                    if is_choice_group && particle.occurrence.min >= 1 && selected == 0 {
                         self.push_error(
                             ValidationSeverity::Error,
                             "required choice group has no selected branch".to_string(),
