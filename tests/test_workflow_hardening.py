@@ -930,6 +930,27 @@ def assert_dependabot_contract(dependabot: str) -> None:
         cargo,
         re.MULTILINE,
     ), "pyo3 0.30 and later must be ignored while the wheels support Python 3.8"
+    # The consumer shells load napi 2 builds, and napi-derive 3 only works with
+    # the napi 3 runtime: neither major may arrive on its own.
+    for crate in ("napi", "napi-derive"):
+        assert re.search(
+            rf'^      - dependency-name: "{re.escape(crate)}"\n        versions:\n          - ">=3"$',
+            cargo,
+            re.MULTILINE,
+        ), f"{crate} 3 and later must be ignored while the consumer shells load napi 2 builds"
+    # tiny-skia 0.12 changes rendered pixels; it waits for a reviewed change.
+    assert re.search(
+        r'^      - dependency-name: "tiny-skia"\n        versions:\n          - ">=0\.12"$',
+        cargo,
+        re.MULTILINE,
+    ), "tiny-skia 0.12 and later must be ignored until its rendering change is accepted"
+    # The Arrow pin follows the consumers; every Arrow crate past it is held,
+    # by one pattern, so the crates cannot drift apart.
+    assert re.search(
+        r'^      - dependency-name: "arrow\*"\n        versions:\n          - ">=59"$',
+        cargo,
+        re.MULTILINE,
+    ), "Arrow 59 and later must be ignored while the consumers stay on 58"
 
 
 def workflow_id(path: Path) -> str:
@@ -1313,6 +1334,14 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_dependabot_contract, DEPENDABOT, "      arrow-major:", "      arrow-anything:"),
         (assert_dependabot_contract, DEPENDABOT, '          - "arrow-*"\n', ""),
         (assert_dependabot_contract, DEPENDABOT, '          - ">=0.30"', '          - ">=0.31"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "napi"\n        versions:\n          - ">=3"\n', ""),
+        (assert_dependabot_contract, DEPENDABOT, '"napi"\n        versions:\n          - ">=3"', '"napi"\n        versions:\n          - ">=4"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "napi-derive"\n', '      - dependency-name: "napi-build"\n'),
+        (assert_dependabot_contract, DEPENDABOT, '"napi-derive"\n        versions:\n          - ">=3"', '"napi-derive"\n        versions:\n          - ">=3.1"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "tiny-skia"\n', '      - dependency-name: "tiny-skia-path"\n'),
+        (assert_dependabot_contract, DEPENDABOT, '          - ">=0.12"', '          - ">=0.13"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "arrow*"\n', '      - dependency-name: "arrow"\n'),
+        (assert_dependabot_contract, DEPENDABOT, '          - ">=59"', '          - ">=61"'),
         (assert_dependabot_contract, DEPENDABOT, "        update-types:\n", "        exclude-patterns:\n          - arrow-*\n        update-types:\n"),
         (assert_dependabot_contract, DEPENDABOT, "      cargo-minor-and-patch:\n", "      arrow:\n        patterns:\n          - arrow-*\n      cargo-minor-and-patch:\n"),
     ],
