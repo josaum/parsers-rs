@@ -459,6 +459,17 @@ pub struct PdfDocument {
     storage: PdfStorage,
     #[cfg_attr(feature = "serde", serde(skip))]
     object_index: HashMap<(u32, u16), usize>,
+    /// The catalog the newest trailer's `/Root` names, when the
+    /// cross-reference chain could be followed.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    catalog: Option<(u32, u16)>,
+    /// Entries and sections examined while following the cross-reference
+    /// chain.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    xref_work: usize,
+    /// In-use entries the chain kept, before it was applied or discarded.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    xref_entries: usize,
     #[cfg_attr(feature = "serde", serde(skip))]
     decoded_byte_budget: DecodedByteBudget,
     /// PDF header line (e.g. `%PDF-1.7`) when one was recovered.
@@ -655,11 +666,18 @@ impl PdfDocument {
         }
         objects.extend(objstm_objects);
 
-        let object_index = objects
+        // Scan order first: a later definition of an object replaces an
+        // earlier one, which is right for a file whose revisions were
+        // appended in order and is all there is to go on when the
+        // cross-reference data is missing or broken.
+        let mut object_index: HashMap<(u32, u16), usize> = objects
             .iter()
             .enumerate()
             .map(|(index, object)| ((object.object_number, object.generation), index))
             .collect();
+        // Then the document as its cross-reference chain defines it.
+        let (catalog, xref_work, xref_entries) =
+            apply_xref_chain(bytes, &objects, &streams, &mut object_index);
 
         if objects.len() >= options.max_objects {
             warnings.push(PdfWarning {
@@ -682,6 +700,9 @@ impl PdfDocument {
         let mut document = Self {
             storage,
             object_index,
+            catalog,
+            xref_work,
+            xref_entries,
             decoded_byte_budget,
             header,
             objects,
@@ -743,6 +764,22 @@ impl PdfDocument {
                 .as_ref(),
             _ => None,
         }
+    }
+
+    /// Units of work spent following the cross-reference chain: one per
+    /// entry examined and a fixed cost per section. Exposed so tests can
+    /// bound the work a hostile file causes without timing it.
+    #[doc(hidden)]
+    pub fn xref_chain_work(&self) -> usize {
+        self.xref_work
+    }
+
+    /// In-use cross-reference entries kept while following the chain,
+    /// whether or not the chain was then applied. Exposed so tests can
+    /// show nothing is kept for objects the scan never produced.
+    #[doc(hidden)]
+    pub fn xref_chain_entries(&self) -> usize {
+        self.xref_entries
     }
 
     /// Resolve pages and their associated content/image streams.
@@ -957,6 +994,16 @@ impl PdfDocument {
 
     /// Render a page with the full PDF interpreter and propagate resource-
     /// budget failures to the caller.
+    ///
+    /// `page_index` counts the pages [`Self::pages`] returns. An index past
+    /// the last of them gives `Ok(None)`, with or without the `rasterize`
+    /// feature, which is what the language bindings have always passed on;
+    /// [`Self::page_rasterized_png`] reports the same index as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the page is refused as unsafe to interpret or
+    /// when a resource budget is spent.
     #[cfg(feature = "rasterize")]
     pub fn page_rasterized_png_interpreted_checked(
         &self,
@@ -2765,13 +2812,29 @@ impl PdfDocument {
     }
 
     fn pages_from_catalog(&self) -> Option<Vec<PdfPage>> {
-        let catalog = self.objects.iter().find(|object| {
-            object
-                .dictionary
-                .as_ref()
-                .and_then(|dict| dict.get_name("Type"))
-                == Some("Catalog")
-        })?;
+        // The document is the one the newest trailer's `/Root` names. A
+        // file saved with incremental updates holds a catalog per revision,
+        // and the first in the file is the oldest. Without a usable
+        // cross-reference chain, the catalog latest in the file is the best
+        // guess for the same reason.
+        let catalog = self
+            .catalog
+            .and_then(|(number, generation)| self.object_by_id(number, generation))
+            .or_else(|| {
+                // Latest in the file, by where each object's bytes are. An
+                // object unpacked from an object stream has its container's
+                // offset; its place in `objects` says nothing about order.
+                self.objects
+                    .iter()
+                    .filter(|object| {
+                        object
+                            .dictionary
+                            .as_ref()
+                            .and_then(|dict| dict.get_name("Type"))
+                            == Some("Catalog")
+                    })
+                    .max_by_key(|object| object.span.start)
+            })?;
         let pages_ref = match catalog.dictionary.as_ref()?.get("Pages")? {
             PdfValue::Reference {
                 object_number,
@@ -7722,6 +7785,485 @@ fn reverse_parse_ascii_digits(bytes: &[u8], end: usize, max_digits: usize) -> Op
         value = value.checked_mul(10)?.checked_add((byte - b'0') as u64)?;
     }
     Some((value, start))
+}
+
+/// Work the cross-reference chain may do, per byte of file.
+///
+/// One unit is one entry examined; a section costs [`XREF_SECTION_COST`].
+/// Sections may not overlap, and the shortest table entry (`0 0n` and a line
+/// end) is five bytes, so every table in a file together holds fewer
+/// entries than a fifth of its length. A cross-reference stream is refused
+/// past [`XREF_DECODE_MULTIPLE`] times the file length decoded, one row per
+/// byte at the least, and each is read once. Eight units a byte covers both
+/// with room to spare; a chain that spends it is abandoned and the scan's
+/// own answer stands.
+const XREF_WORK_PER_BYTE: usize = 8;
+
+/// Work charged for entering one cross-reference section.
+const XREF_SECTION_COST: usize = 64;
+
+/// Largest decoded cross-reference stream accepted, as a multiple of the
+/// file length. A real one is far smaller than its file; a hostile one can
+/// inflate megabytes of rows from a few bytes.
+const XREF_DECODE_MULTIPLE: usize = 4;
+
+/// Where the cross-reference chain says an in-use object is.
+#[derive(Clone, Copy)]
+enum XrefEntry {
+    /// At a byte offset in the file, with this generation.
+    At(usize, u16),
+    /// Inside the object stream with this object number.
+    Packed(u32),
+}
+
+/// The in-use entries read so far and the work spent reading them.
+struct XrefChain<'a> {
+    bytes: &'a [u8],
+    /// Object numbers the scan produced. No entry is kept for any other.
+    known: &'a HashSet<u32>,
+    /// The newest in-use entry for each known object.
+    entries: HashMap<u32, XrefEntry>,
+    work: usize,
+    budget: usize,
+}
+
+impl XrefChain<'_> {
+    /// Spends `units` of work; `None` once the budget is gone.
+    fn charge(&mut self, units: usize) -> Option<()> {
+        self.work = self.work.saturating_add(units);
+        (self.work <= self.budget).then_some(())
+    }
+
+    /// Records an in-use entry unless a newer section already placed the
+    /// object or the scan never saw it.
+    fn offer(&mut self, number: u32, entry: XrefEntry) -> Option<()> {
+        self.charge(1)?;
+        if self.known.contains(&number) {
+            self.entries.entry(number).or_insert(entry);
+        }
+        Some(())
+    }
+
+    /// Reads the classic table at `offset`. Returns its trailer and where
+    /// the section ends. Free entries are read past and not recorded.
+    ///
+    /// The format accepted is the renderer's (hayro-syntax 0.5.0,
+    /// `xref.rs` 762-786 and `XRefEntry::read` at 670-692): after each
+    /// `first count` header, exactly twenty bytes per entry, ten digits of
+    /// offset, a separator, five digits of generation, a separator and `n`
+    /// for in use. Anything else is `None`, as it is there.
+    fn read_table(&mut self, offset: usize) -> Option<(PdfDictionary, usize)> {
+        let bytes = self.bytes;
+        let blanks = |cursor: &mut usize| {
+            while bytes
+                .get(*cursor)
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0))
+            {
+                *cursor += 1;
+            }
+        };
+        let digits = |field: &[u8]| -> Option<usize> {
+            field.iter().try_fold(0usize, |value, byte| {
+                byte.is_ascii_digit()
+                    .then(|| {
+                        value
+                            .checked_mul(10)?
+                            .checked_add(usize::from(*byte - b'0'))
+                    })
+                    .flatten()
+            })
+        };
+        let mut cursor = offset.checked_add(4)?;
+        loop {
+            self.charge(1)?;
+            blanks(&mut cursor);
+            if bytes.get(cursor..)?.starts_with(b"trailer") {
+                cursor = cursor.checked_add(7)?;
+                break;
+            }
+            let mut parser = ValueParser::new(bytes, cursor);
+            let first = number_to_u32(parser.parse_number_token().ok()?)?;
+            cursor = parser.pos;
+            blanks(&mut cursor);
+            let mut parser = ValueParser::new(bytes, cursor);
+            let count = number_to_u32(parser.parse_number_token().ok()?)?;
+            cursor = parser.pos;
+            blanks(&mut cursor);
+            for index in 0..count {
+                let end = cursor.checked_add(20)?;
+                let entry = bytes.get(cursor..end)?;
+                let position = digits(entry.get(..10)?)?;
+                let generation = u16::try_from(digits(entry.get(11..16)?)?).ok()?;
+                if entry.get(17) == Some(&b'n') {
+                    self.offer(
+                        first.checked_add(index)?,
+                        XrefEntry::At(position, generation),
+                    )?;
+                } else {
+                    self.charge(1)?;
+                }
+                cursor = end;
+            }
+        }
+        skip_whitespace_and_comments(bytes, &mut cursor);
+        let mut parser = ValueParser::new(bytes, cursor);
+        match parser.parse_value().ok()? {
+            PdfValue::Dictionary(trailer) => Some((trailer, parser.pos)),
+            _ => None,
+        }
+    }
+
+    /// Reads the rows of a cross-reference stream straight from its decoded
+    /// bytes. Free rows are read past and not recorded.
+    fn read_stream(&mut self, dictionary: &PdfDictionary, data: &[u8]) -> Option<()> {
+        let integers = |value: &PdfValue| -> Option<Vec<usize>> {
+            match value {
+                PdfValue::Array(items) => items
+                    .iter()
+                    .map(|item| match item {
+                        PdfValue::Integer(number) => usize::try_from(*number).ok(),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => None,
+            }
+        };
+        let widths = integers(dictionary.get("W")?)?;
+        let [kind_width, second_width, third_width] = <[usize; 3]>::try_from(widths).ok()?;
+        if kind_width > 8 || second_width > 8 || third_width > 8 {
+            return None;
+        }
+        let row = kind_width + second_width + third_width;
+        if row == 0 {
+            return None;
+        }
+        let ranges = match dictionary.get("Index") {
+            Some(index) => integers(index)?,
+            None => vec![0, usize::try_from(dictionary.get_integer("Size")?).ok()?],
+        };
+        let field = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .fold(0u64, |value, byte| value << 8 | u64::from(*byte))
+        };
+        let mut rows = data.chunks_exact(row);
+        for [start, count] in ranges.as_chunks::<2>().0 {
+            self.charge(1)?;
+            let first = u32::try_from(*start).ok()?;
+            for index in 0..*count {
+                let Some(row) = rows.next() else {
+                    return Some(());
+                };
+                let (kind, rest) = row.split_at_checked(kind_width)?;
+                let (second, third) = rest.split_at_checked(second_width)?;
+                let number = first.checked_add(u32::try_from(index).ok()?)?;
+                // A missing type field means an in-use object.
+                match if kind_width == 0 { 1 } else { field(kind) } {
+                    1 => self.offer(
+                        number,
+                        XrefEntry::At(
+                            usize::try_from(field(second)).ok()?,
+                            u16::try_from(field(third)).ok()?,
+                        ),
+                    )?,
+                    2 => self.offer(
+                        number,
+                        XrefEntry::Packed(u32::try_from(field(second)).ok()?),
+                    )?,
+                    _ => self.charge(1)?,
+                }
+            }
+        }
+        Some(())
+    }
+}
+
+/// Whether `offset` begins a line, allowing leading blanks.
+///
+/// A cross-reference table is entered only at an `xref` keyword that stands
+/// at the start of its line. One written after a `%`, or in the middle of
+/// other tokens, is a comment or data, not a section.
+fn starts_its_line(bytes: &[u8], offset: usize) -> bool {
+    let before = bytes.get(..offset).unwrap_or_default();
+    before
+        .iter()
+        .rev()
+        .take(64)
+        .find(|byte| !matches!(byte, b' ' | b'\t'))
+        .is_none_or(|byte| matches!(byte, b'\n' | b'\r'))
+}
+
+/// Points `object_index` at the copy of each object the cross-reference
+/// chain calls current, and returns the catalog the newest trailer names
+/// together with the work spent.
+///
+/// The chain does two things and no more. It names the newest trailer's
+/// `/Root`, and where the scan found several copies of an object number it
+/// says which one is current. It starts at the last `startxref` and follows
+/// `/Prev`; a table and its `/XRefStm` are one section; the newest section
+/// that lists an object in use wins and an older one never overrides it.
+///
+/// Free entries are ignored. The interpreter that renders pages ignores
+/// them too, and text extraction has to describe the same document it
+/// draws: a content stream a later revision marks free but a page still
+/// references is drawn, so it is extracted.
+///
+/// Everything is bounded by what the scan found. An entry is kept only for
+/// an object number the scan produced. A table is entered only at an `xref`
+/// keyword at the start of a line, outside every scanned object and outside
+/// every section already read, so sections cannot overlap or be re-read.
+/// A cross-reference stream is one the scan parsed as an object, decoded
+/// here whether or not decoded streams are being kept, and refused past
+/// [`XREF_DECODE_MULTIPLE`] times the file length. All of it draws on one
+/// budget of [`XREF_WORK_PER_BYTE`] units per byte of file.
+///
+/// The chain is all or nothing, because the renderer's is. A table that is
+/// not in the strict twenty-byte entry format, an in-use entry that does
+/// not land exactly on that object's header, a section that cannot be
+/// read, a `/Root` that is not a catalog, or a spent budget each discard
+/// everything read: the scan-order index stands for every object and no
+/// catalog is returned.
+///
+/// # Known differences from the renderer
+///
+/// Two remain, both older than this function.
+///
+/// * This function refuses some tables the renderer follows: one with
+///   other bytes before `xref` on its line, one swallowed by an unfinished
+///   final object's span, and one written inside a stream body. Extraction
+///   then uses scan order while the renderer uses the table, so when an
+///   object is written twice they can read different copies.
+/// * An object whose only cross-reference entry is free, or one appended
+///   after the last `%%EOF` and listed nowhere, is not in the renderer's
+///   map. This crate's scan still finds it, so its text is extracted from
+///   a page the renderer draws without it.
+fn apply_xref_chain(
+    bytes: &[u8],
+    objects: &[PdfObject],
+    streams: &[PdfStream],
+    object_index: &mut HashMap<(u32, u16), usize>,
+) -> (Option<(u32, u16)>, usize, usize) {
+    let known: HashSet<u32> = objects.iter().map(|object| object.object_number).collect();
+    let mut chain = XrefChain {
+        bytes,
+        known: &known,
+        entries: HashMap::new(),
+        work: 0,
+        budget: bytes
+            .len()
+            .saturating_mul(XREF_WORK_PER_BYTE)
+            .saturating_add(4096),
+    };
+    let catalog = follow_xref_chain(&mut chain, objects, streams, object_index);
+    (catalog, chain.work, chain.entries.len())
+}
+
+/// The body of [`apply_xref_chain`], with `None` for every way the chain
+/// can fail to be usable.
+fn follow_xref_chain(
+    chain: &mut XrefChain<'_>,
+    objects: &[PdfObject],
+    streams: &[PdfStream],
+    object_index: &mut HashMap<(u32, u16), usize>,
+) -> Option<(u32, u16)> {
+    let bytes = chain.bytes;
+    let marker = memchr::memmem::rfind(bytes, b"startxref")?;
+    let mut cursor = marker.checked_add(9)?;
+    skip_whitespace_and_comments(bytes, &mut cursor);
+    let start = number_to_usize(ValueParser::new(bytes, cursor).parse_number_token().ok()?)?;
+
+    // Objects by where their header starts. Objects unpacked from an
+    // object stream carry their container's span and come after every
+    // directly written object, so the first object at an offset is the one
+    // written there.
+    let mut by_offset: HashMap<usize, usize> = HashMap::new();
+    // Objects unpacked from an object stream, by number and container.
+    let mut packed: HashMap<(u32, usize), usize> = HashMap::new();
+    // The byte ranges of directly written objects, in file order.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        match by_offset.entry(object.span.start) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                packed.insert((object.object_number, object.span.start), index);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(index);
+                spans.push((object.span.start, object.span.end));
+            }
+        }
+    }
+    spans.sort_unstable();
+    let inside_object = |offset: usize| {
+        let after = spans.partition_point(|(start, _)| *start <= offset);
+        after
+            .checked_sub(1)
+            .and_then(|index| spans.get(index))
+            .is_some_and(|(_, end)| offset < *end)
+    };
+    let at = |offset: usize| -> Option<usize> {
+        let mut cursor = offset;
+        skip_whitespace_and_comments(bytes, &mut cursor);
+        by_offset.get(&cursor).copied()
+    };
+    let decode_cap = bytes
+        .len()
+        .saturating_mul(XREF_DECODE_MULTIPLE)
+        .saturating_add(4096);
+    // Reads the cross-reference stream object at `offset` into the chain
+    // and returns its dictionary.
+    let read_stream_at = |chain: &mut XrefChain<'_>,
+                          seen: &mut HashSet<usize>,
+                          offset: usize|
+     -> Option<PdfDictionary> {
+        let index = at(offset)?;
+        if !seen.insert(index) {
+            return None;
+        }
+        let object = objects.get(index)?;
+        let dictionary = object.dictionary.as_ref()?;
+        let stream = streams.get(object.stream_index?)?;
+        let decoded;
+        let data: &[u8] = match stream.decoded.as_deref() {
+            Some(kept) => kept,
+            None => {
+                let raw = bytes.get(stream.raw_range.start..stream.raw_range.end)?;
+                decoded = decode_filters(
+                    raw,
+                    &stream.filters,
+                    dictionary.get("DecodeParms"),
+                    decode_cap,
+                )
+                .ok()?;
+                &decoded
+            }
+        };
+        if data.len() > decode_cap {
+            return None;
+        }
+        chain.read_stream(dictionary, data)?;
+        Some(dictionary.clone())
+    };
+
+    let mut root: Option<(u32, u16)> = None;
+    let mut tables: Vec<(usize, usize)> = Vec::new();
+    let mut seen_streams: HashSet<usize> = HashSet::new();
+    let mut next = Some(start);
+    while let Some(offset) = next.take() {
+        chain.charge(XREF_SECTION_COST)?;
+        let mut cursor = offset;
+        skip_whitespace_and_comments(bytes, &mut cursor);
+        let is_table = bytes
+            .get(cursor..)
+            .is_some_and(|rest| rest.starts_with(b"xref"));
+        let trailer = if is_table {
+            let enterable = starts_its_line(bytes, cursor)
+                && !inside_object(cursor)
+                && !tables
+                    .iter()
+                    .any(|(start, end)| *start <= cursor && cursor < *end);
+            if !enterable {
+                return None;
+            }
+            let (trailer, end) = chain.read_table(cursor)?;
+            tables.push((cursor, end));
+            // A hybrid file's stream belongs to this section: it places the
+            // objects the table could not describe.
+            if let Some(hybrid) = trailer
+                .get_integer("XRefStm")
+                .and_then(|value| usize::try_from(value).ok())
+            {
+                read_stream_at(chain, &mut seen_streams, hybrid)?;
+            }
+            trailer
+        } else {
+            read_stream_at(chain, &mut seen_streams, offset)?
+        };
+        if root.is_none() {
+            if let Some(PdfValue::Reference {
+                object_number,
+                generation,
+            }) = trailer.get("Root")
+            {
+                root = Some((*object_number, *generation));
+            }
+        }
+        next = trailer
+            .get_integer("Prev")
+            .and_then(|value| usize::try_from(value).ok());
+    }
+
+    // Every in-use entry at an offset must land exactly on the header of
+    // that object, number and generation, as the scan recorded it. The
+    // renderer reads `N G obj` at the offset with no skipping and compares
+    // the identifier (hayro-syntax 0.5.0, `xref.rs` 518-522), and on the
+    // first offset that fails it throws its whole map away and rebuilds by
+    // scanning (534-545). So one bad entry here discards the whole chain.
+    let mut placed: Vec<(u32, usize)> = Vec::new();
+    let mut packed_entries: Vec<(u32, u32)> = Vec::new();
+    for (number, entry) in &chain.entries {
+        match *entry {
+            XrefEntry::At(offset, generation) => {
+                let found = *by_offset.get(&offset)?;
+                let object = objects.get(found)?;
+                if object.object_number != *number || object.generation != generation {
+                    return None;
+                }
+                placed.push((*number, found));
+            }
+            XrefEntry::Packed(container) => packed_entries.push((*number, container)),
+        }
+    }
+
+    let root = root?;
+    // Every generation the scan indexed, by object number.
+    let mut generations: HashMap<u32, Vec<u16>> = HashMap::new();
+    for (number, generation) in object_index.keys() {
+        generations.entry(*number).or_default().push(*generation);
+    }
+    let mut chosen = object_index.clone();
+    let choose = |chosen: &mut HashMap<(u32, u16), usize>, number: u32, found: usize| {
+        let Some(object) = objects.get(found) else {
+            return;
+        };
+        for generation in generations.get(&number).into_iter().flatten() {
+            chosen.remove(&(number, *generation));
+        }
+        chosen.insert((number, object.generation), found);
+    };
+    for (number, found) in placed {
+        choose(&mut chosen, number, found);
+    }
+    // Then the objects inside object streams, now that every container is
+    // settled. One this scan did not unpack keeps the scan's answer: the
+    // renderer does not rebuild its map over an object stream.
+    for (number, container) in packed_entries {
+        let found = chosen
+            .get(&(container, 0))
+            .and_then(|index| objects.get(*index))
+            .and_then(|container| packed.get(&(number, container.span.start)));
+        if let Some(found) = found {
+            choose(&mut chosen, number, *found);
+        }
+    }
+    let root_index = *generations
+        .get(&root.0)
+        .into_iter()
+        .flatten()
+        .find_map(|generation| chosen.get(&(root.0, *generation)))?;
+    if !chain.entries.contains_key(&root.0) {
+        return None;
+    }
+    let is_catalog = objects
+        .get(root_index)?
+        .dictionary
+        .as_ref()
+        .and_then(|dictionary| dictionary.get_name("Type"))
+        == Some("Catalog");
+    if !is_catalog {
+        return None;
+    }
+    *object_index = chosen;
+    Some((root.0, objects.get(root_index)?.generation))
 }
 
 fn skip_whitespace_and_comments(bytes: &[u8], cursor: &mut usize) {
