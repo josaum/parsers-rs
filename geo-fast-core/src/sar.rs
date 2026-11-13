@@ -7,6 +7,19 @@
 
 use crate::error::GeoError;
 use crate::types::{BBox, Coordinate};
+use crate::xml_text::TextRun;
+
+/// Sets a reader up for the event loops of this module.
+///
+/// The reader does not trim text: a value arrives in pieces (see
+/// [`TextRun`]), and trimming each piece would close up `a &amp; b` to `a&b`.
+/// A `&` that starts no reference is reported as text, not as an error, so
+/// one unescaped ampersand does not cost the whole document.
+fn configure(reader: &mut quick_xml::Reader<&[u8]>) {
+    let config = reader.config_mut();
+    config.trim_text(false);
+    config.allow_dangling_amp = true;
+}
 
 /// Metadata extracted from a SAR product.
 #[derive(Debug, Clone)]
@@ -59,8 +72,9 @@ impl SarParser {
         use quick_xml::Reader;
 
         let mut reader = Reader::from_reader(xml_bytes);
-        reader.config_mut().trim_text(true);
+        configure(&mut reader);
         let mut buf = Vec::with_capacity(4096);
+        let mut run = TextRun::default();
 
         let mut sensor = String::new();
         let mut acquisition_date = String::new();
@@ -79,18 +93,111 @@ impl SarParser {
         let mut in_acquisition = false;
 
         loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) => {
-                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    current_tag = tag_name.clone();
+            let event = reader.read_event_into(&mut buf).map_err(|e| {
+                GeoError::Xml(format!(
+                    "Error parsing SAFE manifest at position {}: {}",
+                    reader.buffer_position(),
+                    e
+                ))
+            })?;
+            match &event {
+                Event::Text(piece) => {
+                    run.push_text(piece);
+                    buf.clear();
+                    continue;
+                }
+                Event::CData(section) => {
+                    run.push_cdata(section);
+                    buf.clear();
+                    continue;
+                }
+                Event::GeneralRef(reference) => {
+                    run.push_reference(reference);
+                    buf.clear();
+                    continue;
+                }
+                _ => {}
+            }
 
+            // Any other event ends the character data collected so far.
+            let text = run.take().unwrap_or_default();
+            let text = text.trim().to_string();
+            if !text.is_empty() {
+                match current_tag.as_str() {
+                    // Platform / sensor
+                    "safe:familyName" | "familyName" if in_platform => {
+                        sensor = text;
+                    }
+                    "safe:number" | "number" if in_platform => {
+                        if !sensor.is_empty() {
+                            sensor = format!("{}{}", sensor, text);
+                        }
+                    }
+                    // Acquisition date
+                    "safe:startTime" | "startTime" if in_acquisition => {
+                        acquisition_date = text;
+                    }
+                    // Product type
+                    "s1sarl1:productType" | "productType" => {
+                        product_type = text;
+                    }
+                    // Polarization
+                    "s1sarl1:transmitterReceiverPolarisation"
+                    | "transmitterReceiverPolarisation" => {
+                        if !polarization.contains(&text) {
+                            polarization.push(text);
+                        }
+                    }
+                    // Pass direction
+                    "s1:pass" | "pass" => {
+                        orbit_direction = text.to_lowercase();
+                    }
+                    // Resolution
+                    "s1sarl1:resolution" | "resolution" => {
+                        if let Ok(v) = text.parse::<f64>() {
+                            resolution_m = v;
+                        }
+                    }
+                    // Image dimensions
+                    "s1sarl1:numberOfSamples" | "numberOfSamples" => {
+                        if let Ok(v) = text.parse::<u32>() {
+                            width = v;
+                        }
+                    }
+                    "s1sarl1:numberOfLines" | "numberOfLines" => {
+                        if let Ok(v) = text.parse::<u32>() {
+                            height = v;
+                        }
+                    }
+                    // Incidence angle
+                    "s1sarl1:incidenceAngleMidSwath" | "incidenceAngleMidSwath" => {
+                        if let Ok(v) = text.parse::<f64>() {
+                            incidence_angle_deg = v;
+                        }
+                    }
+                    // GML footprint coordinates (lat lon pairs)
+                    "gml:coordinates" | "coordinates" => {
+                        Self::parse_gml_coordinates(&text, &mut footprint_coords);
+                    }
+                    // posList variant
+                    "gml:posList" | "posList" => {
+                        Self::parse_gml_pos_list(&text, &mut footprint_coords);
+                    }
+                    _ => {}
+                }
+            }
+
+            match &event {
+                Event::Start(e) => {
+                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     match tag_name.as_str() {
                         "safe:platform" | "platform" => in_platform = true,
                         "safe:acquisitionPeriod" | "acquisitionPeriod" => in_acquisition = true,
                         _ => {}
                     }
+                    current_tag = tag_name;
                 }
-                Ok(Event::End(ref e)) => {
+                Event::End(e) => {
                     let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     match tag_name.as_str() {
                         "safe:platform" | "platform" => in_platform = false,
@@ -99,84 +206,7 @@ impl SarParser {
                     }
                     current_tag.clear();
                 }
-                Ok(Event::Text(ref e)) => {
-                    let text = e.unescape().unwrap_or_default().to_string();
-                    let text = text.trim().to_string();
-                    if text.is_empty() {
-                        continue;
-                    }
-
-                    match current_tag.as_str() {
-                        // Platform / sensor
-                        "safe:familyName" | "familyName" if in_platform => {
-                            sensor = text;
-                        }
-                        "safe:number" | "number" if in_platform => {
-                            if !sensor.is_empty() {
-                                sensor = format!("{}{}", sensor, text);
-                            }
-                        }
-                        // Acquisition date
-                        "safe:startTime" | "startTime" if in_acquisition => {
-                            acquisition_date = text;
-                        }
-                        // Product type
-                        "s1sarl1:productType" | "productType" => {
-                            product_type = text;
-                        }
-                        // Polarization
-                        "s1sarl1:transmitterReceiverPolarisation"
-                        | "transmitterReceiverPolarisation" => {
-                            if !polarization.contains(&text) {
-                                polarization.push(text);
-                            }
-                        }
-                        // Pass direction
-                        "s1:pass" | "pass" => {
-                            orbit_direction = text.to_lowercase();
-                        }
-                        // Resolution
-                        "s1sarl1:resolution" | "resolution" => {
-                            if let Ok(v) = text.parse::<f64>() {
-                                resolution_m = v;
-                            }
-                        }
-                        // Image dimensions
-                        "s1sarl1:numberOfSamples" | "numberOfSamples" => {
-                            if let Ok(v) = text.parse::<u32>() {
-                                width = v;
-                            }
-                        }
-                        "s1sarl1:numberOfLines" | "numberOfLines" => {
-                            if let Ok(v) = text.parse::<u32>() {
-                                height = v;
-                            }
-                        }
-                        // Incidence angle
-                        "s1sarl1:incidenceAngleMidSwath" | "incidenceAngleMidSwath" => {
-                            if let Ok(v) = text.parse::<f64>() {
-                                incidence_angle_deg = v;
-                            }
-                        }
-                        // GML footprint coordinates (lat lon pairs)
-                        "gml:coordinates" | "coordinates" => {
-                            Self::parse_gml_coordinates(&text, &mut footprint_coords);
-                        }
-                        // posList variant
-                        "gml:posList" | "posList" => {
-                            Self::parse_gml_pos_list(&text, &mut footprint_coords);
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(Event::Eof) => break,
-                Err(e) => {
-                    return Err(GeoError::Xml(format!(
-                        "Error parsing SAFE manifest at position {}: {}",
-                        reader.buffer_position(),
-                        e
-                    )));
-                }
+                Event::Eof => break,
                 _ => {}
             }
             buf.clear();
@@ -321,8 +351,9 @@ impl SarParser {
         use quick_xml::Reader;
 
         let mut reader = Reader::from_reader(annotation_xml);
-        reader.config_mut().trim_text(true);
+        configure(&mut reader);
         let mut buf = Vec::with_capacity(2048);
+        let mut run = TextRun::default();
 
         let mut gcps: Vec<GroundControlPoint> = Vec::new();
 
@@ -335,8 +366,47 @@ impl SarParser {
         let mut gcp_height: f64 = 0.0;
 
         loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) => {
+            let event = reader.read_event_into(&mut buf).map_err(|e| {
+                GeoError::Xml(format!(
+                    "Error parsing annotation XML at position {}: {}",
+                    reader.buffer_position(),
+                    e
+                ))
+            })?;
+            match &event {
+                Event::Text(piece) => {
+                    run.push_text(piece);
+                    buf.clear();
+                    continue;
+                }
+                Event::CData(section) => {
+                    run.push_cdata(section);
+                    buf.clear();
+                    continue;
+                }
+                Event::GeneralRef(reference) => {
+                    run.push_reference(reference);
+                    buf.clear();
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Any other event ends the character data collected so far.
+            if let Some(text) = run.take().filter(|_| in_gcp) {
+                let text = text.trim();
+                match current_tag.as_str() {
+                    "line" => gcp_line = text.parse().unwrap_or(0.0),
+                    "pixel" => gcp_sample = text.parse().unwrap_or(0.0),
+                    "latitude" => gcp_lat = text.parse().unwrap_or(0.0),
+                    "longitude" => gcp_lon = text.parse().unwrap_or(0.0),
+                    "height" => gcp_height = text.parse().unwrap_or(0.0),
+                    _ => {}
+                }
+            }
+
+            match &event {
+                Event::Start(e) => {
                     let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     if tag == "geolocationGridPoint" {
                         in_gcp = true;
@@ -348,7 +418,7 @@ impl SarParser {
                     }
                     current_tag = tag;
                 }
-                Ok(Event::End(ref e)) => {
+                Event::End(e) => {
                     let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     if tag == "geolocationGridPoint" && in_gcp {
                         gcps.push(GroundControlPoint {
@@ -361,26 +431,7 @@ impl SarParser {
                     }
                     current_tag.clear();
                 }
-                Ok(Event::Text(ref e)) if in_gcp => {
-                    let text = e.unescape().unwrap_or_default().to_string();
-                    let text = text.trim();
-                    match current_tag.as_str() {
-                        "line" => gcp_line = text.parse().unwrap_or(0.0),
-                        "pixel" => gcp_sample = text.parse().unwrap_or(0.0),
-                        "latitude" => gcp_lat = text.parse().unwrap_or(0.0),
-                        "longitude" => gcp_lon = text.parse().unwrap_or(0.0),
-                        "height" => gcp_height = text.parse().unwrap_or(0.0),
-                        _ => {}
-                    }
-                }
-                Ok(Event::Eof) => break,
-                Err(e) => {
-                    return Err(GeoError::Xml(format!(
-                        "Error parsing annotation XML at position {}: {}",
-                        reader.buffer_position(),
-                        e
-                    )));
-                }
+                Event::Eof => break,
                 _ => {}
             }
             buf.clear();
@@ -537,5 +588,112 @@ mod tests {
         assert_eq!(gcps.len(), 2);
         assert!((gcps[0].geo.lat - (-10.5)).abs() < 1e-6);
         assert!((gcps[1].sample - 200.0).abs() < 1e-6);
+    }
+
+    /// A SAFE manifest whose platform name is `family_name`, with `extra`
+    /// elements after the platform.
+    fn manifest(family_name: &str, extra: &str) -> Vec<u8> {
+        format!(
+            "<x><safe:platform><safe:familyName>{family_name}</safe:familyName>\
+             </safe:platform>{extra}</x>"
+        )
+        .into_bytes()
+    }
+
+    fn sensor(family_name: &str) -> Result<String, String> {
+        SarParser::parse_safe_manifest(&manifest(family_name, ""))
+            .map(|metadata| metadata.sensor)
+            .map_err(|error| error.to_string())
+    }
+
+    /// The values quick-xml 0.36 produced, when a reference was part of the
+    /// text event around it. From 0.41 a reference is an event of its own and
+    /// a value arrives in pieces; assigning per piece would keep ` B` of
+    /// `A &amp; B` and `.5` of `1&#48;.5`.
+    #[test]
+    fn references_in_a_platform_name_are_resolved_in_place() {
+        for (written, expected) in [
+            ("A &amp; B", "A & B"),
+            ("Caf&#233;", "Café"),
+            ("Caf&#xE9;", "Café"),
+            ("&amp;", "&"),
+            ("a&lt;b", "a<b"),
+            ("  padded &amp;  ", "padded &"),
+            ("&#32;x&#32;", "x"),
+            ("1&#48;.5", "10.5"),
+        ] {
+            assert_eq!(sensor(written).as_deref(), Ok(expected), "{written}");
+        }
+    }
+
+    /// A CDATA section used to be skipped: a platform named only in one was
+    /// "no platform", and `pre<![CDATA[mid]]>post` was read as `post`. It is
+    /// text like the rest of the value, taken as written. Character data on
+    /// either side of a comment is still one stretch at a time, the last one
+    /// winning.
+    #[test]
+    fn cdata_in_a_platform_name_is_read_as_text() {
+        assert_eq!(sensor("<![CDATA[X &amp; Y]]>").as_deref(), Ok("X &amp; Y"));
+        assert_eq!(sensor("<![CDATA[A < B]]>").as_deref(), Ok("A < B"));
+        assert_eq!(
+            sensor("pre<![CDATA[mid]]>post").as_deref(),
+            Ok("premidpost")
+        );
+        assert_eq!(sensor(" a <![CDATA[ & ]]> b ").as_deref(), Ok("a  &  b"));
+        assert!(sensor("<![CDATA[]]>").is_err());
+        assert_eq!(sensor("a<!-- c -->b").as_deref(), Ok("b"));
+        assert!(sensor("   ").is_err());
+    }
+
+    #[test]
+    fn numeric_field_written_with_a_reference_is_read_whole() {
+        let parsed = SarParser::parse_safe_manifest(&manifest(
+            "S1",
+            "<resolution>1&#48;.5</resolution>\
+             <numberOfSamples> 2&#53;0 </numberOfSamples>\
+             <numberOfLines>&#49;&#48;</numberOfLines>\
+             <incidenceAngleMidSwath>3&#57;&#46;25</incidenceAngleMidSwath>\
+             <pass>ASC&#69;NDING</pass>\
+             <coordinates>-1&#48;.0,-60.0 -12.0,-58.0</coordinates>",
+        ))
+        .expect("manifest");
+        assert_eq!(parsed.resolution_m, 10.5);
+        assert_eq!(parsed.width, 250);
+        assert_eq!(parsed.height, 10);
+        assert_eq!(parsed.incidence_angle_deg, 39.25);
+        assert_eq!(parsed.orbit_direction, "ascending");
+        assert_eq!(parsed.bbox, BBox::new(-60.0, -12.0, -58.0, -10.0));
+        // A numeric field in a CDATA section is read too.
+        let parsed = SarParser::parse_safe_manifest(&manifest(
+            "S1",
+            "<resolution><![CDATA[10.5]]></resolution>",
+        ))
+        .expect("manifest");
+        assert_eq!(parsed.resolution_m, 10.5);
+    }
+
+    #[test]
+    fn ground_control_point_written_with_references_is_read_whole() {
+        let annotation = b"<p><geolocationGridPoint>\
+            <line>1&#48;0</line><pixel> 2&#48;0 </pixel>\
+            <latitude>-1&#48;.5</latitude><longitude>&#45;59&#46;25</longitude>\
+            <height><![CDATA[150.0]]></height>\
+            </geolocationGridPoint></p>";
+        let points = SarParser::extract_gcps(annotation).expect("annotation");
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].line, 100.0);
+        assert_eq!(points[0].sample, 200.0);
+        assert_eq!(points[0].geo.lat, -10.5);
+        assert_eq!(points[0].geo.lon, -59.25);
+        assert_eq!(points[0].height, 150.0);
+    }
+
+    /// quick-xml 0.36 failed to unescape such a value and the reader then
+    /// dropped it whole: a platform named `A &unknown; B` was "no platform".
+    #[test]
+    fn reference_that_cannot_be_resolved_is_kept_as_written() {
+        for written in ["A &unknown; B", "A & B", "A &#0; B", "AT&T"] {
+            assert_eq!(sensor(written).as_deref(), Ok(written), "{written}");
+        }
     }
 }

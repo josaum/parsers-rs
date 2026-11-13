@@ -8,11 +8,12 @@
 #![cfg(feature = "http")]
 
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use reqwest::Client;
 
 use crate::error::GeoError;
 use crate::types::BBox;
+use crate::xml_text::TextRun;
 
 /// A layer description extracted from a WMS `GetCapabilities` response.
 #[derive(Debug, Clone)]
@@ -146,7 +147,13 @@ impl WmsClient {
 /// Returns [`GeoError`] when `xml` is not well-formed.
 pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // The reader does not trim: a value arrives in pieces (see `TextRun`),
+    // and trimming each piece would close up `a &amp; b` to `a&b`. A `&` that
+    // starts no reference is reported as text, not as an error, so one
+    // unescaped ampersand in a title does not cost the whole document.
+    reader.config_mut().trim_text(false);
+    reader.config_mut().allow_dangling_amp = true;
+    let mut run = TextRun::default();
 
     let mut layers: Vec<WmsLayer> = Vec::new();
     let mut current_layer: Option<WmsLayerBuilder> = None;
@@ -158,8 +165,43 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
     let mut layer_depth: usize = 0;
 
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
+        let event = reader
+            .read_event()
+            .map_err(|e| GeoError::Xml(e.to_string()))?;
+        match &event {
+            Event::Text(piece) => {
+                run.push_text(piece);
+                continue;
+            }
+            Event::CData(section) => {
+                run.push_cdata(section);
+                continue;
+            }
+            Event::GeneralRef(reference) => {
+                run.push_reference(reference);
+                continue;
+            }
+            _ => {}
+        }
+
+        // Any other event ends the character data collected so far.
+        if let Some(text) = run.take() {
+            if let Some(ref mut builder) = current_layer {
+                if capture_name {
+                    builder.name = text;
+                    capture_name = false;
+                } else if capture_title {
+                    builder.title = text;
+                    capture_title = false;
+                } else if capture_crs {
+                    builder.crs_list.push(text);
+                    capture_crs = false;
+                }
+            }
+        }
+
+        match event {
+            Event::Start(ref e) => {
                 depth += 1;
                 match e.local_name().as_ref() {
                     b"Layer" => {
@@ -178,7 +220,7 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                     _ => {}
                 }
             }
-            Ok(Event::Empty(ref e)) => {
+            Event::Empty(ref e) => {
                 if inside_layer {
                     match e.local_name().as_ref() {
                         b"EX_GeographicBoundingBox" | b"LatLonBoundingBox" | b"BoundingBox" => {
@@ -189,7 +231,9 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                                 let mut max_y: Option<f64> = None;
                                 for attr in e.attributes().with_checks(false).flatten() {
                                     let key = attr.key.local_name();
-                                    let val = attr.unescape_value().unwrap_or_default();
+                                    let val = attr
+                                        .normalized_value(XmlVersion::Implicit1_0)
+                                        .unwrap_or_default();
                                     let f = val.parse::<f64>().ok();
                                     match key.as_ref() {
                                         b"minx" | b"westBoundLongitude" => min_x = f,
@@ -210,22 +254,7 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                     }
                 }
             }
-            Ok(Event::Text(e)) => {
-                let text = e.unescape().unwrap_or_default().to_string();
-                if let Some(ref mut builder) = current_layer {
-                    if capture_name {
-                        builder.name = text;
-                        capture_name = false;
-                    } else if capture_title {
-                        builder.title = text;
-                        capture_title = false;
-                    } else if capture_crs {
-                        builder.crs_list.push(text);
-                        capture_crs = false;
-                    }
-                }
-            }
-            Ok(Event::End(ref e)) => {
+            Event::End(ref e) => {
                 if inside_layer && e.local_name().as_ref() == b"Layer" && depth == layer_depth {
                     if let Some(builder) = current_layer.take() {
                         if !builder.name.is_empty() {
@@ -244,10 +273,7 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                 capture_crs = false;
                 depth = depth.saturating_sub(1);
             }
-            Ok(Event::Eof) => break,
-            Err(e) => {
-                return Err(GeoError::Xml(e.to_string()));
-            }
+            Event::Eof => break,
             _ => {}
         }
     }
@@ -296,5 +322,89 @@ mod tests {
         );
         let l = carta.unwrap();
         assert!(l.crs_list.contains(&"EPSG:4326".to_string()));
+    }
+
+    /// The name, title and CRS list of each layer of a document whose first
+    /// layer has `value` as its title and CRS, and whose second has it as
+    /// its name.
+    fn layers_with(value: &str) -> Vec<(String, String, Vec<String>)> {
+        let capabilities = format!(
+            "<C><Layer><Name>n</Name><Title>{value}</Title><CRS>{value}</CRS></Layer>\
+             <Layer><Name>{value}</Name><Title>t</Title></Layer></C>"
+        );
+        parse_capabilities_xml(&capabilities)
+            .expect("capabilities")
+            .into_iter()
+            .map(|layer| (layer.name, layer.title, layer.crs_list))
+            .collect()
+    }
+
+    /// Both layers of [`layers_with`], had `value` been read as `read`.
+    fn both(read: &str) -> Vec<(String, String, Vec<String>)> {
+        vec![
+            ("n".into(), read.into(), vec![read.into()]),
+            (read.into(), "t".into(), vec![]),
+        ]
+    }
+
+    /// The values quick-xml 0.36 produced, when a reference was part of the
+    /// text event around it. From 0.41 a reference is an event of its own and
+    /// a value arrives in pieces; the first piece of `A &amp; B` is `A `.
+    #[test]
+    fn references_in_a_layer_title_are_resolved_in_place() {
+        for (written, read) in [
+            ("A &amp; B", "A & B"),
+            ("Caf&#233;", "Café"),
+            ("Caf&#xE9;", "Café"),
+            ("&amp;", "&"),
+            ("a&lt;b", "a<b"),
+            ("  padded &amp;  ", "padded &"),
+            // Whitespace written as a reference is content.
+            ("&#32;x&#32;", " x "),
+            (" &#32;x&#32; ", " x "),
+            ("EPSG&#58;4326", "EPSG:4326"),
+        ] {
+            assert_eq!(layers_with(written), both(read), "{written}");
+        }
+    }
+
+    /// A CDATA section used to be skipped: a layer named only in one had an
+    /// empty name and was left out, and `pre<![CDATA[mid]]>post` was read as
+    /// `pre`. It is text like the rest of the value, taken as written. Of
+    /// the character data on either side of a comment or a child element
+    /// the first stretch is still the value.
+    #[test]
+    fn cdata_in_a_layer_title_is_read_as_text() {
+        let untitled = vec![("n".to_string(), String::new(), vec![])];
+        assert_eq!(layers_with("<![CDATA[X &amp; Y]]>"), both("X &amp; Y"));
+        assert_eq!(
+            layers_with("<![CDATA[Roads & <Rivers>]]>"),
+            both("Roads & <Rivers>")
+        );
+        assert_eq!(layers_with("<![CDATA[]]>"), untitled);
+        assert_eq!(layers_with("   "), untitled);
+        assert_eq!(layers_with("pre<![CDATA[mid]]>post"), both("premidpost"));
+        assert_eq!(layers_with("a<!-- c -->b"), both("a"));
+        assert_eq!(layers_with("<b>x</b>y"), both("x"));
+    }
+
+    #[test]
+    fn bounding_box_written_with_references_is_read_whole() {
+        let layers = parse_capabilities_xml(
+            "<C><Layer><Name>n</Name>\
+             <BoundingBox minx=\"&#45;74.0\" miny=\"-3&#51;.8\" maxx=\"-28&#46;5\" maxy=\"5.3\"/>\
+             </Layer></C>",
+        )
+        .expect("capabilities");
+        assert_eq!(layers[0].bbox, Some(BBox::new(-74.0, -33.8, -28.5, 5.3)));
+    }
+
+    /// quick-xml 0.36 failed to unescape such a value and the reader then
+    /// blanked it: a layer named `A & B` had no name and was left out.
+    #[test]
+    fn reference_that_cannot_be_resolved_is_kept_as_written() {
+        for written in ["A &unknown; B", "A & B", "A &#0; B", "AT&T"] {
+            assert_eq!(layers_with(written), both(written), "{written}");
+        }
     }
 }
