@@ -977,13 +977,13 @@ def assert_dependabot_contract(dependabot: str) -> None:
         cargo,
         re.MULTILINE,
     ), "hayro 0.6 and later must be ignored until the render guard is ported to it"
-    # mailparse 0.18 splits MIME parts differently, and email-fast-core's
-    # nesting and header-cost guards replay 0.15's search; it waits for both.
-    assert re.search(
-        r'^      - dependency-name: "mailparse"\n        versions:\n          - ">=0\.16"$',
-        cargo,
-        re.MULTILINE,
-    ), "mailparse 0.16 and later must be ignored until email-fast-core's guards follow it"
+    # email-fast-core's nesting walk and header-cost guard follow mailparse
+    # 0.18, and `mime_depth_walk_agrees_with_mailparse` fails the update
+    # pull request of a version that splits parts differently, so mailparse
+    # is not held: a hold would only leave the guards on an old version.
+    assert not re.search(
+        r'^      - dependency-name: "mailparse"$', cargo, re.MULTILINE
+    ), "mailparse is not held; its update pull request runs the walk's agreement test"
     # tiff 0.10 and later drops an unspecified extra sample (an RGB+NIR
     # raster loses its NIR band) and changes JPEG pixels; it waits for both.
     assert re.search(
@@ -1445,8 +1445,8 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_dependabot_contract, DEPENDABOT, '          - ">=0.12"', '          - ">=0.13"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "hayro"\n', '      - dependency-name: "hayro-syntax"\n'),
         (assert_dependabot_contract, DEPENDABOT, '          - ">=0.6"', '          - ">=0.10"'),
-        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "mailparse"\n        versions:\n          - ">=0.16"\n', ""),
-        (assert_dependabot_contract, DEPENDABOT, '"mailparse"\n        versions:\n          - ">=0.16"', '"mailparse"\n        versions:\n          - ">=0.19"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "tiff"\n', '      - dependency-name: "mailparse"\n        versions:\n          - ">=0.19"\n      - dependency-name: "tiff"\n'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "tiff"\n', '      - dependency-name: "mailparse"\n        versions:\n          - ">=0.16"\n      - dependency-name: "tiff"\n'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "tiff"\n        versions:\n          - ">=0.10"\n', ""),
         (assert_dependabot_contract, DEPENDABOT, '"tiff"\n        versions:\n          - ">=0.10"', '"tiff"\n        versions:\n          - ">=0.12"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "libdeflater"\n        versions:\n          - ">=1"\n', ""),

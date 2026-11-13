@@ -87,23 +87,6 @@ updates:
       - dependency-name: "arrow*"
         versions:
           - ">=59"
-      # mailparse 0.18 splits a message differently: it drops the line break
-      # before each MIME boundary from the part above it, finds a boundary
-      # that ends the message (0.15 missed it), treats every `multipart*`
-      # type as multipart, splits Content-Type parameters around quoted
-      # semicolons and refuses nesting past 100 levels. On 2026-11-13, 8 of
-      # 14 real .eml files parsed to different JSON (`body` in all 8,
-      # `attachments` in 2), as did 3394 of the 23797 parses email-fast-core's
-      # tests make (`body`, `attachments`, `to`, `cc`, `from`), and
-      # `mime_depth_walk_agrees_with_mailparse` failed: the crate's nesting
-      # walk (`find_bytes`) replays 0.15's boundary search, quirk included,
-      # and its header-cost bound was measured on 0.15. Unblocked by
-      # re-deriving the walk and re-measuring the bound against the new
-      # version, and a review that accepts the new output, with a
-      # before-and-after JSON comparison in the upgrade's pull request.
-      - dependency-name: "mailparse"
-        versions:
-          - ">=0.16"
       # tiff 0.10 and later reads a raster differently, and geo-fast-core's
       # bands follow 0.9. On 2026-11-13, 0.11.3 against GDAL's 237 test
       # TIFFs (autotest/gcore/data) gave:
