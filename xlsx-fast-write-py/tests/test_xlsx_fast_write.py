@@ -11,6 +11,7 @@ import io
 import json
 import zipfile
 import inspect
+import sys
 import threading
 from pathlib import Path
 
@@ -19,20 +20,41 @@ import pytest
 MODULE = pytest.importorskip("xlsx_fast_write")
 
 
-def in_two_threads(call):
-    """Run `call` on two threads at once and return both results."""
-    results: list = [None, None]
+def times_another_thread_ran_during(call, attempts: int = 5) -> int:
+    """How many of `attempts` calls let a second Python thread run meanwhile.
 
-    def work(slot: int) -> None:
-        results[slot] = call()
+    The switch interval is raised so the interpreter never hands the GIL over
+    between bytecodes of the calling thread. A second thread, made runnable
+    just before `call`, can then run only if `call` releases the GIL itself:
+    with the GIL held the count is exactly 0, whatever the machine's load.
+    No duration is compared with a threshold.
+    """
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1000.0)
+    count = 0
+    try:
+        for _ in range(attempts):
+            go = threading.Event()
+            ran: list = []
 
-    threads = [threading.Thread(target=work, args=(slot,)) for slot in (0, 1)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=60)
-    assert not any(thread.is_alive() for thread in threads)
-    return results
+            def waiter() -> None:
+                go.wait()
+                ran.append(True)
+
+            thread = threading.Thread(target=waiter)
+            thread.start()  # returns once the waiter is blocked in go.wait()
+            go.set()
+            call()
+            count += bool(ran)
+            thread.join()
+    finally:
+        sys.setswitchinterval(previous)
+    return count
+
+
+def holds_the_gil() -> int:
+    """A call that never releases the GIL: the control for the test below."""
+    return sum(range(3_000_000))
 
 
 SPEC = {
@@ -90,9 +112,11 @@ def test_a_wrong_path_type_is_a_type_error() -> None:
         MODULE.write_xlsx(SPEC, 7)
 
 
-def test_two_threads_write_at_once() -> None:
-    first, second = in_two_threads(lambda: MODULE.write_xlsx_bytes(SPEC))
-    assert "Alpha" in workbook_xml(first) and "Alpha" in workbook_xml(second)
+def test_writing_releases_the_gil() -> None:
+    row = [{"t": "s", "v": "cell"}, {"t": "n", "v": 42}] * 10
+    spec = json.dumps({"sheets": [{"name": "Big", "rows": [row] * 20_000}]})
+    assert times_another_thread_ran_during(holds_the_gil) == 0
+    assert times_another_thread_ran_during(lambda: MODULE.write_xlsx_bytes(spec)) >= 1
 
 
 def test_the_wheel_ships_type_information_that_matches_the_module() -> None:
