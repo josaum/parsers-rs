@@ -934,6 +934,51 @@ fn a_run_of_saved_states_does_not_grow_the_table_extractor() {
     });
 }
 
+/// Runs `parse` on a thread with half of the harness's small stack.
+fn run_on_half_the_small_stack<F>(parse: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(smoke::SMALL_STACK_BYTES / 2)
+        .spawn(parse)
+        .expect("spawn half-stack thread")
+        .join()
+        .expect("parser panicked on half the small stack");
+}
+
+/// The two nesting inputs again, on half the stack.
+///
+/// Passing on the small stack says the recursion fits; it does not say by
+/// how much. With the limits these inputs hit, the parsers once needed over
+/// three quarters of that stack in an unoptimized macOS build, which passed
+/// here and overflowed now and then on Windows, where frames are larger.
+/// Halving the stack makes a lost margin fail on every platform.
+#[test]
+fn deep_nesting_leaves_half_the_small_stack_unused() {
+    let _serial = serial();
+    for (open, close) in [
+        (&b"["[..], &b"]"[..]),
+        (b"<< /A ", b" >>"),
+        (b"[ << /A ", b" >> ]"),
+    ] {
+        let mut document = b"%PDF-1.7\n1 0 obj\n".to_vec();
+        document.extend(smoke::nested(open, b"1", close, 200_000));
+        document.extend_from_slice(b"\nendobj\n");
+        run_on_half_the_small_stack(move || {
+            exercise_text(&document, ParseOptions::default());
+        });
+    }
+    let mut payloads = Payloads::seed();
+    payloads.content = smoke::nested(b"[", b"(x)", b"]", 200_000);
+    payloads.content.extend_from_slice(b" TJ");
+    let document = document(&payloads);
+    run_on_half_the_small_stack(move || {
+        exercise_text(&document, tight_options());
+        exercise_tables(&document, tight_options());
+    });
+}
+
 // ── Seed sanity ─────────────────────────────────────────────────────────────
 
 /// The seed has to reach the readers it claims to; a seed whose streams fail

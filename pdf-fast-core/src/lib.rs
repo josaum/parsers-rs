@@ -7665,11 +7665,14 @@ fn is_delimiter(byte: u8) -> bool {
 /// Deepest array or dictionary nesting the object parser follows.
 ///
 /// Real documents nest a handful of levels; an input that nests deeper is
-/// malformed or hostile, and each level costs two recursive calls. The bound
-/// matches the 128-hop limit the `/Parent` walks use, and is small enough that
-/// the recursion fits a 256 KiB worker-thread stack in an unoptimized build.
-/// Raising it trades that stack headroom away.
-const MAX_VALUE_NESTING: usize = 128;
+/// malformed or hostile, and each level costs two recursive calls. At 128
+/// levels an unoptimized build on macOS needed between 128 and 192 KiB of
+/// stack, which left a 256 KiB worker thread no margin where frames are
+/// larger; the same parse overflowed intermittently on Windows. At 32 it
+/// needs under 40 KiB. Raising it trades that headroom away. Objects nested
+/// more than 32 arrays and dictionaries deep inside a single object's text
+/// are refused; indirect references do not count toward the depth.
+const MAX_VALUE_NESTING: usize = 32;
 
 struct ValueParser<'a> {
     bytes: &'a [u8],
@@ -8690,25 +8693,56 @@ fn is_content_whitespace(byte: u8) -> bool {
 /// Deepest array nesting the content-stream tokenizer follows.
 ///
 /// A content stream only nests arrays one level (`TJ`, dash patterns), so
-/// anything deeper is malformed. Each level is one recursive call; the bound
-/// keeps that recursion inside a 256 KiB worker-thread stack.
+/// anything deeper is malformed. The arrays still open are kept in a list,
+/// not on the call stack, so the bound limits memory and nonsense, not
+/// stack: at one recursive call per level, 128 levels needed more than
+/// 192 KiB of a 256 KiB thread in an unoptimized build.
 const MAX_CONTENT_ARRAY_NESTING: usize = 128;
 
+/// Reads the next token of a content stream.
+///
+/// Returns `None`, the same answer as the end of the stream, when arrays
+/// nest past [`MAX_CONTENT_ARRAY_NESTING`] or an array is never closed, so a
+/// caller stops reading a stream it cannot make sense of.
 fn next_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> {
-    next_content_token_nested(bytes, cursor, 0)
+    skip_whitespace_and_comments(bytes, cursor);
+    if bytes.get(*cursor) != Some(&b'[') {
+        return next_scalar_content_token(bytes, cursor);
+    }
+    // The arrays opened and not yet closed, outermost first.
+    let mut open: Vec<Vec<ContentValue>> = Vec::new();
+    loop {
+        skip_whitespace_and_comments(bytes, cursor);
+        match bytes.get(*cursor) {
+            Some(b'[') => {
+                if open.len() >= MAX_CONTENT_ARRAY_NESTING {
+                    return None;
+                }
+                *cursor += 1;
+                open.push(Vec::new());
+            }
+            Some(b']') => {
+                *cursor += 1;
+                let finished = ContentValue::Array(open.pop()?);
+                match open.last_mut() {
+                    Some(parent) => parent.push(finished),
+                    None => return Some(ContentToken::Value(finished)),
+                }
+            }
+            _ => {
+                let item = match next_scalar_content_token(bytes, cursor)? {
+                    ContentToken::Value(value) => value,
+                    ContentToken::Operator(_) => ContentValue::Other,
+                };
+                open.last_mut()?.push(item);
+            }
+        }
+    }
 }
 
-/// [`next_content_token`] with the number of arrays already open.
-///
-/// Returns `None` — the same answer as the end of the stream — when arrays
-/// nest past [`MAX_CONTENT_ARRAY_NESTING`], so a caller stops reading a stream
-/// it cannot make sense of instead of recursing without bound.
-fn next_content_token_nested(
-    bytes: &[u8],
-    cursor: &mut usize,
-    depth: usize,
-) -> Option<ContentToken> {
-    skip_whitespace_and_comments(bytes, cursor);
+/// Reads one token that is not an array. The cursor must already be past
+/// any whitespace.
+fn next_scalar_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> {
     let byte = *bytes.get(*cursor)?;
     match byte {
         b'(' => {
@@ -8730,25 +8764,6 @@ fn next_content_token_nested(
             let value = parser.parse_hex_string().ok()?;
             *cursor = parser.pos;
             Some(ContentToken::Value(ContentValue::HexString(value)))
-        }
-        b'[' => {
-            if depth >= MAX_CONTENT_ARRAY_NESTING {
-                return None;
-            }
-            *cursor += 1;
-            let mut items = Vec::new();
-            loop {
-                skip_whitespace_and_comments(bytes, cursor);
-                if bytes.get(*cursor) == Some(&b']') {
-                    *cursor += 1;
-                    break;
-                }
-                match next_content_token_nested(bytes, cursor, depth + 1)? {
-                    ContentToken::Value(value) => items.push(value),
-                    ContentToken::Operator(_) => items.push(ContentValue::Other),
-                }
-            }
-            Some(ContentToken::Value(ContentValue::Array(items)))
         }
         b'/' => {
             let mut parser = ValueParser::new(bytes, *cursor);
