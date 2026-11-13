@@ -73,22 +73,27 @@ pub const MAX_VALIDATION_NESTING_DEPTH: usize = crate::DEFAULT_MAX_NESTING_DEPTH
 /// `$ref` layers uses 5 to 10.
 ///
 /// Stack: an application measured 4 to 8 KiB in an unoptimized build. The
-/// first [`INLINE_APPLICATION_DEPTH`] levels run on the caller's stack; a
-/// validation that needs more is run again on a thread whose stack is
-/// `MAX_APPLICATION_DEPTH * STACK_BYTES_PER_APPLICATION` (64 MiB of address
-/// space, touched only as far as the recursion goes).
+/// worst-case depth is worked out before validating, from the longest chain
+/// of subschemas and the document's depth. Up to
+/// [`INLINE_APPLICATION_DEPTH`] it runs on the caller's stack; beyond that it
+/// runs, once, on a thread whose stack is that depth (at most this limit)
+/// times `STACK_BYTES_PER_APPLICATION`: at most 64 MiB of address space,
+/// touched only as far as the recursion goes.
 pub const MAX_APPLICATION_DEPTH: usize = 2_048;
 
-/// Applications nested on the caller's own stack before validation moves to
-/// a dedicated thread: 64 levels at up to 8 KiB each stay within 512 KiB.
-const INLINE_APPLICATION_DEPTH: usize = 64;
+/// Nested applications the caller's own stack is trusted with: at up to
+/// 8 KiB each in an unoptimized build, 128 stay within 1 MiB (an optimized
+/// build uses a quarter of that). A validation whose worst case is deeper
+/// runs on a dedicated thread from the start.
+const INLINE_APPLICATION_DEPTH: usize = 128;
 
 /// Stack reserved per nested application on the dedicated thread: four
 /// times the 8 KiB measured in an unoptimized build.
 const STACK_BYTES_PER_APPLICATION: usize = 32 * 1024;
 
-/// Most results remembered per validation; past this, results are recomputed.
-const MAX_REMEMBERED_RESULTS: usize = 1_000_000;
+/// Most bytes of remembered results per validation; past this, results are
+/// recomputed instead of kept.
+const MAX_REMEMBERED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Subschema applications allowed per schema node and document value.
 ///
@@ -278,10 +283,6 @@ struct Ctx<'a, 'v> {
     pattern_bytes: usize,
     /// Subschema applications in progress.
     depth: usize,
-    /// Applications that may be in progress on this stack.
-    max_depth: usize,
-    /// Set when `max_depth` was the limit that stopped the validation.
-    too_deep: bool,
     /// Subschema applications started so far.
     steps: u64,
     /// Subschema applications allowed in total.
@@ -294,7 +295,14 @@ struct Ctx<'a, 'v> {
     /// Results of shared applications, by (schema node, document value)
     /// address. Both trees are borrowed for the whole validation, so an
     /// address identifies a node.
-    remembered: HashMap<(usize, usize), Remembered<'v>>,
+    /// `None` is the common outcome, kept in a few bytes: passed, with no
+    /// findings and nothing evaluated.
+    remembered: HashMap<(usize, usize), Option<Box<Remembered<'v>>>>,
+    /// Estimated bytes held by `remembered`.
+    remembered_bytes: usize,
+    /// Schema nodes that lie on a `$ref` cycle. Only these can be applied
+    /// to the same value twice, so only their results are remembered.
+    cyclic: &'a HashSet<usize>,
     /// Shared applications currently running; meeting one again means the
     /// schema applies itself to the same value without end.
     running: HashSet<(usize, usize)>,
@@ -350,18 +358,189 @@ fn measure(root: &Value) -> (u64, usize) {
     (values, deepest)
 }
 
-/// Runs one validation and returns the findings with the number of subschema
-/// applications it started. `budget` of `None` applies the documented budget.
-fn run(document: &Value, schema: &Value, budget: Option<u64>) -> (Vec<Finding>, u64) {
+/// What the schema's shape says about the work of validating with it.
+struct SchemaShape {
+    /// Addresses of the schema nodes that lie on a `$ref` cycle.
+    cyclic: HashSet<usize>,
+    /// Longest chain of nested subschemas, following `$ref` but not around
+    /// a cycle.
+    longest_chain: usize,
+    /// `$ref`s that lead back into a schema still being applied.
+    back_references: usize,
+}
+
+/// Finds the `$ref` cycles of a schema and its longest chain of subschemas.
+///
+/// One depth-first walk over the schema's objects and arrays, with `$ref`
+/// as an extra edge, using Tarjan's strongly-connected-components algorithm
+/// on an explicit stack.
+fn schema_shape(root: &Value, anchors: &HashMap<String, Vec<String>>) -> SchemaShape {
+    fn address(value: &Value) -> usize {
+        std::ptr::from_ref(value) as usize
+    }
+    fn children<'a>(
+        node: &'a Value,
+        root: &'a Value,
+        anchors: &HashMap<String, Vec<String>>,
+    ) -> Vec<&'a Value> {
+        let nested = |value: &&Value| value.is_object() || value.is_array();
+        match node {
+            Value::Array(items) => items.iter().filter(nested).collect(),
+            Value::Object(map) => {
+                let mut out: Vec<&Value> = map.values().filter(nested).collect();
+                let target = map
+                    .get("$ref")
+                    .and_then(Value::as_str)
+                    .and_then(|reference| resolve_reference(reference, root, anchors));
+                out.extend(target.filter(nested));
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+    struct Frame<'a> {
+        node: &'a Value,
+        index: usize,
+        children: Vec<&'a Value>,
+        next: usize,
+    }
+    let mut shape = SchemaShape {
+        cyclic: HashSet::new(),
+        longest_chain: 1,
+        back_references: 0,
+    };
+    let mut indexes: HashMap<usize, usize> = HashMap::new();
+    let mut low: Vec<usize> = Vec::new();
+    let mut chain: Vec<usize> = Vec::new();
+    let mut open: Vec<bool> = Vec::new();
+    let mut component: Vec<usize> = Vec::new();
+    let mut frames: Vec<Frame<'_>> = Vec::new();
+    let enter = |node: &'_ Value,
+                 indexes: &mut HashMap<usize, usize>,
+                 low: &mut Vec<usize>,
+                 chain: &mut Vec<usize>,
+                 open: &mut Vec<bool>|
+     -> usize {
+        let index = low.len();
+        indexes.insert(address(node), index);
+        low.push(index);
+        chain.push(usize::from(node.is_object()));
+        open.push(true);
+        index
+    };
+    if !(root.is_object() || root.is_array()) {
+        return shape;
+    }
+    let index = enter(root, &mut indexes, &mut low, &mut chain, &mut open);
+    component.push(address(root));
+    frames.push(Frame {
+        node: root,
+        index,
+        children: children(root, root, anchors),
+        next: 0,
+    });
+    while let Some(frame) = frames.last_mut() {
+        if let Some(child) = frame.children.get(frame.next).copied() {
+            frame.next += 1;
+            let own = usize::from(frame.node.is_object());
+            match indexes.get(&address(child)).copied() {
+                Some(seen) if open[seen] => {
+                    // Back into a schema that is still being walked.
+                    low[frame.index] = low[frame.index].min(seen);
+                    shape.back_references += 1;
+                    if seen == frame.index {
+                        shape.cyclic.insert(address(child));
+                    }
+                }
+                Some(seen) => {
+                    chain[frame.index] = chain[frame.index].max(own + chain[seen]);
+                }
+                None => {
+                    let index = enter(child, &mut indexes, &mut low, &mut chain, &mut open);
+                    component.push(address(child));
+                    frames.push(Frame {
+                        node: child,
+                        index,
+                        children: children(child, root, anchors),
+                        next: 0,
+                    });
+                }
+            }
+            continue;
+        }
+        let Some(done) = frames.pop() else {
+            break;
+        };
+        shape.longest_chain = shape.longest_chain.max(chain[done.index]);
+        if low[done.index] == done.index {
+            // `done` roots a component: everything walked since it began.
+            let start = component
+                .iter()
+                .rposition(|member| *member == address(done.node))
+                .unwrap_or(0);
+            let members = component.split_off(start);
+            for member in &members {
+                if let Some(index) = indexes.get(member) {
+                    open[*index] = false;
+                }
+            }
+            if members.len() > 1 {
+                shape.cyclic.extend(members);
+            }
+        }
+        if let Some(parent) = frames.last_mut() {
+            let own = usize::from(parent.node.is_object());
+            low[parent.index] = low[parent.index].min(low[done.index]);
+            chain[parent.index] = chain[parent.index].max(own + chain[done.index]);
+        }
+    }
+    shape
+}
+
+/// The result of one validation, with the counters the tests bound work by.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the counters are read by tests")
+)]
+struct Outcome {
+    findings: Vec<Finding>,
+    /// Subschema applications started.
+    steps: u64,
+    /// Results kept for reuse.
+    remembered: usize,
+    /// Whether the validation ran on a dedicated thread.
+    spawned: bool,
+}
+
+impl Outcome {
+    fn stopped(reason: impl Into<String>) -> Self {
+        Self {
+            findings: vec![Finding::error("$", reason)],
+            steps: 0,
+            remembered: 0,
+            spawned: false,
+        }
+    }
+}
+
+/// Why validation could not start on a dedicated thread.
+const NO_VALIDATION_THREAD: &str = "validation stopped: this schema and document need a \
+     dedicated stack and the thread for it could not be started; the document was not validated";
+
+/// Why validation on the dedicated thread did not return.
+const VALIDATION_THREAD_FAILED: &str = "validation stopped: the validation thread ended \
+     abnormally; the document was not validated";
+
+/// Runs one validation. `budget` of `None` applies the documented budget.
+fn run(document: &Value, schema: &Value, budget: Option<u64>) -> Outcome {
     let (schema_values, schema_depth) = measure(schema);
     let (document_values, document_depth) = measure(document);
     for (what, depth) in [("schema", schema_depth), ("document", document_depth)] {
         if depth > MAX_VALIDATION_NESTING_DEPTH {
-            let message = format!(
+            return Outcome::stopped(format!(
                 "the {what} is nested {depth} levels deep; the limit is \
                  {MAX_VALIDATION_NESTING_DEPTH}; the document was not validated"
-            );
-            return (vec![Finding::error("$", message)], 0);
+            ));
         }
     }
     let budget = budget.unwrap_or_else(|| {
@@ -369,53 +548,66 @@ fn run(document: &Value, schema: &Value, budget: Option<u64>) -> (Vec<Finding>, 
             .saturating_mul(schema_values.saturating_add(1))
             .saturating_mul(document_values.saturating_add(1))
     });
-    let (findings, steps, too_deep) =
-        run_on_this_stack(document, schema, budget, INLINE_APPLICATION_DEPTH);
-    if !too_deep {
-        return (findings, steps);
+    let anchors = collect_anchors(schema);
+    let shape = schema_shape(schema, &anchors);
+    // Worst-case nesting of applications, decided once. Without a cycle it
+    // is the longest chain of subschemas. With one, a chain can restart at
+    // every level of the document and once more per reference that leads
+    // back into the cycle (the same schema cannot be entered twice on one
+    // value).
+    let worst_depth = if shape.cyclic.is_empty() {
+        shape.longest_chain
+    } else {
+        shape
+            .longest_chain
+            .saturating_mul(shape.back_references + 1)
+            .saturating_mul(document_depth + 1)
+    };
+    if worst_depth <= INLINE_APPLICATION_DEPTH {
+        return run_on_this_stack(document, schema, budget, anchors, &shape.cyclic);
     }
-    // Deeper than the caller's stack is trusted with: start again on a
-    // thread with a stack sized for the full application depth.
-    let stack_bytes = MAX_APPLICATION_DEPTH * STACK_BYTES_PER_APPLICATION;
-    let deep = std::thread::scope(|scope| {
-        std::thread::Builder::new()
+    let stack_bytes = worst_depth.min(MAX_APPLICATION_DEPTH) * STACK_BYTES_PER_APPLICATION;
+    let cyclic = &shape.cyclic;
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
             .stack_size(stack_bytes)
-            .spawn_scoped(scope, || {
-                run_on_this_stack(document, schema, budget, MAX_APPLICATION_DEPTH)
-            })
-            .ok()
-            .and_then(|handle| handle.join().ok())
-    });
-    match deep {
-        Some((findings, steps, _)) => (findings, steps),
-        None => (
-            vec![Finding::error("$", TOO_MANY_NESTED_APPLICATIONS)],
-            steps,
-        ),
-    }
+            .spawn_scoped(scope, move || {
+                run_on_this_stack(document, schema, budget, anchors, cyclic)
+            });
+        match spawned {
+            Ok(handle) => match handle.join() {
+                Ok(mut outcome) => {
+                    outcome.spawned = true;
+                    outcome
+                }
+                Err(_) => Outcome::stopped(VALIDATION_THREAD_FAILED),
+            },
+            Err(_) => Outcome::stopped(NO_VALIDATION_THREAD),
+        }
+    })
 }
 
-/// Validates with at most `max_depth` nested applications; the last value
-/// reports whether that depth was what stopped it.
+/// Validates on the current thread's stack.
 fn run_on_this_stack(
     document: &Value,
     schema: &Value,
     budget: u64,
-    max_depth: usize,
-) -> (Vec<Finding>, u64, bool) {
+    anchors: HashMap<String, Vec<String>>,
+    cyclic: &HashSet<usize>,
+) -> Outcome {
     let mut findings = Vec::new();
     let mut ctx = Ctx {
         root: schema,
-        anchors: collect_anchors(schema),
+        anchors,
         patterns: HashMap::new(),
         pattern_bytes: 0,
         depth: 0,
-        max_depth,
-        too_deep: false,
         steps: 0,
         budget,
         halted: None,
         remembered: HashMap::new(),
+        remembered_bytes: 0,
+        cyclic,
         running: HashSet::new(),
     };
     let mut path = String::from("$");
@@ -423,9 +615,14 @@ fn run_on_this_stack(
     if let Some(reason) = ctx.halted {
         // Findings gathered around an abandoned application are not
         // verdicts, so only the reason is reported.
-        return (vec![Finding::error("$", reason)], ctx.steps, ctx.too_deep);
+        findings = vec![Finding::error("$", reason)];
     }
-    (findings, ctx.steps, false)
+    Outcome {
+        findings,
+        steps: ctx.steps,
+        remembered: ctx.remembered.len(),
+        spawned: false,
+    }
 }
 
 impl<'a> Ctx<'a, '_> {
@@ -438,12 +635,12 @@ impl<'a> Ctx<'a, '_> {
             patterns: std::mem::take(&mut self.patterns),
             pattern_bytes: self.pattern_bytes,
             depth: self.depth,
-            max_depth: self.max_depth,
-            too_deep: self.too_deep,
             steps: self.steps,
             budget: self.budget,
             halted: self.halted,
             remembered: HashMap::new(),
+            remembered_bytes: 0,
+            cyclic: self.cyclic,
             running: HashSet::new(),
         }
     }
@@ -452,7 +649,6 @@ impl<'a> Ctx<'a, '_> {
         self.anchors = inner.anchors;
         self.patterns = inner.patterns;
         self.pattern_bytes = inner.pattern_bytes;
-        self.too_deep = inner.too_deep;
         self.steps = inner.steps;
         self.halted = inner.halted;
     }
@@ -490,7 +686,7 @@ impl Ctx<'_, '_> {
 /// [`Severity::Error`] finding at `$` that says so: an unfinished validation
 /// is never reported as a clean document.
 pub fn validate(document: &Value, schema: &Value) -> Vec<Finding> {
-    run(document, schema, None).0
+    run(document, schema, None).findings
 }
 
 /// True when any finding is an [`Severity::Error`].
@@ -525,9 +721,8 @@ fn validate_node<'v>(
         ctx.halted = Some(BUDGET_EXHAUSTED);
         return Evaluated::default();
     }
-    if ctx.depth >= ctx.max_depth {
+    if ctx.depth >= MAX_APPLICATION_DEPTH {
         ctx.halted = Some(TOO_MANY_NESTED_APPLICATIONS);
-        ctx.too_deep = true;
         return Evaluated::default();
     }
     ctx.depth += 1;
@@ -611,27 +806,45 @@ fn applying_shared<'v>(
     findings: &mut Vec<Finding>,
     soft: bool,
 ) -> Applied<'v> {
-    let key = (
-        std::ptr::from_ref(schema) as usize,
-        std::ptr::from_ref(value) as usize,
-    );
+    let schema_address = std::ptr::from_ref(schema) as usize;
+    if !ctx.cyclic.contains(&schema_address) {
+        // Not on a `$ref` cycle: this pair cannot come up again.
+        let mut local = Vec::new();
+        let evaluated = validate_node(value, schema, path, ctx, &mut local);
+        let passed = !local.iter().any(|f| f.severity == Severity::Error);
+        if soft {
+            local.retain(|f| f.severity == Severity::Warning);
+        }
+        findings.append(&mut local);
+        return Applied { passed, evaluated };
+    }
+    let key = (schema_address, std::ptr::from_ref(value) as usize);
     let surfaced = |finding: &Finding| !soft || finding.severity == Severity::Warning;
-    if let Some(known) = ctx.remembered.get(&key) {
-        findings.extend(
-            known
-                .findings
-                .iter()
-                .filter(|finding| surfaced(finding))
-                .map(|finding| Finding {
-                    severity: finding.severity,
-                    path: format!("{path}{}", finding.path),
-                    message: finding.message.clone(),
-                }),
-        );
-        return Applied {
-            passed: known.passed,
-            evaluated: known.evaluated.clone(),
-        };
+    match ctx.remembered.get(&key) {
+        Some(None) => {
+            return Applied {
+                passed: true,
+                evaluated: Evaluated::default(),
+            };
+        }
+        Some(Some(known)) => {
+            findings.extend(
+                known
+                    .findings
+                    .iter()
+                    .filter(|finding| surfaced(finding))
+                    .map(|finding| Finding {
+                        severity: finding.severity,
+                        path: format!("{path}{}", finding.path),
+                        message: finding.message.clone(),
+                    }),
+            );
+            return Applied {
+                passed: known.passed,
+                evaluated: known.evaluated.clone(),
+            };
+        }
+        None => {}
     }
     if !ctx.running.insert(key) {
         ctx.halted = Some(ENDLESS_SELF_APPLICATION);
@@ -646,23 +859,33 @@ fn applying_shared<'v>(
     ctx.running.remove(&key);
     let passed = !local.iter().any(|f| f.severity == Severity::Error);
     let container = value.is_array() || value.is_object();
-    if container && ctx.halted.is_none() && ctx.remembered.len() < MAX_REMEMBERED_RESULTS {
-        let relative = local
-            .iter()
-            .map(|finding| Finding {
-                severity: finding.severity,
-                path: finding.path.get(base..).unwrap_or_default().to_owned(),
-                message: finding.message.clone(),
-            })
-            .collect();
-        ctx.remembered.insert(
-            key,
-            Remembered {
+    if container && ctx.halted.is_none() && ctx.remembered_bytes < MAX_REMEMBERED_BYTES {
+        let plain = local.is_empty() && evaluated.props.is_empty() && evaluated.items.is_empty();
+        // A map slot is about 48 bytes; the rest is what the entry owns.
+        let mut bytes = 48;
+        let entry = (!plain).then(|| {
+            let relative: Vec<Finding> = local
+                .iter()
+                .map(|finding| Finding {
+                    severity: finding.severity,
+                    path: finding.path.get(base..).unwrap_or_default().to_owned(),
+                    message: finding.message.clone(),
+                })
+                .collect();
+            bytes += 128
+                + 24 * (evaluated.props.len() + evaluated.items.len())
+                + relative
+                    .iter()
+                    .map(|f| 56 + f.path.len() + f.message.len())
+                    .sum::<usize>();
+            Box::new(Remembered {
                 passed,
                 evaluated: evaluated.clone(),
                 findings: relative,
-            },
-        );
+            })
+        });
+        ctx.remembered_bytes += bytes;
+        ctx.remembered.insert(key, entry);
     }
     findings.extend(local.into_iter().filter(surfaced));
     Applied { passed, evaluated }
@@ -1713,16 +1936,24 @@ fn collect_anchors(root: &Value) -> HashMap<String, Vec<String>> {
 }
 
 fn resolve_ref<'a>(reference: &str, ctx: &Ctx<'a, '_>) -> Option<&'a Value> {
+    resolve_reference(reference, ctx.root, &ctx.anchors)
+}
+
+fn resolve_reference<'a>(
+    reference: &str,
+    root: &'a Value,
+    anchors: &HashMap<String, Vec<String>>,
+) -> Option<&'a Value> {
     if reference == "#" {
-        return Some(ctx.root);
+        return Some(root);
     }
     if let Some(pointer) = reference.strip_prefix("#/") {
-        return pointer_get(ctx.root, pointer);
+        return pointer_get(root, pointer);
     }
     if let Some(name) = reference.strip_prefix('#') {
-        if let Some(pointers) = ctx.anchors.get(name) {
+        if let Some(pointers) = anchors.get(name) {
             for pointer in pointers {
-                if let Some(target) = pointer_get(ctx.root, pointer) {
+                if let Some(target) = pointer_get(root, pointer) {
                     return Some(target);
                 }
             }
@@ -2264,7 +2495,9 @@ mod tests {
         // Left alone this doubled per reference hop (93, 1,533, 24,573 and
         // 393,213 applications at 4, 8, 12 and 16 hops). The schema applies
         // itself to the same value, which is now recognized at once.
-        let (findings, steps) = run(&document, &schema, None);
+        let Outcome {
+            findings, steps, ..
+        } = run(&document, &schema, None);
         assert!(steps < 10, "{steps} applications");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Error);
@@ -2369,7 +2602,9 @@ mod tests {
     #[test]
     fn recursive_discriminated_unions_validate_in_polynomial_work() {
         let schema = union_schema(8);
-        let (findings, steps) = run(&union_chain(40, "k3"), &schema, None);
+        let Outcome {
+            findings, steps, ..
+        } = run(&union_chain(40, "k3"), &schema, None);
         assert_eq!(findings, []);
         assert!(steps < 10_000, "{steps} applications");
         let findings = validate(&union_chain(40, "nope"), &schema);
@@ -2445,6 +2680,42 @@ mod tests {
         assert!(passes("[9007199254740993, 9007199254740992]", &unique));
         assert!(fails("[9007199254740992, 9007199254740992.0]", &unique));
         assert!(fails("[-3, -3.0]", &unique));
+    }
+
+    #[test]
+    fn results_are_remembered_only_where_the_schema_can_repeat() {
+        // No `$ref` cycle: nothing can be asked twice, so nothing is kept.
+        let schema = json!({"items": {"anyOf": [{"type": "object"}, {"type": "string"}, {"type": "array"}]},
+            "contains": {"not": {"type": "null"}}, "if": {"type": "array"}, "then": {"$ref": "#/$defs/x"},
+            "$defs": {"x": {"minItems": 1}}});
+        let document = Value::Array(vec![json!([]); 5_000]);
+        let outcome = run(&document, &schema, None);
+        assert_eq!(outcome.findings, []);
+        assert_eq!(outcome.remembered, 0);
+        assert!(!outcome.spawned);
+        // A recursive union needs them, and stays polynomial with them.
+        let outcome = run(&union_chain(40, "k3"), &union_schema(8), None);
+        assert_eq!(outcome.findings, []);
+        assert!(outcome.remembered > 0);
+        assert!(outcome.steps < 10_000, "{} applications", outcome.steps);
+    }
+
+    #[test]
+    fn deep_validations_run_once_on_a_stack_chosen_up_front() {
+        let list_schema = json!({"properties": {"next": {"$ref": "#"}, "v": {"type": "integer"}}});
+        let list = |depth: usize| {
+            (0..depth).fold(json!({"v": 1}), |next, _| json!({"v": 1, "next": next}))
+        };
+        // Shallow recursive documents stay on the caller's stack.
+        let shallow = run(&list(10), &list_schema, None);
+        assert!(!shallow.spawned);
+        assert_eq!(shallow.findings, []);
+        // Deep ones go straight to the large stack: the work is done once.
+        let deep = run(&list(60), &list_schema, None);
+        assert!(deep.spawned);
+        assert_eq!(deep.findings, []);
+        // Three applications per list node, less one: linear, and not doubled.
+        assert_eq!((shallow.steps, deep.steps), (32, 182));
     }
 
     #[test]
