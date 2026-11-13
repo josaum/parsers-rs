@@ -191,18 +191,22 @@ fn every_page_of_three_revisions_renders_through_both_entry_points() {
             .expect("interpreted entry");
         assert!(interpreted.is_some(), "page {page} was not interpreted");
     }
-    // Past the end, both entry points say so with the same error.
+    // Past the end: an error from the fast entry, nothing from the
+    // interpreted one, which is what the language bindings pass on.
     let fast = document
         .page_rasterized_png(3, 72.0)
         .expect_err("fast entry");
+    assert_eq!(fast.to_string(), "page index 3 out of bounds");
     let interpreted = document
         .page_rasterized_png_interpreted_checked(3, 72.0)
-        .expect_err("interpreted entry");
-    assert_eq!(fast.to_string(), "page index 3 out of bounds");
-    assert_eq!(interpreted.to_string(), fast.to_string());
+        .expect("interpreted entry");
+    assert!(interpreted.is_none());
     assert!(document.page_rasterized_png_interpreted(3, 72.0).is_none());
 }
 
+/// Passes with any rule that prefers a later copy of an object, including
+/// plain scan order. It guards that preference itself: the chain must not
+/// make a superseded content stream current again.
 #[test]
 fn a_revision_that_replaces_content_shows_the_new_content() {
     let mut out = Vec::new();
@@ -270,6 +274,9 @@ fn an_older_catalog_written_later_in_the_file_is_not_the_document() {
     assert_eq!(open(&out).pages().len(), 2);
 }
 
+/// Passes under "take the last catalog" too. What it guards is that a
+/// `/Prev` pointing at its own section ends the walk and leaves a usable
+/// document.
 #[test]
 fn a_prev_chain_that_loops_terminates() {
     let mut out = Vec::new();
@@ -285,6 +292,8 @@ fn a_prev_chain_that_loops_terminates() {
     assert_eq!(open(&out).pages().len(), 2);
 }
 
+/// The fallback itself: with no chain to follow, the catalog latest in the
+/// file is the document. "Take the last catalog" is the rule under test.
 #[test]
 fn a_broken_startxref_falls_back_to_the_newest_catalog_in_the_file() {
     let document = open(&three_revisions(true));
@@ -292,8 +301,82 @@ fn a_broken_startxref_falls_back_to_the_newest_catalog_in_the_file() {
     assert!(words(&document).contains("Three"));
 }
 
+fn zlib(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("compress");
+    encoder.finish().expect("finish compression")
+}
+
+fn with_stream(dictionary: &str, data: &[u8]) -> Vec<u8> {
+    let mut out = format!("<< {dictionary} /Length {} >>\nstream\n", data.len()).into_bytes();
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+/// The trailer names catalog 10, with two pages. Catalog 1, with one page,
+/// is written after it. Only a cross-reference stream describes the file.
+fn described_by_a_stream_only(flate: bool) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut objects = second_page();
+    objects.extend([
+        (3, page(11, 4)),
+        (4, text("One")),
+        (9, FONT.to_string()),
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+    ]);
+    let mut offsets = write_objects(&mut out, &objects);
+    let xref = out.len();
+    offsets.push((30, xref));
+    let mut index = String::new();
+    let mut rows = Vec::new();
+    for (object, offset) in offsets {
+        index.push_str(&format!("{object} 1 "));
+        rows.push(1u8);
+        rows.extend_from_slice(&u32::try_from(offset).expect("small file").to_be_bytes());
+        rows.push(0);
+    }
+    let (filter, data) = if flate {
+        (" /Filter /FlateDecode", zlib(&rows))
+    } else {
+        ("", rows)
+    };
+    out.extend_from_slice(b"30 0 obj\n");
+    out.extend_from_slice(&with_stream(
+        &format!("/Type /XRef /Size 100 /W [1 4 1] /Index [{index}] /Root 10 0 R{filter}"),
+        &data,
+    ));
+    out.extend_from_slice(format!("\nendobj\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    out
+}
+
 #[test]
-fn an_object_freed_by_a_later_revision_is_gone() {
+fn a_cross_reference_stream_names_the_catalog_whatever_the_options() {
+    // Compressed and not, with decoded streams kept and not (the language
+    // bindings do not keep them). The last catalog in the file is the
+    // one-page one, so "take the last catalog" fails all four.
+    for flate in [true, false] {
+        for keep in [true, false] {
+            let options = ParseOptions {
+                keep_decoded_streams: keep,
+                ..ParseOptions::default()
+            };
+            let document = PdfDocument::from_slice(&described_by_a_stream_only(flate), options)
+                .expect("parses");
+            assert_eq!(
+                document.pages().len(),
+                2,
+                "flate {flate}, keep_decoded_streams {keep}"
+            );
+        }
+    }
+}
+
+/// A two-page file whose second revision adds nothing and marks `freed`
+/// free.
+fn with_a_free_entry(freed: u32) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
     let first = revision(
         &mut out,
@@ -313,15 +396,132 @@ fn an_object_freed_by_a_later_revision_is_gone() {
         None,
         None,
     );
-    // The second revision adds nothing and frees page object 12.
     let table = out.len();
     out.extend_from_slice(
         format!(
-            "xref\n12 1\n0000000000 00001 f \ntrailer\n<< /Size 100 /Root 1 0 R /Prev {first} >>\n\
+            "xref\n{freed} 1\n0000000000 00001 f \ntrailer\n<< /Size 100 /Root 1 0 R /Prev {first} >>\n\
              startxref\n{table}\n%%EOF\n"
         )
         .as_bytes(),
     );
-    let document = open(&out);
-    assert_eq!(document.pages().len(), 1, "the freed page is still listed");
+    out
+}
+
+#[test]
+fn a_free_entry_changes_nothing_that_is_still_referenced() {
+    // The renderer ignores free entries, so extraction must too: a content
+    // stream or a page a later table calls free, but the page tree still
+    // points at, is still part of the document.
+    for freed in [13, 12, 2] {
+        let document = open(&with_a_free_entry(freed));
+        assert_eq!(document.pages().len(), 2, "object {freed} freed");
+        let words = words(&document);
+        assert!(
+            words.contains("One") && words.contains("Two"),
+            "object {freed} freed: {words:?}"
+        );
+    }
+}
+
+#[cfg(feature = "rasterize")]
+#[test]
+fn extraction_and_the_interpreter_agree_about_a_freed_content_stream() {
+    let blank = {
+        let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        revision(
+            &mut out,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+                (3, page(2, 4)),
+                (4, stream("")),
+                (9, FONT.to_string()),
+            ],
+            1,
+            None,
+            None,
+        );
+        open(&out)
+            .page_rasterized_png_interpreted_checked(0, 72.0)
+            .expect("blank page renders")
+    };
+    let document = open(&with_a_free_entry(13));
+    let drawn = document
+        .page_rasterized_png_interpreted_checked(1, 72.0)
+        .expect("renders");
+    let has_text = words(&document).contains("Two");
+    assert_eq!(
+        drawn != blank,
+        has_text,
+        "the page is drawn exactly when its text is extracted"
+    );
+    assert!(has_text);
+}
+
+#[test]
+fn a_hybrid_file_takes_packed_objects_from_its_cross_reference_stream() {
+    // Object 2, the page tree, exists twice, each time inside a compressed
+    // object stream: stream 5 holds a stale one-page tree, stream 7 the
+    // live two-page tree. The classic table can only call object 2 free;
+    // the `/XRefStm` section of the same trailer says it is in stream 7.
+    // Both orders of the two streams are tried, so whichever copy scan
+    // order prefers, one of the two files needs the chain to get it right.
+    let packed = |number: u32, body: &str| {
+        let data = format!("2 0 {body}");
+        (
+            number,
+            with_stream(
+                "/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode",
+                &zlib(data.as_bytes()),
+            ),
+        )
+    };
+    for live_first in [true, false] {
+        let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        let mut offsets = write_objects(
+            &mut out,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+                (3, page(2, 4)),
+                (4, text("One")),
+                (12, page(2, 13)),
+                (13, text("Two")),
+                (9, FONT.to_string()),
+            ],
+        );
+        let mut streams = vec![
+            packed(7, "<< /Type /Pages /Kids [3 0 R 12 0 R] /Count 2 >>"),
+            packed(5, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        ];
+        if !live_first {
+            streams.reverse();
+        }
+        for (number, body) in streams {
+            offsets.push((number, out.len()));
+            out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            out.extend_from_slice(&body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let stream_offset = out.len();
+        out.extend_from_slice(b"6 0 obj\n");
+        out.extend_from_slice(&with_stream(
+            "/Type /XRef /Size 100 /W [1 4 1] /Index [2 1]",
+            &[2, 0, 0, 0, 7, 0],
+        ));
+        out.extend_from_slice(b"\nendobj\n");
+        let table = out.len();
+        out.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n2 1\n0000000000 00000 f \n");
+        for (number, offset) in offsets {
+            out.extend_from_slice(format!("{number} 1\n{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 100 /Root 1 0 R /XRefStm {stream_offset} >>\nstartxref\n{table}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let document = open(&out);
+        assert_eq!(document.pages().len(), 2, "live stream first: {live_first}");
+        assert!(words(&document).contains("Two"));
+    }
 }
