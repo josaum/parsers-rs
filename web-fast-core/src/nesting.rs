@@ -21,7 +21,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
@@ -47,6 +47,62 @@ pub(crate) enum Stopped {
     TooManyElements,
 }
 
+/// Element depth of every attached node, four bytes per node of the tree.
+///
+/// The tree stores its nodes in one vector and a handle is a position in
+/// it, but exposes that number only through `Hash`. It is read through a
+/// hasher that keeps the single integer it is given, and used as an index.
+/// A hash map from handle to depth, tried first, roughly doubled the time
+/// and added a third to the memory of parsing a 28 MB document.
+#[derive(Default)]
+struct Depths(Vec<u32>);
+
+/// Keeps the one integer written to it.
+#[derive(Default)]
+struct Position(u64);
+
+impl Hasher for Position {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 << 8) | u64::from(*byte);
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.0 = value as u64;
+    }
+}
+
+impl Depths {
+    fn position(handle: Handle) -> usize {
+        let mut position = Position::default();
+        handle.hash(&mut position);
+        position.finish() as usize
+    }
+
+    fn get(&self, handle: Handle) -> u32 {
+        self.0.get(Self::position(handle)).copied().unwrap_or(0)
+    }
+
+    fn set(&mut self, handle: Handle, depth: u32) {
+        let position = Self::position(handle);
+        // Positions are small and dense for any real tree; a handle that
+        // hashes to something else is not tracked (its depth reads as 0,
+        // and the finished tree is still checked exactly).
+        if position > (1 << 32) {
+            return;
+        }
+        if position >= self.0.len() {
+            self.0.resize(position + 1, 0);
+        }
+        self.0[position] = depth;
+    }
+}
+
 /// A tree sink that records when the tree grows too deep or too large.
 struct DepthLimitedSink {
     inner: HtmlTreeSink,
@@ -55,7 +111,7 @@ struct DepthLimitedSink {
     elements: Cell<usize>,
     /// Number of elements from the document down to and including each
     /// attached node, so attaching a node costs one lookup.
-    depths: RefCell<HashMap<Handle, usize>>,
+    depths: RefCell<Depths>,
     stopped: Cell<Option<Stopped>>,
 }
 
@@ -71,17 +127,20 @@ impl DepthLimitedSink {
             return;
         };
         let mut depths = self.depths.borrow_mut();
-        let above = node
-            .parent()
-            .map_or(0, |parent| depths.get(&parent.id()).copied().unwrap_or(0));
-        let mut deepest = 0;
-        let mut pending = vec![(node, above)];
-        while let Some((node, above)) = pending.pop() {
-            let depth = above + usize::from(node.value().is_element());
-            depths.insert(node.id(), depth);
-            deepest = deepest.max(depth);
-            pending.extend(node.children().map(|child| (child, depth)));
+        let above = node.parent().map_or(0, |parent| depths.get(parent.id()));
+        let mut deepest = above + u32::from(node.value().is_element());
+        depths.set(child, deepest);
+        if node.has_children() {
+            // A moved subtree: everything below has a new depth.
+            let mut pending: Vec<_> = node.children().map(|below| (below, deepest)).collect();
+            while let Some((node, above)) = pending.pop() {
+                let depth = above + u32::from(node.value().is_element());
+                depths.set(node.id(), depth);
+                deepest = deepest.max(depth);
+                pending.extend(node.children().map(|below| (below, depth)));
+            }
         }
+        let deepest = deepest as usize;
         if deepest > self.depth_limit + TRANSIENT_DEPTH_ALLOWANCE {
             self.stopped.set(Some(Stopped::TooDeep));
         }
@@ -263,7 +322,7 @@ pub(crate) fn parse_document_within(
         depth_limit,
         element_limit,
         elements: Cell::new(0),
-        depths: RefCell::new(HashMap::new()),
+        depths: RefCell::new(Depths::default()),
         stopped: Cell::new(None),
     };
     let mut parser = html5ever::parse_document(sink, html5ever::ParseOpts::default());
