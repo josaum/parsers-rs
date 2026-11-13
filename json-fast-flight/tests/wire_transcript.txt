@@ -1,0 +1,141 @@
+Handshake without a bearer
+    0 responses
+Handshake
+    0 responses
+ListFlights without a bearer
+    Unauthenticated: missing authorization metadata
+ListFlights
+    2 flights
+    path=data.jsonl tickets=["data.jsonl"] total_bytes=90 total_records=-1 schema_len=320 schema_fnv=97179c53a8fcaaf2
+    path=sub/nested.json tickets=["sub/nested.json"] total_bytes=14 total_records=-1 schema_len=128 schema_fnv=f3452a6b65bf3cb4
+GetFlightInfo data.jsonl without a bearer
+    Unauthenticated: missing authorization metadata
+GetFlightInfo data.jsonl
+    path=data.jsonl tickets=["data.jsonl"] total_bytes=90 total_records=-1 schema_len=320 schema_fnv=97179c53a8fcaaf2
+GetFlightInfo data.jsonl?batch_size=1
+    path=data.jsonl?batch_size=1 tickets=["data.jsonl"] total_bytes=90 total_records=-1 schema_len=320 schema_fnv=97179c53a8fcaaf2
+GetFlightInfo data.jsonl?batch=1
+    InvalidArgument: unsupported query parameter: batch
+GetFlightInfo data.jsonl?table=x
+    InvalidArgument: unsupported query parameter: table
+GetFlightInfo data.jsonl?batch_size
+    InvalidArgument: invalid query pair: batch_size
+GetFlightInfo data.jsonl?batch_size=x
+    InvalidArgument: batch_size must be a number
+GetFlightInfo data.jsonl?batch_size=0
+    path=data.jsonl?batch_size=0 tickets=["data.jsonl"] total_bytes=90 total_records=-1 schema_len=320 schema_fnv=97179c53a8fcaaf2
+GetFlightInfo data.jsonl?batch_size=%31
+    InvalidArgument: batch_size must be a number
+GetFlightInfo data.jsonl?
+    path=data.jsonl? tickets=["data.jsonl"] total_bytes=90 total_records=-1 schema_len=320 schema_fnv=97179c53a8fcaaf2
+GetFlightInfo Upper.JSON
+    path=Upper.JSON tickets=["Upper.JSON"] total_bytes=90 total_records=-1 schema_len=320 schema_fnv=97179c53a8fcaaf2
+GetFlightInfo sub/nested.json
+    path=sub/nested.json tickets=["sub/nested.json"] total_bytes=14 total_records=-1 schema_len=128 schema_fnv=f3452a6b65bf3cb4
+GetFlightInfo sub\nested.json
+    NotFound: file not found
+GetFlightInfo notes.txt
+    Internal: json parse error: line 1: json parse error: Invalid literal (`true`, `false`, or a `null`) while parsing at line 1 column 4
+
+	not json
+	...^....
+GetFlightInfo sub
+    Internal: read <base>/root/sub: <os error>
+GetFlightInfo missing.jsonl
+    NotFound: file not found
+GetFlightInfo missing.jsonl?batch=1
+    InvalidArgument: unsupported query parameter: batch
+GetFlightInfo ../outside.jsonl
+    PermissionDenied: path escapes root
+GetFlightInfo link.jsonl
+    PermissionDenied: path escapes root
+GetFlightInfo <base>/outside.jsonl
+    PermissionDenied: path escapes root
+GetFlightInfo parts ["sub", "nested.json?batch_size=2"]
+    path=sub/nested.json?batch_size=2 tickets=["sub/nested.json"] total_bytes=14 total_records=-1 schema_len=128 schema_fnv=f3452a6b65bf3cb4
+GetFlightInfo parts ["sub", "..", "data.jsonl"]
+    path=sub/../data.jsonl tickets=["data.jsonl"] total_bytes=90 total_records=-1 schema_len=320 schema_fnv=97179c53a8fcaaf2
+GetFlightInfo cmd data.jsonl?batch_size=2
+    path=cmd:data.jsonl?batch_size=2 tickets=["data.jsonl"] total_bytes=90 total_records=-1 schema_len=320 schema_fnv=97179c53a8fcaaf2
+GetFlightInfo cmd data.jsonl?batch=2
+    InvalidArgument: unsupported query parameter: batch
+GetFlightInfo cmd �
+    InvalidArgument: descriptor cmd must be utf-8 path
+GetFlightInfo cmd 
+    InvalidArgument: missing flight descriptor path
+PollFlightInfo data.jsonl without a bearer
+    Unimplemented: poll_flight_info
+PollFlightInfo data.jsonl
+    Unimplemented: poll_flight_info
+GetSchema data.jsonl without a bearer
+    Unauthenticated: missing authorization metadata
+GetSchema data.jsonl
+    schema_len=320 schema_fnv=97179c53a8fcaaf2
+GetSchema sub/nested.json
+    schema_len=128 schema_fnv=f3452a6b65bf3cb4
+GetSchema missing.jsonl
+    NotFound: file not found
+GetSchema notes.txt
+    Internal: json parse error: line 1: json parse error: Invalid literal (`true`, `false`, or a `null`) while parsing at line 1 column 4
+
+	not json
+	...^....
+DoGet data.jsonl without a bearer
+    Unauthenticated: missing authorization metadata
+DoGet data.jsonl
+    messages=2 bytes=1172 fnv=ad20a2101dfb7d5c batches=1 rows=3 columns=["id", "name", "tags", "score"]
+DoGet data.jsonl?batch_size=1
+    messages=4 bytes=2500 fnv=057cbf78ec0d3cfd batches=3 rows=3 columns=["id", "name", "tags", "score"]
+DoGet data.jsonl?batch=1
+    InvalidArgument: unsupported query parameter: batch
+DoGet data.jsonl?batch_size=x
+    InvalidArgument: batch_size must be a number
+DoGet data.jsonl?
+    messages=2 bytes=1172 fnv=ad20a2101dfb7d5c batches=1 rows=3 columns=["id", "name", "tags", "score"]
+DoGet Upper.JSON
+    messages=2 bytes=1172 fnv=ad20a2101dfb7d5c batches=1 rows=3 columns=["id", "name", "tags", "score"]
+DoGet sub/nested.json
+    messages=2 bytes=312 fnv=f57fc4169c719d33 batches=1 rows=1 columns=["only"]
+DoGet sub\nested.json
+    NotFound: file not found
+DoGet notes.txt
+    Internal: json parse error: line 1: json parse error: Invalid literal (`true`, `false`, or a `null`) while parsing at line 1 column 4
+
+	not json
+	...^....
+DoGet sub
+    Internal: read <base>/root/sub: <os error>
+DoGet missing.jsonl
+    NotFound: file not found
+DoGet ../outside.jsonl
+    PermissionDenied: path escapes root
+DoGet sub/../data.jsonl
+    messages=2 bytes=1172 fnv=ad20a2101dfb7d5c batches=1 rows=3 columns=["id", "name", "tags", "score"]
+DoGet link.jsonl
+    PermissionDenied: path escapes root
+DoGet <base>/outside.jsonl
+    PermissionDenied: path escapes root
+DoGet 
+    Internal: read <base>/root: <os error>
+DoGet �
+    InvalidArgument: ticket must be utf-8 path
+DoPut without a bearer
+    Unimplemented: json-fast-flight is reader-only (use json-fast-zerobus for writes)
+DoPut
+    Unimplemented: json-fast-flight is reader-only (use json-fast-zerobus for writes)
+DoExchange descriptor data.jsonl without a bearer
+    Unimplemented: do_exchange
+DoExchange descriptor data.jsonl
+    Unimplemented: do_exchange
+DoExchange no message
+    Unimplemented: do_exchange
+DoAction parsers.flight.codec_capabilities.v1  without a bearer
+    Unauthenticated: missing authorization metadata
+DoAction parsers.flight.codec_capabilities.v1 
+    ["{}"]
+DoAction unknown 
+    Unimplemented: do_action
+ListActions without a bearer
+    Unauthenticated: missing authorization metadata
+ListActions
+    ["parsers.flight.codec_capabilities.v1: cached codec capabilities"]
