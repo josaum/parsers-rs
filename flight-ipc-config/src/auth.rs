@@ -755,6 +755,168 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
         assert!(verify_es256_claim(&wrong_audience).is_err());
     }
 
+    /// A second P-256 key that no verifier here trusts.
+    const OTHER_ES256_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg4xWsuYHdYuVJWuPZ
+0kWvdTTLFn0Zp/lrhCxoHk4UTGKhRANCAASASJi/9MboXVi5IdnTQNCcA53umttQ
+UqpDbPztzm7Q5NrtrIeIedhgEcgdviEF9vZoXGVQRj+NOxoxsp0jQA90
+-----END PRIVATE KEY-----"#;
+
+    /// `{"alg":"none","typ":"JWT"}`, base64url without padding.
+    const NONE_HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn bearer(token: &str) -> MetadataMap {
+        let mut metadata = MetadataMap::new();
+        metadata.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        metadata
+    }
+
+    fn sign_hs256(claim: &CanonicalPythonAccessClaim, secret: &[u8]) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            claim,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap()
+    }
+
+    fn sign_es256(claim: &CanonicalPythonAccessClaim, private_key_pem: &str) -> String {
+        encode(
+            &Header::new(Algorithm::ES256),
+            claim,
+            &EncodingKey::from_ec_pem(private_key_pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Returns the claims segment of a compact JWT.
+    fn claims_segment(token: &str) -> &str {
+        token.split('.').nth(1).unwrap()
+    }
+
+    fn es256_verifier() -> FlightRequestAuthVerifier {
+        FlightRequestAuthVerifier::new(AuthConfig {
+            require_auth: true,
+            issuer: Some("parsers-api".to_owned()),
+            audience: Some("parsers".to_owned()),
+            es256_public_key_pem: Some(TEST_ES256_PUBLIC_KEY.to_owned()),
+            legacy_hs256_secret: None,
+            allow_legacy_hs256: false,
+        })
+        .unwrap()
+    }
+
+    /// Trusts both the ES256 public key and the legacy HS256 secret.
+    fn dual_verifier() -> FlightRequestAuthVerifier {
+        FlightRequestAuthVerifier::new(AuthConfig {
+            require_auth: true,
+            issuer: Some("parsers-api".to_owned()),
+            audience: Some("parsers".to_owned()),
+            es256_public_key_pem: Some(TEST_ES256_PUBLIC_KEY.to_owned()),
+            legacy_hs256_secret: Some("test-only-secret".to_owned()),
+            allow_legacy_hs256: true,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn expired_tokens_are_refused_past_the_leeway() {
+        let now = now_secs();
+        let fresh = canonical_python_claim(now);
+        let mut expired = canonical_python_claim(now - 300);
+        // Two minutes past expiry: outside the 60-second leeway.
+        expired.exp = now - 120;
+
+        verifier()
+            .verify_metadata(&bearer(&sign_hs256(&fresh, b"test-only-secret")))
+            .unwrap();
+        assert!(verifier()
+            .verify_metadata(&bearer(&sign_hs256(&expired, b"test-only-secret")))
+            .is_err());
+
+        es256_verifier()
+            .verify_metadata(&bearer(&sign_es256(&fresh, TEST_ES256_PRIVATE_KEY)))
+            .unwrap();
+        assert!(es256_verifier()
+            .verify_metadata(&bearer(&sign_es256(&expired, TEST_ES256_PRIVATE_KEY)))
+            .is_err());
+    }
+
+    #[test]
+    fn tokens_in_an_algorithm_the_verifier_does_not_expect_are_refused() {
+        let claim = canonical_python_claim(now_secs());
+        let hs256 = sign_hs256(&claim, b"test-only-secret");
+        let es256 = sign_es256(&claim, TEST_ES256_PRIVATE_KEY);
+        verifier().verify_metadata(&bearer(&hs256)).unwrap();
+        es256_verifier().verify_metadata(&bearer(&es256)).unwrap();
+
+        // Unsigned, `alg: none`.
+        let unsigned = format!("{NONE_HEADER}.{}.", claims_segment(&hs256));
+        for verifier in [verifier(), es256_verifier(), dual_verifier()] {
+            assert!(verifier.verify_metadata(&bearer(&unsigned)).is_err());
+        }
+
+        // HS256 keyed with the ES256 public key: the key-confusion attack.
+        let confused = sign_hs256(&claim, TEST_ES256_PUBLIC_KEY.as_bytes());
+        assert!(es256_verifier()
+            .verify_metadata(&bearer(&confused))
+            .is_err());
+        assert!(dual_verifier().verify_metadata(&bearer(&confused)).is_err());
+
+        // A correctly signed token in the other algorithm.
+        assert!(es256_verifier().verify_metadata(&bearer(&hs256)).is_err());
+        assert!(verifier().verify_metadata(&bearer(&es256)).is_err());
+    }
+
+    #[test]
+    fn tokens_signed_with_another_key_are_refused() {
+        let claim = canonical_python_claim(now_secs());
+        assert!(verifier()
+            .verify_metadata(&bearer(&sign_hs256(&claim, b"another-secret")))
+            .is_err());
+        for verifier in [es256_verifier(), dual_verifier()] {
+            assert!(verifier
+                .verify_metadata(&bearer(&sign_es256(&claim, OTHER_ES256_PRIVATE_KEY)))
+                .is_err());
+        }
+    }
+
+    /// Signs `claim` with the test HS256 secret under a hand-written header.
+    fn sign_hs256_with_header(claim: &CanonicalPythonAccessClaim, header: &str) -> String {
+        let valid = sign_hs256(claim, b"test-only-secret");
+        let signing_input = format!("{header}.{}", claims_segment(&valid));
+        let signature = jsonwebtoken::crypto::sign(
+            signing_input.as_bytes(),
+            &EncodingKey::from_secret(b"test-only-secret"),
+            Algorithm::HS256,
+        )
+        .unwrap();
+        format!("{signing_input}.{signature}")
+    }
+
+    /// jsonwebtoken 10 reads unregistered header parameters as strings, so a
+    /// header with any other value there fails to decode. jsonwebtoken 11
+    /// accepts any JSON value; this pins the refusal until that is decided.
+    #[test]
+    fn tokens_whose_header_has_a_non_string_extra_parameter_are_refused() {
+        let claim = canonical_python_claim(now_secs());
+        // `{"alg":"HS256","typ":"JWT","ver":"1"}`, base64url without padding.
+        let string_extra =
+            sign_hs256_with_header(&claim, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsInZlciI6IjEifQ");
+        verifier().verify_metadata(&bearer(&string_extra)).unwrap();
+        // `{"alg":"HS256","typ":"JWT","ver":1}`, base64url without padding.
+        let number_extra =
+            sign_hs256_with_header(&claim, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsInZlciI6MX0");
+        assert!(verifier().verify_metadata(&bearer(&number_extra)).is_err());
+    }
+
     #[test]
     fn es256_workload_authorization_is_accepted_by_es256_only_verifier() {
         let now = SystemTime::now()
