@@ -558,9 +558,18 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
 /// Parse GeoTIFF and return raster data as one `Vec<f32>` per band.
 ///
 /// Unsigned 8- and 16-bit samples are scaled to `0.0..=1.0` by their full
-/// range. Every other sample type (signed 8-, 16- and 32-bit integers,
-/// unsigned 32-bit integers, 32- and 64-bit floats) keeps its value, rounded
-/// to the nearest `f32` where `f32` cannot hold it exactly.
+/// range. Every other sample type (signed 8-, 16-, 32- and 64-bit integers,
+/// unsigned 32- and 64-bit integers, 32- and 64-bit floats) keeps its value,
+/// rounded to the nearest `f32` where `f32` cannot hold it exactly.
+///
+/// # Precision
+///
+/// An `f32` holds every integer up to 2^24 (16,777,216) in magnitude and no
+/// more than 24 significant bits of a larger one. A 32- or 64-bit integer
+/// sample beyond that range comes back as the nearest `f32`: 2^40 + 1 reads
+/// as 2^40, and `u64::MAX` as 2^64. Rasters of identifiers or of counts
+/// above 2^24 lose their low bits here, and 64-bit floats likewise keep 24
+/// significant bits.
 ///
 /// Bands stored interleaved and bands stored as separate planes
 /// (`PlanarConfiguration` 2) are both read, to the same values.
@@ -571,8 +580,7 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
 ///
 /// Returns [`GeoError::Io`] when the file cannot be opened,
 /// [`GeoError::Tiff`] or [`GeoError::InvalidFormat`] when it is not a TIFF
-/// the decoder can read, and [`GeoError::UnsupportedFormat`] for 64-bit
-/// integer samples and for a raster whose bands would take
+/// the decoder can read, and [`GeoError::UnsupportedFormat`] for a raster whose bands would take
 /// more `f32` bytes than the default limit: 512 MiB or four times the size
 /// of the file, whichever is larger. Four bytes out per byte in is an
 /// uncompressed 8-bit raster, so no uncompressed file is refused for its
@@ -710,7 +718,10 @@ fn read_bands<R: Read + Seek>(reader: R, max_band_bytes: usize) -> Result<Vec<Ve
         DecodingResult::I16(data) => split_bands(&data, n_pixels, f32::from),
         DecodingResult::I32(data) => split_bands(&data, n_pixels, |v| v as f32),
         DecodingResult::U32(data) => split_bands(&data, n_pixels, |v| v as f32),
-        DecodingResult::U64(_) | DecodingResult::I64(_) => Err(unsupported_64_bit()),
+        // 64-bit integers keep their values too, as far as `f32` holds
+        // them: see `parse_geotiff_bands`.
+        DecodingResult::U64(data) => split_bands(&data, n_pixels, |v| v as f32),
+        DecodingResult::I64(data) => split_bands(&data, n_pixels, |v| v as f32),
     }
 }
 
@@ -724,15 +735,10 @@ fn unit_u16(sample: u16) -> f32 {
     f32::from(sample) / 65535.0
 }
 
-/// The error for a raster of 64-bit integer samples.
-fn unsupported_64_bit() -> GeoError {
-    GeoError::UnsupportedFormat("Unsupported pixel type in GeoTIFF: 64-bit integer samples".into())
-}
-
 /// The samples of one decoded chunk as `f32`, converted as [`read_bands`]
 /// converts the samples of a whole raster.
-fn chunk_to_f32(decoded: DecodingResult) -> Result<Vec<f32>, GeoError> {
-    Ok(match decoded {
+fn chunk_to_f32(decoded: DecodingResult) -> Vec<f32> {
+    match decoded {
         DecodingResult::U8(data) => data.into_iter().map(unit_u8).collect(),
         DecodingResult::U16(data) => data.into_iter().map(unit_u16).collect(),
         DecodingResult::F32(data) => data,
@@ -741,8 +747,9 @@ fn chunk_to_f32(decoded: DecodingResult) -> Result<Vec<f32>, GeoError> {
         DecodingResult::I16(data) => data.into_iter().map(f32::from).collect(),
         DecodingResult::I32(data) => data.into_iter().map(|v| v as f32).collect(),
         DecodingResult::U32(data) => data.into_iter().map(|v| v as f32).collect(),
-        DecodingResult::U64(_) | DecodingResult::I64(_) => return Err(unsupported_64_bit()),
-    })
+        DecodingResult::U64(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::I64(data) => data.into_iter().map(|v| v as f32).collect(),
+    }
 }
 
 /// Reads a raster stored one plane per band (`PlanarConfiguration` 2).
@@ -831,7 +838,7 @@ fn read_planar_bands<R: Read + Seek>(
             let decoded = decoder
                 .read_chunk(plane * chunks_per_plane + chunk)
                 .map_err(tiff_error)?;
-            let samples = chunk_to_f32(decoded)?;
+            let samples = chunk_to_f32(decoded);
             // Allocated once a chunk of the plane has been read, so a file
             // without the plane does not cost a band.
             if band.is_empty() {
@@ -1735,6 +1742,36 @@ mod tests {
         assert_eq!(
             bands_of(&raster::<colortype::Gray32>(2, 1, &[0u32, 3_000_000_000])).expect("u32"),
             vec![vec![0.0, 3_000_000_000.0]]
+        );
+    }
+
+    /// 64-bit integer rasters were refused as an unsupported pixel type.
+    /// They keep their values, exactly up to 2^24 and rounded to the nearest
+    /// `f32` beyond it.
+    #[test]
+    fn sixty_four_bit_integer_rasters_are_read_as_their_values() {
+        assert_eq!(
+            bands_of(&raster::<colortype::Gray64>(
+                3,
+                1,
+                &[0u64, 16_777_216, u64::MAX]
+            ))
+            .expect("u64"),
+            vec![vec![0.0, 16_777_216.0, u64::MAX as f32]]
+        );
+        assert_eq!(
+            bands_of(&raster::<colortype::GrayI64>(
+                3,
+                1,
+                &[-5i64, 1 << 40, i64::MIN]
+            ))
+            .expect("i64"),
+            vec![vec![-5.0, (1u64 << 40) as f32, i64::MIN as f32]]
+        );
+        // Several bands, interleaved.
+        assert_eq!(
+            bands_of(&raster::<colortype::RGB64>(2, 1, &[1u64, 2, 3, 4, 5, 6])).expect("rgb"),
+            vec![vec![1.0, 4.0], vec![2.0, 5.0], vec![3.0, 6.0]]
         );
     }
 
