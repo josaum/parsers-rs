@@ -669,3 +669,66 @@ fn a_nested_app_property_is_keyed_by_the_property_that_holds_it() {
         ]
     );
 }
+
+/// The app properties of a document whose `docProps/app.xml` is `app`.
+fn app_properties(app: &str) -> std::collections::HashMap<String, String> {
+    let bytes = package(&[
+        (
+            "word/document.xml",
+            w_part("document", "<w:body><w:p/></w:body>"),
+        ),
+        ("docProps/app.xml", app.as_bytes().to_vec()),
+    ]);
+    parse_docx_bytes(bytes, ParseOptions::default())
+        .expect("document parses")
+        .metadata
+        .app
+}
+
+// Every item of a vector is one line, empty or not, so the items can be
+// counted and paired with `HeadingPairs` again.
+#[test]
+fn an_empty_item_of_a_nested_app_property_keeps_its_line() {
+    let app = app_properties(&format!(
+        "<?xml version=\"1.0\"?><Properties {APP_NS}><Company>ACo</Company><HeadingPairs><vt:vector size=\"4\" baseType=\"variant\"><vt:variant><vt:lpstr>Title</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant><vt:variant><vt:lpstr>Headings</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size=\"3\" baseType=\"lpstr\"><vt:lpstr></vt:lpstr><vt:lpstr>Scope</vt:lpstr><vt:lpstr/></vt:vector></TitlesOfParts><lpstr>toplevel</lpstr><Pages>3</Pages></Properties>"
+    ));
+    assert_eq!(
+        sorted(&app),
+        [
+            ("Company", "ACo"),
+            ("HeadingPairs", "Title\n1\nHeadings\n2"),
+            ("Pages", "3"),
+            ("TitlesOfParts", "\nScope\n"),
+            ("lpstr", "toplevel"),
+        ]
+    );
+
+    // A vector of nothing but empty items is still there, with its count.
+    let app = app_properties(&format!(
+        "<Properties {APP_NS}><TitlesOfParts><vt:vector size=\"3\" baseType=\"lpstr\">\n  <vt:lpstr></vt:lpstr>\n  <vt:lpstr/>\n  <vt:lpstr>\n  </vt:lpstr>\n</vt:vector></TitlesOfParts><Single><vt:vector size=\"1\" baseType=\"lpstr\"><vt:lpstr/></vt:vector></Single><None><vt:vector size=\"0\" baseType=\"lpstr\"/></None></Properties>"
+    ));
+    assert_eq!(sorted(&app), [("Single", ""), ("TitlesOfParts", "\n\n")]);
+}
+
+// A line break inside an item reads as a space, so a line is always one
+// item. Properties that are not nested are read as before.
+#[test]
+fn a_line_break_inside_a_nested_item_does_not_split_it() {
+    let app = app_properties(&format!(
+        "<?xml version=\"1.0\"?><Properties {APP_NS}><Company>ACo</Company><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>Line1\nLine2</vt:lpstr><vt:lpstr>2024-01-02T03:04:05Z</vt:lpstr></vt:vector></TitlesOfParts><Company>Second</Company><Mixed>text<vt:lpstr>inner</vt:lpstr>tail</Mixed><Notes>one\r\ntwo&#10;three</Notes></Properties>"
+    ));
+    assert_eq!(
+        sorted(&app),
+        [
+            ("Company", "Second"),
+            ("Mixed", "text\ninner"),
+            ("Notes", "one\r\ntwo\nthree"),
+            ("TitlesOfParts", "Line1 Line2\n2024-01-02T03:04:05+00:00"),
+        ]
+    );
+
+    let app = app_properties(&format!(
+        "<Properties {APP_NS}><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>a\r\nb&#10;c&#13;d</vt:lpstr><vt:lpstr>e</vt:lpstr></vt:vector></TitlesOfParts></Properties>"
+    ));
+    assert_eq!(sorted(&app), [("TitlesOfParts", "a b c d\ne")]);
+}
