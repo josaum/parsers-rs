@@ -48,7 +48,7 @@
 //! ```
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 #[cfg(feature = "arrow")]
 use ooxml_archive::SharedInflateBudget;
 use ooxml_archive::{
@@ -1689,8 +1689,45 @@ fn excel_serial_to_iso(serial: f64, date_1904: bool) -> Option<String> {
     // infallible constructor panics on it.
     let date = base_date.checked_add_signed(chrono::Duration::try_days(days)?)?;
     let time = NaiveTime::from_num_seconds_from_midnight_opt(u32::try_from(seconds).ok()?, 0)?;
-    let dt = NaiveDateTime::new(date, time);
-    Some(dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+    Some(format_iso_seconds(date, time))
+}
+
+/// Formats a date and time as `%Y-%m-%dT%H:%M:%S`.
+///
+/// The digits are written directly for the years a four-digit field holds,
+/// which is every date a workbook normally carries; the general formatter
+/// costs several times the rest of a date cell's decoding. A year outside
+/// `0..=9999` is signed and widened by that formatter, so it is left to it.
+fn format_iso_seconds(date: NaiveDate, time: NaiveTime) -> String {
+    let year = match u32::try_from(date.year()) {
+        Ok(year) if year <= 9999 => year,
+        _ => {
+            return NaiveDateTime::new(date, time)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string()
+        }
+    };
+    let mut out = String::with_capacity(19);
+    push_decimal(&mut out, year, 4);
+    out.push('-');
+    push_decimal(&mut out, date.month(), 2);
+    out.push('-');
+    push_decimal(&mut out, date.day(), 2);
+    out.push('T');
+    push_decimal(&mut out, time.hour(), 2);
+    out.push(':');
+    push_decimal(&mut out, time.minute(), 2);
+    out.push(':');
+    push_decimal(&mut out, time.second(), 2);
+    out
+}
+
+/// Appends the last `width` decimal digits of `value`, zero-padded.
+fn push_decimal(out: &mut String, value: u32, width: u32) {
+    for place in (0..width).rev() {
+        let digit = (value / 10u32.pow(place)) % 10;
+        out.push(char::from_digit(digit, 10).unwrap_or('0'));
+    }
 }
 
 fn parse_cell_ref(r: &str) -> Option<(u32, u32)> {
@@ -1939,6 +1976,38 @@ unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{find_first_digit, format_has_date_tokens, parse_cell_ref_bytes};
+
+    /// The hand-written date formatter must agree with chrono's for every
+    /// year, including the ones it hands back to chrono.
+    #[test]
+    fn format_iso_seconds_matches_the_general_formatter() {
+        use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+        let times = [(0, 0, 0), (0, 0, 9), (9, 5, 59), (12, 30, 0), (23, 59, 59)];
+        let mut checked = 0;
+        for year in (-3..=3)
+            .chain(95..=105)
+            .chain(995..=1005)
+            .chain(1899..=2105)
+            .chain(9995..=10_003)
+        {
+            for (month, day) in [(1, 1), (2, 28), (2, 29), (7, 4), (10, 9), (12, 31)] {
+                let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
+                    continue;
+                };
+                for (hour, minute, second) in times {
+                    let time = NaiveTime::from_hms_opt(hour, minute, second).unwrap();
+                    assert_eq!(
+                        super::format_iso_seconds(date, time),
+                        NaiveDateTime::new(date, time)
+                            .format("%Y-%m-%dT%H:%M:%S")
+                            .to_string()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 5_000);
+    }
     use ooxml_archive::{parse_root_rels, resolve_part};
 
     /// The vectorized scan must agree with a byte-by-byte scan whatever the
