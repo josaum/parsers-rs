@@ -89,6 +89,18 @@ pub const MAX_APPLICATION_DEPTH: usize = 128;
 /// reference hop and exhausts the budget instead.
 pub const VALIDATION_STEPS_PER_PAIR: u64 = 64;
 
+/// Most distinct regular expressions one validation may compile.
+///
+/// Counts `pattern`, `patternProperties` keys and, because `format: "regex"`
+/// compiles a string taken from the document, every distinct document
+/// string checked against that format. Each compiled expression is kept for
+/// the whole validation, so the count bounds both the compile time and the
+/// memory an input can demand. Beyond it validation stops with an error.
+pub const MAX_PATTERNS_PER_VALIDATION: usize = 4_096;
+
+/// Most bytes of regular-expression text one validation may compile.
+pub const MAX_PATTERN_BYTES_PER_VALIDATION: usize = 1 << 20;
+
 /// Severity of a schema [`Finding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -251,6 +263,8 @@ struct Ctx<'a> {
     ref_depth: usize,
     /// Compiled patterns, keyed by pattern text, so rows never recompile.
     patterns: HashMap<String, Result<regex::Regex, String>>,
+    /// Bytes of pattern text compiled so far.
+    pattern_bytes: usize,
     /// `$ref` hops allowed on one path.
     max_ref_depth: usize,
     /// Subschema applications in progress.
@@ -269,6 +283,11 @@ struct Ctx<'a> {
 /// Why validation stopped at the work budget.
 const BUDGET_EXHAUSTED: &str = "validation stopped: the schema needs more subschema \
      applications than the work budget allows (a schema that branches into itself); \
+     the document was not fully validated";
+
+/// Why validation stopped at the pattern budget.
+const PATTERN_BUDGET_EXHAUSTED: &str = "validation stopped: the schema and document ask for \
+     more than 4096 distinct regular expressions or more than 1 MiB of pattern text; \
      the document was not fully validated";
 
 /// Why validation stopped at the application depth.
@@ -323,6 +342,7 @@ fn run(
         anchors: collect_anchors(schema),
         ref_depth: 0,
         patterns: HashMap::new(),
+        pattern_bytes: 0,
         max_ref_depth,
         depth: 0,
         steps: 0,
@@ -344,13 +364,24 @@ fn run(
 }
 
 impl Ctx<'_> {
-    fn compile_pattern(&mut self, pattern: &str) -> Result<regex::Regex, String> {
+    /// Compiles `pattern` once per validation, within the pattern budget.
+    ///
+    /// Returns `None` when the budget is exhausted; validation is then
+    /// halted, so the caller only has to stop.
+    fn compile_pattern(&mut self, pattern: &str) -> Option<Result<regex::Regex, String>> {
         if let Some(hit) = self.patterns.get(pattern).cloned() {
-            return hit;
+            return Some(hit);
+        }
+        self.pattern_bytes = self.pattern_bytes.saturating_add(pattern.len());
+        if self.patterns.len() >= MAX_PATTERNS_PER_VALIDATION
+            || self.pattern_bytes > MAX_PATTERN_BYTES_PER_VALIDATION
+        {
+            self.halted = Some(PATTERN_BUDGET_EXHAUSTED);
+            return None;
         }
         let compiled = regex::Regex::new(pattern).map_err(|e| e.to_string());
         self.patterns.insert(pattern.to_string(), compiled.clone());
-        compiled
+        Some(compiled)
     }
 }
 
@@ -752,7 +783,7 @@ fn check_string(
     }
     if let Some(p) = obj.get("pattern").and_then(|p| p.as_str()) {
         match ctx.compile_pattern(p) {
-            Ok(re) => {
+            Some(Ok(re)) => {
                 if !re.is_match(s) {
                     findings.push(Finding::error(
                         path,
@@ -760,14 +791,28 @@ fn check_string(
                     ));
                 }
             }
-            Err(e) => findings.push(Finding::warning(
+            Some(Err(e)) => findings.push(Finding::warning(
                 path,
                 format!("invalid pattern {p:?}: {e}"),
             )),
+            None => return,
         }
     }
     if let Some(f) = obj.get("format").and_then(|f| f.as_str()) {
-        match check_format(f, s) {
+        // `regex` compiles a string from the document: it goes through the
+        // same cache and budget as the schema's own patterns.
+        let checked = if f == "regex" {
+            match ctx.compile_pattern(s) {
+                Some(Ok(_)) => Ok(()),
+                Some(Err(e)) => Err(FormatError::Violation(format!(
+                    "not a valid regular expression: {e}"
+                ))),
+                None => return,
+            }
+        } else {
+            check_format(f, s)
+        };
+        match checked {
             Ok(()) => {}
             Err(FormatError::Unimplemented) => findings.push(Finding::warning(
                 path,
@@ -830,7 +875,9 @@ fn check_array<'v>(
         }
     }
 
-    check_unique_items(arr, path, findings);
+    if obj.get("uniqueItems").and_then(Value::as_bool) == Some(true) {
+        check_unique_items(arr, path, findings);
+    }
 
     // items / prefixItems / additionalItems cover the array positions; every
     // subschema that passes marks its position as evaluated.
@@ -1096,13 +1143,14 @@ fn check_object<'v>(
     if let Some(pp) = obj.get("patternProperties").and_then(|p| p.as_object()) {
         for (pattern, subschema) in pp {
             match ctx.compile_pattern(pattern) {
-                Ok(re) => patterns.push((re, subschema)),
-                Err(e) => {
+                Some(Ok(re)) => patterns.push((re, subschema)),
+                Some(Err(e)) => {
                     findings.push(Finding::warning(
                         path,
                         format!("invalid patternProperty pattern {pattern:?}: {e}"),
                     ));
                 }
+                None => return evaluated,
             }
         }
         for key in map.keys() {
@@ -2100,6 +2148,37 @@ mod tests {
     }
 
     #[test]
+    fn pattern_compilations_are_bounded_per_validation() {
+        // The same document string is compiled once, however often it occurs.
+        let schema = json!({"items": {"format": "regex"}});
+        let repeated = Value::Array(vec![json!("^a+$"); 50_000]);
+        assert_eq!(validate(&repeated, &schema), []);
+
+        // Distinct document strings each need a compilation: capped by count.
+        let distinct = |count: usize| {
+            Value::Array(
+                (0..count)
+                    .map(|i| Value::String(format!("^x{i}$")))
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            validate(&distinct(MAX_PATTERNS_PER_VALIDATION), &schema),
+            []
+        );
+        let findings = validate(&distinct(MAX_PATTERNS_PER_VALIDATION + 1), &schema);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("regular expressions"));
+
+        // Capped by total pattern bytes, for schema patterns as well.
+        let long = "a".repeat(MAX_PATTERN_BYTES_PER_VALIDATION / 2);
+        let schema = json!({"patternProperties": {long.clone(): true, format!("{long}b"): true, format!("{long}c"): true}});
+        let findings = validate(&json!({"k": 1}), &schema);
+        assert_eq!(findings.len(), 1);
+        assert!(has_errors(&findings));
+    }
+
+    #[test]
     fn validates_a_clean_document() {
         let doc = json!({
             "nome": "Carlos Souza",
@@ -2180,6 +2259,10 @@ mod tests {
     #[test]
     fn unique_items_and_budget_keywords() {
         assert!(fails("[1, 2, 1]", &json!({"uniqueItems": true})));
+        // Duplicates are only an error when the schema asks for uniqueness.
+        assert!(passes("[1, 2, 1]", &json!({})));
+        assert!(passes("[1, 2, 1]", &json!({"uniqueItems": false})));
+        assert!(passes("[[1, 1]]", &json!({"items": {"type": "array"}})));
         assert!(passes("[1, 2, 3]", &json!({"uniqueItems": true})));
         assert!(fails("[1, 2]", &json!({"minItems": 3})));
         assert!(fails("[1, 2, 3, 4]", &json!({"maxItems": 3})));
