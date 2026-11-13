@@ -1,0 +1,160 @@
+Handshake without a bearer
+    0 responses
+Handshake
+    0 responses
+ListFlights without a bearer
+    Unauthenticated: missing authorization metadata
+ListFlights
+    2 flights
+    path=order.xsd tickets=["order.xsd"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+    path=sub/Upper.XSD tickets=["sub/Upper.XSD"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo order.xsd without a bearer
+    Unauthenticated: missing authorization metadata
+GetFlightInfo order.xsd
+    path=order.xsd tickets=["order.xsd"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo order.xsd?element=order
+    path=order.xsd?element=order tickets=["order.xsd?element=order"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo order.xsd?element=order&max_depth=1&table=x
+    path=order.xsd?element=order&max_depth=1&table=x tickets=["order.xsd?element=order"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo order.xsd?element=a%20b&element=c
+    path=order.xsd?element=a%20b&element=c tickets=["order.xsd?element=c"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo order.xsd?
+    path=order.xsd? tickets=["order.xsd"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo sub/Upper.XSD
+    path=sub/Upper.XSD tickets=["sub/Upper.XSD"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo sub\Upper.XSD
+    NotFound: XSD file not found
+GetFlightInfo notes.txt
+    path=notes.txt tickets=["notes.txt"] total_bytes=12 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo missing.xsd
+    NotFound: XSD file not found
+GetFlightInfo ../outside.xsd
+    PermissionDenied: path escapes root
+GetFlightInfo link.xsd
+    PermissionDenied: path escapes root
+GetFlightInfo <base>/outside.xsd
+    PermissionDenied: path escapes root
+GetFlightInfo parts ["sub", "Upper.XSD?element=order"]
+    path=sub/Upper.XSD?element=order tickets=["sub/Upper.XSD?element=order"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo parts ["sub", "..", "order.xsd"]
+    path=sub/../order.xsd tickets=["order.xsd"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo cmd order.xsd?element=order
+    path=cmd:order.xsd?element=order tickets=["order.xsd?element=order"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo cmd �
+    InvalidArgument: descriptor cmd must be utf-8
+GetFlightInfo cmd 
+    InvalidArgument: missing flight descriptor path
+PollFlightInfo order.xsd without a bearer
+    Unimplemented: poll_flight_info
+PollFlightInfo order.xsd
+    Unimplemented: poll_flight_info
+GetSchema order.xsd without a bearer
+    Unauthenticated: missing authorization metadata
+GetSchema order.xsd
+    schema_len=256 schema_fnv=1afb8237d01cd844
+GetSchema missing.xsd
+    schema_len=256 schema_fnv=1afb8237d01cd844
+DoGet order.xsd?element=order without a bearer
+    Unauthenticated: missing authorization metadata
+DoGet order.xsd
+    InvalidArgument: ticket must specify ?element=<name>
+DoGet order.xsd?element=order
+    messages=2 bytes=1000 fnv=d766d52dd8e50a0e batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
+DoGet order.xsd?element=nope
+    Internal: External error: element 'nope' not found in global elements
+DoGet order.xsd?element=order&max_depth=0
+    messages=2 bytes=872 fnv=64bc034a5f264bb2 batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
+DoGet order.xsd?element=order&max_depth=x&map_dates=0
+    messages=2 bytes=1000 fnv=51755922b1318376 batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
+DoGet order.xsd?element=order&map_dates=true&batch=1
+    messages=2 bytes=1000 fnv=d766d52dd8e50a0e batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
+DoGet sub/Upper.XSD?element=order
+    messages=2 bytes=1000 fnv=d766d52dd8e50a0e batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
+DoGet sub\Upper.XSD?element=order
+    NotFound: XSD file not found
+DoGet notes.txt?element=order
+    Internal: External error: element 'order' not found in global elements
+DoGet missing.xsd?element=order
+    NotFound: XSD file not found
+DoGet missing.xsd
+    NotFound: XSD file not found
+DoGet ../outside.xsd?element=order
+    PermissionDenied: path escapes root
+DoGet sub/../order.xsd?element=order
+    messages=2 bytes=1000 fnv=d766d52dd8e50a0e batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
+DoGet link.xsd?element=order
+    PermissionDenied: path escapes root
+DoGet <base>/outside.xsd?element=order
+    PermissionDenied: path escapes root
+DoGet 
+    InvalidArgument: ticket must specify ?element=<name>
+DoGet �
+    InvalidArgument: ticket must be utf-8
+DoPut without a bearer
+    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
+DoPut
+    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
+DoExchange descriptor order.xsd?element=order without a bearer
+    Unauthenticated: missing authorization metadata
+DoExchange descriptor order.xsd?element=order
+    messages=2 bytes=1000 fnv=d766d52dd8e50a0e batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
+DoExchange descriptor order.xsd
+    InvalidArgument: ticket must specify ?element=<name>
+DoExchange descriptor missing.xsd?element=order
+    NotFound: XSD file not found
+DoExchange app_metadata order.xsd?element=order&max_depth=1
+    messages=2 bytes=1000 fnv=20d640502ce74872 batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
+DoExchange app_metadata ../outside.xsd?element=order
+    PermissionDenied: path escapes root
+DoExchange an empty message
+    InvalidArgument: exchange requires descriptor or app_metadata path
+DoExchange no message
+    InvalidArgument: exchange missing initial message
+DoAction parsers.flight.codec_capabilities.v1  without a bearer
+    Unauthenticated: missing authorization metadata
+DoAction parsers.flight.codec_capabilities.v1 
+    ["{}"]
+DoAction list_elements {"root":"order.xsd"} without a bearer
+    Unauthenticated: missing authorization metadata
+DoAction list_elements {"root":"order.xsd"}
+    ["[\"order\"]"]
+DoAction list_elements   order.xsd 
+    ["[\"order\"]"]
+DoAction list_elements {"root":"sub/Upper.XSD"}
+    ["[\"order\"]"]
+DoAction list_elements {"path":"order.xsd"}
+    InvalidArgument: missing 'root' field in action body
+DoAction list_elements {bad
+    InvalidArgument: JSON parse error: key must be a string at line 1 column 2
+DoAction list_elements {"root":"notes.txt"}
+    ["[]"]
+DoAction list_elements {"root":"missing.xsd"}
+    NotFound: XSD file not found
+DoAction list_elements {"root":"../outside.xsd"}
+    PermissionDenied: path escapes root
+DoAction list_elements {"root":"link.xsd"}
+    PermissionDenied: path escapes root
+DoAction list_elements 
+    ["Internal: mmap: <base>/root"]
+DoAction describe {"root":"order.xsd","element":"order"} without a bearer
+    Unauthenticated: missing authorization metadata
+DoAction describe {"root":"order.xsd","element":"order"}
+    ["len=1096 fnv=00742c24a86d9bb9"]
+DoAction describe {"root":"order.xsd","element":"nope"}
+    ["Internal: element 'nope' not found in global elements"]
+DoAction describe {"root":"order.xsd"}
+    InvalidArgument: missing 'element' field
+DoAction describe {"element":"order"}
+    InvalidArgument: missing 'root' field
+DoAction describe order.xsd
+    InvalidArgument: JSON parse error: expected value at line 1 column 1
+DoAction describe {"root":"missing.xsd","element":"order"}
+    NotFound: XSD file not found
+DoAction describe {"root":"../outside.xsd","element":"order"}
+    PermissionDenied: path escapes root
+DoAction unknown 
+    Unimplemented: unknown action: unknown
+ListActions without a bearer
+    Unauthenticated: missing authorization metadata
+ListActions
+    ["list_elements: List global element names for an XSD file", "describe: Derive Arrow schema description for a root element", "parsers.flight.codec_capabilities.v1: cached codec capabilities"]
