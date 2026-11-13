@@ -88,7 +88,9 @@ jobs:
   miri:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The digit scan test makes about 175,000 calls, and the interpreter is
+    # some hundreds of times slower than the machine.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
