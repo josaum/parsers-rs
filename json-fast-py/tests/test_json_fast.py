@@ -75,6 +75,30 @@ def test_validate_reports_findings_as_dicts() -> None:
     assert errors and set(errors[0]) == {"severity", "path", "message"}
 
 
+def test_validate_takes_supplied_schema_documents_and_fails_closed() -> None:
+    schema = '{"$ref": "https://example.com/positive.json"}'
+    resources = {"https://example.com/positive.json": '{"type": "integer", "minimum": 1}'}
+    errors = lambda findings: [f for f in findings if f["severity"] == "error"]
+    assert not errors(json_fast.validate("3", schema, resources=resources))
+    assert errors(json_fast.validate("0", schema, resources=resources))
+    # Nothing is fetched: without the document the reference fails closed.
+    unresolved = errors(json_fast.validate("3", schema))
+    assert unresolved and "does not resolve" in unresolved[0]["message"]
+    with pytest.raises(RuntimeError, match="https://example.com/positive.json"):
+        json_fast.validate("3", schema, resources={"https://example.com/positive.json": "{"})
+
+
+def test_validate_takes_two_documents_claiming_one_uri_in_uri_order() -> None:
+    # Both claim https://example.com/t.json through `$id`; "a" sorts first.
+    a = '{"$id": "https://example.com/t.json", "type": "integer"}'
+    b = '{"$id": "https://example.com/t.json", "type": "string"}'
+    schema = '{"$ref": "https://example.com/t.json"}'
+    errors = lambda findings: [f for f in findings if f["severity"] == "error"]
+    for resources in ({"https://e.com/a": a, "https://e.com/b": b}, {"https://e.com/b": b, "https://e.com/a": a}):
+        assert not errors(json_fast.validate("1", schema, resources=resources))
+        assert errors(json_fast.validate('"x"', schema, resources=resources))
+
+
 def test_jsonrpc_envelopes_round_trip() -> None:
     assert json_fast.jsonrpc_request('{"jsonrpc":"2.0","method":"ping","id":1}')["method"] == "ping"
     assert json_fast.jsonrpc_response('{"jsonrpc":"2.0","result":7,"id":1}')["result"] == 7
