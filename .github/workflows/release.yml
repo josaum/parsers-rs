@@ -148,7 +148,7 @@ jobs:
           test "${#built_wheels[@]}" -eq "${#built_bindings[@]}"
           python -m pip install "pyarrow==25.0.1"
           python -m pip install --no-index --no-deps dist/*.whl
-          python -I -c "import importlib, os; [importlib.import_module(crate.removesuffix('-py').replace('-', '_')) for crate in os.environ['BINDINGS'].split()]"
+          python -I -c "import importlib, os, sys; sys.path.insert(0, 'scripts'); from binding_modules import import_name; [importlib.import_module(import_name(crate)) for crate in os.environ['BINDINGS'].split()]"
       - name: Build native ARM manylinux wheels
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
@@ -186,7 +186,7 @@ jobs:
           python3 -c "import sys; from pathlib import Path; sys.path.insert(0, 'scripts'); from release_manifest import artifact_target; wheels = list(Path('dist').glob('*.whl')); assert len(wheels) == len(sys.argv) - 1; assert all(artifact_target(wheel) == 'aarch64-unknown-linux-gnu' for wheel in wheels)" "${task_bindings[@]}"
           python3 -m pip install "pytest==9.1.1" "pyarrow==25.0.1"
           python3 -m pip install --no-index --no-deps dist/*.whl
-          python3 -I -c "import importlib, os; [importlib.import_module(crate.removesuffix('-py').replace('-', '_')) for crate in os.environ['BINDINGS'].split()]"
+          python3 -I -c "import importlib, os, sys; sys.path.insert(0, 'scripts'); from binding_modules import import_name; [importlib.import_module(import_name(crate)) for crate in os.environ['BINDINGS'].split()]"
           python3 -I -m pytest --import-mode=importlib -q \
             docx-fast-py/tests email-fast-py/tests geo-fast-py/tests \
             json-fast-py/tests ontology-fast-py/tests pdf-fast-py/tests \

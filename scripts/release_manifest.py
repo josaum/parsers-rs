@@ -67,7 +67,10 @@ CRATES: dict[str, str] = {
     "pdf_fast_write": "pdf-fast-write-py",
     "ontology_fast": "ontology-fast-py",
     "geo_fast": "geo-fast-py",
-    "mcts_fast_py": "mcts-fast-py",
+    # Keyed by distribution (`[project] name`, normalised), not by import
+    # name: mcts-fast-py is distributed as `mcts-fast` and imports as
+    # `mcts_fast_py`.
+    "mcts_fast": "mcts-fast-py",
 }
 
 TARGET_PLATFORMS = {

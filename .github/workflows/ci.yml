@@ -170,7 +170,7 @@ jobs:
             test_paths+=("$crate/tests")
           done
           python -m pip install --no-index --no-deps dist/*.whl
-          python -I -c "import importlib, os; [importlib.import_module(crate.removesuffix('-py').replace('-', '_')) for crate in os.environ['TESTED_BINDINGS'].split()]"
+          python -I -c "import importlib, os, sys; sys.path.insert(0, 'scripts'); from binding_modules import import_name; [importlib.import_module(import_name(crate)) for crate in os.environ['TESTED_BINDINGS'].split()]"
           python -I -m pytest --import-mode=importlib -q "${test_paths[@]}"
 
   node-bindings:

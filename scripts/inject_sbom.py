@@ -44,6 +44,7 @@ SBOM_SOURCES: dict[str, str] = {
     "pdf_fast_write": "pdf-fast-write",
     "ontology_fast": "ontology-fast-core",
     "geo_fast": "geo-fast-core",
+    "mcts_fast": "mcts-fast-core",
 }
 
 
