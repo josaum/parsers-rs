@@ -41,7 +41,7 @@ glyph-catalog = []   # retained only to keep downstream cfg compatibility; not p
 # ── Core (always on) ─────────────────────────────────────────────────────
 anyhow      = "1.0"
 bumpalo     = "3.17"
-libdeflater = "0.12"
+libdeflater = "1.26"
 memchr      = "2.7"
 
 # ── Optional ─────────────────────────────────────────────────────────────
