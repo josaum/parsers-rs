@@ -40,6 +40,12 @@ classifiers = [
     "Topic :: Text Processing :: General",
 ]
 
+[project.urls]
+Homepage = "https://github.com/josaum/parsers-rs"
+Repository = "https://github.com/josaum/parsers-rs/tree/main/pdf-fast-py"
+Documentation = "https://github.com/josaum/parsers-rs#readme"
+"Bug Tracker" = "https://github.com/josaum/parsers-rs/issues"
+
 [tool.maturin]
 module-name = "pdf_fast._core"
 python-source = "."

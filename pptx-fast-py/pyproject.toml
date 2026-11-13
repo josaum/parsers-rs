@@ -38,6 +38,12 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+[project.urls]
+Homepage = "https://github.com/josaum/parsers-rs"
+Repository = "https://github.com/josaum/parsers-rs/tree/main/pptx-fast-py"
+Documentation = "https://github.com/josaum/parsers-rs#readme"
+"Bug Tracker" = "https://github.com/josaum/parsers-rs/issues"
+
 [tool.maturin]
 module-name = "pptx_fast._core"
 python-source = "."
