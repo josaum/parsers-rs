@@ -18,10 +18,40 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## What the writer does with input Excel cannot hold
+//!
+//! Every package this crate returns opens in Excel. Input that cannot be
+//! written faithfully is either made valid in a documented way or refused:
+//!
+//! - **Sheet names** are made valid by [`Workbook::add_sheet`] (31 characters,
+//!   no `[ ] : * ? / \`, unique ignoring case); [`Sheet::name`] returns the
+//!   name actually used.
+//! - **A workbook with no sheet** is written with one empty sheet.
+//! - **A cell outside the grid** (1,048,576 rows, 16,384 columns), **text
+//!   over 32,767 characters** and **a formula over 8,192** make
+//!   [`Workbook::write_to`] return an error before anything is written.
+//! - **`NaN` and infinite numbers** are written as the error value `#NUM!`.
+//! - **Column widths** that are not finite are left out; others are brought
+//!   into 0 to 255.
+//! - **Dates** are written with [`Sheet::write_date`] as a serial number with
+//!   a date format.
+//!
+//! ## Formula injection
+//!
+//! Text is never turned into a formula. [`Sheet::write`] and
+//! [`Sheet::write_with_format`] write every string as an inline text cell,
+//! including one that starts with `=`, `+`, `-` or `@`, so text from an
+//! untrusted source cannot run as a formula when the workbook is opened. The
+//! only ways to create a formula are [`Sheet::write_formula`] and the JSON
+//! spec cell type `"f"`; do not pass untrusted text to either. The text is
+//! stored unchanged (no leading apostrophe is added), so a program that later
+//! exports these cells to CSV must do its own escaping.
 
 #![deny(missing_docs)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
@@ -132,12 +162,26 @@ impl Format {
     }
 }
 
+/// Whether a stored string is cell text or a formula.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellKind {
+    /// The value is written as it is.
+    Plain,
+    /// The string value is a formula, written in an `<f>` element.
+    Formula,
+}
+
+/// Style index of a cell shown as a date (built-in number format 14).
+const STYLE_DATE: u8 = 6;
+/// Style index of a cell shown as a date and time (built-in number format 22).
+const STYLE_DATE_TIME: u8 = 7;
+
 /// A worksheet.
 pub struct Sheet {
     name: String,
     /// Cells keyed by zero-based `(row, col)`. Style index is `None` (default),
     /// `Some(1)` (bold), or `Some(2)` (header: bold + fill + white font).
-    cells: BTreeMap<(u32, u16), (CellValue, Option<u8>)>,
+    cells: BTreeMap<(u32, u16), (CellValue, Option<u8>, CellKind)>,
     column_widths: BTreeMap<u16, f64>,
     freeze_rows: u32,
 }
@@ -147,7 +191,7 @@ impl Sheet {
     pub fn write(&mut self, row: u32, col: u16, value: impl Into<CellValue>) {
         let v = value.into();
         if !matches!(v, CellValue::Empty) {
-            self.cells.insert((row, col), (v, None));
+            self.cells.insert((row, col), (v, None, CellKind::Plain));
         }
     }
     /// Write a cell with a format marker (bold / header styles in the styles.xml table).
@@ -160,8 +204,61 @@ impl Sheet {
     ) {
         let v = value.into();
         if !matches!(v, CellValue::Empty) {
-            self.cells.insert((row, col), (v, Some(fmt.style_index())));
+            self.cells
+                .insert((row, col), (v, Some(fmt.style_index()), CellKind::Plain));
         }
+    }
+    /// Write a formula at zero-based `(row, col)`.
+    ///
+    /// This is the only way to create a formula: [`Sheet::write`] and
+    /// [`Sheet::write_with_format`] always write text, whatever it starts
+    /// with. One leading `=` is accepted and removed. Never pass text from an
+    /// untrusted source here. An empty formula writes nothing.
+    pub fn write_formula(&mut self, row: u32, col: u16, formula: impl Into<String>) {
+        let formula: String = formula.into();
+        let formula = formula.strip_prefix('=').unwrap_or(&formula);
+        if !formula.is_empty() {
+            self.cells.insert(
+                (row, col),
+                (
+                    CellValue::String(formula.to_string()),
+                    None,
+                    CellKind::Formula,
+                ),
+            );
+        }
+    }
+    /// Write a date, or a date and time, at zero-based `(row, col)`.
+    ///
+    /// `iso` is `YYYY-MM-DD`, optionally followed by `T` or a space and
+    /// `HH:MM`, `HH:MM:SS` or `HH:MM:SS.fff`, and an optional `Z`. No time
+    /// zone conversion is done. The cell holds Excel's serial number with a
+    /// date format, so readers see a date.
+    ///
+    /// Returns `false` and writes nothing when `iso` is not such a date or
+    /// lies outside 1900-03-01 to 9999-12-31, the range in which Excel's
+    /// serial numbers are unambiguous.
+    pub fn write_date(&mut self, row: u32, col: u16, iso: &str) -> bool {
+        match parse_iso_date(iso) {
+            Some(serial) => {
+                self.write_date_serial(row, col, serial);
+                true
+            }
+            None => false,
+        }
+    }
+    /// Stores `serial` with the date style, or the date-time style when it
+    /// has a time of day.
+    fn write_date_serial(&mut self, row: u32, col: u16, serial: f64) {
+        let style = if serial.fract() == 0.0 {
+            STYLE_DATE
+        } else {
+            STYLE_DATE_TIME
+        };
+        self.cells.insert(
+            (row, col),
+            (CellValue::Number(serial), Some(style), CellKind::Plain),
+        );
     }
     /// Set Excel column width (character units) for a zero-based column.
     pub fn set_column_width(&mut self, col: u16, width: f64) {
@@ -177,20 +274,87 @@ impl Sheet {
     }
 }
 
+/// Rows in a worksheet: Excel's grid ends at row 1,048,576.
+const MAX_ROWS: u32 = 1_048_576;
+/// Columns in a worksheet: Excel's grid ends at column `XFD` (16,384).
+const MAX_COLS: u16 = 16_384;
+/// Most characters (UTF-16 code units) one cell's text may hold.
+const MAX_CELL_CHARS: usize = 32_767;
+/// Most characters (UTF-16 code units) a formula may hold.
+const MAX_FORMULA_CHARS: usize = 8_192;
+/// Most characters (UTF-16 code units) a sheet name may hold.
+const MAX_SHEET_NAME_CHARS: usize = 31;
+/// Widest column Excel accepts, in character units.
+const MAX_COLUMN_WIDTH: f64 = 255.0;
+
 /// A workbook.
 pub struct Workbook {
     sheets: Vec<Sheet>,
+    /// Lower-cased sheet names in use, each with the next numeric suffix to
+    /// try when the same name is asked for again.
+    taken_names: HashMap<String, u32>,
+}
+
+/// Cuts `name` to at most `limit` UTF-16 code units without splitting a
+/// character.
+fn truncate_utf16(name: &str, limit: usize) -> &str {
+    let mut units = 0;
+    for (index, ch) in name.char_indices() {
+        units += ch.len_utf16();
+        if units > limit {
+            return &name[..index];
+        }
+    }
+    name
+}
+
+/// Makes `name` one Excel accepts, apart from uniqueness.
+///
+/// `position` is the one-based position of the sheet, used to name a sheet
+/// whose name is empty.
+fn valid_sheet_name(name: &str, position: usize) -> String {
+    let mut valid: String = truncate_utf16(name, MAX_SHEET_NAME_CHARS)
+        .chars()
+        .map(|ch| match ch {
+            '[' | ']' | ':' | '*' | '?' | '/' | '\\' => '_',
+            other => other,
+        })
+        .collect();
+    if valid.starts_with('\'') {
+        valid.replace_range(..1, "_");
+    }
+    if valid.ends_with('\'') {
+        valid.replace_range(valid.len() - 1.., "_");
+    }
+    if valid.is_empty() {
+        valid = format!("Sheet{position}");
+    }
+    if valid.eq_ignore_ascii_case("history") {
+        valid.push('_');
+    }
+    valid
 }
 
 impl Workbook {
     /// Create an empty workbook.
     pub fn new() -> Self {
-        Self { sheets: Vec::new() }
+        Self {
+            sheets: Vec::new(),
+            taken_names: HashMap::new(),
+        }
     }
     /// Append a worksheet and return a mutable handle to it.
+    ///
+    /// Excel refuses a workbook with a sheet name it does not accept, so the
+    /// name is made valid here and [`Sheet::name`] returns the name actually
+    /// used: it is cut to 31 characters; each of `[ ] : * ? / \` and an
+    /// apostrophe at either end becomes `_`; an empty name becomes `SheetN`;
+    /// the reserved name `History` gets a trailing `_`; and a name already in
+    /// use (ignoring case) gets a suffix such as ` (2)`.
     pub fn add_sheet(&mut self, name: impl Into<String>) -> &mut Sheet {
+        let name = self.unique_sheet_name(&name.into());
         self.sheets.push(Sheet {
-            name: name.into(),
+            name,
             cells: BTreeMap::new(),
             column_widths: BTreeMap::new(),
             freeze_rows: 0,
@@ -200,6 +364,68 @@ impl Workbook {
             Some(sheet) => sheet,
             None => unreachable!("sheet just pushed"),
         }
+    }
+
+    /// Returns a valid sheet name no other sheet uses, and records it.
+    fn unique_sheet_name(&mut self, requested: &str) -> String {
+        let base = valid_sheet_name(requested, self.sheets.len() + 1);
+        let mut name = base.clone();
+        loop {
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                self.taken_names.entry(name.to_lowercase())
+            {
+                slot.insert(2);
+                return name;
+            }
+            // The counter is kept per requested name, so asking for the same
+            // name many times does not retry every earlier suffix.
+            let counter = self.taken_names.entry(base.to_lowercase()).or_insert(2);
+            let suffix = format!(" ({counter})");
+            *counter = counter.saturating_add(1);
+            let room = MAX_SHEET_NAME_CHARS.saturating_sub(suffix.len());
+            name = format!("{}{suffix}", truncate_utf16(&base, room));
+        }
+    }
+
+    /// Checks every cell against Excel's limits before anything is written.
+    fn check_limits(sheets: &[Sheet]) -> Result<(), Box<dyn std::error::Error>> {
+        for sheet in sheets {
+            for (&(row, col), (value, _, kind)) in &sheet.cells {
+                if row >= MAX_ROWS || col >= MAX_COLS {
+                    return Err(format!(
+                        "sheet {:?}: the cell at row {}, column {} is outside Excel's grid \
+                         of {MAX_ROWS} rows and {MAX_COLS} columns",
+                        sheet.name,
+                        u64::from(row) + 1,
+                        u32::from(col) + 1
+                    )
+                    .into());
+                }
+                let CellValue::String(text) = value else {
+                    continue;
+                };
+                let (limit, what) = match kind {
+                    CellKind::Plain => (MAX_CELL_CHARS, "text"),
+                    CellKind::Formula => (MAX_FORMULA_CHARS, "formula"),
+                };
+                // UTF-8 never uses fewer bytes than UTF-16 uses code units, so
+                // only a text longer than `limit` bytes needs counting.
+                if text.len() > limit {
+                    let chars = text.encode_utf16().count();
+                    if chars > limit {
+                        return Err(format!(
+                            "sheet {:?}: the {what} in cell {}{} is {chars} characters long; \
+                             Excel's limit is {limit}",
+                            sheet.name,
+                            col_letter(col),
+                            row + 1
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Borrow a sheet by zero-based index.
@@ -218,13 +444,37 @@ impl Workbook {
         Ok(())
     }
     /// Write the workbook ZIP package to any seekable writer.
+    ///
+    /// # Errors
+    ///
+    /// Besides I/O errors, returns an error and writes nothing when a cell
+    /// lies outside Excel's grid (1,048,576 rows, 16,384 columns), when a
+    /// cell's text is longer than 32,767 characters or a formula longer than
+    /// 8,192. Excel reports such a file as damaged or silently cuts the
+    /// text, so the caller is told instead.
+    ///
+    /// A workbook with no sheet is written with one empty sheet, `Sheet1`,
+    /// because Excel cannot open a workbook that has none.
     pub fn write_to<W: Write + std::io::Seek>(
         &self,
         writer: W,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let placeholder;
+        let sheets: &[Sheet] = if self.sheets.is_empty() {
+            placeholder = [Sheet {
+                name: "Sheet1".to_string(),
+                cells: BTreeMap::new(),
+                column_widths: BTreeMap::new(),
+                freeze_rows: 0,
+            }];
+            &placeholder
+        } else {
+            &self.sheets
+        };
+        Self::check_limits(sheets)?;
         let mut zip = ZipWriter::new(writer);
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-        let nsheets = self.sheets.len();
+        let nsheets = sheets.len();
 
         // [Content_Types].xml
         zip.start_file("[Content_Types].xml", opts)?;
@@ -250,7 +500,7 @@ impl Workbook {
         // xl/workbook.xml
         zip.start_file("xl/workbook.xml", opts)?;
         let mut wb_xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets>");
-        for (i, s) in self.sheets.iter().enumerate() {
+        for (i, s) in sheets.iter().enumerate() {
             wb_xml.push_str(&format!(
                 "<sheet name=\"{}\" sheetId=\"{}\" r:id=\"rId{}\"/>",
                 xa(&s.name),
@@ -273,14 +523,16 @@ impl Workbook {
 
         // xl/styles.xml — fixed: index 0 = default, index 1 = bold, index 2 = header (bold+bg+font)
         zip.start_file("xl/styles.xml", opts)?;
-        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\n<fonts count=\"3\">\n<font><sz val=\"11\"/><name val=\"Calibri\"/></font>\n<font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font>\n<font><b/><sz val=\"11\"/><color rgb=\"FFFFFFFF\"/><name val=\"Calibri\"/></font>\n</fonts>\n<fills count=\"4\">\n<fill><patternFill patternType=\"none\"/></fill>\n<fill><patternFill patternType=\"none\"/></fill>\n<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF4472C4\"/></patternFill></fill>\n<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFF2F2F2\"/></patternFill></fill>\n</fills>\n<borders count=\"1\"><border/></borders>\n<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\n<cellXfs count=\"6\">\n<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>\n<xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>\n<xf numFmtId=\"0\" fontId=\"2\" fillId=\"2\" borderId=\"0\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyAlignment=\"1\"><alignment vertical=\"center\" wrapText=\"1\"/></xf>\n<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyAlignment=\"1\"><alignment vertical=\"top\" wrapText=\"1\"/></xf>\n<xf numFmtId=\"0\" fontId=\"0\" fillId=\"3\" borderId=\"0\" xfId=\"0\" applyFill=\"1\"/>\n<xf numFmtId=\"0\" fontId=\"0\" fillId=\"3\" borderId=\"0\" xfId=\"0\" applyFill=\"1\" applyAlignment=\"1\"><alignment vertical=\"top\" wrapText=\"1\"/></xf>\n</cellXfs>\n</styleSheet>")?;
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\n<fonts count=\"3\">\n<font><sz val=\"11\"/><name val=\"Calibri\"/></font>\n<font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font>\n<font><b/><sz val=\"11\"/><color rgb=\"FFFFFFFF\"/><name val=\"Calibri\"/></font>\n</fonts>\n<fills count=\"4\">\n<fill><patternFill patternType=\"none\"/></fill>\n<fill><patternFill patternType=\"none\"/></fill>\n<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF4472C4\"/></patternFill></fill>\n<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFF2F2F2\"/></patternFill></fill>\n</fills>\n<borders count=\"1\"><border/></borders>\n<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\n<cellXfs count=\"8\">\n<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>\n<xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>\n<xf numFmtId=\"0\" fontId=\"2\" fillId=\"2\" borderId=\"0\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyAlignment=\"1\"><alignment vertical=\"center\" wrapText=\"1\"/></xf>\n<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyAlignment=\"1\"><alignment vertical=\"top\" wrapText=\"1\"/></xf>\n<xf numFmtId=\"0\" fontId=\"0\" fillId=\"3\" borderId=\"0\" xfId=\"0\" applyFill=\"1\"/>\n<xf numFmtId=\"0\" fontId=\"0\" fillId=\"3\" borderId=\"0\" xfId=\"0\" applyFill=\"1\" applyAlignment=\"1\"><alignment vertical=\"top\" wrapText=\"1\"/></xf>\n<xf numFmtId=\"14\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>\n<xf numFmtId=\"22\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>\n</cellXfs>\n</styleSheet>")?;
 
         // xl/worksheets/sheetN.xml
-        for (i, sheet) in self.sheets.iter().enumerate() {
+        for (i, sheet) in sheets.iter().enumerate() {
             zip.start_file(format!("xl/worksheets/sheet{}.xml", i + 1), opts)?;
             let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">");
 
-            if sheet.freeze_rows > 0 {
+            // A pane needs at least one row below it; a larger value has no
+            // meaning in the grid and is left out.
+            if sheet.freeze_rows > 0 && sheet.freeze_rows < MAX_ROWS {
                 let n = sheet.freeze_rows;
                 xml.push_str(&format!(
                     "<sheetViews><sheetView workbookViewId=\"0\"><pane ySplit=\"{n}\" topLeftCell=\"A{}\" activePane=\"bottomLeft\" state=\"frozen\"/><selection pane=\"bottomLeft\" activeCell=\"A{}\" sqref=\"A{}\"/></sheetView></sheetViews>",
@@ -290,9 +542,17 @@ impl Workbook {
                 ));
             }
 
-            if !sheet.column_widths.is_empty() {
+            // A width that is not a number, or for a column outside the grid,
+            // is left out; the rest are brought into Excel's 0 to 255.
+            let widths: Vec<(u16, f64)> = sheet
+                .column_widths
+                .iter()
+                .filter(|(col, width)| **col < MAX_COLS && width.is_finite())
+                .map(|(col, width)| (*col, width.clamp(0.0, MAX_COLUMN_WIDTH)))
+                .collect();
+            if !widths.is_empty() {
                 xml.push_str("<cols>");
-                for (&col, &width) in &sheet.column_widths {
+                for (col, width) in widths {
                     xml.push_str(&format!(
                         "<col min=\"{}\" max=\"{}\" width=\"{}\" customWidth=\"1\"/>",
                         col + 1,
@@ -305,41 +565,42 @@ impl Workbook {
 
             xml.push_str("<sheetData>");
             let mut current_row: Option<u32> = None;
-            for (&(row, col), (value, style_idx)) in &sheet.cells {
+            for (&(row, col), (value, style_idx, kind)) in &sheet.cells {
                 if current_row != Some(row) {
                     if current_row.is_some() {
                         xml.push_str("</row>");
                     }
-                    xml.push_str(&format!("<row r=\"{}\">", row + 1));
+                    write!(xml, "<row r=\"{}\">", row + 1)?;
                     current_row = Some(row);
                 }
-                let cell_ref = col_letter(col) + &(row + 1).to_string();
-                let s_attr = match style_idx {
-                    Some(idx) => format!(" s=\"{idx}\""),
-                    None => String::new(),
-                };
+                write!(xml, "<c r=\"{}{}\"", col_letter(col), row + 1)?;
+                if let Some(idx) = style_idx {
+                    write!(xml, " s=\"{idx}\"")?;
+                }
                 match value {
+                    CellValue::String(s) if *kind == CellKind::Formula => {
+                        write!(xml, "><f>{}</f></c>", xe(s))?;
+                    }
                     CellValue::String(s) => {
-                        xml.push_str(&format!(
-                            "<c r=\"{}\" t=\"inlineStr\"{}><is><t{}>{}</t></is></c>",
-                            cell_ref,
-                            s_attr,
+                        write!(
+                            xml,
+                            " t=\"inlineStr\"><is><t{}>{}</t></is></c>",
                             space_attr(s),
                             xe(s)
-                        ));
+                        )?;
+                    }
+                    // SpreadsheetML has no NaN or infinity; Excel shows a
+                    // result it cannot represent as `#NUM!`.
+                    CellValue::Number(n) if !n.is_finite() => {
+                        xml.push_str(" t=\"e\"><v>#NUM!</v></c>");
                     }
                     CellValue::Number(n) => {
-                        xml.push_str(&format!("<c r=\"{}\"{}><v>{}</v></c>", cell_ref, s_attr, n));
+                        write!(xml, "><v>{n}</v></c>")?;
                     }
                     CellValue::Bool(b) => {
-                        xml.push_str(&format!(
-                            "<c r=\"{}\" t=\"b\"{}><v>{}</v></c>",
-                            cell_ref,
-                            s_attr,
-                            if *b { 1 } else { 0 }
-                        ));
+                        write!(xml, " t=\"b\"><v>{}</v></c>", u8::from(*b))?;
                     }
-                    CellValue::Empty => {}
+                    CellValue::Empty => xml.push_str("/>"),
                 }
             }
             if current_row.is_some() {
@@ -401,11 +662,17 @@ pub struct SheetSpec {
 
 /// A JSON-serializable cell specification.
 ///
-/// `t` is the cell type: `"s"` (string), `"n"` (number), `"b"` (bool).
+/// `t` is the cell type: `"s"` (string), `"n"` (number), `"b"` (bool),
+/// `"d"` (date: an ISO `YYYY-MM-DD[THH:MM[:SS]]` string or an Excel serial
+/// number) or `"f"` (formula). A value that does not fit the declared type is
+/// written as what it is: text stays text, `null` leaves the cell empty.
+///
+/// Only `"f"` creates a formula. Text under any other type is written as
+/// text even when it starts with `=`, `+`, `-` or `@`.
 /// `fmt` optionally names a format: `"bold"` or `"header"`.
 #[derive(Debug, serde::Deserialize)]
 pub struct CellSpec {
-    /// Cell type discriminator: `s`, `n`, or `b`.
+    /// Cell type discriminator: `s`, `n`, `b`, `d` or `f`.
     #[serde(default = "default_cell_type")]
     pub t: String,
     /// The value (string, number, or bool as JSON).
@@ -431,16 +698,54 @@ impl Workbook {
                 }
             }
             for (row_idx, row) in sheet_spec.rows.iter().enumerate() {
+                // A position past the integer type is past Excel's grid too.
+                // Saturating keeps it there, so writing reports it instead
+                // of wrapping around onto column A.
+                let row_idx = u32::try_from(row_idx).unwrap_or(u32::MAX);
                 for (col_idx, cell) in row.iter().enumerate() {
-                    let value = match cell.t.as_str() {
-                        "n" => CellValue::Number(cell.v.as_f64().unwrap_or(0.0)),
-                        "b" => CellValue::Bool(cell.v.as_bool().unwrap_or(false)),
-                        _ => CellValue::String(
-                            cell.v
-                                .as_str()
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| cell.v.to_string()),
-                        ),
+                    let col_idx = u16::try_from(col_idx).unwrap_or(u16::MAX);
+                    use serde_json::Value;
+                    // The declared type applies when the value fits it.
+                    match (cell.t.as_str(), &cell.v) {
+                        ("f", Value::String(formula)) => {
+                            sheet.write_formula(row_idx, col_idx, formula.as_str());
+                            continue;
+                        }
+                        ("d", Value::String(iso)) if sheet.write_date(row_idx, col_idx, iso) => {
+                            continue;
+                        }
+                        ("d", Value::Number(serial)) => {
+                            if let Some(serial) = serial.as_f64() {
+                                sheet.write_date_serial(row_idx, col_idx, serial);
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                    let numeric_text = match (cell.t.as_str(), &cell.v) {
+                        ("n", Value::String(text)) => text
+                            .trim()
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|number| number.is_finite()),
+                        _ => None,
+                    };
+                    // Otherwise the value is written as what it is, so a
+                    // mismatch never turns into a different value (a number
+                    // given as text used to become 0).
+                    let value = match (&cell.v, numeric_text) {
+                        (_, Some(number)) => CellValue::Number(number),
+                        (Value::Null, _) => CellValue::Empty,
+                        (Value::Bool(flag), _) => CellValue::Bool(*flag),
+                        (Value::Number(number), _) if cell.t == "s" => {
+                            CellValue::String(number.to_string())
+                        }
+                        (Value::Number(number), _) => match number.as_f64() {
+                            Some(number) => CellValue::Number(number),
+                            None => CellValue::String(number.to_string()),
+                        },
+                        (Value::String(text), _) => CellValue::String(text.clone()),
+                        (other, _) => CellValue::String(other.to_string()),
                     };
                     let fmt = match cell.fmt.as_deref() {
                         Some("header") => Format::new()
@@ -449,11 +754,11 @@ impl Workbook {
                             .font_color(0xFFFFFF),
                         Some(_) => Format::new().bold(),
                         None => {
-                            sheet.write(row_idx as u32, col_idx as u16, value);
+                            sheet.write(row_idx, col_idx, value);
                             continue;
                         }
                     };
-                    sheet.write_with_format(row_idx as u32, col_idx as u16, value, &fmt);
+                    sheet.write_with_format(row_idx, col_idx, value, &fmt);
                 }
             }
         }
@@ -481,8 +786,83 @@ impl Workbook {
     }
 }
 
+/// Days from 1970-01-01 to the given proleptic Gregorian date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Returns Excel's serial number (1900 date system) for a calendar date.
+///
+/// Returns `None` when the date does not exist or lies outside 1900-03-01 to
+/// 9999-12-31. Earlier dates are refused because Excel counts a 29 February
+/// 1900 that never happened, so their serial numbers are ambiguous.
+pub fn date_serial(year: i32, month: u32, day: u32) -> Option<f64> {
+    if !(1900..=9999).contains(&year) || !(1..=12).contains(&month) || day == 0 {
+        return None;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 31,
+    };
+    if day > days_in_month || (year == 1900 && month < 3) {
+        return None;
+    }
+    let days = days_from_civil(i64::from(year), i64::from(month), i64::from(day))
+        - days_from_civil(1899, 12, 30);
+    Some(days as f64)
+}
+
+/// Parses the date forms [`Sheet::write_date`] documents into a serial number.
+fn parse_iso_date(iso: &str) -> Option<f64> {
+    let iso = iso.trim();
+    let iso = iso.strip_suffix('Z').unwrap_or(iso);
+    let (date, time) = match iso.find(['T', ' ']) {
+        Some(index) => (&iso[..index], Some(&iso[index + 1..])),
+        None => (iso, None),
+    };
+    let digits = |text: &str, len: usize| -> Option<u32> {
+        (text.len() == len && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse().ok())
+            .flatten()
+    };
+    let mut parts = date.split('-');
+    let year = digits(parts.next()?, 4)?;
+    let month = digits(parts.next()?, 2)?;
+    let day = digits(parts.next()?, 2)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let mut serial = date_serial(i32::try_from(year).ok()?, month, day)?;
+    if let Some(time) = time {
+        let mut parts = time.split(':');
+        let hour = digits(parts.next()?, 2)?;
+        let minute = digits(parts.next()?, 2)?;
+        let second: f64 = match parts.next() {
+            Some(text) => {
+                let whole = text.split('.').next()?;
+                digits(whole, 2)?;
+                text.parse().ok()?
+            }
+            None => 0.0,
+        };
+        if parts.next().is_some() || hour > 23 || minute > 59 || !(0.0..60.0).contains(&second) {
+            return None;
+        }
+        serial += (f64::from(hour) * 3600.0 + f64::from(minute) * 60.0 + second) / 86_400.0;
+    }
+    Some(serial)
+}
+
 fn col_letter(col: u16) -> String {
-    let mut n = col + 1;
+    let mut n = u32::from(col) + 1;
     let mut s = String::new();
     while n > 0 {
         n -= 1;
