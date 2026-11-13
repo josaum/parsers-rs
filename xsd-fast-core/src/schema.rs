@@ -257,6 +257,18 @@ pub enum ContentModel {
     Empty,
 }
 
+/// How a complex type derives from its complex base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Derivation {
+    /// `xs:extension`: the base's particles and attributes, then the type's
+    /// own.
+    #[default]
+    Extension,
+    /// `xs:restriction`: the particles the type states itself, and the
+    /// base's attributes except those it prohibits.
+    Restriction,
+}
+
 /// A complex type: attributes + content model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComplexType {
@@ -276,16 +288,43 @@ pub struct ComplexType {
     /// After [`SchemaModel::resolve_inheritance`] runs, inherited attributes are
     /// prepended ahead of locally declared ones (for inheriting types only).
     pub attributes: Vec<AttributeDecl>,
-    /// Base type for `complexContent`/`extension` against a *complex* base.
+    /// Base type of an extension or restriction against a *complex* base,
+    /// under `complexContent` or, for a restriction, `simpleContent`.
     ///
     /// `None` for types that do not derive from a complex base (the common
-    /// case). When set, [`SchemaModel::resolve_inheritance`] uses it to fold the
-    /// base's particles and attributes into [`content`] and [`attributes`].
+    /// case). When set, [`SchemaModel::resolve_inheritance`] uses it to fold
+    /// the base into [`content`] and [`attributes`]: particles and attributes
+    /// for an extension, attributes only for a restriction, as
+    /// [`derivation`] says.
     ///
     /// [`content`]: ComplexType::content
     /// [`attributes`]: ComplexType::attributes
+    /// [`derivation`]: ComplexType::derivation
     #[serde(default)]
     pub base: Option<QName>,
+    /// How the type derives from [`base`](ComplexType::base); means nothing
+    /// without one.
+    #[serde(default)]
+    pub derivation: Derivation,
+    /// Names of the attributes a restriction declares with
+    /// `use="prohibited"`.
+    ///
+    /// They are not attributes of the type, so they are not in
+    /// [`attributes`](ComplexType::attributes); the names are kept so the
+    /// base's attributes of those names are left out when it is folded in.
+    #[serde(default)]
+    pub prohibited_attributes: Vec<String>,
+    /// Whether the type was written with nothing in it but annotations:
+    /// `<xs:complexType/>`, or the open-and-closed form of that.
+    ///
+    /// This is not the same as having no particles and no attributes. The
+    /// parser leaves out what it does not model (attribute references,
+    /// attribute groups, group references, wildcards, a derivation from a
+    /// base it cannot find), so a type built only from those has neither
+    /// and is not empty. `false` for a model that was deserialized without
+    /// this field or built by a caller that does not set it.
+    #[serde(default)]
+    pub empty_in_source: bool,
     /// Occurrence bounds of the model group that is the type's content: the
     /// `minOccurs` / `maxOccurs` written on its `xs:sequence`, `xs:all` or
     /// `xs:choice`. With a minimum of zero the whole content may be left out,
@@ -314,7 +353,8 @@ impl ComplexType {
         &self.attributes
     }
 
-    /// Whether this type derives from a complex base via `complexContent`/`extension`.
+    /// Whether this type derives from a complex base, by extension or by
+    /// restriction.
     pub fn inherits(&self) -> bool {
         self.base.is_some()
     }
@@ -404,18 +444,30 @@ impl SchemaModel {
         self.global_elements.get(local)
     }
 
-    /// Fold `complexContent`/`extension` base types into derived types.
+    /// Fold `complexContent` base types into derived types.
     ///
     /// For every complex type whose [`base`](ComplexType::base) is set, this
     /// prepends the (transitively) resolved base's particles and attributes
-    /// ahead of the type's own. Inline complex types nested in particles are
-    /// resolved too, so inheritance works regardless of where it appears. Types
-    /// that do not inherit are left byte-identical.
+    /// ahead of the type's own. A restriction keeps the particles it states
+    /// and takes only the base's attributes: those it prohibits are left
+    /// out, and one it declares again keeps the base's type. A restriction
+    /// of a base with simple content also takes the type of its text. Inline complex types nested in particles, and
+    /// the inline types of global elements, are resolved too, so inheritance
+    /// works regardless of where it appears. A chain of bases is followed to
+    /// its end, however long. Types that do not inherit are left
+    /// byte-identical.
+    ///
+    /// A recursive type, one holding an element whose inline type extends
+    /// the type itself or a type that leads back to it, is unrolled to a
+    /// fixed nesting, and less far when the copies that takes are more than
+    /// one type is allowed. Where the unrolling ends, and below the deepest
+    /// nesting that is folded at all, an inline type keeps only what it
+    /// declares itself. Neither is an error.
     ///
     /// Idempotent in effect for the common case, but intended to run exactly
-    /// once, immediately after a schema set finishes loading. Cycles and
-    /// self-references are bounded by a visited set and a depth cap, so a
-    /// malformed schema can never cause unbounded recursion.
+    /// once, immediately after a schema set finishes loading. A cycle is
+    /// broken at the first name met twice, and the chain walk does not
+    /// recurse, so a malformed schema can never cause unbounded recursion.
     ///
     /// Folding copies each base into every type derived from it, so the model
     /// can grow far beyond the schema text, and the copies are capped by a
@@ -452,38 +504,163 @@ impl SchemaModel {
         // order-independent and prevents double-folding when a base type is
         // itself resolved later in the same pass.
         let originals = self.complex_types.clone();
-        let mut budget = InheritanceBudget {
-            remaining: MAX_INHERITED_NODES,
-            uncharged_text_bytes: 0,
+        let mut budget = FoldBudget {
+            required: InheritanceBudget {
+                remaining: MAX_INHERITED_NODES,
+                uncharged_text_bytes: 0,
+            },
+            optional: InheritanceBudget {
+                remaining: MAX_OPTIONAL_NODES,
+                uncharged_text_bytes: 0,
+            },
+            allowance: 0,
         };
 
+        let mut folding = Vec::new();
+
         for (name, ct) in self.complex_types.iter_mut() {
-            resolve_complex_type(ct, Some(name.as_str()), &originals, 0, &mut budget)?;
+            budget.allowance = MAX_OPTIONAL_NODES_PER_TYPE;
+            resolve_complex_type(
+                ct,
+                Some(name.as_str()),
+                &originals,
+                0,
+                &mut folding,
+                &mut budget,
+            )?;
+        }
+        // A global element can hold an inline type, which can extend a named
+        // type itself or hold elements whose inline types do.
+        for element in self.global_elements.values_mut() {
+            if let XsdType::Complex(inline) = &mut element.type_def {
+                budget.allowance = MAX_OPTIONAL_NODES_PER_TYPE;
+                resolve_complex_type(inline, None, &originals, 0, &mut folding, &mut budget)?;
+            }
         }
         Ok(())
     }
 }
 
-/// Most that inheritance folding may copy in one schema set, in budget units.
+/// Most that the folds a schema is wrong without may copy in one schema
+/// set, in budget units.
 ///
 /// A unit is one copied particle, attribute, enumeration value or
 /// simple-content type, or [`TEXT_BYTES_PER_NODE`] bytes of the text they
 /// own; see [`CopyCost`].
 ///
-/// Folding is eager: every derived type receives its own copy of each
-/// ancestor's content, and an inline type that extends a named type receives
-/// a copy that can itself hold inline extensions. A schema of a few kilobytes
-/// can therefore ask for billions of copies (six inline extensions of the
-/// enclosing type, folded sixteen levels deep, is 6^16), and a base holding
-/// one large enumeration is copied whole into every type derived from it.
+/// Folding is eager: every derived type receives its own copy of the
+/// content of each of its bases, and an inline type that extends a named
+/// type receives a copy that can itself hold inline extensions. A schema of
+/// a few hundred kilobytes can therefore ask for far more than it holds:
+/// two thousand types that each extend one base of a hundred elements copy
+/// two hundred thousand particles, and a base holding one large enumeration
+/// is copied whole into every type derived from it.
 ///
-/// The limit is a bound on memory. A schema set that spends all of it peaks
-/// at about 130 MiB of process memory when the copies are plain element
-/// particles, about 120 MiB for inline types with attributes, and about
-/// 70 MiB for long names or values (the three shapes measured, on a 64-bit
-/// build, loading included). Changing what a unit charges needs those
-/// measurements repeated.
+/// This budget pays for the folds that were always made: the nearest
+/// [`REQUIRED_CHAIN_LINKS`] bases of a type, at a nesting below
+/// [`REQUIRED_FOLD_DEPTH`], recursion apart. A schema set that asks for
+/// more of those than the budget holds is refused with a `resource_limit`
+/// error. Everything else folding does (unrolling a recursive type, deeper
+/// nesting, bases further up a chain) is paid from [`MAX_OPTIONAL_NODES`]
+/// and never refuses a schema.
+///
+/// The limit is a bound on memory. A schema set that spends all of this
+/// budget and none of the other peaks at about 130 MiB of process memory
+/// when the copies are plain element particles (132 MiB measured), about
+/// 120 MiB for inline types with attributes, and about 70 MiB for long
+/// names or values (on a 64-bit build, loading included). One that spends
+/// both budgets peaks at about 200 MiB for plain element particles (196 MiB
+/// measured, of which the schema itself is 10 MiB); that is the size to plan
+/// for, since the two budgets are spent independently. A schema that is
+/// refused can peak higher while it is being read: the largest seen is
+/// 332 MiB, for a 4.6 MiB schema file. Changing what a unit charges needs
+/// these measurements repeated.
 const MAX_INHERITED_NODES: usize = 1 << 18;
+
+/// Most that the folds a schema can do without may copy in one schema set,
+/// in the units of [`MAX_INHERITED_NODES`].
+///
+/// A fold is one a schema can do without when it unrolls a recursive type,
+/// lies at [`REQUIRED_FOLD_DEPTH`] or deeper, or brings in a base further
+/// up a chain than [`REQUIRED_CHAIN_LINKS`]. Such folds are paid from this
+/// pool and never from the one that required folds use, so they cannot
+/// make a required fold fail; when the pool is empty, or the type being
+/// resolved has used its [`MAX_OPTIONAL_NODES_PER_TYPE`], they are left out
+/// without an error. Types are resolved in the order they are declared, so
+/// the pool goes to the first types that ask for it.
+///
+/// It bounds memory as [`MAX_INHERITED_NODES`] does and is the same size:
+/// a folded model holds at most the copies of both, 2^19 units, on top of
+/// the schema as written. The measured peaks are given there.
+const MAX_OPTIONAL_NODES: usize = MAX_INHERITED_NODES;
+
+/// Most that the folds a schema can do without may copy inside one named
+/// type or one global element, in the same units.
+///
+/// It keeps one type from emptying [`MAX_OPTIONAL_NODES`] for all the
+/// others. A type with two recursive children doubles its copies with every
+/// level, and is stopped here after 2^14 units (about 8 MiB) instead of the
+/// 2^17 copies sixteen levels ask for; a type with one recursive child of a
+/// thousand nodes is still unrolled to the full depth. Once a type has no
+/// allowance left none of its remaining folds of this kind are made.
+const MAX_OPTIONAL_NODES_PER_TYPE: usize = 1 << 14;
+
+/// Nesting from which a fold is one the schema can do without, and at which
+/// a recursive type is no longer unrolled.
+///
+/// A named type can hold an element whose inline type extends that same
+/// type, directly or through other types. That is legal, and folding it has
+/// no end by itself: the copied base holds the inline extension again.
+/// Sixteen is the nesting at which folding used to stop altogether, so a
+/// recursive type is unrolled as deep as it always was, and what is folded
+/// below this nesting is exactly what was folded then. Raising it deepens
+/// every later walk over the model (validation, Arrow derivation, `Clone`,
+/// `Drop`).
+const REQUIRED_FOLD_DEPTH: usize = 16;
+
+/// How many of a type's nearest bases are always folded into it.
+///
+/// A chain of bases used to be followed this far and no further. These
+/// links are paid from the required budget, so their cost can refuse a
+/// schema, exactly as it always could. Bases further away are a fold the
+/// schema can do without: they are folded while [`MAX_OPTIONAL_NODES`] and
+/// [`MAX_OPTIONAL_NODES_PER_TYPE`] last, and left out after that.
+const REQUIRED_CHAIN_LINKS: usize = 16;
+
+/// The two budgets inheritance folding draws on.
+struct FoldBudget {
+    /// For the folds a schema is wrong without; running out is an error.
+    required: InheritanceBudget,
+    /// For the folds it can do without; see [`MAX_OPTIONAL_NODES`].
+    optional: InheritanceBudget,
+    /// What the type now being resolved may still take from `optional`;
+    /// see [`MAX_OPTIONAL_NODES_PER_TYPE`].
+    allowance: usize,
+}
+
+impl FoldBudget {
+    /// Charges `cost` to the budget for folds a schema can do without.
+    ///
+    /// Returns `false`, with nothing spent, when the pool or the allowance
+    /// of the type being resolved cannot pay for it; the type then has no
+    /// allowance left.
+    fn charge_optional(&mut self, cost: CopyCost) -> bool {
+        let available = self.optional.remaining.min(self.allowance);
+        let mut budget = InheritanceBudget {
+            remaining: available,
+            uncharged_text_bytes: self.optional.uncharged_text_bytes,
+        };
+        if budget.charge(cost).is_err() {
+            self.allowance = 0;
+            return false;
+        }
+        let spent = available - budget.remaining;
+        self.optional.remaining -= spent;
+        self.optional.uncharged_text_bytes = budget.uncharged_text_bytes;
+        self.allowance -= spent;
+        true
+    }
+}
 
 /// Copies still allowed during one [`SchemaModel::try_resolve_inheritance`] pass.
 struct InheritanceBudget {
@@ -532,15 +709,6 @@ struct CopyCost {
 }
 
 impl CopyCost {
-    /// Cost of copying `particles`, nested inline types included.
-    ///
-    /// The recursion follows the nesting of the model.
-    fn of_particles(particles: &[Particle]) -> Self {
-        let mut cost = Self::default();
-        cost.add_particles(particles);
-        cost
-    }
-
     /// Cost of copying `attributes`.
     fn of_attributes(attributes: &[AttributeDecl]) -> Self {
         let mut cost = Self::default();
@@ -626,6 +794,9 @@ impl CopyCost {
         for name in complex.name.iter().chain(complex.base.iter()) {
             self.add_qname(name);
         }
+        for name in &complex.prohibited_attributes {
+            self.add_text(name);
+        }
         self.add_attributes(&complex.attributes);
         self.add_content(&complex.content);
     }
@@ -644,82 +815,146 @@ impl CopyCost {
     }
 }
 
-/// Maximum complex-type derivation depth chased during inheritance resolution.
+/// Deepest nesting of inline types and model groups folded in one type.
 ///
-/// Type extension chains are shallow in real schemas (schema bottoms out at two
-/// levels). The cap only exists to bound malformed/cyclic schemas; mirrors the
-/// bounded-recursion philosophy of the Arrow derivation walk.
-const MAX_INHERITANCE_DEPTH: usize = 16;
+/// Folding recurses once per level, and a fold can nest deeper than the
+/// schema text does: every base copied into an inline type brings its own
+/// inline types with it. A long run of different named types, each with an
+/// inline child extending the next, nests as deep as the run is long. What
+/// lies deeper than this is left as written, without an error: its inline
+/// types keep the particles and attributes they declare themselves.
+const MAX_INHERITANCE_NESTING: usize = 256;
 
 /// Resolve one complex type in place: fold its base, then recurse into inline
 /// children so nested `complexContent`/`extension` is resolved as well.
 ///
 /// `owner` is the type's own name (for named types), used to reject a base that
-/// points straight back at the type itself.
-fn resolve_complex_type(
+/// points straight back at the type itself. `depth` is the nesting of this
+/// type inside the named type being resolved; it has no bearing on how long
+/// a chain of bases is followed.
+///
+/// `folding` names the bases whose copied particles the walk is inside of.
+/// A base met again there is recursion: its fold is one the schema can do
+/// without, and is not made at [`REQUIRED_FOLD_DEPTH`] or deeper. A fold
+/// that is not made, for that reason or because its budget is spent, is
+/// left out without an error: the type keeps the particles and attributes
+/// it declares itself, and its `base`.
+fn resolve_complex_type<'a>(
     ct: &mut ComplexType,
     owner: Option<&str>,
-    originals: &IndexMap<String, ComplexType>,
+    originals: &'a IndexMap<String, ComplexType>,
     depth: usize,
-    budget: &mut InheritanceBudget,
+    folding: &mut Vec<&'a str>,
+    budget: &mut FoldBudget,
 ) -> anyhow::Result<()> {
-    // Fold the base chain into this type's content + attributes. A fresh
-    // visited stack (seeded with the owner) bounds cycles for this chain only.
+    if depth > MAX_INHERITANCE_NESTING {
+        return Ok(());
+    }
+    let outer = folding.len();
+    // How many of the type's particles are copies of its bases'.
+    let mut copied = 0;
+    // Fold the base chain into this type's content + attributes.
     if let Some(base) = ct.base.clone() {
-        let mut visited: Vec<String> = owner.map(|s| vec![s.to_string()]).unwrap_or_default();
-        if let Some((mut base_particles, mut base_attrs)) =
-            collect_base(&base.local, originals, &mut visited, depth, budget)?
-        {
-            match &mut ct.content {
-                // The type's own particles move behind the inherited ones.
-                ContentModel::Sequence(own) => {
-                    base_particles.append(own);
-                    *own = base_particles;
+        let recursive = folding.contains(&base.local.as_str());
+        let inherited = if depth < REQUIRED_FOLD_DEPTH && !recursive {
+            collect_base(
+                &base.local,
+                owner,
+                originals,
+                folding,
+                budget,
+                REQUIRED_CHAIN_LINKS,
+            )?
+        } else if depth < REQUIRED_FOLD_DEPTH || !recursive {
+            // Nothing of this fold is required, so it cannot fail.
+            collect_base(&base.local, owner, originals, folding, budget, 0)?
+        } else {
+            None
+        };
+        if let Some((mut base_particles, mut base_attrs, base_text)) = inherited {
+            if ct.derivation == Derivation::Restriction {
+                // A restriction states its particles itself; only the
+                // attributes come from the base, and the type of the text
+                // when the base has simple content and the restriction
+                // states no content of its own.
+                restrict_attributes(
+                    &mut base_attrs,
+                    std::mem::take(&mut ct.attributes),
+                    &ct.prohibited_attributes,
+                );
+                if let (ContentModel::Empty, Some(text)) = (&ct.content, base_text) {
+                    ct.content = ContentModel::SimpleContent(text);
                 }
-                // Pure extension that only adds attributes: keep the base's
-                // particles verbatim.
-                ContentModel::Empty => ct.content = ContentModel::Sequence(base_particles),
-                ContentModel::All(_) | ContentModel::Choice(_) | ContentModel::SimpleContent(_) => {
+            } else {
+                match &mut ct.content {
+                    // The type's own particles move behind the inherited ones.
+                    ContentModel::Sequence(own) => {
+                        copied = base_particles.len();
+                        base_particles.append(own);
+                        *own = base_particles;
+                    }
+                    // Pure extension that only adds attributes: keep the base's
+                    // particles verbatim.
+                    ContentModel::Empty => {
+                        copied = base_particles.len();
+                        ct.content = ContentModel::Sequence(base_particles);
+                    }
+                    ContentModel::All(_)
+                    | ContentModel::Choice(_)
+                    | ContentModel::SimpleContent(_) => {}
                 }
+                // Inherited attributes come first, then locally declared ones.
+                base_attrs.append(&mut ct.attributes);
             }
-            // Inherited attributes come first, then locally declared ones.
-            base_attrs.append(&mut ct.attributes);
             ct.attributes = base_attrs;
         }
     }
 
     // Recurse into inline complex types so nested extensions are resolved too.
-    if depth < MAX_INHERITANCE_DEPTH {
-        if let Some(particles) = content_particles_mut(&mut ct.content) {
-            for particle in particles {
-                resolve_element_ref(&mut particle.element, originals, depth + 1, budget)?;
+    // The bases just folded stay named while their copies are walked, and
+    // only then: the particles the type declares itself are
+    // not a copy of anything, so an extension of the same base among them is
+    // not recursion.
+    if let Some(particles) = content_particles_mut(&mut ct.content) {
+        for (position, particle) in particles.iter_mut().enumerate() {
+            if position == copied {
+                folding.truncate(outer);
             }
+            resolve_element_ref(&mut particle.element, originals, depth + 1, folding, budget)?;
         }
     }
+    folding.truncate(outer);
     Ok(())
 }
 
 /// Resolve any inline complex type reachable through one particle's element.
-fn resolve_element_ref(
+fn resolve_element_ref<'a>(
     element: &mut ElementRef,
-    originals: &IndexMap<String, ComplexType>,
+    originals: &'a IndexMap<String, ComplexType>,
     depth: usize,
-    budget: &mut InheritanceBudget,
+    folding: &mut Vec<&'a str>,
+    budget: &mut FoldBudget,
 ) -> anyhow::Result<()> {
-    if depth >= MAX_INHERITANCE_DEPTH {
+    if depth > MAX_INHERITANCE_NESTING {
         return Ok(());
     }
     match element {
         ElementRef::Inline(decl) => {
             if let XsdType::Complex(inner) = &mut decl.type_def {
                 // Inline types are anonymous; they have no name to self-reference.
-                resolve_complex_type(inner, None, originals, depth, budget)?;
+                resolve_complex_type(inner, None, originals, depth, folding, budget)?;
             }
         }
         ElementRef::Group(group) => {
             if let Some(particles) = content_particles_mut(group) {
                 for particle in particles {
-                    resolve_element_ref(&mut particle.element, originals, depth + 1, budget)?;
+                    resolve_element_ref(
+                        &mut particle.element,
+                        originals,
+                        depth + 1,
+                        folding,
+                        budget,
+                    )?;
                 }
             }
         }
@@ -728,48 +963,157 @@ fn resolve_element_ref(
     Ok(())
 }
 
-/// One base's effective particles and attributes, ancestors first.
-type Inherited = (Vec<Particle>, Vec<AttributeDecl>);
+/// One base's effective particles and attributes, ancestors first, and the
+/// type of its text when the base has simple content.
+type Inherited = (
+    Vec<Particle>,
+    Vec<AttributeDecl>,
+    Option<Box<SimpleTypeDef>>,
+);
 
-/// Collect a base type's effective particles and attributes, base-first,
-/// chasing the base chain transitively. Returns `None` if the base is unknown
-/// or already on the current chain (cycle).
+/// Collect a base type's effective particles and attributes, oldest ancestor
+/// first, following the chain of bases. Returns `None` if the base is
+/// unknown or is `owner`, the type being resolved, or if nothing of the
+/// chain can be paid for.
 ///
-/// Everything copied here is charged to `budget`, at its [`CopyCost`], before
-/// the copy is made.
-fn collect_base(
+/// The chain ends at a type with no base, at a base that is not a known
+/// complex type, or at a name already met (a cycle, which is broken there).
+/// Each type on it costs one unit and the [`CopyCost`] of what is copied
+/// from it, charged before anything is copied, nearest base first.
+///
+/// The nearest `required_links` types are paid from the required budget,
+/// and a chain that budget cannot pay for is an error. The types beyond
+/// them are paid from the budget for folds a schema can do without; the
+/// chain is cut, without an error, at the first one that budget cannot pay
+/// for, and the derived type then lacks what its furthest ancestors
+/// declare. The walk stops there too, so its length is bounded by what was
+/// paid.
+///
+/// The name of every type kept on the chain is appended to `folding`.
+fn collect_base<'a>(
     base_local: &str,
-    originals: &IndexMap<String, ComplexType>,
-    visited: &mut Vec<String>,
-    depth: usize,
-    budget: &mut InheritanceBudget,
+    owner: Option<&str>,
+    originals: &'a IndexMap<String, ComplexType>,
+    folding: &mut Vec<&'a str>,
+    budget: &mut FoldBudget,
+    required_links: usize,
 ) -> anyhow::Result<Option<Inherited>> {
-    if depth >= MAX_INHERITANCE_DEPTH || visited.iter().any(|v| v == base_local) {
+    // Nearest base first.
+    let mut chain: Vec<&ComplexType> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = owner.into_iter().collect();
+    let mut next = Some(base_local);
+    while let Some(name) = next {
+        if !seen.insert(name) {
+            break;
+        }
+        let Some((name, base)) = originals.get_key_value(name) else {
+            break;
+        };
+        // `seen` holds the map's own key from here on, which outlives `next`.
+        seen.insert(name.as_str());
+        let mut cost = CopyCost::of_attributes(&base.attributes);
+        cost.add_node();
+        if let ContentModel::Sequence(p) = &base.content {
+            cost.add_particles(p);
+        }
+        if chain.len() < required_links {
+            budget.required.charge(cost)?;
+        } else if !budget.charge_optional(cost) {
+            break;
+        }
+        chain.push(base);
+        folding.push(name.as_str());
+        next = base.base.as_ref().map(|base| base.local.as_str());
+    }
+    if chain.is_empty() {
         return Ok(None);
     }
-    let Some(base) = originals.get(base_local) else {
-        return Ok(None);
-    };
-    visited.push(base_local.to_string());
 
-    // Recurse first so deeper ancestors land before this base's own members.
     let mut particles: Vec<Particle> = Vec::new();
     let mut attrs: Vec<AttributeDecl> = Vec::new();
-    if let Some(grand) = base.base.as_ref() {
-        if let Some((gp, ga)) = collect_base(&grand.local, originals, visited, depth + 1, budget)? {
-            particles.extend(gp);
-            attrs.extend(ga);
+    // The simple content nearest to the derived type.
+    let mut text: Option<&SimpleTypeDef> = None;
+    for base in chain.into_iter().rev() {
+        if let ContentModel::SimpleContent(simple) = &base.content {
+            text = Some(simple);
+        }
+        let restricts = base.base.is_some() && base.derivation == Derivation::Restriction;
+        if restricts {
+            // A restriction on the chain replaces the particles of
+            // everything before it with the ones it states.
+            particles.clear();
+        }
+        if let ContentModel::Sequence(p) = &base.content {
+            particles.extend(p.iter().cloned());
+        }
+        if restricts {
+            restrict_attributes(
+                &mut attrs,
+                base.attributes.clone(),
+                &base.prohibited_attributes,
+            );
+        } else {
+            attrs.extend(base.attributes.iter().cloned());
         }
     }
-    if let ContentModel::Sequence(p) = &base.content {
-        budget.charge(CopyCost::of_particles(p))?;
-        particles.extend(p.iter().cloned());
-    }
-    budget.charge(CopyCost::of_attributes(&base.attributes))?;
-    attrs.extend(base.attributes.iter().cloned());
+    let text = match text {
+        Some(simple) => {
+            let mut cost = CopyCost::default();
+            cost.add_node();
+            cost.add_simple_type(simple);
+            let paid = if required_links > 0 {
+                budget.required.charge(cost)?;
+                true
+            } else {
+                budget.charge_optional(cost)
+            };
+            paid.then(|| Box::new(simple.clone()))
+        }
+        None => None,
+    };
+    Ok(Some((particles, attrs, text)))
+}
 
-    visited.pop();
-    Ok(Some((particles, attrs)))
+/// Applies a restriction's attribute declarations to the attributes it
+/// inherits.
+///
+/// An inherited attribute named in `prohibited` is removed. One the
+/// restriction declares again stays where it is and keeps the type the base
+/// gave it, with the restriction's `use` and whichever default and fixed
+/// value the restriction states. An attribute the base does not have is
+/// appended.
+fn restrict_attributes(
+    inherited: &mut Vec<AttributeDecl>,
+    own: Vec<AttributeDecl>,
+    prohibited: &[String],
+) {
+    if !prohibited.is_empty() {
+        let prohibited: std::collections::HashSet<&str> =
+            prohibited.iter().map(String::as_str).collect();
+        inherited.retain(|attribute| !prohibited.contains(attribute.name.as_str()));
+    }
+    let positions: std::collections::HashMap<String, usize> = inherited
+        .iter()
+        .enumerate()
+        .map(|(position, attribute)| (attribute.name.clone(), position))
+        .collect();
+    for attribute in own {
+        match positions
+            .get(&attribute.name)
+            .and_then(|position| inherited.get_mut(*position))
+        {
+            Some(existing) => {
+                existing.required = attribute.required;
+                if attribute.default.is_some() {
+                    existing.default = attribute.default;
+                }
+                if attribute.fixed.is_some() {
+                    existing.fixed = attribute.fixed;
+                }
+            }
+            None => inherited.push(attribute),
+        }
+    }
 }
 
 /// Mutable access to a content model's particles, for the variants that carry them.

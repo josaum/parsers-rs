@@ -18,8 +18,8 @@ const PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationsh
 /// What is written into each place of the fixture document.
 ///
 /// `text` is element content and goes to every text path at once; a text
-/// path never fails the parse. Each attribute has its own field because a
-/// rejected attribute value fails the whole document.
+/// path never fails the parse. Each attribute has its own field so that
+/// each attribute reader is observed on its own.
 #[derive(Clone)]
 struct Samples<'a> {
     text: &'a str,
@@ -405,10 +405,113 @@ fn references_resolve_in_attributes() {
 }
 
 #[test]
-fn an_attribute_with_a_reference_that_cannot_be_resolved_rejects_the_document() {
-    assert_attribute("x &foo; y", None);
-    assert_attribute("n&#0;m", None);
-    assert_attribute("AT&T", None);
+fn an_attribute_with_a_reference_that_cannot_be_resolved_is_kept_as_written() {
+    assert_attribute("x &foo; y", Some("x &foo; y"));
+    assert_attribute("n&#0;m", Some("n&#0;m"));
+    assert_attribute("AT&T", Some("AT&T"));
+    // The references around the bad one still resolve, and literal white
+    // space is still normalized.
+    assert_attribute("a &amp; b &foo; c&#233;\td", Some("a & b &foo; c\u{e9} d"));
+}
+
+/// A document whose every other attribute reader meets `bad`: section
+/// references, content types, numbering, notes, style fonts and the
+/// extended comments part.
+fn other_readers(bad: &str) -> Result<DocxDocument, String> {
+    let body = format!(
+        r#"<w:body><w:p><w:pPr><w:pStyle w:val="{bad}"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:rPr><w:rFonts w:ascii="{bad}"/></w:rPr><w:t>body</w:t></w:r><w:r><w:sym w:font="{bad}" w:char="0041"/></w:r></w:p><w:sectPr><w:headerReference w:type="{bad}" r:id="rId8"/></w:sectPr></w:body>"#
+    );
+    let parts: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "[Content_Types].xml",
+            format!(
+                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml{bad}"/><Override PartName="/word/document.xml" ContentType="main{bad}"/></Types>"#
+            )
+            .into_bytes(),
+        ),
+        (
+            "_rels/.rels",
+            format!(
+                r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="word/document.xml"/></Relationships>"#
+            )
+            .into_bytes(),
+        ),
+        ("word/document.xml", w_part("document", &body)),
+        (
+            "word/_rels/document.xml.rels",
+            format!(
+                r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/styles" Target="styles.xml"/><Relationship Id="rId2" Type="{REL}/numbering" Target="numbering.xml"/><Relationship Id="rId3" Type="{REL}/footnotes" Target="footnotes.xml"/><Relationship Id="rId5" Type="{REL}/comments" Target="comments.xml"/><Relationship Id="rId6" Type="http://schemas.microsoft.com/office/2011/relationships/commentsExtended" Target="commentsExtended.xml"/><Relationship Id="rId8" Type="{REL}/header" Target="header1.xml"/></Relationships>"#
+            )
+            .into_bytes(),
+        ),
+        (
+            "word/styles.xml",
+            w_part(
+                "styles",
+                &format!(
+                    r#"<w:style w:type="paragraph" w:styleId="S1"><w:name w:val="Name"/><w:basedOn w:val="{bad}"/><w:rPr><w:rFonts w:ascii="{bad}"/></w:rPr></w:style>"#
+                ),
+            ),
+        ),
+        (
+            "word/numbering.xml",
+            w_part(
+                "numbering",
+                &format!(
+                    r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="{bad}"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#
+                ),
+            ),
+        ),
+        (
+            "word/footnotes.xml",
+            w_part(
+                "footnotes",
+                &format!(
+                    r#"<w:footnote w:id="1" w:type="{bad}"><w:p/></w:footnote><w:footnote w:id="2"><w:p><w:pPr><w:pStyle w:val="{bad}"/></w:pPr><w:r><w:t>note</w:t></w:r></w:p></w:footnote>"#
+                ),
+            ),
+        ),
+        (
+            "word/comments.xml",
+            w_part(
+                "comments",
+                r#"<w:comment w:id="1" w:author="A"><w:p w14:paraId="P1"><w:r><w:t>c</w:t></w:r></w:p></w:comment>"#,
+            ),
+        ),
+        (
+            "word/commentsExtended.xml",
+            format!(
+                r#"<w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w15:commentEx w15:paraId="P1" w15:paraIdParent="{bad}" w15:done="0"/></w15:commentsEx>"#
+            )
+            .into_bytes(),
+        ),
+        (
+            "word/header1.xml",
+            w_part("hdr", "<w:p><w:r><w:t>head</w:t></w:r></w:p>"),
+        ),
+    ];
+    parse_docx_bytes(package(&parts), ParseOptions::default()).map_err(|error| error.to_string())
+}
+
+#[test]
+fn a_bad_attribute_reference_survives_in_every_other_reader() {
+    for bad in ["x &foo; y", "n&#0;m", "AT&T"] {
+        let doc = other_readers(bad).unwrap_or_else(|error| panic!("{bad:?}: {error}"));
+        // Numbering: the level text is the attribute as written.
+        assert_eq!(
+            doc.numbering.abstract_nums[0].levels[0].text.as_deref(),
+            Some(bad),
+            "numbering level text"
+        );
+        // Styles: the base style name.
+        assert_eq!(doc.styles[0].based_on.as_deref(), Some(bad), "style base");
+        // Notes, the body (paragraph style, run fonts, w:sym), the section
+        // reference and the comments are all still read.
+        // A note whose type is not `normal` is not a user note, as before.
+        assert_eq!(doc.footnotes.len(), 1, "footnotes");
+        assert_eq!(doc.comments.len(), 1, "comments");
+        assert!(first_paragraph(&doc.blocks).starts_with("body"), "body");
+    }
 }
 
 // XML attribute-value normalization: a literal tab or line break in an
@@ -511,7 +614,11 @@ fn whitespace_between_property_elements_is_not_a_value() {
         );
         assert_eq!(
             sorted(&doc.metadata.app),
-            [("Company", "Acme & Co"), ("Pages", "3"), ("lpstr", "Title")],
+            [
+                ("Company", "Acme & Co"),
+                ("Pages", "3"),
+                ("TitlesOfParts", "Title")
+            ],
             "app with gap {gap:?}"
         );
         assert_eq!(
@@ -521,4 +628,107 @@ fn whitespace_between_property_elements_is_not_a_value() {
         );
         assert_eq!(doc.page_count, Some(3));
     }
+}
+
+// A property whose value is a vector is keyed by the property, not by the
+// type of its items, and holds every item, one per line, in document order.
+#[test]
+fn a_nested_app_property_is_keyed_by_the_property_that_holds_it() {
+    let app = [
+        &format!("<Properties {APP_NS}>"),
+        "<Company>Acme</Company>",
+        "<HeadingPairs><vt:vector size=\"4\" baseType=\"variant\">",
+        "<vt:variant><vt:lpstr>Title</vt:lpstr></vt:variant>",
+        "<vt:variant><vt:i4>1</vt:i4></vt:variant>",
+        "<vt:variant><vt:lpstr>Headings</vt:lpstr></vt:variant>",
+        "<vt:variant><vt:i4>2</vt:i4></vt:variant>",
+        "</vt:vector></HeadingPairs>",
+        "<TitlesOfParts><vt:vector size=\"3\" baseType=\"lpstr\">",
+        "<vt:lpstr>Report</vt:lpstr><vt:lpstr>Scope</vt:lpstr><vt:lpstr>R&amp;D</vt:lpstr>",
+        "</vt:vector></TitlesOfParts>",
+        "<AppVersion>16.0000</AppVersion>",
+        "</Properties>",
+    ]
+    .concat()
+    .into_bytes();
+    let bytes = package(&[
+        (
+            "word/document.xml",
+            w_part("document", "<w:body><w:p/></w:body>"),
+        ),
+        ("docProps/app.xml", app),
+    ]);
+    let doc = parse_docx_bytes(bytes, ParseOptions::default()).expect("document parses");
+    assert_eq!(
+        sorted(&doc.metadata.app),
+        [
+            ("AppVersion", "16.0000"),
+            ("Company", "Acme"),
+            ("HeadingPairs", "Title\n1\nHeadings\n2"),
+            ("TitlesOfParts", "Report\nScope\nR&D"),
+        ]
+    );
+}
+
+/// The app properties of a document whose `docProps/app.xml` is `app`.
+fn app_properties(app: &str) -> std::collections::HashMap<String, String> {
+    let bytes = package(&[
+        (
+            "word/document.xml",
+            w_part("document", "<w:body><w:p/></w:body>"),
+        ),
+        ("docProps/app.xml", app.as_bytes().to_vec()),
+    ]);
+    parse_docx_bytes(bytes, ParseOptions::default())
+        .expect("document parses")
+        .metadata
+        .app
+}
+
+// Every item of a vector is one line, empty or not, so the items can be
+// counted and paired with `HeadingPairs` again.
+#[test]
+fn an_empty_item_of_a_nested_app_property_keeps_its_line() {
+    let app = app_properties(&format!(
+        "<?xml version=\"1.0\"?><Properties {APP_NS}><Company>ACo</Company><HeadingPairs><vt:vector size=\"4\" baseType=\"variant\"><vt:variant><vt:lpstr>Title</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant><vt:variant><vt:lpstr>Headings</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size=\"3\" baseType=\"lpstr\"><vt:lpstr></vt:lpstr><vt:lpstr>Scope</vt:lpstr><vt:lpstr/></vt:vector></TitlesOfParts><lpstr>toplevel</lpstr><Pages>3</Pages></Properties>"
+    ));
+    assert_eq!(
+        sorted(&app),
+        [
+            ("Company", "ACo"),
+            ("HeadingPairs", "Title\n1\nHeadings\n2"),
+            ("Pages", "3"),
+            ("TitlesOfParts", "\nScope\n"),
+            ("lpstr", "toplevel"),
+        ]
+    );
+
+    // A vector of nothing but empty items is still there, with its count.
+    let app = app_properties(&format!(
+        "<Properties {APP_NS}><TitlesOfParts><vt:vector size=\"3\" baseType=\"lpstr\">\n  <vt:lpstr></vt:lpstr>\n  <vt:lpstr/>\n  <vt:lpstr>\n  </vt:lpstr>\n</vt:vector></TitlesOfParts><Single><vt:vector size=\"1\" baseType=\"lpstr\"><vt:lpstr/></vt:vector></Single><None><vt:vector size=\"0\" baseType=\"lpstr\"/></None></Properties>"
+    ));
+    assert_eq!(sorted(&app), [("Single", ""), ("TitlesOfParts", "\n\n")]);
+}
+
+// A line break inside an item reads as a space, so a line is always one
+// item. Properties that are not nested are read as before.
+#[test]
+fn a_line_break_inside_a_nested_item_does_not_split_it() {
+    let app = app_properties(&format!(
+        "<?xml version=\"1.0\"?><Properties {APP_NS}><Company>ACo</Company><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>Line1\nLine2</vt:lpstr><vt:lpstr>2024-01-02T03:04:05Z</vt:lpstr></vt:vector></TitlesOfParts><Company>Second</Company><Mixed>text<vt:lpstr>inner</vt:lpstr>tail</Mixed><Notes>one\r\ntwo&#10;three</Notes></Properties>"
+    ));
+    assert_eq!(
+        sorted(&app),
+        [
+            ("Company", "Second"),
+            ("Mixed", "text\ninner"),
+            ("Notes", "one\r\ntwo\nthree"),
+            ("TitlesOfParts", "Line1 Line2\n2024-01-02T03:04:05+00:00"),
+        ]
+    );
+
+    let app = app_properties(&format!(
+        "<Properties {APP_NS}><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>a\r\nb&#10;c&#13;d</vt:lpstr><vt:lpstr>e</vt:lpstr></vt:vector></TitlesOfParts></Properties>"
+    ));
+    assert_eq!(sorted(&app), [("TitlesOfParts", "a b c d\ne")]);
 }

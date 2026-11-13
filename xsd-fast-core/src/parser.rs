@@ -18,7 +18,7 @@ use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 
 use crate::schema::{
-    AttributeDecl, ComplexType, ContentModel, ElementDecl, ElementRef, EnumValue,
+    AttributeDecl, ComplexType, ContentModel, Derivation, ElementDecl, ElementRef, EnumValue,
     OccurrenceConstraint, Particle, QName, SchemaModel, SimpleFacets, SimpleTypeDef,
     SimpleTypeKind, XsdType,
 };
@@ -404,6 +404,20 @@ impl Loader {
 
         match local.as_str() {
             "include" | "import" => return self.include_target(e),
+            // A self-closing named type declares a type with nothing in it:
+            // no content and no attributes, or no restriction.
+            "complexType" if file.in_schema => {
+                if let Some(name) = collect_attrs(e).remove("name") {
+                    self.model.complex_types.insert(name, empty_complex_type());
+                }
+            }
+            "simpleType" if file.in_schema => {
+                if let Some(name) = collect_attrs(e).remove("name") {
+                    let mut simple = SimpleTypeDef::string_unbounded();
+                    simple.name = Some(QName::local(name.as_str()));
+                    self.model.simple_types.insert(name, simple);
+                }
+            }
             "element" if file.in_schema => {
                 let attrs = collect_attrs(e);
                 // Self-closing top-level element with type= attribute.
@@ -585,13 +599,20 @@ fn unbounded_string_type() -> Box<XsdType> {
     Box::new(XsdType::Simple(SimpleTypeDef::string_unbounded()))
 }
 
-/// A complex type with no content, no attributes and no base.
+/// A complex type with no content, no attributes and no base, as
+/// `<xs:complexType/>` declares it.
+///
+/// It is marked empty in the source; [`parse_complex_type_into`] takes the
+/// mark away at the first child that is not an annotation.
 fn empty_complex_type() -> ComplexType {
     ComplexType {
         name: None,
         content: ContentModel::Empty,
         attributes: Vec::new(),
         base: None,
+        derivation: Derivation::default(),
+        prohibited_attributes: Vec::new(),
+        empty_in_source: true,
         content_occurrence: OccurrenceConstraint::default(),
     }
 }
@@ -627,6 +648,10 @@ fn parse_complex_type_into(
         match next_tag(reader, &mut buf, "complexType")? {
             Tag::Start { local, attrs } => {
                 depth += 1;
+                // Anything but an annotation is content, modelled or not.
+                if local != "annotation" {
+                    complex_type.empty_in_source = false;
+                }
                 match local.as_str() {
                     "sequence" => {
                         complex_type.content_occurrence = parse_occurrence(&attrs);
@@ -679,6 +704,9 @@ fn parse_complex_type_into(
                 }
             }
             Tag::Empty { local, attrs } => {
+                if local != "annotation" {
+                    complex_type.empty_in_source = false;
+                }
                 if local == "attribute" {
                     push_attribute_decl(&attrs, None, ns_map, &mut complex_type.attributes);
                 }
@@ -721,10 +749,8 @@ fn parse_particles(
                     }
                 }
                 "sequence" => {
-                    // A nested sequence is order-equivalent to inlining its
-                    // particles, so flatten it into the parent.
                     let inner = parse_particles(reader, ns_map, "sequence", depth + 1)?;
-                    particles.extend(inner);
+                    push_nested_sequence(&attrs, inner, &mut particles);
                 }
                 "choice" => {
                     // A nested choice is a discriminated union; preserve it
@@ -1031,6 +1057,29 @@ fn push_choice_group(
     });
 }
 
+/// Appends what a nested `<xs:sequence>` holds.
+///
+/// A sequence that occurs exactly once is order-equivalent to its particles
+/// written in the parent, and is flattened into it. With any other
+/// occurrence it is kept as one group particle: an optional sequence may be
+/// left out whole, required children included, which its particles written
+/// in the parent could not say.
+fn push_nested_sequence(
+    attrs: &HashMap<String, String>,
+    inner: Vec<Particle>,
+    particles: &mut Vec<Particle>,
+) {
+    let occurrence = parse_occurrence(attrs);
+    if occurrence == OccurrenceConstraint::default() {
+        particles.extend(inner);
+    } else {
+        particles.push(Particle {
+            occurrence,
+            element: ElementRef::Group(Box::new(ContentModel::Sequence(inner))),
+        });
+    }
+}
+
 /// Appends the declaration for an `<xs:attribute>`, if it has a name.
 ///
 /// `inline_type` is the `<xs:simpleType>` written inside the attribute, if any.
@@ -1074,11 +1123,15 @@ fn parse_attribute_children(
 
 /// Parses a `simpleContent`/`complexContent` element into `complex_type`.
 ///
-/// Sets the locally declared content and, for an extension against a
-/// *complex* base, the base's qualified name so
-/// [`SchemaModel::resolve_inheritance`] can fold the inherited particles and
-/// attributes in afterwards. Simple-content and unknown extensions leave the
-/// base unset.
+/// Sets the locally declared content and attributes and, for a derivation
+/// from a *complex* base, the base's qualified name so
+/// [`SchemaModel::resolve_inheritance`] can fold the base in afterwards:
+/// particles and attributes for an extension, attributes only for a
+/// `complexContent` restriction, which keeps the particles it states itself,
+/// and attributes and the type of the text for a `simpleContent`
+/// restriction. The attributes a restriction prohibits are recorded by name
+/// and are not attributes of the type. An extension or restriction of a
+/// built-in type and a restriction of `xs:anyType` leave the base unset.
 ///
 /// [`SchemaModel::resolve_inheritance`]: crate::schema::SchemaModel::resolve_inheritance
 fn parse_content_extension(
@@ -1091,23 +1144,66 @@ fn parse_content_extension(
     check_nesting(depth)?;
     complex_type.content = ContentModel::Empty;
     complex_type.base = None;
+    complex_type.derivation = Derivation::default();
     let mut buf = Vec::new();
     loop {
         match next_tag(reader, &mut buf, "content extension")? {
             Tag::Start { local, attrs } => match local.as_str() {
                 "extension" => {
-                    if let Some(content) = simple_extension_content(&attrs, ns_map) {
-                        skip_element(reader, "extension")?;
-                        skip_element(reader, outer_tag)?;
-                        complex_type.content = content;
-                        return Ok(());
-                    }
-                    // Complex base: record the base name so inheritance can
-                    // be resolved later, and keep the locally added particles.
-                    let particles = parse_particles(reader, ns_map, "extension", depth + 1)?;
+                    let mut particles = Vec::new();
+                    parse_derivation_children(
+                        reader,
+                        ns_map,
+                        "extension",
+                        depth + 1,
+                        &mut particles,
+                        &mut complex_type.attributes,
+                        None,
+                    )?;
                     skip_element(reader, outer_tag)?;
-                    complex_type.content = ContentModel::Sequence(particles);
-                    complex_type.base = Some(extension_base(&attrs));
+                    if let Some(content) = simple_extension_content(&attrs, ns_map) {
+                        complex_type.content = content;
+                    } else {
+                        // Complex base: record the base name so inheritance
+                        // can be resolved later, and keep the locally added
+                        // particles.
+                        complex_type.content = ContentModel::Sequence(particles);
+                        complex_type.base = Some(extension_base(&attrs));
+                    }
+                    return Ok(());
+                }
+                "restriction" => {
+                    let mut particles = Vec::new();
+                    parse_derivation_children(
+                        reader,
+                        ns_map,
+                        "restriction",
+                        depth + 1,
+                        &mut particles,
+                        &mut complex_type.attributes,
+                        Some(&mut complex_type.prohibited_attributes),
+                    )?;
+                    skip_element(reader, outer_tag)?;
+                    if outer_tag == "simpleContent" {
+                        // The text keeps the kind of a built-in base. The
+                        // facets the restriction adds are not read. Any
+                        // other base is a complex type with simple content:
+                        // it is recorded, and its text and attributes are
+                        // folded in afterwards.
+                        if let Some(content) = simple_extension_content(&attrs, ns_map) {
+                            complex_type.content = content;
+                        } else {
+                            record_restriction_base(&attrs, ns_map, complex_type);
+                        }
+                    } else {
+                        // A restriction states its particles again, so they
+                        // stay as written. Its attributes are the base's,
+                        // which is recorded for that.
+                        if !particles.is_empty() {
+                            complex_type.content = ContentModel::Sequence(particles);
+                        }
+                        record_restriction_base(&attrs, ns_map, complex_type);
+                    }
                     return Ok(());
                 }
                 other => skip_element(reader, other)?,
@@ -1122,6 +1218,11 @@ fn parse_content_extension(
                         complex_type.content = ContentModel::Sequence(Vec::new());
                         complex_type.base = Some(extension_base(&attrs));
                     }
+                } else if local == "restriction"
+                    && (outer_tag == "complexContent"
+                        || simple_extension_content(&attrs, ns_map).is_none())
+                {
+                    record_restriction_base(&attrs, ns_map, complex_type);
                 }
             }
             Tag::End { local } => {
@@ -1133,6 +1234,104 @@ fn parse_content_extension(
         }
     }
     Ok(())
+}
+
+/// Reads the children of an `<xs:extension>` or `<xs:restriction>` up to and
+/// including its end tag, `end_tag`.
+///
+/// Model groups are appended to `particles` as they are inside a sequence:
+/// a sequence or an `xs:all` by its particles (or as a group when it does not
+/// occur exactly once), a choice as a group. Attribute declarations are
+/// appended to `attributes`. Anything else (annotations, facets, attribute
+/// group references, wildcards) is skipped.
+///
+/// With `prohibited`, which a restriction passes, an attribute declared with
+/// `use="prohibited"` is not appended to `attributes`: its name goes to
+/// `prohibited` instead.
+fn parse_derivation_children(
+    reader: &mut Reader<&[u8]>,
+    ns_map: &HashMap<String, String>,
+    end_tag: &str,
+    depth: usize,
+    particles: &mut Vec<Particle>,
+    attributes: &mut Vec<AttributeDecl>,
+    mut prohibited: Option<&mut Vec<String>>,
+) -> Result<()> {
+    check_nesting(depth)?;
+    let mut buf = Vec::new();
+    loop {
+        match next_tag(reader, &mut buf, "derivation")? {
+            Tag::Start { local, attrs } => match local.as_str() {
+                "sequence" | "all" => {
+                    let inner = parse_particles(reader, ns_map, &local, depth + 1)?;
+                    push_nested_sequence(&attrs, inner, particles);
+                }
+                "choice" => {
+                    let inner = parse_particles(reader, ns_map, "choice", depth + 1)?;
+                    push_choice_group(&attrs, inner, particles);
+                }
+                "attribute" => {
+                    let inline_type = parse_attribute_children(reader, ns_map)?;
+                    if !push_prohibited(&attrs, prohibited.as_deref_mut()) {
+                        push_attribute_decl(&attrs, inline_type, ns_map, attributes);
+                    }
+                }
+                other => skip_element(reader, other)?,
+            },
+            Tag::Empty { local, attrs } => {
+                if local == "attribute" && !push_prohibited(&attrs, prohibited.as_deref_mut()) {
+                    push_attribute_decl(&attrs, None, ns_map, attributes);
+                }
+            }
+            // Every nested element is read to its end above, so the first
+            // end tag met here closes the derivation itself.
+            Tag::End { local } => {
+                if local == end_tag {
+                    break;
+                }
+            }
+            Tag::Eof => break,
+        }
+    }
+    Ok(())
+}
+
+/// Records the name of an `<xs:attribute use="prohibited">` in `prohibited`.
+///
+/// Returns whether the attribute was taken: `false` when it is not
+/// prohibited, or when the caller keeps no list of prohibited names.
+fn push_prohibited(attrs: &HashMap<String, String>, prohibited: Option<&mut Vec<String>>) -> bool {
+    let Some(prohibited) = prohibited else {
+        return false;
+    };
+    if attrs.get("use").is_none_or(|u| u != "prohibited") {
+        return false;
+    }
+    if let Some(name) = attrs.get("name") {
+        prohibited.push(name.clone());
+    }
+    true
+}
+
+/// Records the complex base of a restriction.
+///
+/// A restriction of the built-in `xs:anyType` has no base to take attributes
+/// from, and neither has one that names no base.
+fn record_restriction_base(
+    attrs: &HashMap<String, String>,
+    ns_map: &HashMap<String, String>,
+    complex_type: &mut ComplexType,
+) {
+    let base = attrs.get("base").map_or("", String::as_str);
+    let (prefix, local) = split_prefix(base);
+    let namespace = prefix
+        .and_then(|prefix| ns_map.get(prefix))
+        .map_or("", String::as_str);
+    if local.is_empty() || (local == "anyType" && is_xs_ns(namespace)) {
+        return;
+    }
+    complex_type.base = Some(QName::local(local));
+    complex_type.derivation = Derivation::Restriction;
 }
 
 /// Local name of the type an `<xs:extension>` derives from; empty without `base`.
