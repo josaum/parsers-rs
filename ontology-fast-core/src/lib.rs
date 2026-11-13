@@ -33,6 +33,22 @@
 //! left to isomorphism. The refusals fail closed with [`OntologyError`].
 //! Nothing here reads a source system, signs data, or promotes a fact: parsing
 //! preserves structure and provenance, and the output is unsigned.
+//!
+//! # Limits
+//!
+//! Each limit bounds one thing, and none of them is a bound on "parser state"
+//! as a whole:
+//!
+//! * [`OntologyLimits::max_source_bytes`] — the input accepted.
+//! * [`OntologyLimits::max_statements`] — the distinct statements a result
+//!   holds; not the statements read, and not applied to [`declared_prefixes`].
+//! * [`MAX_NESTING_DEPTH`] — the parser's heap state for open brackets; not
+//!   the call stack.
+//! * [`MAX_TRIPLE_TERM_DEPTH`] — the call stack nested triple terms add; not
+//!   the parser's whole stack, which has a fixed cost of its own.
+//! * [`TERM_BYTES_PER_SOURCE_BYTE`] — the term text copied out of the parser
+//!   for the two parsing entry points; not resident memory, and not applied
+//!   to [`declared_prefixes`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, RandomState};
@@ -111,8 +127,10 @@ pub const MAX_NESTING_DEPTH: usize = 10_000;
 /// are held by [`MAX_NESTING_DEPTH`] alone.
 ///
 /// Like [`MAX_NESTING_DEPTH`], the guard is the scan of the bytes that runs
-/// first: it counts the `<<(` tokens open at once, which is at least the
-/// depth of any term the parser builds. A [`parse_turtle`] or
+/// first: it counts the `<<(` tokens open at once. The deepest term the
+/// parser builds is that count or one more: a reified triple or an annotation
+/// around a triple term states `rdf:reifies` of it, which wraps it once, and
+/// reifiers themselves are blank nodes and do not nest. A [`parse_turtle`] or
 /// [`parse_turtle_terms`] call still refuses every triple term within the
 /// limit with [`OntologyError::TripleTerm`]; only [`declared_prefixes`] reads
 /// such a document.
