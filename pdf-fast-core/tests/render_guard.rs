@@ -460,7 +460,9 @@ fn deep_chains_through_every_other_route_are_refused() {
 
 #[test]
 fn ordinary_use_of_every_route_still_renders() {
-    for depth in [1usize, 8, 12] {
+    // 100 nested forms need about 2 MiB of unoptimized interpreter stack,
+    // more than a test thread has: it renders on a stack of its own.
+    for depth in [1usize, 8, 12, 100] {
         assert_renders(&format!("form chain {depth}"), &form_chain(depth));
     }
     assert_renders("annotation", &annotation_appearance(1));

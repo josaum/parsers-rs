@@ -993,12 +993,6 @@ impl PdfDocument {
         page_object: (u32, u16),
         dpi: f32,
     ) -> Result<Option<Vec<u8>>> {
-        use hayro::hayro_interpret::InterpreterSettings;
-        use hayro::hayro_syntax::object::ObjectIdentifier;
-        use hayro::hayro_syntax::Pdf;
-        use hayro::RenderSettings;
-        use std::sync::Arc;
-
         if !dpi.is_finite() || !(1.0..=600.0).contains(&dpi) {
             return Ok(None);
         }
@@ -1018,7 +1012,48 @@ impl PdfDocument {
         self.decoded_byte_budget
             .charge_resource_bytes(reserved_before_render)?;
 
+        // The interpreter recurses, and a stack overflow aborts the process
+        // rather than unwinding. Run it on a thread whose stack size is
+        // known, so the guard's budget does not depend on how much stack the
+        // caller happens to have left. The stack is reserved address space;
+        // the system commits pages only as they are touched. If the thread
+        // cannot be created the render fails: it never falls back to the
+        // caller's stack.
         let pdf_bytes = self.bytes().to_vec();
+        let budget = &self.decoded_byte_budget;
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("pdf-fast-render".to_string())
+                .stack_size(render_guard::RENDER_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    Self::interpret_on_render_stack(budget, pdf_bytes, page_object, dpi)
+                })
+                .map_err(|error| {
+                    anyhow!("interpreted render refused: no render thread ({error})")
+                })?;
+            match worker.join() {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
+    }
+
+    /// Opens the document with the full interpreter, vets the page and
+    /// renders it. Must run on a stack of
+    /// [`render_guard::RENDER_STACK_BYTES`].
+    #[cfg(feature = "rasterize")]
+    fn interpret_on_render_stack(
+        budget: &DecodedByteBudget,
+        pdf_bytes: Vec<u8>,
+        page_object: (u32, u16),
+        dpi: f32,
+    ) -> Result<Option<Vec<u8>>> {
+        use hayro::hayro_interpret::InterpreterSettings;
+        use hayro::hayro_syntax::object::ObjectIdentifier;
+        use hayro::hayro_syntax::Pdf;
+        use hayro::RenderSettings;
+        use std::sync::Arc;
+
         let Ok(pdf) = Pdf::new(Arc::new(pdf_bytes)) else {
             return Ok(None);
         };
@@ -1057,17 +1092,17 @@ impl PdfDocument {
         }
         let pixel_count = u64::from(px_width)
             .checked_mul(u64::from(px_height))
-            .ok_or_else(|| self.decoded_byte_budget.total_limit_error())?;
+            .ok_or_else(|| budget.total_limit_error())?;
         if pixel_count > 100_000_000 {
             return Ok(None);
         }
         let rgba_bytes = usize::try_from(
             pixel_count
                 .checked_mul(4)
-                .ok_or_else(|| self.decoded_byte_budget.total_limit_error())?,
+                .ok_or_else(|| budget.total_limit_error())?,
         )
-        .map_err(|_| self.decoded_byte_budget.total_limit_error())?;
-        self.decoded_byte_budget.charge_resource_bytes(rgba_bytes)?;
+        .map_err(|_| budget.total_limit_error())?;
+        budget.charge_resource_bytes(rgba_bytes)?;
         let settings = RenderSettings {
             x_scale: scale,
             y_scale: scale,
@@ -1082,9 +1117,7 @@ impl PdfDocument {
         if rgba.len() != rgba_bytes {
             return Err(anyhow!("Hayro raster size changed after bounded preflight"));
         }
-        self.decoded_byte_budget
-            .encode_rgba_png(rgba, width, height)
-            .map(Some)
+        budget.encode_rgba_png(rgba, width, height).map(Some)
     }
 
     /// Extract the largest embedded image from a page (JPEG, JBIG2, etc.).

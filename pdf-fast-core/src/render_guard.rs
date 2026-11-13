@@ -31,12 +31,19 @@ use hayro::hayro_syntax::page::{Page, Resources};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// Stack the interpreter may need for one page, in bytes.
+/// Stack given to the thread that opens, vets and renders a page.
 ///
-/// Sized so that a render refused here would not have fit on a 512 KiB thread
-/// stack, the smallest this crate is expected to render on, with a quarter
-/// left for the caller's own frames and for whatever the rasterizer does at
-/// the bottom of the deepest stream.
+/// The interpreter recurses and an overflow aborts the process, so it never
+/// runs on the caller's stack, whose remaining size nobody knows. This is
+/// reserved address space, not memory: the system commits a page only when
+/// it is first touched, so a shallow page touches a few hundred kilobytes.
+pub(crate) const RENDER_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Stack the interpreter may need for one page's nested content streams.
+///
+/// One eighth of [`RENDER_STACK_BYTES`]. The rest is margin for the
+/// recursion this budget does not count: the rasterizer at the bottom of the
+/// deepest stream and the interpreter's recursion over objects.
 ///
 /// The costs below were measured with `probe_interpreter_stack` in
 /// `tests/render_guard.rs`, which renders a chain of nested streams on a
@@ -45,7 +52,7 @@ use std::rc::Rc;
 /// Measured against hayro 0.5.0 on aarch64 macOS (deepest surviving chain at
 /// 512 KiB / 2 MiB, then bytes per level):
 ///
-/// | route        | debug               | release             |
+/// | route        | unoptimized         | optimized           |
 /// |--------------|---------------------|---------------------|
 /// | form `Do`    | 21 / 106, 18,504    | 127 / 504, 4,172    |
 /// | annotation   | 22 / 107, 18,504    | same code as a form |
@@ -53,51 +60,31 @@ use std::rc::Rc;
 /// | soft mask    | 17 / 84, 23,476     | 70 / 280, 7,490     |
 /// | Type 3 glyph | 13 / 67, 29,127     | 82 / 327, 6,420     |
 ///
-/// What is left of 512 KiB after the levels is the fixed cost: about 146,000
-/// bytes in a debug build and too little to measure in a release build.
-/// Each constant below is its figure rounded up, chosen by build profile
-/// because an unoptimized interpreter uses over four times the stack. With
-/// these numbers a debug build accepts 12 nested forms (21 survive at
-/// 512 KiB) and a release build 87 (127 survive).
+/// The fixed cost left over is about 146,000 bytes unoptimized. Every
+/// profile uses the unoptimized figures, rounded up: how this crate was
+/// compiled says nothing reliable about how the interpreter was. With them
+/// the budget accepts 433 nested forms ((8,388,608 - 150,000) / 19,000),
+/// 294 tiling cells or 343 soft masks, each needing at most 8 MiB of the
+/// 64 MiB stack.
 ///
 /// Raising the budget or lowering a cost without re-measuring trades a
 /// refused render for an aborted process. So does upgrading the interpreter.
-const STACK_BUDGET: u32 = 384 * 1024;
+const STACK_BUDGET: u32 = 8 * 1024 * 1024;
 
 /// Stack held before the page's own content stream starts.
-const PAGE_COST: u32 = if cfg!(debug_assertions) {
-    150_000
-} else {
-    16_000
-};
+const PAGE_COST: u32 = 150_000;
 
 /// Stack one nested Form XObject (or annotation appearance) costs.
-const FORM_COST: u32 = if cfg!(debug_assertions) {
-    19_000
-} else {
-    4_300
-};
+const FORM_COST: u32 = 19_000;
 
 /// Stack one tiling pattern cell costs. A cell gets a renderer of its own.
-const PATTERN_COST: u32 = if cfg!(debug_assertions) {
-    28_000
-} else {
-    7_400
-};
+const PATTERN_COST: u32 = 28_000;
 
 /// Stack one soft-mask group costs. A group gets a renderer of its own.
-const SOFT_MASK_COST: u32 = if cfg!(debug_assertions) {
-    24_000
-} else {
-    7_700
-};
+const SOFT_MASK_COST: u32 = 24_000;
 
 /// Stack one Type 3 glyph procedure costs.
-const GLYPH_COST: u32 = if cfg!(debug_assertions) {
-    30_000
-} else {
-    6_600
-};
+const GLYPH_COST: u32 = 30_000;
 
 /// Most contexts one render will vet.
 ///
@@ -551,7 +538,8 @@ fn settle(parent: &mut Frame<'_>, route: Route, form_chain: u32, height: u32) {
 /// Refuses `page` unless the interpreter can render it within
 /// [`STACK_BUDGET`].
 ///
-/// `page` must be the very object handed to the interpreter afterwards.
+/// `page` must be the very object handed to the interpreter afterwards, and
+/// this must run on the thread that will render it.
 ///
 /// # Errors
 ///
