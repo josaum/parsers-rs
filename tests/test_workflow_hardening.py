@@ -354,12 +354,68 @@ def assert_ci_skips_only_what_the_release_rebuilds(ci: str) -> None:
     assert body.count("inputs.") == len(REBUILT_BY_RELEASE)
 
 
+def assert_release_tag_is_on_main(blocks: dict[str, str]) -> None:
+    """A tag is released only if its commit is on main, where CI ran in full."""
+    gate = blocks["on-main"]
+    # Everything else waits for it, through `verify`.
+    assert job_value(blocks["verify"], "needs") == "on-main"
+    assert job_value(gate, "needs") is None and job_value(gate, "if") is None
+    assert "continue-on-error" not in gate
+    assert not re.search(r"^\s*(?:- )?if:", gate, re.MULTILINE), "the check itself can be skipped"
+    assert "self-hosted" not in gate and job_value(gate, "runs-on") == "ubuntu-latest"
+    script = re.search(r"^        run: \|\n(?P<body>(?:          [^\n]*\n|\n)+)", gate, re.MULTILINE)
+    assert script is not None
+    lines = [line.strip() for line in script["body"].splitlines() if line.strip()]
+    lines = [line for line in lines if not line.startswith("#")]
+    assert lines[0] == "set -euo pipefail"
+    # Only a ref that is not a release tag leaves early; a manual trial
+    # publishes nothing (the publish step has the same condition).
+    assert lines[1:5] == [
+        'case "$GITHUB_REF" in',
+        "refs/tags/v*) ;;",
+        '*) echo "$GITHUB_REF is not a release tag; nothing will be published."; exit 0 ;;',
+        "esac",
+    ]
+    assert lines[5:] == [
+        "git fetch --no-tags --depth=2147483647 origin '+refs/heads/main:refs/remotes/origin/main'",
+        'git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
+    ]
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in blocks["manifest"]
+
+
+def assert_every_wheel_leg_imports_its_wheels(wheels: str) -> None:
+    """No leg uploads a wheel that nothing installed and imported."""
+    steps = re.split(r"^      - ", wheels, flags=re.MULTILINE)
+    names = [step.split("\n", 1)[0] for step in steps]
+    smoke = [i for i, step in enumerate(steps) if step.startswith("name: Install and import every wheel")]
+    arm = [i for i, step in enumerate(steps) if step.startswith("name: Smoke native ARM wheel artifacts")]
+    upload = [i for i, name in enumerate(names) if name.startswith("uses: actions/upload-artifact@")]
+    assert len(smoke) == len(arm) == len(upload) == 1
+    assert smoke[0] < upload[0] and arm[0] < upload[0], "wheels are uploaded before they are imported"
+    step = steps[smoke[0]]
+    # Between them the two smokes cover every leg: this one is every target
+    # but ARM Linux, the other one is ARM Linux.
+    conditions = re.findall(r"^        if: (.+)$", step, re.MULTILINE)
+    assert conditions == ["matrix.target != 'aarch64-unknown-linux-gnu'"]
+    assert re.findall(r"^        if: (.+)$", steps[arm[0]], re.MULTILINE) == [
+        "matrix.target == 'aarch64-unknown-linux-gnu'"
+    ]
+    assert "continue-on-error" not in wheels
+    assert "set -euo pipefail" in step
+    assert 'test "${#built_wheels[@]}" -eq "${#built_bindings[@]}"' in step
+    assert "python -m pip install --no-index --no-deps dist/*.whl" in step
+    assert "python -I -c" in step and "importlib.import_module" in step
+    assert "os.environ['BINDINGS'].split()" in step
+
+
 def assert_release_waits_for_ci(release: str, ci: str | None = None) -> None:
     ci = read(CI) if ci is None else ci
-    blocks = required_jobs(release, "verify", "wheels", "node", "manifest")
+    blocks = required_jobs(release, "on-main", "verify", "wheels", "node", "manifest")
     verify = blocks["verify"]
     assert job_value(verify, "uses") == "./.github/workflows/ci.yml"
     assert job_value(verify, "if") is None, "the CI gate must never be skipped"
+    assert_release_tag_is_on_main(blocks)
+    assert_every_wheel_leg_imports_its_wheels(blocks["wheels"])
     assert job_value(blocks["wheels"], "needs") == "verify"
     assert job_value(blocks["node"], "needs") == "verify"
     assert job_value(blocks["manifest"], "needs") == "[wheels, node]"
@@ -665,6 +721,21 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_release_waits_for_ci, RELEASE, "      - name: Load and parse a generated fixture through each binding\n        run: node scripts/smoke-node.mjs\n", ""),
         (assert_release_waits_for_ci, RELEASE, 'scripts/build-node.sh "${node_bindings[@]}"', "true"),
         (assert_release_waits_for_ci, RELEASE, "for crate in $BINDINGS; do\n            (cd", "for crate in docx-fast-py; do\n            (cd"),
+        # A tag released from a commit that never went through CI on main.
+        (assert_release_waits_for_ci, RELEASE, "  verify:\n    needs: on-main\n", "  verify:\n"),
+        (assert_release_waits_for_ci, RELEASE, "          git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main\n", ""),
+        (assert_release_waits_for_ci, RELEASE, "          git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main\n", "          git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main || true\n"),
+        (assert_release_waits_for_ci, RELEASE, "--is-ancestor \"$GITHUB_SHA\" origin/main", "--is-ancestor origin/main \"$GITHUB_SHA\""),
+        (assert_release_waits_for_ci, RELEASE, "            refs/tags/v*) ;;\n", "            refs/tags/v*) exit 0 ;;\n"),
+        (assert_release_waits_for_ci, RELEASE, "            refs/tags/v*) ;;\n", "            refs/tags/v0*) ;;\n"),
+        (assert_release_waits_for_ci, RELEASE, "      - name: Refuse a release tag whose commit is not on main\n", "      - name: Refuse a release tag whose commit is not on main\n        if: github.event_name == 'workflow_dispatch'\n"),
+        (assert_release_waits_for_ci, RELEASE, "    runs-on: ubuntu-latest\n    timeout-minutes: 10\n", "    runs-on: ubuntu-latest\n    continue-on-error: true\n    timeout-minutes: 10\n"),
+        (assert_release_waits_for_ci, RELEASE, "'+refs/heads/main:refs/remotes/origin/main'", "'+refs/heads/*:refs/remotes/origin/*'"),
+        # A wheel uploaded from a leg where nothing installed and imported it.
+        (assert_release_waits_for_ci, RELEASE, "          python -m pip install --no-index --no-deps dist/*.whl\n", ""),
+        (assert_release_waits_for_ci, RELEASE, "          python -I -c \"import importlib, os; [importlib.import_module", "          python -I -c \"import importlib, os; [importlib.util.find_spec"),
+        (assert_release_waits_for_ci, RELEASE, "        if: matrix.target != 'aarch64-unknown-linux-gnu'\n        shell: bash\n        run: |\n          set -euo pipefail\n          read -r -a built_bindings", "        if: matrix.target == 'x86_64-unknown-linux-gnu'\n        shell: bash\n        run: |\n          set -euo pipefail\n          read -r -a built_bindings"),
+        (assert_release_waits_for_ci, RELEASE, '          test "${#built_wheels[@]}" -eq "${#built_bindings[@]}"\n', ""),
         # A CI job that can be skipped outside a release, or a third one inside it.
         (assert_ci_skips_only_what_the_release_rebuilds, CI, "    if: ${{ inputs.skip_binding_jobs != true }}\n    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n    defaults:", "    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n    if: ${{ inputs.skip_binding_jobs == true }}\n    defaults:"),
         (assert_ci_skips_only_what_the_release_rebuilds, CI, "  rust:\n    runs-on: ubuntu-latest\n", "  rust:\n    if: ${{ inputs.skip_binding_jobs != true }}\n    runs-on: ubuntu-latest\n"),
