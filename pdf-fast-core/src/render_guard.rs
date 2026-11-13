@@ -77,12 +77,11 @@
 //! Bounded beyond recursion: the copies of its cell a tiling pattern needs
 //! to cover the page, by `MAX_TILING_COPIES`; the pixels an image XObject,
 //! its soft mask or an inline image declares, and the pixels of the tiling
-//! cell renderers
-//! held at once along one path of nested patterns, each by
+//! cell renderers held at once along one path of nested patterns, each by
 //! [`image_pixel_budget`] (a cell is sized by `cell_pixels`, at the largest
 //! scale the interpreter allows, since the transform is not known before
-//! rendering); the interpreter's
-//! saved-state stack, by [`MAX_SAVED_STATES`]; a sampled function's table, by
+//! rendering); the interpreter's saved-state stack, by
+//! [`MAX_SAVED_STATES`]; a sampled function's table, by
 //! [`MAX_SAMPLED_FUNCTION_ENTRIES`], and its cost per evaluation, which
 //! doubles with each input, by [`MAX_SAMPLED_FUNCTION_INPUTS`]. Every font a
 //! stream selects, and every object it reaches, is held to
