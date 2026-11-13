@@ -685,6 +685,14 @@ impl Ctx<'_, '_> {
 /// budget ([`VALIDATION_STEPS_PER_PAIR`]) runs out, the result is a single
 /// [`Severity::Error`] finding at `$` that says so: an unfinished validation
 /// is never reported as a clean document.
+///
+/// One case differs from validators that stop at the first matching
+/// alternative. A schema that applies itself to the same value again while
+/// that application is still running, with no step into the document in
+/// between, is such an error even when another alternative would have
+/// matched first: `a = {"anyOf": [{"type": "integer"}, {"$ref": "#/$defs/a"}]}`
+/// stops with an error for `1`, where a short-circuiting validator accepts
+/// it. Every alternative is evaluated here, and that one never finishes.
 pub fn validate(document: &Value, schema: &Value) -> Vec<Finding> {
     run(document, schema, None).findings
 }
@@ -1358,13 +1366,15 @@ fn hash_value(value: &Value) -> u64 {
             Value::Bool(false) => mix_u64(h, 0x02),
             Value::Number(n) => {
                 mix_u64(h, 0x03);
-                let f = n.as_f64().unwrap_or(f64::NAN);
-                let bits = if f == 0.0 {
-                    0.0f64.to_bits()
+                // Integers (and floats holding one) hash by their exact
+                // value, as they compare: through f64, the integers near
+                // 2^64 would all land in a few buckets.
+                if let Some(integer) = exact_integer(n) {
+                    mix(h, integer as u64);
+                    mix(h, (integer >> 64) as u64);
                 } else {
-                    f.to_bits()
-                };
-                mix(h, bits);
+                    mix(h, n.as_f64().unwrap_or(f64::NAN).to_bits());
+                }
             }
             Value::String(s) => {
                 mix_u64(h, 0x04);
@@ -1963,10 +1973,14 @@ fn resolve_reference<'a>(
     if reference == "#" {
         return Some(root);
     }
-    if let Some(pointer) = reference.strip_prefix("#/") {
+    // A fragment is percent-encoded (RFC 3986); the JSON Pointer inside it
+    // then has its own `~0`/`~1` escapes (RFC 6901).
+    let fragment = percent_decode(reference.strip_prefix('#')?);
+    if let Some(pointer) = fragment.strip_prefix('/') {
         return pointer_get(root, pointer);
     }
-    if let Some(name) = reference.strip_prefix('#') {
+    {
+        let name = fragment.as_ref();
         if let Some(pointers) = anchors.get(name) {
             for pointer in pointers {
                 if let Some(target) = pointer_get(root, pointer) {
@@ -1976,6 +1990,31 @@ fn resolve_reference<'a>(
         }
     }
     None
+}
+
+/// Decodes `%XX` escapes; text that is not valid UTF-8 afterwards, or has
+/// no escapes, is returned unchanged.
+fn percent_decode(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('%') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        let hex = |at: usize| bytes.get(at).and_then(|b| char::from(*b).to_digit(16));
+        match (byte, hex(index + 1), hex(index + 2)) {
+            (b'%', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                index += 3;
+            }
+            _ => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
 }
 
 /// RFC 6901 JSON-pointer get (document-local references only).
@@ -2782,6 +2821,36 @@ mod tests {
         assert!(passes("[1,2]", &json!({"maxItems": 2.0, "minItems": 2.0})));
         // Not a count: ignored, as before.
         assert!(passes("[1,2]", &json!({"maxItems": 1.5})));
+    }
+
+    #[test]
+    fn references_decode_percent_and_pointer_escapes() {
+        let schema = json!({
+            "$defs": {"tilde~field": {"type": "integer"}, "slash/field": {"type": "integer"},
+                      "percent%field": {"type": "integer"}, "a b": {"type": "integer"}},
+            "properties": {
+                "tilde": {"$ref": "#/$defs/tilde~0field"},
+                "slash": {"$ref": "#/$defs/slash~1field"},
+                "percent": {"$ref": "#/$defs/percent%25field"},
+                "space": {"$ref": "#/$defs/a%20b"}
+            }
+        });
+        for key in ["tilde", "slash", "percent", "space"] {
+            let findings = validate(&json!({ key: "x" }), &schema);
+            assert_eq!(findings.len(), 1, "{key}: {findings:?}");
+            assert_eq!(findings[0].severity, Severity::Error, "{key}");
+            assert_eq!(validate(&json!({ key: 1 }), &schema), [], "{key}");
+        }
+    }
+
+    #[test]
+    fn distinct_large_integers_hash_apart() {
+        let near_max = |i: u64| Value::from(u64::MAX - i);
+        assert_ne!(hash_value(&near_max(0)), hash_value(&near_max(1)));
+        assert_eq!(hash_value(&json!(3)), hash_value(&json!(3.0)));
+        assert_eq!(hash_value(&json!(-0.0)), hash_value(&json!(0)));
+        let items = Value::Array((0..20_000).map(near_max).collect());
+        assert_eq!(validate(&items, &json!({"uniqueItems": true})), []);
     }
 
     #[test]
