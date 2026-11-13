@@ -50,7 +50,9 @@ pub fn json_type(s: String) -> Result<String> {
 ///
 /// `resources` maps a URI to the JSON text of another schema document that a
 /// `$ref` may name. Nothing is fetched: a reference that resolves neither in
-/// the schema nor in `resources` is an error finding.
+/// the schema nor in `resources` is an error finding. Documents are taken in
+/// URI order, so when two claim one URI (through `$id`) the first by URI
+/// order wins. `index.js` refuses any `resources` that is not a plain object.
 #[napi(catch_unwind)]
 pub fn validate(
     s: String,
@@ -62,7 +64,10 @@ pub fn validate(
     let mut supplied = resources
         .unwrap_or_default()
         .into_iter()
-        .map(|(uri, text)| Ok((uri, json_fast_core::parse(&text).map_err(err)?)))
+        .map(|(uri, text)| match json_fast_core::parse(&text) {
+            Ok(value) => Ok((uri, value)),
+            Err(error) => Err(err(format!("schema resource {uri:?}: {error}"))),
+        })
         .collect::<Result<Vec<(String, Value)>>>()?;
     // An object's key order is not kept by the map; sorting makes the
     // choice between two documents claiming one URI deterministic.

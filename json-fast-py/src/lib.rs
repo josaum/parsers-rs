@@ -38,6 +38,16 @@ fn err(error: JsonError) -> PyErr {
     }
 }
 
+/// Like [`err`], for a supplied schema document: the message names its URI.
+fn resource_err(uri: &str, error: &JsonError) -> PyErr {
+    let message = format!("schema resource {uri:?}: {error}");
+    if matches!(error, JsonError::ResourceLimit { .. }) {
+        JsonResourceError::new_err(message)
+    } else {
+        PyRuntimeError::new_err(message)
+    }
+}
+
 fn runtime_err(error: impl ToString) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
@@ -190,7 +200,10 @@ fn json_type(py: Python<'_>, s: &str) -> PyResult<&'static str> {
 /// Each finding is `{"severity": "error"|"warning", "path", "message"}`.
 /// `resources` maps a URI to the JSON text of another schema document that a
 /// `$ref` may name. Nothing is fetched: a reference that resolves neither in
-/// the schema nor in `resources` is an error finding.
+/// the schema nor in `resources` is an error finding. Documents are taken in
+/// URI order, so when two claim one URI (through `$id`) the first by URI
+/// order wins. A document that does not parse raises the usual exception,
+/// with its URI in the message.
 #[pyfunction]
 #[pyo3(signature = (s, schema, *, resources=None))]
 fn validate<'py>(
@@ -199,28 +212,35 @@ fn validate<'py>(
     schema: &str,
     resources: Option<Bound<'py, PyDict>>,
 ) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    // Copied with the GIL held, in the dict's order.
+    // Copied with the GIL held, then put in URI order like the Node binding.
     let mut supplied: Vec<(String, String)> = Vec::new();
     if let Some(resources) = resources {
         for (uri, text) in resources.iter() {
             supplied.push((uri.extract()?, text.extract()?));
         }
     }
+    supplied.sort_by(|a, b| a.0.cmp(&b.0));
     let findings = py
-        .detach(|| -> Result<_, JsonError> {
-            let doc: Value = json_fast_core::parse(s)?;
-            let sch: Value = json_fast_core::parse(schema)?;
+        .detach(|| -> Result<_, (Option<&str>, JsonError)> {
+            let doc: Value = json_fast_core::parse(s).map_err(|e| (None, e))?;
+            let sch: Value = json_fast_core::parse(schema).map_err(|e| (None, e))?;
             let parsed = supplied
                 .iter()
-                .map(|(uri, text)| Ok((uri.as_str(), json_fast_core::parse(text)?)))
-                .collect::<Result<Vec<(&str, Value)>, JsonError>>()?;
+                .map(|(uri, text)| match json_fast_core::parse(text) {
+                    Ok(value) => Ok((uri.as_str(), value)),
+                    Err(error) => Err((Some(uri.as_str()), error)),
+                })
+                .collect::<Result<Vec<(&str, Value)>, _>>()?;
             let documents: Vec<(&str, &Value)> =
                 parsed.iter().map(|(uri, value)| (*uri, value)).collect();
             Ok(json_fast_core::schema::validate_with_resources(
                 &doc, &sch, &documents,
             ))
         })
-        .map_err(err)?;
+        .map_err(|(uri, error)| match uri {
+            Some(uri) => resource_err(uri, &error),
+            None => err(error),
+        })?;
     findings
         .into_iter()
         .map(|f| {

@@ -1030,11 +1030,14 @@ impl<'a> Ctx<'a, '_> {
 /// When two schema resources share a URI, the first in document order is
 /// used and a warning names the URI. When the root's `$schema` names
 /// draft-04, draft-06 or draft-07, an object holding `$ref` sets no base URI
-/// and no anchor, as those drafts ignore every keyword beside `$ref`.
+/// and no anchor, as those drafts ignore every keyword beside `$ref` (the
+/// root excepted, see below).
 ///
 /// Resolving URIs is bounded too: more URI text than
 /// `URI_BYTES_PER_SCHEMA_BYTE` (16) per byte of schema text, plus 1 MiB,
-/// stops the validation with an error.
+/// stops the validation with an error. A fragment-only reference (`#...`)
+/// costs only its fragment. The document root's `$id` names it in every
+/// dialect, even beside a draft-07 `$ref`.
 pub fn validate(document: &Value, schema: &Value) -> Vec<Finding> {
     run(document, schema, None).findings
 }
@@ -2611,10 +2614,24 @@ impl<'s> Registry<'s> {
                 .resources
                 .get(site.resource)
                 .map_or("", |declared| declared.uri.as_str());
-            let absolute = resolve_uri(site.reference, base);
-            registry.charge(absolute.len())?;
-            let target = registry.resolve(&absolute, site.dynamic);
-            if target.is_none() && is_well_known_meta_schema(&absolute) {
+            let (target, meta_schema) = if let Some(fragment) = site.reference.strip_prefix('#') {
+                // A fragment-only reference names the site's own resource:
+                // no URI is built, and only the fragment is charged.
+                let meta_schema = is_well_known_meta_schema(base);
+                registry.charge(fragment.len())?;
+                (
+                    registry.resolve_in(site.resource, fragment, site.dynamic),
+                    meta_schema,
+                )
+            } else {
+                let absolute = resolve_uri(site.reference, base);
+                registry.charge(absolute.len())?;
+                (
+                    registry.resolve(&absolute, site.dynamic),
+                    is_well_known_meta_schema(&absolute),
+                )
+            };
+            if target.is_none() && meta_schema {
                 registry.meta_schema_sites.insert(key);
             }
             live.extend(target.and_then(|target| target.dynamic));
@@ -2744,8 +2761,10 @@ impl<'s> Registry<'s> {
                     if role == Role::Schema {
                         let document_root = std::ptr::eq(node, document);
                         // Draft-07 and older ignore every keyword beside
-                        // `$ref`, `$id` included.
-                        if !(legacy && map.contains_key("$ref")) {
+                        // `$ref`, `$id` included. The document root is
+                        // exempt: generators put `$id` beside a root `$ref`,
+                        // and its `$id` names the document in every dialect.
+                        if document_root || !(legacy && map.contains_key("$ref")) {
                             resource = self.identify(node, map, resource, document_root)?;
                         }
                         if document_root {
@@ -2848,7 +2867,11 @@ impl<'s> Registry<'s> {
     /// Finds what the absolute URI reference `absolute` names.
     fn resolve(&self, absolute: &str, dynamic: bool) -> Option<Target<'s>> {
         let (uri, fragment) = absolute.split_once('#').unwrap_or((absolute, ""));
-        let mut resource = self.lookup(uri)?;
+        self.resolve_in(self.lookup(uri)?, fragment, dynamic)
+    }
+
+    /// Finds what `fragment` (still percent-encoded) names in `resource`.
+    fn resolve_in(&self, mut resource: usize, fragment: &str, dynamic: bool) -> Option<Target<'s>> {
         let declared = self.resources.get(resource)?;
         // A fragment is percent-encoded (RFC 3986); the JSON Pointer inside
         // it then has its own `~0`/`~1` escapes (RFC 6901).
@@ -4428,6 +4451,42 @@ mod tests {
         let schema = schema_with_base("https://example.com/schemas/".to_owned());
         assert_eq!(validate(&json!(1), &schema), []);
         assert!(has_errors(&validate(&json!("x"), &schema)));
+    }
+
+    #[test]
+    fn fragment_references_are_charged_by_their_fragment() {
+        // Many short fragment references under a long base are ordinary.
+        let long_base =
+            |length: usize| format!("https://e.com/{}s.json", "seg/".repeat((length - 14) / 4));
+        let anchors = json!({
+            "$id": long_base(100),
+            "$defs": {"a": {"$anchor": "a", "type": "integer"}},
+            "anyOf": vec![json!({"$ref": "#a"}); 200_000]
+        });
+        let pointers = json!({
+            "$id": long_base(250),
+            "$defs": {"a": {"type": "integer"}},
+            "anyOf": vec![json!({"$ref": "#/$defs/a"}); 200_000]
+        });
+        for schema in [&anchors, &pointers] {
+            assert_eq!(validate(&json!(1), schema), []);
+            assert!(has_errors(&validate(&json!("x"), schema)));
+        }
+    }
+
+    #[test]
+    fn a_draft_07_root_id_beside_ref_still_names_the_document() {
+        let schema = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "$id": "http://e.com/root.json",
+            "$ref": "#/definitions/A",
+            "definitions": {
+                "A": {"properties": {"self": {"$ref": "http://e.com/root.json#/definitions/B"}}},
+                "B": {"type": "integer"}
+            }
+        });
+        assert!(passes(r#"{"self": 1}"#, &schema));
+        assert!(fails(r#"{"self": "x"}"#, &schema));
     }
 
     /// `r0` applies `r1`..`rn`, each declaring the same `$dynamicAnchor` and

@@ -16,17 +16,22 @@ request.
   `json_fast_core::schema::validate_with_resources`, or to the new optional
   `resources` argument of `json_fast.validate` (Python, keyword-only, a dict
   from URI to schema text) and of `validate` in `json-fast-node` (a trailing
-  object from URI to schema text). References to the JSON Schema
+  plain object from URI to schema text; anything else throws a `TypeError`).
+  Both bindings take the documents in URI order, so when two claim one URI
+  through `$id` the first by URI order wins, and a document that does not
+  parse raises an error naming its URI. References to the JSON Schema
   meta-schemas (`json_fast_core::schema::WELL_KNOWN_META_SCHEMAS`) stay a
   warning and are skipped.
 - **json:** an `$id` or anchor inside `enum`, `const`, `default`,
   `examples` or an unknown keyword no longer identifies a schema. Two
   resources with one URI: the first in document order is used, with a
   warning. Under a draft-04/06/07 `$schema`, an object holding `$ref` sets
-  no base URI and no anchor.
+  no base URI and no anchor, except the document root, whose `$id` names
+  the document in every dialect.
 - **json:** validation stops with an error when resolving `$id`s and
   references needs more than 16 bytes of URI text per byte of schema text
-  (plus 1 MiB), as a long base URI under many relative `$id`s would.
+  (plus 1 MiB), as a long base URI under many relative `$id`s would. A
+  fragment-only reference (`#...`) is charged its fragment only.
 
 ### Fixed
 

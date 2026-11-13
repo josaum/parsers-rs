@@ -18,8 +18,10 @@ export interface SchemaFinding {
 
 /**
  * Validate a JSON document against a JSON Schema; returns an array of findings.
- * `resources` maps a URI to the JSON text of another schema document a `$ref`
- * may name. Nothing is fetched: a reference that resolves nowhere is an error.
+ * `resources` is a plain object mapping a URI to the JSON text of another
+ * schema document a `$ref` may name; anything else throws a `TypeError`.
+ * Nothing is fetched: a reference that resolves nowhere is an error. When two
+ * documents claim one URI (through `$id`), the first by URI order wins.
  */
 export declare function validate(
   s: string,
