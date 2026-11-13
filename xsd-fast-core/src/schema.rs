@@ -410,6 +410,42 @@ pub enum ElementRef {
     /// flattening its branches into the parent sequence. The particle's own
     /// [`OccurrenceConstraint`] applies to the whole group.
     Group(Box<ContentModel>),
+    /// An `xs:any` wildcard: any element of a namespace it admits.
+    ///
+    /// It derives no Arrow column. Validation takes it as satisfied by a
+    /// child that no named particle of the type claims.
+    Any(Wildcard),
+}
+
+/// An `xs:any` element wildcard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wildcard {
+    /// The `namespace` attribute as written: `##any` (the default),
+    /// `##other`, or a list of URIs, `##targetNamespace` and `##local`.
+    pub namespace: String,
+    /// The `processContents` attribute as written; `strict` by default.
+    pub process_contents: String,
+    /// Target namespace of the schema document the wildcard is written in,
+    /// which `##targetNamespace` and `##other` refer to.
+    pub target_namespace: Option<String>,
+}
+
+impl Wildcard {
+    /// Whether the wildcard admits an element in namespace `namespace`;
+    /// `None` is no namespace.
+    pub fn admits(&self, namespace: Option<&str>) -> bool {
+        let target = self.target_namespace.as_deref();
+        match self.namespace.trim() {
+            "##any" => true,
+            // Any namespace but the target one, and not no namespace.
+            "##other" => namespace.is_some() && namespace != target,
+            listed => listed.split_whitespace().any(|token| match token {
+                "##targetNamespace" => namespace == target,
+                "##local" => namespace.is_none(),
+                uri => namespace == Some(uri),
+            }),
+        }
+    }
 }
 
 /// A top-level or nested element declaration.
@@ -834,6 +870,11 @@ impl CopyCost {
                 }
                 ElementRef::Group(group) => self.add_content(group),
                 ElementRef::Ref(name) => self.add_qname(name),
+                ElementRef::Any(wildcard) => {
+                    self.add_text(&wildcard.namespace);
+                    self.add_text(&wildcard.process_contents);
+                    self.add_optional_text(wildcard.target_namespace.as_ref());
+                }
             }
         }
     }
@@ -1006,7 +1047,7 @@ fn resolve_element_ref<'a>(
                 }
             }
         }
-        ElementRef::Ref(_) => {}
+        ElementRef::Ref(_) | ElementRef::Any(_) => {}
     }
     Ok(())
 }

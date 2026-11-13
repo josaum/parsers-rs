@@ -478,6 +478,8 @@ impl Derivation<'_> {
                 // branch into its own column at the current prefix; mark them
                 // nullable since at most one branch is selected per instance.
                 ElementRef::Group(group) => self.fields_from_group(group, depth, prefix, fields)?,
+                // A wildcard admits elements the schema does not declare.
+                ElementRef::Any(_) => {}
             }
         }
         Ok(())

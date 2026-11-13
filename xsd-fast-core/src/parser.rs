@@ -20,7 +20,7 @@ use quick_xml::{Reader, XmlVersion};
 use crate::schema::{
     AttributeDecl, ComplexType, ContentModel, Derivation, ElementDecl, ElementRef, EnumValue,
     OccurrenceConstraint, Particle, QName, SchemaModel, SimpleFacets, SimpleTypeDef,
-    SimpleTypeKind, XsdType,
+    SimpleTypeKind, Wildcard, XsdType,
 };
 
 // ── XS namespace URIs accepted as the XML Schema namespace ──────────────────
@@ -364,6 +364,10 @@ impl Loader {
                 let attrs = collect_attrs(e);
                 if let Some(tns) = attrs.get("targetNamespace") {
                     self.model.target_namespace = Some(tns.clone());
+                    // Kept with the prefixes, which every parser of this
+                    // document's declarations is handed, for wildcards.
+                    file.ns_map
+                        .insert(TARGET_NAMESPACE_KEY.to_owned(), tns.clone());
                 }
                 file.in_schema = true;
             }
@@ -806,10 +810,16 @@ fn parse_particles(
                     let inner = parse_particles(reader, ns_map, "choice", depth + 1)?;
                     push_choice_group(&attrs, inner, &mut particles);
                 }
+                "any" => {
+                    push_wildcard(&attrs, ns_map, &mut particles);
+                    skip_element(reader, "any")?;
+                }
                 other => skip_element(reader, other)?,
             },
             Tag::Empty { local, attrs } => {
-                if local == "element" {
+                if local == "any" {
+                    push_wildcard(&attrs, ns_map, &mut particles);
+                } else if local == "element" {
                     if let Some(particle) = reference_particle(&attrs) {
                         particles.push(particle);
                     } else if attrs.contains_key("name") {
@@ -828,6 +838,32 @@ fn parse_particles(
         }
     }
     Ok(particles)
+}
+
+/// Key under which a schema document's target namespace is kept in its
+/// prefix map. It starts with a NUL, so no prefix read from XML is equal.
+const TARGET_NAMESPACE_KEY: &str = "\0targetNamespace";
+
+/// Appends the particle for an `<xs:any>` wildcard.
+fn push_wildcard(
+    attrs: &HashMap<String, String>,
+    ns_map: &HashMap<String, String>,
+    particles: &mut Vec<Particle>,
+) {
+    particles.push(Particle {
+        occurrence: parse_occurrence(attrs),
+        element: ElementRef::Any(Wildcard {
+            namespace: attrs
+                .get("namespace")
+                .cloned()
+                .unwrap_or_else(|| "##any".to_owned()),
+            process_contents: attrs
+                .get("processContents")
+                .cloned()
+                .unwrap_or_else(|| "strict".to_owned()),
+            target_namespace: ns_map.get(TARGET_NAMESPACE_KEY).cloned(),
+        }),
+    });
 }
 
 /// The particle for `<xs:element ref="...">`, or `None` without a `ref`.
@@ -1250,7 +1286,7 @@ fn settle_content(content: &mut ContentModel, kinds: &mut SimpleKinds<'_>) {
         match &mut particle.element {
             ElementRef::Inline(element) => settle_type(&mut element.type_def, kinds),
             ElementRef::Group(group) => settle_content(group, kinds),
-            ElementRef::Ref(_) => {}
+            ElementRef::Ref(_) | ElementRef::Any(_) => {}
         }
     }
 }
@@ -1971,7 +2007,7 @@ impl<'a> Expansion<'a> {
                     }
                 }
                 ElementRef::Group(group) => self.expand_content(group),
-                ElementRef::Ref(_) => {}
+                ElementRef::Ref(_) | ElementRef::Any(_) => {}
             }
         }
     }
