@@ -8,7 +8,6 @@
 use anyhow::{anyhow, Context, Result};
 use flate2::read::DeflateDecoder;
 use memmap2::Mmap;
-use quick_xml::encoding::Decoder;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
@@ -22,6 +21,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 mod properties;
+#[doc(hidden)]
+pub mod utf8;
 
 pub use properties::parse_simple_props;
 
@@ -378,13 +379,13 @@ pub struct RelEntry {
 
 /// Parse a `.rels` XML part into Id/Type maps and an entry list.
 pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
-    let mut reader = xml_reader(Cursor::new(xml));
+    let mut reader = xml_reader(repairing_reader(xml));
     let mut buf = Vec::new();
     let mut rels = Relationships::default();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if local_name(e.name().as_ref()) != b"Relationship" {
+                if local_name(e.name().as_ref().as_bytes()) != b"Relationship" {
                     buf.clear();
                     continue;
                 }
@@ -392,13 +393,13 @@ pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
                 let mut rel_type = None;
                 let mut target = None;
                 for attr in e.attributes().with_checks(false).flatten() {
-                    let key = local_name(attr.key.as_ref());
+                    let key = local_name(attr.key.as_ref().as_bytes());
                     if key == b"Id" {
-                        id = Some(attr_text(&attr, reader.decoder())?.to_string());
+                        id = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                     } else if key == b"Type" {
-                        rel_type = Some(attr_text(&attr, reader.decoder())?.to_string());
+                        rel_type = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                     } else if key == b"Target" {
-                        target = Some(attr_text(&attr, reader.decoder())?.to_string());
+                        target = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                     }
                 }
                 if let (Some(id), Some(rel_type), Some(target)) = (id, rel_type, target) {
@@ -544,8 +545,29 @@ fn xml_reader<R: BufRead>(input: R) -> Reader<R> {
 /// The value is normalized as XML 1.0 requires: a literal tab, line feed or
 /// carriage return becomes a space, while one written as a character
 /// reference (`&#9;`) is kept.
-fn attr_text<'a>(attr: &Attribute<'a>, decoder: Decoder) -> Result<Cow<'a, str>> {
-    Ok(attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)?)
+///
+/// A value in which `input` replaced bytes that are not UTF-8 is an error,
+/// as such a value always was; `tag` is the start or empty tag the
+/// attribute was read from. A U+FFFD the part really holds, or a
+/// replacement elsewhere in the part, is not.
+fn attr_text<'a, R: BufRead>(
+    attr: &Attribute<'a>,
+    input: &utf8::LossyUtf8<R>,
+    tag: &str,
+) -> Result<Cow<'a, str>> {
+    if input.repaired_in(tag.as_bytes(), 1..=2, attr.value.as_bytes()) {
+        return Err(anyhow!("attribute value is not UTF-8"));
+    }
+    Ok(attr.normalized_value(XmlVersion::Implicit1_0)?)
+}
+
+/// Reads `xml` as UTF-8, each ill-formed sequence replaced by U+FFFD.
+///
+/// The repaired part is held to [`utf8::unknown_limit`]: the caller's limit
+/// for the raw part is not known here.
+fn repairing_reader(xml: &[u8]) -> utf8::LossyUtf8<Cursor<&[u8]>> {
+    let limit = utf8::unknown_limit(xml.len());
+    utf8::LossyUtf8::with_limit(Cursor::new(xml), limit as u64)
 }
 
 fn local_name(name: &[u8]) -> &[u8] {

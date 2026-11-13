@@ -40,13 +40,18 @@ pub(crate) struct TextRun {
 
 impl TextRun {
     /// Appends a piece of literal text.
-    pub(crate) fn push_text(&mut self, piece: &BytesText<'_>) {
-        let Ok(decoded) = piece.decode() else {
+    ///
+    /// `undecodable` says the piece stood for bytes that are not UTF-8,
+    /// which the reader replaced with U+FFFD. The run is then undecodable, as
+    /// a run holding such a piece always was.
+    pub(crate) fn push_text(&mut self, piece: &BytesText<'_>, undecodable: bool) {
+        let decoded: &str = piece;
+        if undecodable {
             self.started = true;
             self.undecodable = true;
             return;
-        };
-        let mut piece: &str = &decoded;
+        }
+        let mut piece: &str = decoded;
         if !self.started {
             piece = piece.trim_start_matches(is_xml_whitespace);
             if piece.is_empty() {
@@ -66,35 +71,40 @@ impl TextRun {
     /// Appends the content of a CDATA section, exactly as written.
     ///
     /// An empty section adds nothing.
-    pub(crate) fn push_cdata(&mut self, section: &BytesCData<'_>) {
-        let Ok(content) = section.decode() else {
+    /// `undecodable` is as for [`TextRun::push_text`].
+    pub(crate) fn push_cdata(&mut self, section: &BytesCData<'_>, undecodable: bool) {
+        let content: &str = section;
+        if undecodable {
             self.started = true;
             self.undecodable = true;
             return;
-        };
+        }
         if content.is_empty() {
             return;
         }
         self.started = true;
         self.trailing_whitespace = 0;
-        self.text.push_str(&content);
+        self.text.push_str(content);
     }
 
     /// Appends what an entity or character reference stands for.
-    pub(crate) fn push_reference(&mut self, reference: &BytesRef<'_>) {
+    ///
+    /// `undecodable` is as for [`TextRun::push_text`].
+    pub(crate) fn push_reference(&mut self, reference: &BytesRef<'_>, undecodable: bool) {
         self.started = true;
-        let Ok(name) = reference.decode() else {
+        let name: &str = reference;
+        if undecodable {
             self.undecodable = true;
             return;
-        };
+        }
         self.trailing_whitespace = 0;
         if let Ok(Some(character)) = reference.resolve_char_ref() {
             self.text.push(character);
-        } else if let Some(replacement) = resolve_predefined_entity(&name) {
+        } else if let Some(replacement) = resolve_predefined_entity(name) {
             self.text.push_str(replacement);
         } else {
             self.text.push('&');
-            self.text.push_str(&name);
+            self.text.push_str(name);
             self.text.push(';');
         }
     }

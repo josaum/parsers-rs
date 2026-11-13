@@ -391,15 +391,15 @@ fn read_capabilities(xml: &str, report: bool) -> Result<WmsCapabilities, GeoErro
             .map_err(|e| GeoError::Xml(e.to_string()))?;
         match &event {
             Event::Text(piece) => {
-                run.push_text(piece);
+                run.push_text(piece, false);
                 continue;
             }
             Event::CData(section) => {
-                run.push_cdata(section);
+                run.push_cdata(section, false);
                 continue;
             }
             Event::GeneralRef(reference) => {
-                run.push_reference(reference);
+                run.push_reference(reference, false);
                 continue;
             }
             _ => {}
@@ -429,7 +429,7 @@ fn read_capabilities(xml: &str, report: bool) -> Result<WmsCapabilities, GeoErro
             Event::Start(ref e) => {
                 depth += 1;
                 let name = e.local_name();
-                if name.as_ref() == b"Layer" {
+                if name.as_ref().as_bytes() == b"Layer" {
                     let record = layers.len();
                     layers.push(LayerRecord {
                         parent: open.last().map(|parent| parent.record),
@@ -443,7 +443,7 @@ fn read_capabilities(xml: &str, report: bool) -> Result<WmsCapabilities, GeoErro
                     let in_geographic_box = boxes
                         .last()
                         .is_some_and(|open_box| open_box.layer_depth == layer.depth);
-                    match name.as_ref() {
+                    match name.as_ref().as_bytes() {
                         b"Name" if own_child => capture = Capture::Name,
                         b"Title" if own_child => capture = Capture::Title,
                         b"CRS" | b"SRS" if own_child => capture = Capture::Crs,
@@ -473,7 +473,7 @@ fn read_capabilities(xml: &str, report: bool) -> Result<WmsCapabilities, GeoErro
             Event::Empty(ref e) => {
                 if let Some(layer) = open.last() {
                     let is_box = matches!(
-                        e.local_name().as_ref(),
+                        e.local_name().as_ref().as_bytes(),
                         b"EX_GeographicBoundingBox" | b"LatLonBoundingBox" | b"BoundingBox"
                     );
                     // An empty element does not change `depth`.
@@ -488,7 +488,7 @@ fn read_capabilities(xml: &str, report: bool) -> Result<WmsCapabilities, GeoErro
                     let in_geographic_box = boxes
                         .last()
                         .is_some_and(|open_box| open_box.layer_depth == layer.depth);
-                    if name.as_ref() == b"Layer" && depth == layer.depth {
+                    if name.as_ref().as_bytes() == b"Layer" && depth == layer.depth {
                         open.pop();
                     } else if in_geographic_box && depth == layer.depth + 1 {
                         let edges = boxes.pop().map(|open_box| open_box.edges);
@@ -821,7 +821,7 @@ fn read_box(layers: &mut [LayerRecord], record: usize, element: &BytesStart<'_>)
             .normalized_value(XmlVersion::Implicit1_0)
             .unwrap_or_default();
         let f = val.parse::<f64>().ok();
-        match key.as_ref() {
+        match key.as_ref().as_bytes() {
             b"minx" | b"westBoundLongitude" => min_x = f,
             b"miny" | b"southBoundLatitude" => min_y = f,
             b"maxx" | b"eastBoundLongitude" => max_x = f,
@@ -831,7 +831,7 @@ fn read_box(layers: &mut [LayerRecord], record: usize, element: &BytesStart<'_>)
     }
     if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (min_x, min_y, max_x, max_y) {
         let bbox = Some(BBox::new(x0, y0, x1, y1));
-        let projected = element.local_name().as_ref() == b"BoundingBox";
+        let projected = element.local_name().as_ref().as_bytes() == b"BoundingBox";
         declare(layers, record, |own| {
             if projected {
                 own.bounding = bbox;

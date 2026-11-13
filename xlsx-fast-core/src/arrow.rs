@@ -210,7 +210,7 @@ where
 
     let shared_strings = if let Some(path) = shared_strings_path.as_deref() {
         if let Some(reader) = open_optional_part_reader(&archive, path, options.max_inflate)? {
-            parse_shared_strings_reader(reader)?
+            parse_shared_strings_reader(reader, options.max_inflate)?
         } else {
             StringTable::default()
         }
@@ -327,7 +327,7 @@ where
 {
     let reader = open_part_reader(archive, &task.sheet_path, options.max_inflate)
         .with_context(|| format!("read sheet: {}", task.sheet_path))?;
-    let xml_reader = quick_xml::Reader::from_reader(reader);
+    let xml_reader = quick_xml::Reader::from_reader(crate::repairing(reader, options.max_inflate));
     parse_sheet_reader_with(
         xml_reader,
         shared_strings,
@@ -472,7 +472,7 @@ fn parse_sheet_parallel(
 ) -> Result<()> {
     let reader = open_part_reader(archive, &task.sheet_path, options.max_inflate)
         .with_context(|| format!("read sheet: {}", task.sheet_path))?;
-    let xml_reader = quick_xml::Reader::from_reader(reader);
+    let xml_reader = quick_xml::Reader::from_reader(crate::repairing(reader, options.max_inflate));
     let mut builder = ArrowBatchBuilder::new(
         arrow_options.batch_size,
         arrow_options.include_sheet_names,

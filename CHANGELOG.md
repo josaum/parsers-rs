@@ -8,6 +8,24 @@ request.
 
 ### Changed output
 
+- **docx, xlsx, pptx, xsd, geo:** quick-xml moves from 0.41 to 0.42, which
+  rejects a whole document on its first byte that is not UTF-8. Every
+  reader now repairs its input first, replacing each such sequence with
+  U+FFFD exactly as before, so documents read the same: such a byte reads
+  as U+FFFD in text (and in docx attributes) and costs nothing where no
+  value is read, a value that was read strictly (pptx and xlsx attributes,
+  relationship `Id`/`Type`/`Target`, xsd `schemaLocation`) is still an
+  error, and a name or value that xsd and SAR dropped is still dropped. A
+  U+FFFD the document really holds is not mistaken for a repaired byte
+  (but see Known gaps).
+  On 524 real files (docx, xlsx, pptx, xsd; 77 of the xsd hold bytes that
+  are not UTF-8, 2 docx hold UTF-16 parts) all 489 that parse give
+  byte-identical output and the other 35 fail with the same error as
+  before. Only error texts change,
+  on paths that already failed: a strictly read attribute reports
+  `attribute value is not UTF-8` and an xsd `schemaLocation` reports
+  `invalid schemaLocation: not UTF-8`, instead of quick-xml's UTF-8
+  decoding error.
 - **json:** a `$ref` or `$dynamicRef` that resolves to nothing is now an
   error naming the reference, so the document is not accepted, even under
   `not` or beside a passing `anyOf` branch. It used to be a warning and was
@@ -72,6 +90,18 @@ request.
 
 ### New refusals
 
+- **docx, xlsx, pptx, xsd, geo:** a part or document that holds bytes that
+  are not UTF-8 and outgrows its size limit only once each is replaced by
+  U+FFFD (three bytes for each) is refused with `part is larger than N
+  bytes once repaired to UTF-8`. The limit is `max_inflate` for the parts
+  docx, xlsx and pptx stream (document body, headers and footers, sheets,
+  shared strings, slides, notes) and `max_schema_bytes` for an xsd schema.
+  Where no limit is known (parts read whole, relationship and property
+  parts, xsd instance documents, SAR XML), input up to 128 MiB may not grow
+  past 128 MiB, and larger input is not capped. An xsd instance refusal is
+  a parse-error finding. Valid UTF-8 is never refused this way. With the
+  defaults, a 120 MiB part of such bytes, which used to be read at up to
+  1.3 GiB of memory, is now refused at about 260 MiB.
 - **pdf:** the interpreted renderer refuses a tiling pattern that needs
   more than 10,000,000 copies of its cell to cover the page, or whose step
   is zero, infinite or NaN, or whose `/Matrix` collapses the cell. On page
@@ -80,6 +110,13 @@ request.
 - **geo:** a GeoTIFF raster whose samples are not a whole number of bytes
   (1, 2, 4, 10 or 12 bits), and an uncompressed raster with a strip or tile
   shorter than its pixels, including a sparse one.
+
+### Known gaps
+
+- **docx, xlsx, pptx, xsd, geo:** a reader remembers where it replaced
+  bytes that are not UTF-8 in up to 4,096 separate runs per part. Past
+  that, the runs merge into one, and a strictly read value inside the
+  merged run that holds a real U+FFFD is treated as not UTF-8.
 
 ## v2026.11.13
 

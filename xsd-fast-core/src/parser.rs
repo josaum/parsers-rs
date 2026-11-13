@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
+use ooxml_archive::utf8::LossyUtf8;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
@@ -148,6 +149,103 @@ struct FileState {
     ns_map: HashMap<String, String>,
     /// Whether the parser is inside `<xs:schema>`.
     in_schema: bool,
+}
+
+/// A schema document as the XML reader reads it.
+///
+/// The reader takes UTF-8 only, so a byte that is not UTF-8 is read as
+/// U+FFFD. Where a name or an attribute value was once read from raw bytes
+/// and refused when they were not UTF-8, it is still refused: the input
+/// remembers where it put each U+FFFD, and [`Repairs`] tells a value holding
+/// one from a value holding a U+FFFD the document really has. Text that was
+/// never read stays ignored.
+pub(crate) type SchemaInput<'a> = LossyUtf8<&'a [u8]>;
+
+/// Reads `bytes` as a schema document, refusing to repair it past `limit`.
+pub(crate) fn schema_input(bytes: &[u8], limit: usize) -> SchemaInput<'_> {
+    LossyUtf8::with_limit(bytes, limit.max(bytes.len()) as u64)
+}
+
+/// Makes the reader for one schema document, on the heap.
+///
+/// No reader of a schema document collects element text: declarations are
+/// read from attributes alone, and annotations are skipped. So trimming,
+/// which works on each piece of text between references, cannot change a
+/// value here. For the same reason a bare `&` in that text, which is not
+/// well-formed, is passed over and does not fail the load: published
+/// schemas carry them in documentation.
+///
+/// The reader is built here, not in the caller, so that neither it nor the
+/// temporary it is moved from takes room in [`Loader::parse_bytes`]' frame,
+/// which recursion through includes repeats.
+#[inline(never)]
+fn schema_reader(bytes: &[u8], limit: usize) -> Box<Reader<SchemaInput<'_>>> {
+    let mut reader = Box::new(Reader::from_reader(schema_input(bytes, limit)));
+    reader.config_mut().trim_text(true);
+    reader.config_mut().allow_dangling_amp = true;
+    reader
+}
+
+/// Whether the end tag `e` closes `xs:schema`.
+///
+/// Kept out of [`Loader::parse_bytes`] so that its temporaries do not take
+/// room in a frame that recursion through includes repeats.
+#[inline(never)]
+fn closes_schema(e: &quick_xml::events::BytesEnd<'_>, input: &SchemaInput<'_>) -> bool {
+    local_name(e.name().as_ref(), Repairs::end(input, e)) == "schema"
+}
+
+/// Tells the bytes the reader replaced in the event it read last from text
+/// the document holds.
+///
+/// Built from the reader's input and the event's content right after the
+/// event is read, before the next one is.
+#[derive(Clone, Copy)]
+pub(crate) struct Repairs<'a> {
+    input: &'a SchemaInput<'a>,
+    event: &'a str,
+    /// Bytes the reader consumed after the event's content, at least and at
+    /// most; see [`LossyUtf8::repaired_in`].
+    after: (u64, u64),
+}
+
+impl<'a> Repairs<'a> {
+    /// For a start or empty tag.
+    pub(crate) fn tag(input: &'a SchemaInput<'a>, tag: &'a str) -> Self {
+        Self {
+            input,
+            event: tag,
+            after: (1, 2),
+        }
+    }
+
+    /// For an end tag or a `<!DOCTYPE>`, which end with `>`.
+    pub(crate) fn end(input: &'a SchemaInput<'a>, tag: &'a str) -> Self {
+        Self {
+            input,
+            event: tag,
+            after: (1, 1),
+        }
+    }
+
+    /// For text the reader does not trim.
+    pub(crate) fn text(input: &'a SchemaInput<'a>, text: &'a str) -> Self {
+        Self {
+            input,
+            event: text,
+            after: (0, 0),
+        }
+    }
+
+    /// Whether `value`, part of the event, stands for bytes that are not
+    /// UTF-8.
+    pub(crate) fn not_utf8(&self, value: &str) -> bool {
+        self.input.repaired_in(
+            self.event.as_bytes(),
+            self.after.0..=self.after.1,
+            value.as_bytes(),
+        )
+    }
 }
 
 struct Loader {
@@ -323,16 +421,10 @@ impl Loader {
     }
 
     fn parse_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let mut reader = Reader::from_reader(bytes);
-        // No reader of a schema document collects element text: declarations
-        // are read from attributes alone, and annotations are skipped. So
-        // trimming, which works on each piece of text between references,
-        // cannot change a value here.
-        reader.config_mut().trim_text(true);
-        // For the same reason a bare `&` in that text, which is not
-        // well-formed, is passed over and does not fail the load: published
-        // schemas carry them in documentation.
-        reader.config_mut().allow_dangling_amp = true;
+        // This frame stays on the stack while an include is followed, once
+        // per file in the chain, so the reader and its repair state live on
+        // the heap rather than here.
+        let mut reader = schema_reader(bytes, self.max_schema_bytes);
 
         let mut file = FileState {
             ns_map: HashMap::new(),
@@ -345,9 +437,9 @@ impl Loader {
             // is followed from this frame and not from the handler's.
             let include = match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) => self.top_level_start(e, &mut reader, &mut file)?,
-                Ok(Event::Empty(ref e)) => self.top_level_empty(e, &mut file)?,
+                Ok(Event::Empty(ref e)) => self.top_level_empty(e, reader.get_ref(), &mut file)?,
                 Ok(Event::End(ref e)) => {
-                    if local_name(e.name().as_ref()) == "schema" {
+                    if closes_schema(e, reader.get_ref()) {
                         file.in_schema = false;
                     }
                     None
@@ -368,17 +460,17 @@ impl Loader {
     fn top_level_start(
         &mut self,
         e: &quick_xml::events::BytesStart<'_>,
-        reader: &mut Reader<&[u8]>,
+        reader: &mut Reader<SchemaInput<'_>>,
         file: &mut FileState,
     ) -> Result<Option<PathBuf>> {
         // Collect xmlns declarations.
-        collect_xmlns(e, &mut file.ns_map);
-        let local = local_name(e.name().as_ref());
+        collect_xmlns(e, &mut file.ns_map, Repairs::tag(reader.get_ref(), e));
+        let local = local_name(e.name().as_ref(), Repairs::tag(reader.get_ref(), e));
 
         match local.as_str() {
             "schema" => {
                 // Extract targetNamespace.
-                let attrs = collect_attrs(e);
+                let attrs = collect_attrs(e, Repairs::tag(reader.get_ref(), e));
                 if let Some(tns) = attrs.get("targetNamespace") {
                     self.model.target_namespace = Some(tns.clone());
                     // Kept with the prefixes, which every parser of this
@@ -389,7 +481,7 @@ impl Loader {
                 file.in_schema = true;
             }
             "element" if file.in_schema => {
-                let attrs = collect_attrs(e);
+                let attrs = collect_attrs(e, Repairs::tag(reader.get_ref(), e));
                 // Top-level element: parse its children.
                 let decl = parse_element_start(&attrs, reader, &file.ns_map, 0)?;
                 if let Some(decl) = decl {
@@ -399,7 +491,7 @@ impl Loader {
                 }
             }
             "complexType" if file.in_schema => {
-                let attrs = collect_attrs(e);
+                let attrs = collect_attrs(e, Repairs::tag(reader.get_ref(), e));
                 let name = attrs.get("name").cloned();
                 let ct = parse_complex_type(reader, &file.ns_map, 0)?;
                 if let Some(n) = name {
@@ -407,7 +499,7 @@ impl Loader {
                 }
             }
             "simpleType" if file.in_schema => {
-                let attrs = collect_attrs(e);
+                let attrs = collect_attrs(e, Repairs::tag(reader.get_ref(), e));
                 let name = attrs.get("name").cloned();
                 let mut st = parse_simple_type(reader, &file.ns_map)?;
                 if let Some(n) = &name {
@@ -416,7 +508,7 @@ impl Loader {
                 }
             }
             "attribute" if file.in_schema => {
-                let attrs = collect_attrs(e);
+                let attrs = collect_attrs(e, Repairs::tag(reader.get_ref(), e));
                 let inline_type = parse_attribute_children(reader, &file.ns_map)?;
                 if let Some(attribute) = parse_attribute_decl(&attrs, inline_type, &file.ns_map) {
                     self.global_attributes
@@ -424,13 +516,15 @@ impl Loader {
                 }
             }
             "attributeGroup" if file.in_schema => {
-                let attrs = collect_attrs(e);
+                let attrs = collect_attrs(e, Repairs::tag(reader.get_ref(), e));
                 let attributes = parse_attribute_group(reader, &file.ns_map)?;
                 if let Some(name) = attrs.get("name") {
                     self.attribute_groups.insert(name.clone(), attributes);
                 }
             }
-            "include" | "import" => return self.include_target(e),
+            "include" | "import" => {
+                return self.include_target(e, Repairs::tag(reader.get_ref(), e))
+            }
             _ => {}
         }
         Ok(None)
@@ -440,46 +534,50 @@ impl Loader {
     fn top_level_empty(
         &mut self,
         e: &quick_xml::events::BytesStart<'_>,
+        input: &SchemaInput<'_>,
         file: &mut FileState,
     ) -> Result<Option<PathBuf>> {
-        collect_xmlns(e, &mut file.ns_map);
-        let local = local_name(e.name().as_ref());
+        collect_xmlns(e, &mut file.ns_map, Repairs::tag(input, e));
+        let local = local_name(e.name().as_ref(), Repairs::tag(input, e));
 
         match local.as_str() {
-            "include" | "import" => return self.include_target(e),
+            "include" | "import" => return self.include_target(e, Repairs::tag(input, e)),
             // A self-closing named type declares a type with nothing in it:
             // no content and no attributes, or no restriction.
             "complexType" if file.in_schema => {
-                if let Some(name) = collect_attrs(e).remove("name") {
+                if let Some(name) = collect_attrs(e, Repairs::tag(input, e)).remove("name") {
                     self.model.complex_types.insert(name, empty_complex_type());
                 }
             }
             "attributeGroup" if file.in_schema => {
-                if let Some(name) = collect_attrs(e).remove("name") {
+                if let Some(name) = collect_attrs(e, Repairs::tag(input, e)).remove("name") {
                     self.attribute_groups.insert(name, Vec::new());
                 }
             }
             "attribute" if file.in_schema => {
-                if let Some(attribute) = parse_attribute_decl(&collect_attrs(e), None, &file.ns_map)
-                {
+                if let Some(attribute) = parse_attribute_decl(
+                    &collect_attrs(e, Repairs::tag(input, e)),
+                    None,
+                    &file.ns_map,
+                ) {
                     self.global_attributes
                         .insert(attribute.name.clone(), attribute);
                 }
             }
             "simpleType" if file.in_schema => {
-                if let Some(name) = collect_attrs(e).remove("name") {
+                if let Some(name) = collect_attrs(e, Repairs::tag(input, e)).remove("name") {
                     let mut simple = SimpleTypeDef::string_unbounded();
                     simple.name = Some(QName::local(name.as_str()));
                     self.model.simple_types.insert(name, simple);
                 }
             }
             "element" if file.in_schema => {
-                let attrs = collect_attrs(e);
+                let attrs = collect_attrs(e, Repairs::tag(input, e));
                 // Self-closing top-level element with type= attribute.
                 if let Ok(Some(decl)) = parse_element_start(
                     &attrs,
                     // No children to parse since it's empty — pass a stub reader.
-                    &mut Reader::from_reader(b"" as &[u8]),
+                    &mut Reader::from_reader(LossyUtf8::new(&b""[..])),
                     &file.ns_map,
                     0,
                 ) {
@@ -494,8 +592,12 @@ impl Loader {
     }
 
     /// Path of the file an `xs:include` / `xs:import` names, if it names one.
-    fn include_target(&self, e: &quick_xml::events::BytesStart<'_>) -> Result<Option<PathBuf>> {
-        match schema_location(e, self.max_schema_location_bytes)? {
+    fn include_target(
+        &self,
+        e: &quick_xml::events::BytesStart<'_>,
+        repairs: Repairs<'_>,
+    ) -> Result<Option<PathBuf>> {
+        match schema_location(e, self.max_schema_location_bytes, repairs)? {
             Some(location) => self.resolve_schema_location(&location).map(Some),
             None => Ok(None),
         }
@@ -533,7 +635,7 @@ fn check_nesting(depth: usize) -> Result<()> {
 
 fn parse_element_start(
     attrs: &HashMap<String, String>,
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
     depth: usize,
 ) -> Result<Option<ElementDecl>> {
@@ -586,27 +688,13 @@ enum Tag {
 /// Reads up to the next element boundary, skipping text, comments and the like.
 ///
 /// `context` names the construct being parsed, for the error message.
-fn next_tag(reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>, context: &str) -> Result<Tag> {
+fn next_tag(reader: &mut Reader<SchemaInput<'_>>, buf: &mut Vec<u8>, context: &str) -> Result<Tag> {
     loop {
         buf.clear();
         match reader.read_event_into(buf) {
-            Ok(Event::Start(ref e)) => {
-                return Ok(Tag::Start {
-                    local: local_name(e.name().as_ref()),
-                    attrs: collect_attrs(e),
-                });
-            }
-            Ok(Event::Empty(ref e)) => {
-                return Ok(Tag::Empty {
-                    local: local_name(e.name().as_ref()),
-                    attrs: collect_attrs(e),
-                });
-            }
-            Ok(Event::End(ref e)) => {
-                return Ok(Tag::End {
-                    local: local_name(e.name().as_ref()),
-                });
-            }
+            Ok(Event::Start(ref e)) => return Ok(start_tag(e, reader.get_ref(), false)),
+            Ok(Event::Empty(ref e)) => return Ok(start_tag(e, reader.get_ref(), true)),
+            Ok(Event::End(ref e)) => return Ok(end_tag(e, reader.get_ref())),
             Ok(Event::Eof) => return Ok(Tag::Eof),
             Err(e) => return Err(anyhow::anyhow!("{context} parse error: {e}")),
             _ => {}
@@ -614,14 +702,46 @@ fn next_tag(reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>, context: &str) -> Res
     }
 }
 
-/// Local part of a raw element name; empty when the name is not UTF-8.
-fn local_name(raw: &[u8]) -> String {
-    let raw = std::str::from_utf8(raw).unwrap_or("");
-    split_prefix(raw).1.to_owned()
+/// The [`Tag`] for a start or (`empty`) empty tag.
+///
+/// Built outside [`next_tag`], whose frame sits under the reader's own while
+/// an event is read, so these temporaries never add to that deepest point.
+#[inline(never)]
+fn start_tag(e: &quick_xml::events::BytesStart<'_>, input: &SchemaInput<'_>, empty: bool) -> Tag {
+    let repairs = Repairs::tag(input, e);
+    let local = local_name(e.name().as_ref(), repairs);
+    let attrs = collect_attrs(e, repairs);
+    if empty {
+        Tag::Empty { local, attrs }
+    } else {
+        Tag::Start { local, attrs }
+    }
+}
+
+/// The [`Tag`] for an end tag; see [`start_tag`].
+#[inline(never)]
+fn end_tag(e: &quick_xml::events::BytesEnd<'_>, input: &SchemaInput<'_>) -> Tag {
+    Tag::End {
+        local: local_name(e.name().as_ref(), Repairs::end(input, e)),
+    }
+}
+
+/// Local part of an element name; empty when the name is not UTF-8.
+fn local_name(raw: &str, repairs: Repairs<'_>) -> String {
+    split_prefix(name_text(raw, repairs)).1.to_owned()
+}
+
+/// An element name as written; empty when the name is not UTF-8.
+fn name_text<'n>(raw: &'n str, repairs: Repairs<'_>) -> &'n str {
+    if repairs.not_utf8(raw) {
+        ""
+    } else {
+        raw
+    }
 }
 
 fn parse_inline_type(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
     depth: usize,
 ) -> Result<Box<XsdType>> {
@@ -649,7 +769,7 @@ fn parse_inline_type(
 
 /// Parses the children of an inline `<xs:simpleType>` into a boxed type.
 fn parse_inline_simple_type(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
 ) -> Result<Box<XsdType>> {
     Ok(Box::new(XsdType::Simple(parse_simple_type(
@@ -683,7 +803,7 @@ fn empty_complex_type() -> ComplexType {
 // ── Complex type parser ──────────────────────────────────────────────────────
 
 fn parse_complex_type(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
     nesting: usize,
 ) -> Result<ComplexType> {
@@ -698,7 +818,7 @@ fn parse_complex_type(
 /// type out of this function's stack frame: it recurses once per nested
 /// inline type.
 fn parse_complex_type_into(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
     nesting: usize,
     complex_type: &mut ComplexType,
@@ -794,7 +914,7 @@ fn parse_complex_type_into(
 }
 
 fn parse_particles(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
     end_tag: &str,
     depth: usize,
@@ -1529,7 +1649,7 @@ fn push_attribute_decl(
 /// nested inline type, does not carry this function's locals in its frame.
 #[inline(never)]
 fn parse_attribute_children(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
 ) -> Result<Option<SimpleTypeDef>> {
     let mut inline_type = None;
@@ -1561,7 +1681,7 @@ fn parse_attribute_children(
 ///
 /// [`SchemaModel::resolve_inheritance`]: crate::schema::SchemaModel::resolve_inheritance
 fn parse_content_extension(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
     outer_tag: &str,
     depth: usize,
@@ -1675,7 +1795,7 @@ fn parse_content_extension(
 /// `use="prohibited"` is not appended to `attributes`: its name goes to
 /// `prohibited` instead.
 fn parse_derivation_children(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
     end_tag: &str,
     depth: usize,
@@ -1791,7 +1911,7 @@ fn simple_extension_content(
 // ── Simple type parser ───────────────────────────────────────────────────────
 
 fn parse_simple_type(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
 ) -> Result<SimpleTypeDef> {
     parse_simple_type_at(reader, ns_map, 0)
@@ -1804,7 +1924,7 @@ fn parse_simple_type(
 /// items and a union its members, named by `itemType` / `memberTypes` or
 /// written inline; past [`MAX_SIMPLE_TYPE_NESTING`] an inline one is skipped.
 fn parse_simple_type_at(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
     depth: usize,
 ) -> Result<SimpleTypeDef> {
@@ -1817,11 +1937,10 @@ fn parse_simple_type_at(
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 let name_bytes = e.name();
-                let raw = std::str::from_utf8(name_bytes.as_ref())
-                    .unwrap_or("")
-                    .to_owned();
+                let raw =
+                    name_text(name_bytes.as_ref(), Repairs::tag(reader.get_ref(), e)).to_owned();
                 let (_, local) = split_prefix(&raw);
-                let attrs = collect_attrs(e);
+                let attrs = collect_attrs(e, Repairs::tag(reader.get_ref(), e));
                 match local {
                     "restriction" => {
                         if let Some(base) = attrs.get("base") {
@@ -1846,25 +1965,27 @@ fn parse_simple_type_at(
             }
             Ok(Event::Empty(ref e)) => {
                 let name_bytes = e.name();
-                let raw = std::str::from_utf8(name_bytes.as_ref())
-                    .unwrap_or("")
-                    .to_owned();
+                let raw =
+                    name_text(name_bytes.as_ref(), Repairs::tag(reader.get_ref(), e)).to_owned();
                 let (_, local) = split_prefix(&raw);
                 if local == "restriction" {
-                    let attrs = collect_attrs(e);
+                    let attrs = collect_attrs(e, Repairs::tag(reader.get_ref(), e));
                     if let Some(base) = attrs.get("base") {
                         kind = named_simple_kind(base, ns_map);
                     }
                 } else if local == "list" || local == "union" {
-                    let named = named_parts(&collect_attrs(e), local, ns_map);
+                    let named = named_parts(
+                        &collect_attrs(e, Repairs::tag(reader.get_ref(), e)),
+                        local,
+                        ns_map,
+                    );
                     set_parts(&mut simple, local, named);
                 }
             }
             Ok(Event::End(ref e)) => {
                 let name_bytes = e.name();
-                let raw = std::str::from_utf8(name_bytes.as_ref())
-                    .unwrap_or("")
-                    .to_owned();
+                let raw =
+                    name_text(name_bytes.as_ref(), Repairs::end(reader.get_ref(), e)).to_owned();
                 let (_, local) = split_prefix(&raw);
                 if local == "simpleType" {
                     break;
@@ -1908,7 +2029,7 @@ fn named_parts(
 /// Reads the inline simple types of an `<xs:list>` or `<xs:union>` up to and
 /// including its end tag.
 fn parse_simple_type_parts(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
     end_tag: &str,
     depth: usize,
@@ -1956,17 +2077,16 @@ fn set_parts(
     }
 }
 
-fn parse_facets(reader: &mut Reader<&[u8]>, facets: &mut SimpleFacets) -> Result<()> {
+fn parse_facets(reader: &mut Reader<SchemaInput<'_>>, facets: &mut SimpleFacets) -> Result<()> {
     let mut buf = Vec::with_capacity(256);
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let name_bytes = e.name();
-                let raw = std::str::from_utf8(name_bytes.as_ref())
-                    .unwrap_or("")
-                    .to_owned();
+                let raw =
+                    name_text(name_bytes.as_ref(), Repairs::tag(reader.get_ref(), e)).to_owned();
                 let (_, local) = split_prefix(&raw);
-                let attrs = collect_attrs(e);
+                let attrs = collect_attrs(e, Repairs::tag(reader.get_ref(), e));
                 let value = attrs.get("value").cloned().unwrap_or_default();
                 match local {
                     "enumeration" => {
@@ -1989,9 +2109,8 @@ fn parse_facets(reader: &mut Reader<&[u8]>, facets: &mut SimpleFacets) -> Result
             }
             Ok(Event::End(ref e)) => {
                 let name_bytes = e.name();
-                let raw = std::str::from_utf8(name_bytes.as_ref())
-                    .unwrap_or("")
-                    .to_owned();
+                let raw =
+                    name_text(name_bytes.as_ref(), Repairs::end(reader.get_ref(), e)).to_owned();
                 let (_, local) = split_prefix(&raw);
                 if local == "restriction" {
                     break;
@@ -2055,7 +2174,7 @@ fn is_attribute_placeholder(attribute: &AttributeDecl) -> bool {
 ///
 /// Wildcards and annotations are skipped.
 fn parse_attribute_group(
-    reader: &mut Reader<&[u8]>,
+    reader: &mut Reader<SchemaInput<'_>>,
     ns_map: &HashMap<String, String>,
 ) -> Result<Vec<AttributeDecl>> {
     let mut attributes = Vec::new();
@@ -2402,14 +2521,22 @@ fn attribute_value<'a>(
     attribute.normalized_value(XmlVersion::Implicit1_0)
 }
 
-fn collect_attrs(e: &quick_xml::events::BytesStart<'_>) -> HashMap<String, String> {
+/// The attributes of `e` by name; one whose name or value is not UTF-8 is
+/// left out.
+fn collect_attrs(
+    e: &quick_xml::events::BytesStart<'_>,
+    repairs: Repairs<'_>,
+) -> HashMap<String, String> {
     e.attributes()
         .with_checks(false)
         .flatten()
         .filter_map(|attr| {
-            let key = std::str::from_utf8(attr.key.as_ref()).ok()?.to_string();
-            let val = attribute_value(&attr).ok()?.into_owned();
-            Some((key, val))
+            let key: &str = attr.key.as_ref();
+            let val = attribute_value(&attr).ok()?;
+            if repairs.not_utf8(key) || repairs.not_utf8(&attr.value) {
+                return None;
+            }
+            Some((key.to_string(), val.into_owned()))
         })
         .collect()
 }
@@ -2417,11 +2544,12 @@ fn collect_attrs(e: &quick_xml::events::BytesStart<'_>) -> HashMap<String, Strin
 fn schema_location(
     e: &quick_xml::events::BytesStart<'_>,
     max_bytes: usize,
+    repairs: Repairs<'_>,
 ) -> Result<Option<String>> {
     for attribute in e.attributes().with_checks(false) {
         let attribute =
             attribute.map_err(|error| anyhow::anyhow!("XML attribute error: {error}"))?;
-        if attribute.key.as_ref() != b"schemaLocation" {
+        if attribute.key.as_ref() != "schemaLocation" {
             continue;
         }
         let observed = attribute.value.len();
@@ -2430,22 +2558,29 @@ fn schema_location(
                 "resource_limit: schema_location_bytes: observed {observed} exceeds limit {max_bytes}"
             ));
         }
-        return attribute_value(&attribute)
-            .map(|value| Some(value.into_owned()))
-            .map_err(|error| anyhow::anyhow!("invalid schemaLocation: {error}"));
+        let value = attribute_value(&attribute)
+            .map_err(|error| anyhow::anyhow!("invalid schemaLocation: {error}"))?;
+        if repairs.not_utf8(&attribute.value) {
+            return Err(anyhow::anyhow!("invalid schemaLocation: not UTF-8"));
+        }
+        return Ok(Some(value.into_owned()));
     }
     Ok(None)
 }
 
-fn collect_xmlns(e: &quick_xml::events::BytesStart<'_>, ns_map: &mut HashMap<String, String>) {
+fn collect_xmlns(
+    e: &quick_xml::events::BytesStart<'_>,
+    ns_map: &mut HashMap<String, String>,
+    repairs: Repairs<'_>,
+) {
     for attr in e.attributes().with_checks(false).flatten() {
-        let key = match std::str::from_utf8(attr.key.as_ref()) {
-            Ok(k) => k.to_string(),
-            Err(_) => continue,
-        };
+        let key: &str = attr.key.as_ref();
+        if repairs.not_utf8(key) || repairs.not_utf8(&attr.value) {
+            continue;
+        }
         let val = match attribute_value(&attr) {
             Ok(v) => v.into_owned(),
-            Err(_) => continue,
+            _ => continue,
         };
         if key == "xmlns" {
             ns_map.insert(String::new(), val);
@@ -2468,7 +2603,7 @@ fn parse_occurrence(attrs: &HashMap<String, String>) -> OccurrenceConstraint {
     OccurrenceConstraint { min, max }
 }
 
-fn skip_element(reader: &mut Reader<&[u8]>, tag: &str) -> Result<()> {
+fn skip_element(reader: &mut Reader<SchemaInput<'_>>, tag: &str) -> Result<()> {
     let mut depth = 1i32;
     let mut buf = Vec::with_capacity(256);
     loop {
@@ -2478,8 +2613,7 @@ fn skip_element(reader: &mut Reader<&[u8]>, tag: &str) -> Result<()> {
                 depth -= 1;
                 if depth <= 0 {
                     let name_bytes = e.name();
-                    let raw = std::str::from_utf8(name_bytes.as_ref())
-                        .unwrap_or("")
+                    let raw = name_text(name_bytes.as_ref(), Repairs::end(reader.get_ref(), e))
                         .to_owned();
                     let (_, local) = split_prefix(&raw);
                     if local == tag || depth < 0 {
