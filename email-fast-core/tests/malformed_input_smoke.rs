@@ -567,6 +567,41 @@ fn body_lines_after_a_dash_line_are_not_costed_as_headers() {
     }
 }
 
+/// `mailparse` searches a multipart body for its boundary in time
+/// proportional to body size times boundary length (a 900-dash boundary
+/// over 5 MB took 1.4 s optimized). RFC 2046 allows 70 characters; a
+/// boundary far past that is refused, at any nesting level.
+#[test]
+fn an_overlong_multipart_boundary_is_refused() {
+    let long = "-".repeat(900);
+    let cases = [
+        format!("Content-Type: multipart/mixed; boundary=\"{long}\"\r\n\r\n--{long}\r\n\r\ntext\r\n"),
+        format!(
+            "Content-Type: multipart/mixed; boundary=a\r\n\r\n--a\r\n\
+             Content-Type: multipart/alternative;\r\n boundary={long}\r\n\r\n--{long}\r\n\r\ntext\r\n--a--\r\n"
+        ),
+    ];
+    for message in cases {
+        let err = parse_eml_bytes(message.as_bytes(), ParseOptions::default())
+            .expect_err("an overlong boundary must be refused");
+        assert!(err.to_string().contains("boundary longer than"), "{err}");
+    }
+
+    // The longest boundary the standard allows, and some slack, still parse.
+    for len in [70, 200] {
+        let boundary = "b".repeat(len);
+        let message = format!(
+            "Content-Type: multipart/mixed; boundary={boundary}\r\n\r\n--{boundary}\r\n\r\ntext\r\n--{boundary}--\r\n"
+        );
+        let email = parse_eml_bytes(message.as_bytes(), ParseOptions::default()).expect("parses");
+        assert_eq!(
+            email.body.text.as_deref().map(str::trim),
+            Some("text"),
+            "{len}"
+        );
+    }
+}
+
 /// An unfolded `To:` of 2,000 properly encoded recipients is ordinary work
 /// for `mailparse` (a few milliseconds optimized), with or without a raw
 /// non-ASCII character on the line, and base64 padding (`==?=`) does not

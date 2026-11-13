@@ -969,6 +969,14 @@ fn mime_nesting_depth(raw: &[u8], limit: usize) -> Option<usize> {
 /// of 2,000 properly encoded recipients (68 KB) costs 1.4e8.
 const MAX_HEADER_DECODE_COST: u64 = 3_000_000_000;
 
+/// Longest multipart boundary accepted, in bytes.
+///
+/// `mailparse` looks for a boundary by comparing it at every position of the
+/// body, so splitting a message costs its size times the boundary's length:
+/// a 900-byte boundary over 5 MB took 1.4 s in an optimized build. RFC 2046
+/// allows 70 characters; this leaves room for writers that go over.
+const MAX_BOUNDARY_LEN: usize = 200;
+
 /// Returns the work `mailparse` 0.15 does to decode the headers of `raw`.
 ///
 /// `mailparse` looks for encoded-words (`=?charset?B?text?=`) one physical
@@ -995,7 +1003,8 @@ const MAX_HEADER_DECODE_COST: u64 = 3_000_000_000;
 ///
 /// # Errors
 ///
-/// Returns an error once the cost passes `limit`.
+/// Returns an error once the cost passes `limit`, or if a multipart
+/// `Content-Type` declares a boundary longer than [`MAX_BOUNDARY_LEN`].
 fn header_decode_cost(raw: &[u8], limit: u64) -> Result<u64> {
     let mut scan = HeaderScan {
         cost: 0,
@@ -1087,7 +1096,7 @@ impl HeaderScan {
         }
         if !self.block_has_content_type && header[..colon].eq_ignore_ascii_case(b"Content-Type") {
             self.block_has_content_type = true;
-            self.declare_boundary(header);
+            self.declare_boundary(header)?;
         }
         Ok(())
     }
@@ -1098,14 +1107,26 @@ impl HeaderScan {
     /// one it will search for, whatever folding, quoting or encoding the
     /// header uses. Its decoding cost is already counted and within the
     /// limit.
-    fn declare_boundary(&mut self, header: &[u8]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a multipart boundary is longer than
+    /// [`MAX_BOUNDARY_LEN`].
+    fn declare_boundary(&mut self, header: &[u8]) -> Result<()> {
         let Ok((parsed, _)) = mailparse::parse_header(header) else {
-            return;
+            return Ok(());
         };
         let content_type = mailparse::parse_content_type(&parsed.get_value());
         if let Some(boundary) = content_type.params.get("boundary") {
+            if content_type.mimetype.starts_with("multipart/") && boundary.len() > MAX_BOUNDARY_LEN
+            {
+                return Err(anyhow!(
+                    "multipart boundary longer than {MAX_BOUNDARY_LEN} bytes"
+                ));
+            }
             self.delimiters.push(format!("--{boundary}").into_bytes());
         }
+        Ok(())
     }
 
     /// Adds the cost of decoding one header value that holds a `=?`.
