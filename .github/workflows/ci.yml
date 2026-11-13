@@ -112,7 +112,7 @@ jobs:
         shell: bash
     env:
       # Every Python binding crate that has a tests/ directory.
-      TESTED_BINDINGS: email-fast-py json-fast-py ontology-fast-py pdf-fast-py xsd-fast-py
+      TESTED_BINDINGS: docx-fast-py email-fast-py geo-fast-py json-fast-py ontology-fast-py pdf-fast-py pdf-fast-write-py pptx-fast-py xlsx-fast-py xlsx-fast-write-py xsd-fast-py
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -177,6 +177,8 @@ jobs:
         run: scripts/build-node.sh
       - name: Load and parse a generated fixture through each binding
         run: node scripts/smoke-node.mjs
+      - name: Check that every declared type is a real export
+        run: node scripts/check-node-types.mjs
       - name: Pack one tarball per binding
         run: |
           set -euo pipefail
