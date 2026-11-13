@@ -31,7 +31,8 @@
 //! as a warning so validation never silently under-checks; genuinely unknown
 //! keywords likewise warn. A `$ref` or `$dynamicRef` that resolves to
 //! nothing (including any document that was not supplied: nothing is ever
-//! fetched) is an error, so such a schema fails closed.
+//! fetched) is an error, so such a schema fails closed; only references to
+//! the [`WELL_KNOWN_META_SCHEMAS`] keep the old warning.
 //!
 //! Patterns and `format` regexes compile with the Rust `regex` crate; an
 //! ECMA-262 construct Rust `regex` cannot express makes the keyword a warning
@@ -57,6 +58,7 @@
 //! validation in time and memory linear in the schema.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 use serde_json::map::Map;
 use serde_json::Value;
@@ -609,7 +611,10 @@ fn run_with_resources(
             .saturating_mul(schema_values.saturating_add(1))
             .saturating_mul(document_values.saturating_add(1))
     });
-    let registry = Registry::build(schema, resources);
+    let registry = match Registry::build(schema, resources) {
+        Ok(registry) => registry,
+        Err(reason) => return Outcome::stopped(reason),
+    };
     let shape = schema_shape(schema, &registry);
     // Worst-case nesting of applications, decided once. Without a cycle it
     // is the longest chain of subschemas. With one, a chain can restart at
@@ -799,16 +804,37 @@ fn run_on_this_stack<'a>(
         // An unresolvable reference fails the validation even where `not`
         // or another alternative discarded its finding.
         if !ctx.unresolved.is_empty() {
-            let mut reported: HashSet<(String, String)> = findings
+            // Only the unresolved findings are indexed, never the others.
+            let mut missing: HashMap<(&str, &str), bool> = ctx
+                .unresolved
                 .iter()
-                .map(|f| (f.path.clone(), f.message.clone()))
+                .map(|f| ((f.path.as_str(), f.message.as_str()), true))
                 .collect();
-            for unresolved in ctx.unresolved {
-                if reported.insert((unresolved.path.clone(), unresolved.message.clone())) {
-                    findings.push(unresolved);
+            for finding in &findings {
+                if let Some(absent) =
+                    missing.get_mut(&(finding.path.as_str(), finding.message.as_str()))
+                {
+                    *absent = false;
                 }
             }
+            let appended: Vec<Finding> = ctx
+                .unresolved
+                .iter()
+                .filter(|f| {
+                    missing
+                        .insert((f.path.as_str(), f.message.as_str()), false)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            findings.extend(appended);
         }
+        findings.extend(
+            registry
+                .warnings
+                .iter()
+                .map(|warning| Finding::warning("$", warning.clone())),
+        );
     }
     Outcome {
         findings,
@@ -880,18 +906,30 @@ impl Ctx<'_, '_> {
     /// Enters `resource` into the dynamic scope. Returns whether it was
     /// added, in which case the caller must [`Ctx::leave`] afterwards.
     ///
-    /// Only resources declaring a `$dynamicAnchor` are kept, each once (the
-    /// outermost entry decides), and only when some `$dynamicRef` can
-    /// consult them.
+    /// Only resources declaring a `$dynamicAnchor` name that no resource
+    /// further out declares are kept, and only when some `$dynamicRef` can
+    /// consult them: the scope, and the remembered-result key built from it,
+    /// stay as short as the number of distinct names.
     fn enter(&mut self, resource: usize) -> bool {
-        if !self.registry.dynamic
-            || self
-                .registry
-                .resources
-                .get(resource)
-                .is_none_or(|declared| declared.dynamic_anchors.is_empty())
-            || self.scope.iter().any(|scope| scope.resource == resource)
-        {
+        let registry = self.registry;
+        if !registry.dynamic {
+            return false;
+        }
+        let Some(declared) = registry.resources.get(resource) else {
+            return false;
+        };
+        // Only the outermost declarer of a name is ever used, so a resource
+        // whose names are all declared further out changes nothing. The
+        // scope therefore holds at most one resource per distinct name.
+        let adds_a_name = declared.dynamic_anchors.keys().any(|name| {
+            !self.scope.iter().any(|scope| {
+                registry
+                    .resources
+                    .get(scope.resource)
+                    .is_some_and(|outer| outer.dynamic_anchors.contains_key(name))
+            })
+        });
+        if !adds_a_name {
             return false;
         }
         let next = self.scope_ids.len() + 1;
@@ -983,6 +1021,20 @@ impl<'a> Ctx<'a, '_> {
 /// not accepted, even under `not` or beside an alternative that passes.
 /// Before this, such a `$ref` was a warning and was skipped, which accepted
 /// the value. A reference the validation never reaches is not reported.
+/// One exception keeps the old behaviour: a reference to one of the
+/// [`WELL_KNOWN_META_SCHEMAS`] that is not defined locally is a warning and
+/// is skipped, since no schema can resolve those offline.
+///
+/// Identifiers count where 2020-12 says they do: an `$id` or anchor inside
+/// instance data (`enum`, `const`, ...) or an unknown keyword is ignored.
+/// When two schema resources share a URI, the first in document order is
+/// used and a warning names the URI. When the root's `$schema` names
+/// draft-04, draft-06 or draft-07, an object holding `$ref` sets no base URI
+/// and no anchor, as those drafts ignore every keyword beside `$ref`.
+///
+/// Resolving URIs is bounded too: more URI text than
+/// `URI_BYTES_PER_SCHEMA_BYTE` (16) per byte of schema text, plus 1 MiB,
+/// stops the validation with an error.
 pub fn validate(document: &Value, schema: &Value) -> Vec<Finding> {
     run(document, schema, None).findings
 }
@@ -1313,7 +1365,17 @@ fn apply_object<'v>(
         let registry = ctx.registry;
         let site = (schema_address, dynamic);
         let Some(Some(target)) = registry.references.get(&site) else {
-            ctx.unresolvable(site, reference, path, findings);
+            if registry.meta_schema_sites.contains(&site) {
+                findings.push(Finding::warning(
+                    path,
+                    format!(
+                        "{keyword} {reference:?} names a JSON Schema meta-schema, which is not \
+                         bundled; skipped (supply it to validate_with_resources to apply it)"
+                    ),
+                ));
+            } else {
+                ctx.unresolvable(site, reference, path, findings);
+            }
             continue;
         };
         // A `$dynamicRef` to a `$dynamicAnchor` leads to the outermost
@@ -2287,10 +2349,6 @@ fn type_matches(value: &Value, type_name: &str) -> bool {
     }
 }
 
-/// Keywords whose values are instance data, never subschemas: identifiers
-/// inside them are not identifiers.
-const DATA_KEYWORDS: &[&str] = &["enum", "const", "default", "examples"];
-
 /// Keywords whose values are maps from names to subschemas.
 const SCHEMA_MAP_KEYWORDS: &[&str] = &[
     "properties",
@@ -2301,6 +2359,104 @@ const SCHEMA_MAP_KEYWORDS: &[&str] = &[
     "dependencies",
 ];
 
+/// Keywords whose value is a subschema or an array of subschemas.
+///
+/// Identifiers count only inside these and [`SCHEMA_MAP_KEYWORDS`]: an `$id`
+/// or anchor inside instance data (`enum`, `const`, ...) or inside an
+/// unknown keyword does not identify a schema (2020-12, section 9.4.2).
+const SCHEMA_KEYWORDS: &[&str] = &[
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "items",
+    "prefixItems",
+    "additionalItems",
+    "contains",
+    "additionalProperties",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "contentSchema",
+];
+
+/// The JSON Schema meta-schemas, which no schema can resolve offline.
+///
+/// A `$ref` or `$dynamicRef` to one of these that the schema and the
+/// supplied documents do not define keeps the behaviour from before
+/// references failed closed: a [`Severity::Warning`], and the reference is
+/// skipped. Each entry matches with the `http` or `https` scheme and with any
+/// fragment or none (`...schema`, `...schema#`, `...schema#/definitions/x`).
+/// Supplying the document to [`validate_with_resources`] resolves the
+/// reference normally instead.
+pub const WELL_KNOWN_META_SCHEMAS: &[&str] = &[
+    "json-schema.org/draft-04/schema",
+    "json-schema.org/draft-06/schema",
+    "json-schema.org/draft-07/schema",
+    "json-schema.org/draft/2019-09/schema",
+    "json-schema.org/draft/2019-09/meta/core",
+    "json-schema.org/draft/2019-09/meta/applicator",
+    "json-schema.org/draft/2019-09/meta/validation",
+    "json-schema.org/draft/2019-09/meta/meta-data",
+    "json-schema.org/draft/2019-09/meta/format",
+    "json-schema.org/draft/2019-09/meta/content",
+    "json-schema.org/draft/2020-12/schema",
+    "json-schema.org/draft/2020-12/meta/core",
+    "json-schema.org/draft/2020-12/meta/applicator",
+    "json-schema.org/draft/2020-12/meta/unevaluated",
+    "json-schema.org/draft/2020-12/meta/validation",
+    "json-schema.org/draft/2020-12/meta/meta-data",
+    "json-schema.org/draft/2020-12/meta/format-annotation",
+    "json-schema.org/draft/2020-12/meta/format-assertion",
+    "json-schema.org/draft/2020-12/meta/content",
+];
+
+/// Whether `uri` (absolute, fragment allowed) names a well-known meta-schema.
+fn is_well_known_meta_schema(uri: &str) -> bool {
+    let without = uri.split_once('#').map_or(uri, |(before, _)| before);
+    let Some(rest) = without
+        .strip_prefix("https://")
+        .or_else(|| without.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    WELL_KNOWN_META_SCHEMAS.contains(&rest)
+}
+
+/// Whether a `$schema` value names draft-04, draft-06 or draft-07, where
+/// every keyword beside `$ref` is ignored, `$id` included.
+fn is_legacy_dialect(schema: &str) -> bool {
+    let without = schema.split_once('#').map_or(schema, |(before, _)| before);
+    ["draft-04", "draft-06", "draft-07"].iter().any(|draft| {
+        [
+            format!("http://json-schema.org/{draft}/schema"),
+            format!("https://json-schema.org/{draft}/schema"),
+        ]
+        .contains(&without.to_owned())
+    })
+}
+
+/// Most bytes of resolved URI text one validation may hold or build, per
+/// byte of text in the schema and the supplied documents.
+///
+/// A resource's URI repeats its base, so a long base under many relative
+/// `$id`s would otherwise cost the product of the two. 16 leaves room for
+/// ordinary schemas (bases of about 100 bytes under short `$id`s use 4 to 8)
+/// while keeping the registry a small multiple of the schema.
+const URI_BYTES_PER_SCHEMA_BYTE: usize = 16;
+
+/// URI bytes allowed beyond [`URI_BYTES_PER_SCHEMA_BYTE`], so a small schema
+/// with a few long URIs is never refused.
+const URI_BYTES_ALLOWANCE: usize = 1 << 20;
+
+/// Why validation stopped at the URI budget.
+const URI_BUDGET_EXHAUSTED: &str = "validation stopped: resolving the schema's `$id`s and \
+     references needs more URI text than the schema's size allows (a long base URI repeated \
+     under many relative `$id`s); the document was not validated";
+
 /// What a value inside a schema document is, for finding identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -2308,8 +2464,10 @@ enum Role {
     Schema,
     /// A map from names to schemas (`properties`, `$defs`, ...).
     SchemaMap,
-    /// Instance data (`enum`, `const`, ...): nothing here identifies a schema.
-    Data,
+    /// Instance data or the value of an unknown keyword: nothing here
+    /// identifies a schema, though a `$ref` here is still followed if a
+    /// reference leads into it.
+    Other,
 }
 
 /// One schema resource: a document root, or a subschema with its own `$id`.
@@ -2361,21 +2519,28 @@ struct Site<'s> {
 
 /// Every schema resource, anchor and reference target of one validation.
 ///
-/// Built once per validation, in one pass over the schema and the supplied
-/// documents plus one resolution per reference: time and memory are linear
-/// in their size (a resource's URI is at most as long as the `$id`s on its
-/// path, and nesting is limited). JSON-pointer fragments are not
-/// enumerated; each reference's pointer is walked once, here.
+/// Built once per validation, in one document-order pass over the schema
+/// and the supplied documents plus one resolution per reference. Time and
+/// memory are linear in their size: URI text is charged to a budget of
+/// [`URI_BYTES_PER_SCHEMA_BYTE`] per byte of schema text, and each URI is
+/// held once. JSON-pointer fragments are not enumerated; each reference's
+/// pointer is walked once, here.
 #[derive(Debug, Default)]
 struct Registry<'s> {
     resources: Vec<Resource<'s>>,
-    /// Absolute URI (no fragment) -> resource.
-    by_uri: HashMap<String, usize>,
+    /// Hash of an absolute URI (no fragment) -> resources with that hash;
+    /// the URI text itself is held once, in the resource.
+    by_uri: HashMap<u64, Vec<usize>>,
+    hasher: std::hash::RandomState,
+    /// Retrieval URIs of supplied documents whose own `$id` differs.
+    aliases: HashMap<String, usize>,
     /// Address of a resource's root schema -> resource.
     roots: HashMap<usize, usize>,
     /// (address of the schema object, whether it is `$dynamicRef`) -> where
     /// the reference leads, `None` when it resolves to nothing.
     references: HashMap<(usize, bool), Option<Target<'s>>>,
+    /// Unresolved reference sites that name a well-known meta-schema.
+    meta_schema_sites: HashSet<(usize, bool)>,
     /// Every subschema declaring a `$dynamicAnchor`, by name: the places a
     /// `$dynamicRef` to that name can lead.
     dynamic_targets: HashMap<&'s str, Vec<&'s Value>>,
@@ -2384,28 +2549,76 @@ struct Registry<'s> {
     dynamic_ring: HashMap<usize, &'s Value>,
     /// Whether any `$dynamicRef` consults the dynamic scope.
     dynamic: bool,
+    /// Schema-level notes, reported as warnings at `$`.
+    warnings: Vec<String>,
+    /// URI bytes held or built so far, and the most allowed.
+    uri_bytes: usize,
+    uri_budget: usize,
 }
 
 fn address(value: &Value) -> usize {
     std::ptr::from_ref(value) as usize
 }
 
+/// Bytes of string and key text in `root`, without recursion.
+fn text_bytes(root: &Value) -> usize {
+    let mut bytes = 0usize;
+    let mut pending: Vec<&Value> = vec![root];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::String(text) => bytes = bytes.saturating_add(text.len()),
+            Value::Array(items) => pending.extend(items),
+            Value::Object(map) => {
+                for (key, member) in map {
+                    bytes = bytes.saturating_add(key.len());
+                    pending.push(member);
+                }
+            }
+            _ => {}
+        }
+    }
+    bytes
+}
+
 impl<'s> Registry<'s> {
     /// Registers `root` (base URI empty) and each `(retrieval URI, document)`.
-    fn build(root: &'s Value, documents: &[(&str, &'s Value)]) -> Self {
-        let mut registry = Self::default();
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason to report when the URI budget runs out.
+    fn build(root: &'s Value, documents: &[(&str, &'s Value)]) -> Result<Self, &'static str> {
+        let text = documents
+            .iter()
+            .fold(text_bytes(root), |sum, (uri, document)| {
+                sum.saturating_add(uri.len())
+                    .saturating_add(text_bytes(document))
+            });
+        let mut registry = Self {
+            uri_budget: text
+                .saturating_mul(URI_BYTES_PER_SCHEMA_BYTE)
+                .saturating_add(URI_BYTES_ALLOWANCE),
+            ..Self::default()
+        };
         let mut sites = Vec::new();
-        registry.register(root, "", &mut sites);
+        registry.register(root, "", &mut sites)?;
         for (uri, document) in documents {
-            registry.register(document, uri, &mut sites);
+            registry.register(document, uri, &mut sites)?;
         }
         let mut live: HashSet<&'s str> = HashSet::new();
         for site in sites {
-            let target = registry.resolve(site.reference, site.resource, site.dynamic);
+            let key = (site.address, site.dynamic);
+            let base = registry
+                .resources
+                .get(site.resource)
+                .map_or("", |declared| declared.uri.as_str());
+            let absolute = resolve_uri(site.reference, base);
+            registry.charge(absolute.len())?;
+            let target = registry.resolve(&absolute, site.dynamic);
+            if target.is_none() && is_well_known_meta_schema(&absolute) {
+                registry.meta_schema_sites.insert(key);
+            }
             live.extend(target.and_then(|target| target.dynamic));
-            registry
-                .references
-                .insert((site.address, site.dynamic), target);
+            registry.references.insert(key, target);
         }
         registry.dynamic = !live.is_empty();
         for name in live {
@@ -2426,30 +2639,118 @@ impl<'s> Registry<'s> {
                 registry.dynamic_ring.insert(address(anchor), following);
             }
         }
-        registry
+        Ok(registry)
     }
 
-    /// Records the resources, anchors and reference sites of one document.
-    fn register(&mut self, document: &'s Value, retrieval: &str, sites: &mut Vec<Site<'s>>) {
+    /// Counts `bytes` of URI text against the budget.
+    fn charge(&mut self, bytes: usize) -> Result<(), &'static str> {
+        self.uri_bytes = self.uri_bytes.saturating_add(bytes);
+        if self.uri_bytes > self.uri_budget {
+            return Err(URI_BUDGET_EXHAUSTED);
+        }
+        Ok(())
+    }
+
+    /// The resource registered under `uri` (no fragment).
+    fn lookup(&self, uri: &str) -> Option<usize> {
+        self.by_uri
+            .get(&self.hasher.hash_one(uri))
+            .and_then(|candidates| {
+                candidates.iter().copied().find(|index| {
+                    self.resources
+                        .get(*index)
+                        .is_some_and(|resource| resource.uri == uri)
+                })
+            })
+            .or_else(|| self.aliases.get(uri).copied())
+    }
+
+    /// Names document `index` by its URI and, when its own `$id` replaced
+    /// it, by its retrieval URI as well.
+    fn name_document(&mut self, index: usize, retrieval: &str) {
+        let Some(own) = self
+            .resources
+            .get(index)
+            .map(|resource| resource.uri.clone())
+        else {
+            return;
+        };
+        self.name(&own, index);
+        if own != retrieval {
+            match self.lookup(retrieval) {
+                Some(existing) if existing != index => self.warnings.push(format!(
+                    "two schema resources have the URI {retrieval:?}; references to it use \
+                     the first in document order"
+                )),
+                Some(_) => {}
+                None => {
+                    self.aliases.insert(retrieval.to_owned(), index);
+                }
+            }
+        }
+    }
+
+    /// Registers `uri` for `resource`; the first resource in document order
+    /// keeps a URI, and a second one is reported.
+    fn name(&mut self, uri: &str, resource: usize) {
+        match self.lookup(uri) {
+            Some(existing) if existing != resource => self.warnings.push(format!(
+                "two schema resources have the URI {uri:?}; references to it use the first \
+                 in document order"
+            )),
+            Some(_) => {}
+            None => self
+                .by_uri
+                .entry(self.hasher.hash_one(uri))
+                .or_default()
+                .push(resource),
+        }
+    }
+
+    /// Records the resources, anchors and reference sites of one document,
+    /// in document order.
+    fn register(
+        &mut self,
+        document: &'s Value,
+        retrieval: &str,
+        sites: &mut Vec<Site<'s>>,
+    ) -> Result<(), &'static str> {
         let uri = without_fragment(&resolve_uri(retrieval, ""));
+        self.charge(uri.len())?;
         let index = self.resources.len();
-        self.by_uri.entry(uri.clone()).or_insert(index);
-        self.resources.push(Resource::new(uri, document));
+        self.resources.push(Resource::new(uri.clone(), document));
         self.roots.insert(address(document), index);
+        if !document.is_object() {
+            self.name(&uri, index);
+        }
+        let legacy = document
+            .get("$schema")
+            .and_then(Value::as_str)
+            .is_some_and(is_legacy_dialect);
         let mut pending: Vec<(&'s Value, usize, Role)> = vec![(document, index, Role::Schema)];
         while let Some((node, mut resource, role)) = pending.pop() {
             match node {
                 Value::Array(items) => {
+                    // Reversed onto the stack, so they are taken in order.
                     pending.extend(
                         items
                             .iter()
+                            .rev()
                             .filter(|item| item.is_object() || item.is_array())
                             .map(|item| (item, resource, role)),
                     );
                 }
                 Value::Object(map) => {
                     if role == Role::Schema {
-                        resource = self.identify(node, map, resource, std::ptr::eq(node, document));
+                        let document_root = std::ptr::eq(node, document);
+                        // Draft-07 and older ignore every keyword beside
+                        // `$ref`, `$id` included.
+                        if !(legacy && map.contains_key("$ref")) {
+                            resource = self.identify(node, map, resource, document_root)?;
+                        }
+                        if document_root {
+                            self.name_document(index, &uri);
+                        }
                     }
                     for (keyword, dynamic) in [("$ref", false), ("$dynamicRef", true)] {
                         if let Some(reference) = map.get(keyword).and_then(Value::as_str) {
@@ -2461,18 +2762,18 @@ impl<'s> Registry<'s> {
                             });
                         }
                     }
-                    for (key, child) in map {
+                    for (key, child) in map.iter().rev() {
                         if !(child.is_object() || child.is_array()) {
                             continue;
                         }
                         let child_role = match role {
-                            Role::Data => Role::Data,
+                            Role::Other => Role::Other,
                             Role::SchemaMap => Role::Schema,
-                            Role::Schema if DATA_KEYWORDS.contains(&key.as_str()) => Role::Data,
                             Role::Schema if SCHEMA_MAP_KEYWORDS.contains(&key.as_str()) => {
                                 Role::SchemaMap
                             }
-                            Role::Schema => Role::Schema,
+                            Role::Schema if SCHEMA_KEYWORDS.contains(&key.as_str()) => Role::Schema,
+                            Role::Schema => Role::Other,
                         };
                         pending.push((child, resource, child_role));
                     }
@@ -2480,6 +2781,7 @@ impl<'s> Registry<'s> {
                 _ => {}
             }
         }
+        Ok(())
     }
 
     /// Applies one schema object's `$id`, `$anchor` and `$dynamicAnchor`;
@@ -2490,7 +2792,7 @@ impl<'s> Registry<'s> {
         map: &'s Map<String, Value>,
         mut resource: usize,
         document_root: bool,
-    ) -> usize {
+    ) -> Result<usize, &'static str> {
         if let Some(id) = map.get("$id").and_then(Value::as_str) {
             if let Some(name) = id.strip_prefix('#') {
                 // The draft-06/07 plain-name form is an anchor.
@@ -2501,16 +2803,17 @@ impl<'s> Registry<'s> {
                     .get(resource)
                     .map_or("", |declared| declared.uri.as_str());
                 let uri = without_fragment(&resolve_uri(id, base));
+                let same = uri == base;
+                self.charge(uri.len())?;
                 if document_root {
                     // A supplied document's own `$id` names it as well as
                     // its retrieval URI, and is the base inside it.
-                    self.by_uri.entry(uri.clone()).or_insert(resource);
                     if let Some(declared) = self.resources.get_mut(resource) {
                         declared.uri = uri;
                     }
-                } else if uri != base {
+                } else if !same {
                     let index = self.resources.len();
-                    self.by_uri.entry(uri.clone()).or_insert(index);
+                    self.name(&uri, index);
                     self.resources.push(Resource::new(uri, node));
                     self.roots.insert(address(node), index);
                     resource = index;
@@ -2523,11 +2826,11 @@ impl<'s> Registry<'s> {
         if let Some(name) = map.get("$dynamicAnchor").and_then(Value::as_str) {
             self.anchor(resource, name, node, true);
         }
-        resource
+        Ok(resource)
     }
 
     /// Declares a plain-name fragment in `resource`; the first declaration
-    /// of a name wins.
+    /// of a name in document order wins.
     fn anchor(&mut self, resource: usize, name: &'s str, node: &'s Value, dynamic: bool) {
         if name.is_empty() {
             return;
@@ -2542,12 +2845,10 @@ impl<'s> Registry<'s> {
         }
     }
 
-    /// Resolves `reference` against the base URI of `resource`.
-    fn resolve(&self, reference: &str, resource: usize, dynamic: bool) -> Option<Target<'s>> {
-        let base = self.resources.get(resource)?.uri.as_str();
-        let absolute = resolve_uri(reference, base);
-        let (uri, fragment) = absolute.split_once('#').unwrap_or((absolute.as_str(), ""));
-        let mut resource = *self.by_uri.get(uri)?;
+    /// Finds what the absolute URI reference `absolute` names.
+    fn resolve(&self, absolute: &str, dynamic: bool) -> Option<Target<'s>> {
+        let (uri, fragment) = absolute.split_once('#').unwrap_or((absolute, ""));
+        let mut resource = self.lookup(uri)?;
         let declared = self.resources.get(resource)?;
         // A fragment is percent-encoded (RFC 3986); the JSON Pointer inside
         // it then has its own `~0`/`~1` escapes (RFC 6901).
@@ -4095,6 +4396,173 @@ mod tests {
     }
 
     #[test]
+    fn uri_text_stays_a_small_multiple_of_the_schema() {
+        // A long base under many relative `$id`s: each URI repeats the base.
+        let schema_with_base = |base: String| {
+            let mut defs = Map::new();
+            for i in 0..2_000 {
+                defs.insert(
+                    format!("d{i}"),
+                    json!({"$id": format!("d{i}.json"), "type": "integer"}),
+                );
+            }
+            json!({"$id": base, "$defs": defs, "$ref": "d0.json"})
+        };
+        let schema = schema_with_base(format!("https://example.com/{}/", "a".repeat(10_000)));
+        let text = text_bytes(&schema);
+        let held = Registry::build(&schema, &[]).map_or(0, |registry| {
+            registry
+                .resources
+                .iter()
+                .map(|resource| resource.uri.len())
+                .sum::<usize>()
+        });
+        assert!(
+            held <= URI_BYTES_PER_SCHEMA_BYTE * text + URI_BYTES_ALLOWANCE,
+            "{held} URI bytes held for {text} bytes of schema text"
+        );
+        let findings = validate(&json!(1), &schema);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("URI text"));
+        // The same shape with an ordinary base validates.
+        let schema = schema_with_base("https://example.com/schemas/".to_owned());
+        assert_eq!(validate(&json!(1), &schema), []);
+        assert!(has_errors(&validate(&json!("x"), &schema)));
+    }
+
+    /// `r0` applies `r1`..`rn`, each declaring the same `$dynamicAnchor` and
+    /// referring to a tree whose children are `$dynamicRef`s to it.
+    fn dynamic_fan_out(resources: usize) -> Value {
+        let mut defs = Map::new();
+        for i in 1..=resources {
+            defs.insert(
+                format!("r{i}"),
+                json!({"$id": format!("https://e.com/r{i}"), "$dynamicAnchor": "node",
+                       "$ref": "https://e.com/tree"}),
+            );
+        }
+        defs.insert(
+            "tree".to_owned(),
+            json!({"$id": "https://e.com/tree", "$dynamicAnchor": "node", "type": "object",
+                   "properties": {"c": {"$dynamicRef": "#node"}}}),
+        );
+        let all_of: Vec<Value> = (1..=resources)
+            .map(|i| json!({"$ref": format!("r{i}")}))
+            .collect();
+        json!({"$id": "https://e.com/r0", "$dynamicAnchor": "node", "allOf": all_of, "$defs": defs})
+    }
+
+    #[test]
+    fn dynamic_fan_out_stays_linear() {
+        let tree = |depth: usize| (0..depth).fold(json!({}), |inner, _| json!({"c": inner}));
+        let six = run(&tree(5), &dynamic_fan_out(6), None);
+        assert_eq!(six.findings, []);
+        let thirty = run(&tree(5), &dynamic_fan_out(30), None);
+        assert_eq!(thirty.findings, []);
+        // Each extra resource costs a constant number of applications.
+        assert!(six.steps < 200, "{} applications", six.steps);
+        assert!(
+            thirty.steps < 6 * six.steps,
+            "{} applications",
+            thirty.steps
+        );
+        let invalid = run(&json!({"c": {"c": 1}}), &dynamic_fan_out(6), None);
+        assert!(has_errors(&invalid.findings));
+        assert!(!stopped(&invalid.findings));
+    }
+
+    #[test]
+    fn identifiers_count_only_in_schema_positions_and_the_first_wins() {
+        let real = json!({"$id": "https://e.com/my.json", "type": "string"});
+        let unknown = json!({"x-unknown": [{"$id": "https://e.com/my.json", "type": "null"}]});
+        for defs in [
+            json!({"real": real.clone(), "unk": unknown.clone()}),
+            json!({"unk": unknown, "real": real}),
+        ] {
+            let schema = json!({"$defs": defs, "$ref": "https://e.com/my.json"});
+            assert!(fails("null", &schema), "{schema}");
+            assert!(passes(r#""s""#, &schema), "{schema}");
+        }
+        // Two real resources with one URI: the first in document order.
+        let a = json!({"$id": "https://e.com/d.json", "type": "string"});
+        let b = json!({"$id": "https://e.com/d.json", "type": "null"});
+        for (defs, null_is_valid) in [
+            (json!({"a": a.clone(), "b": b.clone()}), false),
+            (json!({"b": b, "a": a}), true),
+        ] {
+            let schema = json!({"$defs": defs, "$ref": "https://e.com/d.json"});
+            let findings = validate(&Value::Null, &schema);
+            assert_eq!(!has_errors(&findings), null_is_valid, "{findings:?}");
+            assert!(
+                findings.iter().any(|f| f.severity == Severity::Warning
+                    && f.message.contains("https://e.com/d.json")),
+                "{findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_07_ignores_identifiers_beside_ref() {
+        let schema = |dialect: Option<&str>| {
+            let mut schema = json!({
+                "definitions": {"x": {"type": "integer"},
+                                "inner": {"$id": "http://e.com/inner", "$ref": "#/definitions/x"}},
+                "properties": {"p": {"$ref": "#/definitions/inner"}}
+            });
+            if let Some(dialect) = dialect {
+                schema["$schema"] = json!(dialect);
+            }
+            schema
+        };
+        let draft_07 = schema(Some("http://json-schema.org/draft-07/schema#"));
+        assert!(passes(r#"{"p": 1}"#, &draft_07));
+        assert!(fails(r#"{"p": "x"}"#, &draft_07));
+        // In 2020-12 the `$id` is the base of its sibling `$ref`, which then
+        // names nothing.
+        for dialect in [None, Some("https://json-schema.org/draft/2020-12/schema")] {
+            assert!(fails(r#"{"p": 1}"#, &schema(dialect)), "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn meta_schema_references_warn_and_are_skipped() {
+        for reference in [
+            "http://json-schema.org/draft-07/schema#",
+            "http://json-schema.org/draft-07/schema",
+            "https://json-schema.org/draft/2020-12/schema",
+            "http://json-schema.org/draft-04/schema#/definitions/positiveInteger",
+            "https://json-schema.org/draft/2019-09/meta/core",
+        ] {
+            let findings = validate(&json!({}), &json!({"$ref": reference}));
+            assert!(!has_errors(&findings), "{reference}: {findings:?}");
+            assert!(
+                findings.iter().any(|f| f.severity == Severity::Warning),
+                "{reference}"
+            );
+        }
+        // Anything else still fails closed.
+        for reference in [
+            "https://json-schema.org/draft/2020-12/other",
+            "https://example.com/draft-07/schema",
+        ] {
+            assert!(has_errors(&validate(
+                &json!({}),
+                &json!({"$ref": reference})
+            )));
+        }
+        // A supplied meta-schema is applied.
+        let meta = json!({"type": "object"});
+        let schema = json!({"$ref": "http://json-schema.org/draft-07/schema#"});
+        let resources = [("http://json-schema.org/draft-07/schema", &meta)];
+        assert_eq!(validate_with_resources(&json!({}), &schema, &resources), []);
+        assert!(has_errors(&validate_with_resources(
+            &json!(1),
+            &schema,
+            &resources
+        )));
+    }
+
+    #[test]
     fn the_shape_of_dynamic_references_is_linear() {
         // 200 `$dynamicRef`s, each able to reach any of 201 anchors.
         let mut defs = Map::new();
@@ -4107,7 +4575,7 @@ mod tests {
         let sites: Vec<Value> = (0..200).map(|_| json!({"$dynamicRef": "#x"})).collect();
         let schema = json!({"$id": "https://example.com/root", "$dynamicAnchor": "x",
             "allOf": sites, "$defs": defs});
-        let registry = Registry::build(&schema, &[]);
+        let registry = Registry::build(&schema, &[]).expect("within the URI budget");
         let shape = schema_shape(&schema, &registry);
         let (values, _) = measure(&schema);
         assert!(
