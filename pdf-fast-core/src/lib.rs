@@ -7852,7 +7852,18 @@ fn apply_xref_chain(
             continue;
         };
         for (number, entry) in section_entries {
-            entries.entry(number).or_insert(entry);
+            match entries.get(&number) {
+                None => {
+                    entries.insert(number, entry);
+                }
+                // A classic table has no way to describe an object inside
+                // an object stream and lists it as free; a hybrid file's
+                // `/XRefStm`, read next, says where it really is.
+                Some(XrefEntry::Free) if matches!(entry, XrefEntry::Packed(_)) => {
+                    entries.insert(number, entry);
+                }
+                Some(_) => {}
+            }
         }
         if root.is_none() {
             if let Some(PdfValue::Reference {
@@ -7919,8 +7930,22 @@ fn apply_xref_chain(
             // scan's answer for this object.
             continue;
         }
+        let unpacked = |index: usize| {
+            objects
+                .get(index)
+                .is_some_and(|object| packed.contains_key(&(number, object.span.start)))
+        };
         for generation in generations.get(&number).into_iter().flatten() {
-            object_index.remove(&(number, *generation));
+            // A free entry deletes an object written directly in the file.
+            // It says nothing about one unpacked from an object stream: a
+            // table lists those as free too, so they are left to the scan.
+            let keep = found.is_none()
+                && object_index
+                    .get(&(number, *generation))
+                    .is_some_and(|index| unpacked(*index));
+            if !keep {
+                object_index.remove(&(number, *generation));
+            }
         }
         if let Some(object) =
             found.and_then(|found| objects.get(found).map(|object| (found, object)))
