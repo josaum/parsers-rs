@@ -1,0 +1,122 @@
+# Checks that need more time, or another compiler, than a pull request gets:
+#   - `fuzz`: every libFuzzer target in every `<crate>/fuzz/` directory, started
+#     from the seeds in `fuzz/seeds/` (the same documents the malformed-input
+#     smoke tests mutate; see `fuzz_seeds` in tools/mutation_smoke.rs).
+#   - `miri`: the tests of the `unsafe` SIMD scans, under the interpreter that
+#     reports an out-of-bounds or unaligned read.
+#   - `msrv`: the workspace builds with the `rust-version` Cargo.toml declares.
+#
+# Weekly and on request. On a pull request only `fuzz` runs, briefly, and only
+# when the pull request changes a fuzz crate or this file: it proves the
+# targets still build and survive their own seeds. None of these jobs is a
+# required check, and ci.yml and release.yml never call this file, so a crash
+# found on a Saturday cannot block an unrelated fix.
+#
+# The compilers are installed with rustup and not with the toolchain action:
+# that action installs the one stable version rust-toolchain.toml pins, and
+# these jobs exist to use other ones. Each is named exactly, a nightly by its
+# date, so a run can be repeated.
+name: fuzz
+
+on:
+  schedule:
+    # Saturdays, 03:41 UTC.
+    - cron: "41 3 * * 6"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "**/fuzz/**"
+      - tools/fuzz_package.rs
+      - .github/workflows/fuzz.yml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NIGHTLY: nightly-2026-09-02
+  MSRV: 1.94.0
+
+jobs:
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - ooxml-archive
+          - docx-fast-core
+          - xlsx-fast-core
+          - pptx-fast-core
+          - email-fast-core
+          - xsd-fast-core
+          - json-fast-core
+          - web-fast-core
+          - geo-fast-core
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Seconds per target: long on the schedule, a smoke run on a pull request.
+      FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '20' || '300' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the dated nightly libFuzzer needs
+        run: rustup toolchain install "$NIGHTLY" --profile minimal
+      - name: Install cargo-fuzz
+        run: rustup run "$NIGHTLY" cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Run every target of this crate
+        working-directory: ${{ matrix.crate }}
+        run: |
+          set -euo pipefail
+          # Every target runs even after one fails, so one run names them all.
+          failed=0
+          for target in $(cargo "+$NIGHTLY" fuzz list); do
+            mkdir -p "fuzz/corpus/$target"
+            cargo "+$NIGHTLY" fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
+              -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=25 || failed=1
+          done
+          exit "$failed"
+      - name: Upload the inputs that crashed
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes-${{ matrix.crate }}
+          path: ${{ matrix.crate }}/fuzz/artifacts
+          if-no-files-found: ignore
+
+  miri:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the dated nightly with Miri
+        run: rustup toolchain install "$NIGHTLY" --profile minimal --component miri --component rust-src
+      # The runner is x86_64, so these interpret the SSE2 scans; the NEON
+      # twins are interpreted by naming an aarch64 target.
+      - name: The digit scan of xlsx-fast-core
+        run: |
+          set -euo pipefail
+          cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --lib find_first_digit
+          cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --lib find_first_digit --target aarch64-unknown-linux-gnu
+      - name: The object marker scan of pdf-fast-core
+        run: |
+          set -euo pipefail
+          cargo "+$NIGHTLY" miri test --locked -p pdf-fast-core --test obj_marker_scan
+          cargo "+$NIGHTLY" miri test --locked -p pdf-fast-core --test obj_marker_scan --target aarch64-unknown-linux-gnu
+
+  msrv:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the declared minimum Rust version
+        run: rustup toolchain install "$MSRV" --profile minimal
+      - name: Build every crate with it
+        run: cargo "+$MSRV" check --workspace --locked

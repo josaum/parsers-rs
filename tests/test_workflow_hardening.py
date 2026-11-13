@@ -19,6 +19,7 @@ WORKFLOWS = ROOT / ".github/workflows"
 CI = WORKFLOWS / "ci.yml"
 RELEASE = WORKFLOWS / "release.yml"
 AUDIT = WORKFLOWS / "audit.yml"
+FUZZ = WORKFLOWS / "fuzz.yml"
 DEPENDABOT = ROOT / ".github/dependabot.yml"
 ALL_WORKFLOWS = sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
 
@@ -36,6 +37,22 @@ REBUILT_BY_RELEASE = {"python-bindings": "wheels", "node-bindings": "node"}
 SKIP_INPUT = "skip_binding_jobs"
 # The doctors are a package outside the workspace; this is its own lockfile.
 DOCTORS_LOCK = ".leio-code/rust-doctors/Cargo.lock"
+# The checks branch protection requires, as ci.yml job names. A job with a
+# matrix reports once per leg, so these seven jobs are the twelve required
+# checks. Renaming or removing one leaves its check pending on every pull
+# request; a job that is not listed here is not required.
+REQUIRED_CI_JOBS = {
+    "rust": None,
+    "rust-platforms": {"macos-latest", "windows-latest"},
+    "python-bindings": HOSTED_RUNNERS,
+    "node-bindings": HOSTED_RUNNERS,
+    "release-tooling": None,
+    "repository-doctors": None,
+    "lean-formal": None,
+}
+# ci.yml jobs that report but are not required checks.
+OPTIONAL_CI_JOBS = {"rustdoc"}
+DENY_CONFIG = "deny.toml"
 SKIP_CONDITION = "${{ inputs.skip_binding_jobs != true }}"
 
 USES = re.compile(r"^\s*(?:- )?uses:[ ]+(?P<ref>\S+)(?P<rest>.*)$")
@@ -505,9 +522,15 @@ def assert_audit_contract(audit: str) -> None:
     }
     assert (ROOT / DOCTORS_LOCK).is_file()
     blocks = jobs(audit)
-    assert set(blocks) == set(expected), "one audit job per lockfile, and nothing else"
+    assert set(blocks) == set(expected) | {"cargo-deny"}, (
+        "one audit job per lockfile, the policy check, and nothing else"
+    )
+    assert_deny_job(blocks["cargo-deny"])
+    assert DENY_CONFIG in listed, "a change to the policy must run the policy check"
     versions = set()
     for name, block in blocks.items():
+        if name not in expected:
+            continue
         install = re.findall(
             r"^ +run: cargo install cargo-audit --locked --version ([0-9]+\.[0-9]+\.[0-9]+)$",
             block,
@@ -529,9 +552,189 @@ def assert_audit_contract(audit: str) -> None:
         assert not (ROOT / config).exists(), f"{config} can hide an advisory from the audit"
 
 
+def assert_deny_job(block: str) -> None:
+    """The licence, source and duplicate policy in deny.toml is checked as written."""
+    assert (ROOT / DENY_CONFIG).is_file(), "cargo-deny has no policy to check"
+    install = re.findall(
+        r"^ +run: cargo install cargo-deny --locked --version ([0-9]+\.[0-9]+\.[0-9]+)$",
+        block,
+        re.MULTILINE,
+    )
+    assert len(install) == 1, "cargo-deny must be installed at a pinned version"
+    # Every check, against the lockfile as committed, with no flag that
+    # downgrades or leaves out a finding.
+    checks = re.findall(r"^ +run: (cargo deny\b.*)$", block, re.MULTILINE)
+    assert checks == ["cargo deny --locked check"], f"cargo-deny: {checks}"
+    assert job_value(block, "needs") is None, "cargo-deny: must not wait for another job"
+    assert job_value(block, "if") is None, "cargo-deny: can be skipped"
+    assert not re.search(r"^\s*(?:- )?if:", block, re.MULTILINE), "cargo-deny: a step can be skipped"
+
+
+def assert_deny_policy(policy: str) -> None:
+    """deny.toml refuses advisories, unknown licences and unknown sources."""
+    body = code(policy)
+    sources = top_table(body, "sources")
+    assert re.search(r'^unknown-registry = "deny"$', sources, re.MULTILINE)
+    assert re.search(r'^unknown-git = "deny"$', sources, re.MULTILINE)
+    assert re.search(
+        r'^allow-registry = \["https://github\.com/rust-lang/crates\.io-index"\]$',
+        sources,
+        re.MULTILINE,
+    ), "crates.io must be the only registry"
+    assert not re.search(r"^allow-git = \[\s*[^\]\s]", sources, re.MULTILINE), "no git source is allowed"
+    advisories = top_table(body, "advisories")
+    # No advisory is waved through: the list of ignored ones is absent or empty.
+    assert not re.search(r"^ignore = \[\s*[^\]\s]", advisories, re.MULTILINE), (
+        "deny.toml ignores an advisory"
+    )
+    licenses = top_table(body, "licenses")
+    allowed = re.search(r"^allow = \[(?P<body>[^\]]*)\]", licenses, re.MULTILINE)
+    assert allowed is not None, "deny.toml has no licence allow-list"
+    names = set(re.findall(r'"([^"]+)"', allowed["body"]))
+    assert {"MIT", "Apache-2.0"} <= names
+    # Copyleft that would bind a consumer of the library is never allowed.
+    assert not {name for name in names if re.match(r"(?:A|L)?GPL|SSPL|EUPL|CC-BY-SA", name)}
+
+
+def top_table(text: str, name: str) -> str:
+    """The body of a top-level TOML table, up to the next table header."""
+    found = re.search(
+        rf"^\[{re.escape(name)}\]\n(?P<body>.*?)(?=^\[[^\[]|\Z)", text, re.MULTILINE | re.DOTALL
+    )
+    assert found is not None, f"deny.toml has no [{name}] table"
+    return found["body"]
+
+
+def fuzz_crates() -> list[str]:
+    """Every directory holding a cargo-fuzz crate."""
+    return sorted(path.parent.parent.name for path in ROOT.glob("*/fuzz/Cargo.toml"))
+
+
+def declared_msrv() -> str:
+    version = re.search(r'^rust-version = "([0-9]+\.[0-9]+)"$', read(ROOT / "Cargo.toml"), re.MULTILINE)
+    assert version is not None, "the workspace declares no rust-version"
+    return version[1]
+
+
+def assert_fuzz_contract(fuzz: str, ci: str | None = None, release: str | None = None) -> None:
+    """fuzz.yml: scheduled, never required, every target, exact compilers."""
+    ci = read(CI) if ci is None else ci
+    release = read(RELEASE) if release is None else release
+    body = code(fuzz)
+    triggers = top_level(fuzz, "on")
+    assert triggers is not None
+    assert re.search(
+        r'^  schedule:\n    - cron: "[0-9]+ [0-9]+ \* \* [0-6]"$', triggers, re.MULTILINE
+    ), "the fuzz workflow must run on a weekly schedule"
+    assert re.search(r"^  workflow_dispatch:$", triggers, re.MULTILINE)
+    # Never part of a release, and on a pull request only for the files below:
+    # a filtered workflow cannot be a required check.
+    assert "workflow_call" not in triggers
+    for caller in (ci, release):
+        assert "fuzz.yml" not in code(caller), "ci.yml and release.yml must not call fuzz.yml"
+    paths = re.search(
+        r"^  pull_request:\n    paths:\n(?P<paths>(?:      - [^\n]+\n)+)", triggers, re.MULTILINE
+    )
+    assert paths is not None, "fuzz.yml must not run on every pull request"
+    listed = {line.strip()[2:].strip('"') for line in paths["paths"].splitlines()}
+    assert listed == {"**/fuzz/**", "tools/fuzz_package.rs", ".github/workflows/fuzz.yml"}
+
+    blocks = jobs(fuzz)
+    assert set(blocks) == {"fuzz", "miri", "msrv"}
+    # No name is shared with a ci.yml job, so no required check is shadowed.
+    assert not set(blocks) & set(jobs(ci))
+    assert "continue-on-error" not in body, "a fuzz.yml job can fail silently"
+
+    # Compilers come from rustup, each named exactly through one variable.
+    env = mapping(body, "env", 0)
+    assert env is not None
+    assert re.fullmatch(r"nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}", env["NIGHTLY"]), (
+        "the nightly must be named by its date"
+    )
+    assert env["MSRV"] == declared_msrv() + ".0", "the msrv job must build with Cargo.toml's rust-version"
+    assert "dtolnay/rust-toolchain@" not in body
+    installs = re.findall(r"rustup toolchain install (\S+)", body)
+    assert sorted(installs) == ['"$MSRV"', '"$NIGHTLY"', '"$NIGHTLY"']
+    # Every cargo command says which of them it runs with; none falls back to
+    # whatever the runner's default happens to be.
+    for found in re.finditer(r"(?:rustup run (?P<run>\S+) )?\bcargo (?P<first>\S+)", body):
+        named = found["run"] or found["first"]
+        assert named in ('"$NIGHTLY"', '"+$NIGHTLY"', '"+$MSRV"'), (
+            f"`{found[0]}`: a compiler not named by a variable"
+        )
+    assert not re.search(r"\+(?:nightly|stable|beta)\b", body), "a floating toolchain"
+
+    target = blocks["fuzz"]
+    assert job_value(target, "if") is None, "the fuzz job must also run on its pull requests"
+    crates = re.search(r"^        crate:\n(?P<body>(?:          - [^\n]+\n)+)", target, re.MULTILINE)
+    assert crates is not None
+    assert sorted(line.strip()[2:] for line in crates["body"].splitlines()) == fuzz_crates(), (
+        "the matrix must list every crate that has a fuzz directory"
+    )
+    assert "for target in $(cargo \"+$NIGHTLY\" fuzz list); do" in target, "every target must run"
+    assert '"fuzz/corpus/$target" "fuzz/seeds/$target"' in target, "targets must start from the seeds"
+    assert "-max_total_time=\"$FUZZ_SECONDS\"" in target and "|| failed=1" in target
+    assert 'exit "$failed"' in target, "a crash must fail the job"
+    assert re.search(
+        r"^      FUZZ_SECONDS: \$\{\{ github\.event_name == 'pull_request' && '[0-9]+' \|\| '[0-9]+' \}\}$",
+        target,
+        re.MULTILINE,
+    )
+    upload = re.search(
+        r"^      - name: [^\n]+\n        if: failure\(\)\n        uses: actions/upload-artifact@[^\n]+\n"
+        r"        with:\n(?P<with>(?:          [^\n]+\n)+)",
+        target,
+        re.MULTILINE,
+    )
+    assert upload is not None, "crashing inputs must be uploaded when the job fails"
+    assert "          path: ${{ matrix.crate }}/fuzz/artifacts\n" in upload["with"]
+    assert len(re.findall(r"^\s*(?:- )?if:", target, re.MULTILINE)) == 1
+
+    # The slow jobs stay off pull requests; nothing else is conditional.
+    for name in ("miri", "msrv"):
+        assert job_value(blocks[name], "if") == "github.event_name != 'pull_request'"
+        assert len(re.findall(r"^\s*(?:- )?if:", blocks[name], re.MULTILINE)) == 1
+    assert "--component miri" in blocks["miri"]
+    assert len(re.findall(r'cargo "\+\$NIGHTLY" miri test --locked ', blocks["miri"])) == 4
+    assert '        run: cargo "+$MSRV" check --workspace --locked\n' in blocks["msrv"]
+
+
+def assert_fuzz_targets_have_seeds() -> None:
+    """Every fuzz target is a declared binary with at least one seed file."""
+    crates = fuzz_crates()
+    assert crates, "no fuzz crate found"
+    for crate in crates:
+        base = ROOT / crate / "fuzz"
+        manifest = read(base / "Cargo.toml")
+        # Outside the workspace: its own root, never a member.
+        assert re.search(r"^\[workspace\]$", manifest, re.MULTILINE), f"{crate}/fuzz joins the workspace"
+        assert f'"{crate}/fuzz"' not in read(ROOT / "Cargo.toml")
+        declared = sorted(re.findall(r'^name = "([a-z0-9_]+)"\npath = "fuzz_targets/', manifest, re.MULTILINE))
+        on_disk = sorted(path.stem for path in (base / "fuzz_targets").glob("*.rs"))
+        assert declared == on_disk and declared, f"{crate}: targets declared {declared}, on disk {on_disk}"
+        for target in declared:
+            seeds = [path for path in (base / "seeds" / target).glob("*") if path.stat().st_size]
+            assert seeds, f"{crate}: fuzz target {target} has no seed"
+
+
+def assert_ci_jobs(ci: str) -> None:
+    """The required checks keep their names; anything else is declared optional."""
+    blocks = jobs(ci)
+    assert set(blocks) == set(REQUIRED_CI_JOBS) | OPTIONAL_CI_JOBS, (
+        "a ci.yml job was renamed, removed, or added without being declared"
+    )
+    for name, legs in REQUIRED_CI_JOBS.items():
+        assert job_value(blocks[name], "name") is None, f"{name}: a display name renames the check"
+        if legs is not None:
+            assert runner_labels(blocks[name]) == legs, f"{name}: its matrix legs are required checks"
+    docs = blocks["rustdoc"]
+    assert mapping(docs, "env", 4) == {"RUSTDOCFLAGS": "-D warnings"}
+    assert "      - run: cargo doc --workspace --no-deps --locked\n" in docs
+
+
 def assert_no_audit_in_the_release_path(text: str) -> None:
     body = code(text)
-    for forbidden in ("cargo audit", "cargo-audit", "audit.yml"):
+    for forbidden in ("cargo audit", "cargo-audit", "audit.yml", "cargo deny", "cargo-deny"):
         assert forbidden not in body, f"{forbidden}: an advisory must not block a release"
 
 
@@ -635,9 +838,9 @@ def test_ci_cancels_only_superseded_pull_request_runs():
     assert_ci_concurrency(read(CI))
 
 
-@pytest.mark.parametrize("path", [CI, AUDIT], ids=workflow_id)
+@pytest.mark.parametrize("path", [CI, AUDIT, FUZZ], ids=workflow_id)
 def test_pull_request_workflows_use_hosted_runners_only(path: Path):
-    # Both run on pull requests from forks; neither may reach a project machine.
+    # All run on pull requests from forks; none may reach a project machine.
     assert_hosted_runners_only(read(path))
 
 
@@ -669,6 +872,22 @@ def test_an_advisory_cannot_block_a_release(path: Path):
 
 def test_dependabot_updates_cargo_and_actions_weekly():
     assert_dependabot_contract(read(DEPENDABOT))
+
+
+def test_the_dependency_policy_is_checked_and_waves_nothing_through():
+    assert_deny_policy(read(ROOT / DENY_CONFIG))
+
+
+def test_fuzzing_miri_and_msrv_run_weekly_and_are_never_required():
+    assert_fuzz_contract(read(FUZZ))
+
+
+def test_every_fuzz_target_is_declared_and_seeded():
+    assert_fuzz_targets_have_seeds()
+
+
+def test_the_required_checks_keep_their_names():
+    assert_ci_jobs(read(CI))
 
 
 SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -851,6 +1070,47 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_audit_contract, AUDIT, "      - .leio-code/rust-doctors/Cargo.lock\n", ""),
         (assert_no_audit_in_the_release_path, CI, "      - run: cargo fmt --all --check", "      - run: cargo audit"),
         (assert_no_audit_in_the_release_path, RELEASE, "    uses: ./.github/workflows/ci.yml", "    uses: ./.github/workflows/audit.yml"),
+        # The policy check dropped, unpinned, narrowed, softened or made skippable.
+        (assert_audit_contract, AUDIT, "\n  cargo-deny:\n", "\n  cargo-deny-off:\n"),
+        (assert_audit_contract, AUDIT, "cargo install cargo-deny --locked --version", "cargo install cargo-deny --locked #"),
+        (assert_audit_contract, AUDIT, "        run: cargo deny --locked check\n", "        run: cargo deny --locked check licenses\n"),
+        (assert_audit_contract, AUDIT, "        run: cargo deny --locked check\n", "        run: cargo deny check\n"),
+        (assert_audit_contract, AUDIT, "        run: cargo deny --locked check\n", "        run: cargo deny --locked check || true\n"),
+        (assert_audit_contract, AUDIT, "  cargo-deny:\n", "  cargo-deny:\n    if: github.event_name == 'schedule'\n"),
+        (assert_audit_contract, AUDIT, "      - deny.toml\n", ""),
+        (assert_installers_are_pinned, AUDIT, "cargo install cargo-deny --locked --version", "cargo install cargo-deny --version"),
+        (assert_no_audit_in_the_release_path, CI, "      - run: cargo fmt --all --check", "      - run: cargo deny check"),
+        (assert_deny_policy, ROOT / DENY_CONFIG, 'unknown-registry = "deny"', 'unknown-registry = "warn"'),
+        (assert_deny_policy, ROOT / DENY_CONFIG, 'unknown-git = "deny"', 'unknown-git = "allow"'),
+        (assert_deny_policy, ROOT / DENY_CONFIG, '"Apache-2.0",', '"Apache-2.0", "GPL-3.0-only",'),
+        (assert_deny_policy, ROOT / DENY_CONFIG, "\n[licenses]\n", '\nignore = ["RUSTSEC-2026-0001"]\n\n[licenses]\n'),
+        # Fuzzing made required or releasable, a crate left out, a floating compiler, a swallowed crash.
+        (assert_fuzz_contract, FUZZ, "  pull_request:\n    paths:\n      - \"**/fuzz/**\"\n      - tools/fuzz_package.rs\n      - .github/workflows/fuzz.yml\n", "  pull_request:\n"),
+        (assert_fuzz_contract, FUZZ, "  workflow_dispatch:\n", "  workflow_dispatch:\n  workflow_call:\n"),
+        (assert_fuzz_contract, FUZZ, '    - cron: "41 3 * * 6"', '    - cron: "41 3 1 * *"'),
+        (assert_fuzz_contract, FUZZ, "          - geo-fast-core\n", ""),
+        (assert_fuzz_contract, FUZZ, "  NIGHTLY: nightly-2026-09-02", "  NIGHTLY: nightly"),
+        (assert_fuzz_contract, FUZZ, "  MSRV: 1.94.0", "  MSRV: 1.98.1"),
+        (assert_fuzz_contract, FUZZ, 'cargo "+$MSRV" check', "cargo +stable check"),
+        (assert_fuzz_contract, FUZZ, 'rustup toolchain install "$MSRV"', "rustup toolchain install stable"),
+        (assert_fuzz_contract, FUZZ, "|| failed=1", "|| true"),
+        (assert_fuzz_contract, FUZZ, '          exit "$failed"\n', ""),
+        (assert_fuzz_contract, FUZZ, ' "fuzz/seeds/$target"', ""),
+        (assert_fuzz_contract, FUZZ, "        if: failure()\n", ""),
+        (assert_fuzz_contract, FUZZ, "  msrv:\n    if: github.event_name != 'pull_request'\n", "  msrv:\n    if: false\n"),
+        (assert_fuzz_contract, FUZZ, "    timeout-minutes: 60\n", "    timeout-minutes: 60\n    continue-on-error: true\n"),
+        (assert_fuzz_contract, FUZZ, "  miri:\n", "  rust:\n"),
+        (assert_installers_are_pinned, FUZZ, "cargo install cargo-fuzz --locked --version 0.13.2", "cargo install cargo-fuzz"),
+        (assert_every_job_has_a_timeout, FUZZ, "    timeout-minutes: 60\n", ""),
+        (assert_least_privilege, FUZZ, "permissions:\n  contents: read", "permissions:\n  contents: write"),
+        (assert_hosted_runners_only, FUZZ, "    runs-on: ubuntu-latest\n    timeout-minutes: 60", "    runs-on: [self-hosted, linux]\n    timeout-minutes: 60"),
+        # A required check renamed, removed or given a display name; an undeclared job; a silent doc build.
+        (assert_ci_jobs, CI, "\n  lean-formal:\n", "\n  lean:\n"),
+        (assert_ci_jobs, CI, "\n  rust:\n", "\n  rust:\n    name: Rust\n"),
+        (assert_ci_jobs, CI, "        os: [macos-latest, windows-latest]", "        os: [macos-latest]"),
+        (assert_ci_jobs, CI, "\n  rustdoc:\n", "\n  docs:\n"),
+        (assert_ci_jobs, CI, "      RUSTDOCFLAGS: -D warnings", "      RUSTDOCFLAGS: --cap-lints warn"),
+        (assert_ci_jobs, CI, "      - run: cargo doc --workspace --no-deps --locked\n", "      - run: cargo doc --workspace --no-deps --locked || true\n"),
         # Dependabot left without an ecosystem, a schedule or its grouping.
         (assert_dependabot_contract, DEPENDABOT, "package-ecosystem: github-actions", "package-ecosystem: npm"),
         (assert_dependabot_contract, DEPENDABOT, "interval: weekly", "interval: monthly"),
