@@ -7665,20 +7665,50 @@ fn is_delimiter(byte: u8) -> bool {
 /// Deepest array or dictionary nesting the object parser follows.
 ///
 /// Real documents nest a handful of levels; an input that nests deeper is
-/// malformed or hostile, and each level costs two recursive calls. At 128
-/// levels an unoptimized build on macOS needed between 128 and 192 KiB of
-/// stack, which left a 256 KiB worker thread no margin where frames are
-/// larger; the same parse overflowed intermittently on Windows. At 32 it
-/// needs under 40 KiB. Raising it trades that headroom away. Objects nested
-/// more than 32 arrays and dictionaries deep inside a single object's text
-/// are refused; indirect references do not count toward the depth.
-const MAX_VALUE_NESTING: usize = 32;
+/// malformed or hostile and is refused. The parser keeps its open containers
+/// in a list on the heap, so this bound is not what protects the parser's
+/// own stack. It bounds the depth of the [`PdfValue`] tree the parser hands
+/// out, which later code walks and drops recursively: raising it deepens
+/// every one of those walks. Indirect references do not count toward it.
+const MAX_VALUE_NESTING: usize = 128;
 
 struct ValueParser<'a> {
     bytes: &'a [u8],
     pos: usize,
     /// Containers currently open, bounded by [`MAX_VALUE_NESTING`].
     depth: usize,
+}
+
+/// An array or dictionary the object parser has opened and not yet closed.
+enum OpenContainer {
+    Array {
+        values: Vec<PdfValue>,
+        /// Where the element being read began, to detect one that consumed
+        /// nothing.
+        element_start: usize,
+    },
+    Dictionary {
+        entries: Vec<PdfDictionaryEntry>,
+        /// Key of the entry whose value is being read.
+        key: String,
+    },
+}
+
+impl OpenContainer {
+    fn into_value(self) -> PdfValue {
+        match self {
+            Self::Array { values, .. } => PdfValue::Array(values),
+            Self::Dictionary { entries, .. } => PdfValue::Dictionary(PdfDictionary { entries }),
+        }
+    }
+}
+
+/// What the first token of a value turned out to be.
+enum ValueStart {
+    /// A value that holds no other values, read in full.
+    Scalar(PdfValue),
+    /// The opening delimiter of an array or dictionary, consumed.
+    Container(OpenContainer),
 }
 
 impl<'a> ValueParser<'a> {
@@ -7701,80 +7731,119 @@ impl<'a> ValueParser<'a> {
         Ok(())
     }
 
+    /// Parse one value, however deeply its arrays and dictionaries nest.
+    ///
+    /// Open containers are kept in a list rather than on the call stack, so
+    /// the stack this needs does not grow with the input's nesting.
     fn parse_value(&mut self) -> Result<PdfValue> {
+        let mut open: Vec<OpenContainer> = Vec::new();
+        loop {
+            let mut value = match self.parse_value_start()? {
+                ValueStart::Scalar(value) => Some(value),
+                ValueStart::Container(container) => {
+                    open.push(container);
+                    None
+                }
+            };
+            // Hand a finished value to the container that holds it, and keep
+            // closing containers until one asks for another child.
+            loop {
+                let Some(top) = open.last_mut() else {
+                    // No container is open, so `value` is the whole value: a
+                    // container that was just opened is still in the list.
+                    return value.ok_or_else(|| anyhow!("unexpected end of input"));
+                };
+                if let Some(value) = value.take() {
+                    match top {
+                        OpenContainer::Array {
+                            values,
+                            element_start,
+                        } => {
+                            if self.pos == *element_start {
+                                // A stray delimiter (`)`, `>`, `{`, `}`) parses
+                                // as an empty bareword without consuming it.
+                                // Pushing that value and looping would never
+                                // advance, so the array is refused.
+                                return Err(anyhow!("unexpected delimiter in PDF array"));
+                            }
+                            values.push(value);
+                        }
+                        OpenContainer::Dictionary { entries, key } => {
+                            entries.push(PdfDictionaryEntry {
+                                key: std::mem::take(key),
+                                value,
+                            });
+                        }
+                    }
+                }
+                skip_whitespace_and_comments(self.bytes, &mut self.pos);
+                match top {
+                    OpenContainer::Array { element_start, .. } => {
+                        if self.bytes.get(self.pos) != Some(&b']') {
+                            *element_start = self.pos;
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                    OpenContainer::Dictionary { key, .. } => {
+                        if self.bytes.get(self.pos..self.pos + 2) != Some(b">>") {
+                            // `parse_name` consumes at least the solidus, so
+                            // every pass makes progress even when the value
+                            // that follows is empty.
+                            *key = self.parse_name()?;
+                            break;
+                        }
+                        self.pos += 2;
+                    }
+                }
+                self.depth -= 1;
+                value = open.pop().map(OpenContainer::into_value);
+            }
+        }
+    }
+
+    /// Read a scalar in full, or consume a container's opening delimiter.
+    fn parse_value_start(&mut self) -> Result<ValueStart> {
         skip_whitespace_and_comments(self.bytes, &mut self.pos);
         let Some(byte) = self.bytes.get(self.pos).copied() else {
             return Err(anyhow!("unexpected end of input"));
         };
-        match byte {
-            b'<' if self.bytes.get(self.pos + 1) == Some(&b'<') => self.parse_dictionary(),
-            b'[' => self.parse_array(),
-            b'/' => self.parse_name().map(PdfValue::Name),
-            b'(' => self
-                .parse_literal_string()
-                .map(|bytes| PdfValue::String(decode_pdf_text(&bytes))),
-            b'<' => self
-                .parse_hex_string()
-                .map(|bytes| PdfValue::HexString(to_upper_hex(&bytes))),
+        let scalar = match byte {
+            b'<' if self.bytes.get(self.pos + 1) == Some(&b'<') => {
+                self.enter_container()?;
+                self.pos += 2;
+                return Ok(ValueStart::Container(OpenContainer::Dictionary {
+                    entries: Vec::new(),
+                    key: String::new(),
+                }));
+            }
+            b'[' => {
+                self.enter_container()?;
+                self.pos += 1;
+                return Ok(ValueStart::Container(OpenContainer::Array {
+                    values: Vec::new(),
+                    element_start: self.pos,
+                }));
+            }
+            b'/' => PdfValue::Name(self.parse_name()?),
+            b'(' => PdfValue::String(decode_pdf_text(&self.parse_literal_string()?)),
+            b'<' => PdfValue::HexString(to_upper_hex(&self.parse_hex_string()?)),
             b't' if self.bytes.get(self.pos..self.pos + 4) == Some(b"true") => {
                 self.pos += 4;
-                Ok(PdfValue::Bool(true))
+                PdfValue::Bool(true)
             }
             b'f' if self.bytes.get(self.pos..self.pos + 5) == Some(b"false") => {
                 self.pos += 5;
-                Ok(PdfValue::Bool(false))
+                PdfValue::Bool(false)
             }
             b'n' if self.bytes.get(self.pos..self.pos + 4) == Some(b"null") => {
                 self.pos += 4;
-                Ok(PdfValue::Null)
+                PdfValue::Null
             }
-            b'+' | b'-' | b'.' | b'0'..=b'9' => self.parse_number_or_reference(),
-            _ => Ok(PdfValue::Raw(self.parse_bareword())),
-        }
-    }
-
-    fn parse_dictionary(&mut self) -> Result<PdfValue> {
-        self.enter_container()?;
-        self.pos += 2;
-        let mut entries = Vec::new();
-        loop {
-            skip_whitespace_and_comments(self.bytes, &mut self.pos);
-            if self.bytes.get(self.pos..self.pos + 2) == Some(b">>") {
-                self.pos += 2;
-                break;
-            }
-            // `parse_name` consumes at least the solidus, so every pass makes
-            // progress even when the value that follows is empty.
-            let key = self.parse_name()?;
-            let value = self.parse_value()?;
-            entries.push(PdfDictionaryEntry { key, value });
-        }
-        self.depth -= 1;
-        Ok(PdfValue::Dictionary(PdfDictionary { entries }))
-    }
-
-    fn parse_array(&mut self) -> Result<PdfValue> {
-        self.enter_container()?;
-        self.pos += 1;
-        let mut values = Vec::new();
-        loop {
-            skip_whitespace_and_comments(self.bytes, &mut self.pos);
-            if self.bytes.get(self.pos) == Some(&b']') {
-                self.pos += 1;
-                break;
-            }
-            let before = self.pos;
-            let value = self.parse_value()?;
-            if self.pos == before {
-                // A stray delimiter (`)`, `>`, `{`, `}`) parses as an empty
-                // bareword without consuming it. Pushing that value and
-                // looping would never advance, so the array is refused.
-                return Err(anyhow!("unexpected delimiter in PDF array"));
-            }
-            values.push(value);
-        }
-        self.depth -= 1;
-        Ok(PdfValue::Array(values))
+            b'+' | b'-' | b'.' | b'0'..=b'9' => self.parse_number_or_reference()?,
+            _ => PdfValue::Raw(self.parse_bareword()),
+        };
+        Ok(ValueStart::Scalar(scalar))
     }
 
     fn parse_name(&mut self) -> Result<String> {
