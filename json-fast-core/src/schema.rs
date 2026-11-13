@@ -1,6 +1,6 @@
 //! JSON Schema validation — every constraint keyword in draft-07 through
-//! 2020-12 (Validation, Applicator and Unevaluated vocabularies), plus local
-//! `$ref` and boolean schemas.
+//! 2020-12 (Validation, Applicator and Unevaluated vocabularies), `$ref` and
+//! `$dynamicRef` with `$id` base URIs, and boolean schemas.
 //!
 //! Supported keywords: `type`, `nullable` (OpenAPI), `enum`, `const`,
 //! `multipleOf`, `minimum`, `maximum`, `exclusiveMinimum` (numeric or the
@@ -12,8 +12,11 @@
 //! (boolean or schema), `propertyNames`, `dependencies` (both forms),
 //! `dependentRequired`, `dependentSchemas`, `unevaluatedItems`,
 //! `unevaluatedProperties`, `allOf`, `anyOf`, `oneOf`, `not`,
-//! `if`/`then`/`else`, `$ref` (local: root, JSON-pointer fragments, and
-//! `$anchor`/plain-name fragments), `$defs` and `definitions` as containers.
+//! `if`/`then`/`else`, `$ref` and `$dynamicRef` (URIs resolved against the
+//! `$id` base URIs per RFC 3986; JSON-pointer fragments, `$anchor` and
+//! `$dynamicAnchor` names, embedded resources, and documents the caller
+//! supplies to [`validate_with_resources`]), `$defs` and `definitions` as
+//! containers.
 //!
 //! Semantics follow 2020-12 where drafts differ (2020-12 `$ref` siblings are
 //! evaluated; `prefixItems` + single-schema `items`; `contains` annotates the
@@ -24,10 +27,11 @@
 //!
 //! `format` validates only string instances. `contentEncoding`,
 //! `contentMediaType` and `contentSchema` are annotations by spec and are
-//! ignored. Core-keyword gaps that would change a document's validity
-//! (`$dynamicRef`, `$recursiveRef`) and remote `$ref` targets are surfaced as
-//! warnings so validation never silently under-checks; genuinely unknown
-//! keywords likewise warn.
+//! ignored. The 2019-09 `$recursiveRef` is not implemented and is surfaced
+//! as a warning so validation never silently under-checks; genuinely unknown
+//! keywords likewise warn. A `$ref` or `$dynamicRef` that resolves to
+//! nothing (including any document that was not supplied: nothing is ever
+//! fetched) is an error, so such a schema fails closed.
 //!
 //! Patterns and `format` regexes compile with the Rust `regex` crate; an
 //! ECMA-262 construct Rust `regex` cannot express makes the keyword a warning
@@ -48,8 +52,9 @@
 //! feature adds zero-cpu-copy file entry points (`crate::parse_file`,
 //! `crate::validate_file`).
 //!
-//! `validate` never panics and never allocates outside the findings list and
-//! the evaluation tracker.
+//! `validate` never panics and never allocates outside the findings list, the
+//! evaluation tracker and the reference registry, which is built once per
+//! validation in time and memory linear in the schema.
 
 use std::collections::{HashMap, HashSet};
 
@@ -203,7 +208,7 @@ const CONTAINER: &[&str] = &["$defs", "definitions"];
 
 /// Constraint-relevant Core keywords that are not implemented; surfaced as
 /// warnings so a schema that relies on them cannot silently under-check.
-const UNSUPPORTED: &[&str] = &["$dynamicRef", "$recursiveRef"];
+const UNSUPPORTED: &[&str] = &["$recursiveRef"];
 
 /// Every constraint keyword this validator applies.
 const SUPPORTED: &[&str] = &[
@@ -249,6 +254,7 @@ const SUPPORTED: &[&str] = &[
     "then",
     "else",
     "$ref",
+    "$dynamicRef",
 ];
 
 /// Which instance properties/items an application of a subschema evaluated
@@ -276,10 +282,27 @@ struct Applied<'v> {
     evaluated: Evaluated<'v>,
 }
 
+/// One resource in the dynamic scope.
+#[derive(Debug, Clone, Copy)]
+struct Scope {
+    resource: usize,
+    /// Interned identity of the dynamic scope up to and including this
+    /// resource; 0 is the empty scope.
+    id: usize,
+}
+
 struct Ctx<'a, 'v> {
-    root: &'a Value,
-    /// `$anchor`/plain-name fragment name -> JSON pointers that define it.
-    anchors: HashMap<String, Vec<String>>,
+    /// Resources, anchors and reference targets, built once per validation.
+    registry: &'a Registry<'a>,
+    /// The dynamic scope: resources entered so far that declare a
+    /// `$dynamicAnchor`, outermost first, each once. Resources without one
+    /// cannot change where a `$dynamicRef` leads, so they are left out.
+    scope: Vec<Scope>,
+    /// (enclosing scope id, resource entered) -> scope id.
+    scope_ids: HashMap<(usize, usize), usize>,
+    /// References that resolved to nothing, each reported once more at the
+    /// end so that neither `not` nor a passing alternative can hide them.
+    unresolved: Vec<Finding>,
     /// Compiled patterns, keyed by pattern text, so rows never recompile.
     patterns: HashMap<String, Result<regex::Regex, String>>,
     /// Bytes of pattern text compiled so far.
@@ -296,11 +319,13 @@ struct Ctx<'a, 'v> {
     /// by `not`.
     halted: Option<&'static str>,
     /// Results of shared applications, by (schema node, document value)
-    /// address. Both trees are borrowed for the whole validation, so an
-    /// address identifies a node.
+    /// address and dynamic scope id. Both trees are borrowed for the whole
+    /// validation, so an address identifies a node; a `$dynamicRef` below
+    /// the node can lead elsewhere in another scope, so the scope is part of
+    /// the key (always 0 for a schema without a dynamic `$dynamicRef`).
     /// `None` is the common outcome, kept in a few bytes: passed, with no
     /// findings and nothing evaluated.
-    remembered: HashMap<(usize, usize), Option<Box<Remembered<'v>>>>,
+    remembered: HashMap<(usize, usize, usize), Option<Box<Remembered<'v>>>>,
     /// Estimated bytes held by `remembered`.
     remembered_bytes: usize,
     /// Schema nodes that lie on a `$ref` cycle. Only these can be applied
@@ -308,7 +333,7 @@ struct Ctx<'a, 'v> {
     cyclic: &'a HashSet<usize>,
     /// Shared applications currently running; meeting one again means the
     /// schema applies itself to the same value without end.
-    running: HashSet<(usize, usize)>,
+    running: HashSet<(usize, usize, usize)>,
 }
 
 /// The outcome of one subschema application, kept for reuse.
@@ -374,28 +399,29 @@ struct SchemaShape {
 
 /// Finds the `$ref` cycles of a schema and its longest chain of subschemas.
 ///
-/// One depth-first walk over the schema's objects and arrays, with `$ref`
-/// as an extra edge, using Tarjan's strongly-connected-components algorithm
-/// on an explicit stack.
-fn schema_shape(root: &Value, anchors: &HashMap<String, Vec<String>>) -> SchemaShape {
-    fn address(value: &Value) -> usize {
-        std::ptr::from_ref(value) as usize
-    }
-    fn children<'a>(
-        node: &'a Value,
-        root: &'a Value,
-        anchors: &HashMap<String, Vec<String>>,
-    ) -> Vec<&'a Value> {
+/// One depth-first walk over the schema's objects and arrays, with every
+/// place a `$ref` or `$dynamicRef` can lead as an extra edge (for a dynamic
+/// one: its own target and every same-named `$dynamicAnchor`), using
+/// Tarjan's strongly-connected-components algorithm on an explicit stack.
+/// Supplied documents are walked as far as references reach into them.
+fn schema_shape<'a>(root: &'a Value, registry: &Registry<'a>) -> SchemaShape {
+    fn children<'a>(node: &'a Value, registry: &Registry<'a>) -> Vec<&'a Value> {
         let nested = |value: &&Value| value.is_object() || value.is_array();
         match node {
             Value::Array(items) => items.iter().filter(nested).collect(),
             Value::Object(map) => {
                 let mut out: Vec<&Value> = map.values().filter(nested).collect();
-                let target = map
-                    .get("$ref")
-                    .and_then(Value::as_str)
-                    .and_then(|reference| resolve_reference(reference, root, anchors));
-                out.extend(target.filter(nested));
+                for dynamic in [false, true] {
+                    let Some(Some(target)) = registry.references.get(&(address(node), dynamic))
+                    else {
+                        continue;
+                    };
+                    out.extend(Some(target.node).filter(nested));
+                    if let Some(name) = target.dynamic {
+                        let anchors = registry.dynamic_targets.get(name);
+                        out.extend(anchors.into_iter().flatten().copied().filter(nested));
+                    }
+                }
                 out
             }
             _ => Vec::new(),
@@ -439,7 +465,7 @@ fn schema_shape(root: &Value, anchors: &HashMap<String, Vec<String>>) -> SchemaS
     frames.push(Frame {
         node: root,
         index,
-        children: children(root, root, anchors),
+        children: children(root, registry),
         next: 0,
     });
     while let Some(frame) = frames.last_mut() {
@@ -464,7 +490,7 @@ fn schema_shape(root: &Value, anchors: &HashMap<String, Vec<String>>) -> SchemaS
                     frames.push(Frame {
                         node: child,
                         index,
-                        children: children(child, root, anchors),
+                        children: children(child, registry),
                         next: 0,
                     });
                 }
@@ -536,7 +562,17 @@ const VALIDATION_THREAD_FAILED: &str = "validation stopped: the validation threa
 
 /// Runs one validation. `budget` of `None` applies the documented budget.
 fn run(document: &Value, schema: &Value, budget: Option<u64>) -> Outcome {
-    let (schema_values, schema_depth) = measure(schema);
+    run_with_resources(document, schema, &[], budget)
+}
+
+/// Runs one validation with supplied schema documents.
+fn run_with_resources(
+    document: &Value,
+    schema: &Value,
+    resources: &[(&str, &Value)],
+    budget: Option<u64>,
+) -> Outcome {
+    let (mut schema_values, schema_depth) = measure(schema);
     let (document_values, document_depth) = measure(document);
     for (what, depth) in [("schema", schema_depth), ("document", document_depth)] {
         if depth > MAX_VALIDATION_NESTING_DEPTH {
@@ -546,19 +582,30 @@ fn run(document: &Value, schema: &Value, budget: Option<u64>) -> Outcome {
             ));
         }
     }
+    for (uri, resource) in resources {
+        let (values, depth) = measure(resource);
+        if depth > MAX_VALIDATION_NESTING_DEPTH {
+            return Outcome::stopped(format!(
+                "the supplied schema {uri:?} is nested {depth} levels deep; the limit is \
+                 {MAX_VALIDATION_NESTING_DEPTH}; the document was not validated"
+            ));
+        }
+        schema_values = schema_values.saturating_add(values);
+    }
     let budget = budget.unwrap_or_else(|| {
         VALIDATION_STEPS_PER_PAIR
             .saturating_mul(schema_values.saturating_add(1))
             .saturating_mul(document_values.saturating_add(1))
     });
-    let anchors = collect_anchors(schema);
-    let shape = schema_shape(schema, &anchors);
+    let registry = Registry::build(schema, resources);
+    let shape = schema_shape(schema, &registry);
     // Worst-case nesting of applications, decided once. Without a cycle it
     // is the longest chain of subschemas. With one, a chain can restart at
     // every level of the document and once more per reference that leads
     // back into the cycle (the same schema cannot be entered twice on one
-    // value).
-    let worst_depth = if shape.cyclic.is_empty() {
+    // value). A dynamic scope can grow by each resource declaring a
+    // `$dynamicAnchor` before a cycle meets itself under the same scope.
+    let mut worst_depth = if shape.cyclic.is_empty() {
         shape.longest_chain
     } else {
         shape
@@ -566,12 +613,16 @@ fn run(document: &Value, schema: &Value, budget: Option<u64>) -> Outcome {
             .saturating_mul(shape.back_references + 1)
             .saturating_mul(document_depth + 1)
     };
+    if registry.dynamic {
+        worst_depth = worst_depth.saturating_mul(registry.dynamic_resources() + 1);
+    }
+    let registry = &registry;
     if worst_depth <= INLINE_APPLICATION_DEPTH {
-        return run_on_this_stack(document, schema, budget, anchors, &shape.cyclic);
+        return run_on_this_stack(document, schema, budget, registry, &shape.cyclic);
     }
     let cyclic = &shape.cyclic;
     let outcome =
-        on_large_stack(move || run_on_this_stack(document, schema, budget, anchors, cyclic));
+        on_large_stack(move || run_on_this_stack(document, schema, budget, registry, cyclic));
     match outcome {
         Ok(mut outcome) => {
             outcome.spawned = true;
@@ -701,17 +752,19 @@ fn on_large_stack<'env, T: Send + 'env>(
 }
 
 /// Validates on the current thread's stack.
-fn run_on_this_stack(
+fn run_on_this_stack<'a>(
     document: &Value,
-    schema: &Value,
+    schema: &'a Value,
     budget: u64,
-    anchors: HashMap<String, Vec<String>>,
-    cyclic: &HashSet<usize>,
+    registry: &'a Registry<'a>,
+    cyclic: &'a HashSet<usize>,
 ) -> Outcome {
     let mut findings = Vec::new();
     let mut ctx = Ctx {
-        root: schema,
-        anchors,
+        registry,
+        scope: Vec::new(),
+        scope_ids: HashMap::new(),
+        unresolved: Vec::new(),
         patterns: HashMap::new(),
         pattern_bytes: 0,
         depth: 0,
@@ -729,6 +782,14 @@ fn run_on_this_stack(
         // Findings gathered around an abandoned application are not
         // verdicts, so only the reason is reported.
         findings = vec![Finding::error("$", reason)];
+    } else {
+        // An unresolvable reference fails the validation even where `not`
+        // or another alternative discarded its finding.
+        for unresolved in ctx.unresolved {
+            if !findings.iter().any(|f| f.message == unresolved.message) {
+                findings.push(unresolved);
+            }
+        }
     }
     Outcome {
         findings,
@@ -743,8 +804,10 @@ impl<'a> Ctx<'a, '_> {
     /// (the scratch value of `propertyNames`); [`Ctx::rejoin`] takes it back.
     fn fork<'s>(&mut self) -> Ctx<'a, 's> {
         Ctx {
-            root: self.root,
-            anchors: std::mem::take(&mut self.anchors),
+            registry: self.registry,
+            scope: std::mem::take(&mut self.scope),
+            scope_ids: std::mem::take(&mut self.scope_ids),
+            unresolved: std::mem::take(&mut self.unresolved),
             patterns: std::mem::take(&mut self.patterns),
             pattern_bytes: self.pattern_bytes,
             depth: self.depth,
@@ -759,7 +822,9 @@ impl<'a> Ctx<'a, '_> {
     }
 
     fn rejoin(&mut self, inner: Ctx<'a, '_>) {
-        self.anchors = inner.anchors;
+        self.scope = inner.scope;
+        self.scope_ids = inner.scope_ids;
+        self.unresolved = inner.unresolved;
         self.patterns = inner.patterns;
         self.pattern_bytes = inner.pattern_bytes;
         self.steps = inner.steps;
@@ -785,6 +850,82 @@ impl Ctx<'_, '_> {
         self.patterns.insert(pattern.to_string(), compiled.clone());
         Some(compiled)
     }
+
+    /// Identity of the current dynamic scope, for remembered results.
+    fn scope_id(&self) -> usize {
+        self.scope.last().map_or(0, |scope| scope.id)
+    }
+
+    /// Enters `resource` into the dynamic scope. Returns whether it was
+    /// added, in which case the caller must [`Ctx::leave`] afterwards.
+    ///
+    /// Only resources declaring a `$dynamicAnchor` are kept, each once (the
+    /// outermost entry decides), and only when some `$dynamicRef` can
+    /// consult them.
+    fn enter(&mut self, resource: usize) -> bool {
+        if !self.registry.dynamic
+            || self
+                .registry
+                .resources
+                .get(resource)
+                .is_none_or(|declared| declared.dynamic_anchors.is_empty())
+            || self.scope.iter().any(|scope| scope.resource == resource)
+        {
+            return false;
+        }
+        let next = self.scope_ids.len() + 1;
+        let id = *self
+            .scope_ids
+            .entry((self.scope_id(), resource))
+            .or_insert(next);
+        self.scope.push(Scope { resource, id });
+        true
+    }
+
+    fn leave(&mut self) {
+        self.scope.pop();
+    }
+}
+
+impl<'a> Ctx<'a, '_> {
+    /// The outermost `$dynamicAnchor` named `name` in the dynamic scope.
+    fn outermost_dynamic_anchor(&self, name: &str) -> Option<(&'a Value, usize)> {
+        let registry = self.registry;
+        self.scope.iter().find_map(|scope| {
+            let declared = registry.resources.get(scope.resource)?;
+            declared
+                .dynamic_anchors
+                .get(name)
+                .map(|node| (*node, scope.resource))
+        })
+    }
+
+    /// Records a `$ref`/`$dynamicRef` that resolves to nothing: an error
+    /// here, and once more at the end of the validation.
+    fn unresolvable(
+        &mut self,
+        keyword: &str,
+        reference: &str,
+        path: &str,
+        findings: &mut Vec<Finding>,
+    ) {
+        let finding = Finding::error(
+            path,
+            format!(
+                "{keyword} {reference:?} does not resolve to a schema in this document or the \
+                 supplied schema documents (nothing is fetched); the reference was not \
+                 followed, so the value is not accepted"
+            ),
+        );
+        if !self
+            .unresolved
+            .iter()
+            .any(|known| known.message == finding.message)
+        {
+            self.unresolved.push(finding.clone());
+        }
+        findings.push(finding);
+    }
 }
 
 /// Validate a JSON document against a JSON Schema.
@@ -806,8 +947,58 @@ impl Ctx<'_, '_> {
 /// matched first: `a = {"anyOf": [{"type": "integer"}, {"$ref": "#/$defs/a"}]}`
 /// stops with an error for `1`, where a short-circuiting validator accepts
 /// it. Every alternative is evaluated here, and that one never finishes.
+///
+/// # References
+///
+/// `$ref` and `$dynamicRef` resolve against base URIs (RFC 3986): the root
+/// schema's base is empty, and every `$id` sets a new base for its
+/// subschema, which may be embedded anywhere in the schema. Targets are
+/// JSON-pointer fragments, `$anchor`/`$dynamicAnchor` names (scoped to the
+/// resource that declares them) and whole resources. `$dynamicRef` follows
+/// the 2020-12 dynamic scope, and `unevaluatedProperties`/`unevaluatedItems`
+/// see through it as through `$ref`. Nothing is ever fetched: to resolve a
+/// reference to another document, pass that document to
+/// [`validate_with_resources`].
+///
+/// **Fails closed.** A reference that is followed and resolves to nothing
+/// is an [`Severity::Error`] finding naming the reference, so the document is
+/// not accepted, even under `not` or beside an alternative that passes.
+/// Before this, such a `$ref` was a warning and was skipped, which accepted
+/// the value. A reference the validation never reaches is not reported.
 pub fn validate(document: &Value, schema: &Value) -> Vec<Finding> {
     run(document, schema, None).findings
+}
+
+/// Validate a JSON document against a schema that refers to other schema
+/// documents, which the caller supplies.
+///
+/// Each entry of `resources` is `(retrieval URI, schema document)`. A
+/// `$ref` to that URI, or to the document's own `$id`, resolves inside it,
+/// and references inside it resolve against its `$id`, or its retrieval URI
+/// when it has none. Nothing is fetched from the network or the file
+/// system, ever: a reference to a document that is not supplied fails
+/// closed, as described on [`validate`], which this otherwise equals. The
+/// supplied documents count toward the work budget and the nesting limit
+/// like the schema itself.
+///
+/// # Examples
+///
+/// ```
+/// use json_fast_core::schema::{has_errors, validate_with_resources};
+/// use serde_json::json;
+///
+/// let schema = json!({"$ref": "https://example.com/positive.json"});
+/// let positive = json!({"type": "integer", "minimum": 1});
+/// let resources = [("https://example.com/positive.json", &positive)];
+/// assert!(validate_with_resources(&json!(3), &schema, &resources).is_empty());
+/// assert!(has_errors(&validate_with_resources(&json!(0), &schema, &resources)));
+/// ```
+pub fn validate_with_resources(
+    document: &Value,
+    schema: &Value,
+    resources: &[(&str, &Value)],
+) -> Vec<Finding> {
+    run_with_resources(document, schema, resources, None).findings
 }
 
 /// True when any finding is an [`Severity::Error`].
@@ -816,6 +1007,15 @@ pub fn has_errors(findings: &[Finding]) -> bool {
 }
 
 /// Parse two JSON strings and validate `document` against `schema`.
+///
+/// Equivalent to [`validate`] on the parsed values, including its
+/// fail-closed handling of references that do not resolve: such a `$ref`
+/// used to be a warning and is now an error.
+///
+/// # Errors
+///
+/// Returns the parse error when either string is not JSON within the
+/// default limits.
 pub fn validate_str(document: &str, schema: &str) -> crate::Result<Vec<Finding>> {
     let doc: Value = crate::parse(document)?;
     let sch: Value = crate::parse(schema)?;
@@ -868,7 +1068,20 @@ fn apply_schema<'v>(
             ));
             Evaluated::default()
         }
-        Value::Object(obj) => apply_object(value, obj, path, ctx, findings),
+        Value::Object(obj) => {
+            // A subschema with its own `$id` enters its resource.
+            let registry = ctx.registry;
+            let entered = registry.dynamic
+                && registry
+                    .roots
+                    .get(&address(schema))
+                    .is_some_and(|resource| ctx.enter(*resource));
+            let evaluated = apply_object(value, address(schema), obj, path, ctx, findings);
+            if entered {
+                ctx.leave();
+            }
+            evaluated
+        }
         _ => {
             findings.push(Finding::warning(
                 path,
@@ -939,7 +1152,7 @@ fn applying_shared<'v>(
         findings.append(&mut local);
         return Applied { passed, evaluated };
     }
-    let key = (schema_address, std::ptr::from_ref(value) as usize);
+    let key = (schema_address, address(value), ctx.scope_id());
     let surfaced = |finding: &Finding| !soft || finding.severity == Severity::Warning;
     match ctx.remembered.get(&key) {
         Some(None) => {
@@ -1042,6 +1255,7 @@ fn push_index(path: &mut String, index: usize) {
 
 fn apply_object<'v>(
     value: &'v Value,
+    schema_address: usize,
     obj: &Map<String, Value>,
     path: &mut String,
     ctx: &mut Ctx<'_, 'v>,
@@ -1075,18 +1289,28 @@ fn apply_object<'v>(
         return evaluated;
     }
 
-    if let Some(reference) = obj.get("$ref").and_then(|r| r.as_str()) {
-        match resolve_ref(reference, ctx) {
-            Some(target) => {
-                let applied = applying_shared(value, target, path, ctx, findings, false);
-                if applied.passed {
-                    evaluated.merge(&applied.evaluated);
-                }
-            }
-            None => findings.push(Finding::warning(
-                path,
-                format!("$ref {reference:?} does not resolve in this document; skipped"),
-            )),
+    for (keyword, dynamic) in [("$ref", false), ("$dynamicRef", true)] {
+        let Some(reference) = obj.get(keyword).and_then(Value::as_str) else {
+            continue;
+        };
+        let registry = ctx.registry;
+        let Some(Some(target)) = registry.references.get(&(schema_address, dynamic)) else {
+            ctx.unresolvable(keyword, reference, path, findings);
+            continue;
+        };
+        // A `$dynamicRef` to a `$dynamicAnchor` leads to the outermost
+        // resource in the dynamic scope that declares the same name.
+        let (node, resource) = target
+            .dynamic
+            .and_then(|name| ctx.outermost_dynamic_anchor(name))
+            .unwrap_or((target.node, target.resource));
+        let entered = ctx.enter(resource);
+        let applied = applying_shared(value, node, path, ctx, findings, false);
+        if entered {
+            ctx.leave();
+        }
+        if applied.passed {
+            evaluated.merge(&applied.evaluated);
         }
     }
 
@@ -2045,75 +2269,442 @@ fn type_matches(value: &Value, type_name: &str) -> bool {
     }
 }
 
-/// Walk the root schema and record every `$anchor` (and `$id` in plain-name
-/// fragment form) so `$ref: "#name"` resolves. Runs once per `validate`.
-fn collect_anchors(root: &Value) -> HashMap<String, Vec<String>> {
-    let mut anchors: HashMap<String, Vec<String>> = HashMap::new();
-    let mut stack: Vec<(&Value, String)> = vec![(root, String::new())];
-    while let Some((node, pointer)) = stack.pop() {
-        if let Some(obj) = node.as_object() {
-            if let Some(name) = obj
-                .get("$anchor")
-                .and_then(|a| a.as_str())
-                .filter(|a| !a.is_empty())
-            {
-                anchors
-                    .entry(name.to_string())
-                    .or_default()
-                    .push(pointer.clone());
-            }
-            if let Some(name) = obj
-                .get("$id")
-                .and_then(|i| i.as_str())
-                .and_then(|i| i.strip_prefix('#'))
-                .filter(|n| !n.is_empty())
-            {
-                anchors
-                    .entry(name.to_string())
-                    .or_default()
-                    .push(pointer.clone());
-            }
-            for (key, child) in obj {
-                let mut child_pointer = pointer.clone();
-                child_pointer.push('/');
-                child_pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
-                child_pointer.shrink_to_fit();
-                stack.push((child, child_pointer));
+/// Keywords whose values are instance data, never subschemas: identifiers
+/// inside them are not identifiers.
+const DATA_KEYWORDS: &[&str] = &["enum", "const", "default", "examples"];
+
+/// Keywords whose values are maps from names to subschemas.
+const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "dependencies",
+];
+
+/// What a value inside a schema document is, for finding identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// A schema or an array of schemas: `$id` and anchors here count.
+    Schema,
+    /// A map from names to schemas (`properties`, `$defs`, ...).
+    SchemaMap,
+    /// Instance data (`enum`, `const`, ...): nothing here identifies a schema.
+    Data,
+}
+
+/// One schema resource: a document root, or a subschema with its own `$id`.
+#[derive(Debug)]
+struct Resource<'s> {
+    /// Absolute URI without fragment; empty for a root schema without `$id`.
+    uri: String,
+    /// The schema the URI names.
+    root: &'s Value,
+    /// Plain-name fragments: `$anchor`, `$dynamicAnchor` and the legacy
+    /// `$id: "#name"` form.
+    anchors: HashMap<&'s str, &'s Value>,
+    /// `$dynamicAnchor` names only.
+    dynamic_anchors: HashMap<&'s str, &'s Value>,
+}
+
+impl<'s> Resource<'s> {
+    fn new(uri: String, root: &'s Value) -> Self {
+        Self {
+            uri,
+            root,
+            anchors: HashMap::new(),
+            dynamic_anchors: HashMap::new(),
+        }
+    }
+}
+
+/// Where one `$ref` or `$dynamicRef` leads before the dynamic scope is
+/// consulted.
+#[derive(Debug, Clone, Copy)]
+struct Target<'s> {
+    /// The subschema the reference names.
+    node: &'s Value,
+    /// The resource that subschema belongs to.
+    resource: usize,
+    /// For a `$dynamicRef` whose target declares the same `$dynamicAnchor`:
+    /// that name, to be looked up in the dynamic scope.
+    dynamic: Option<&'s str>,
+}
+
+/// A `$ref` or `$dynamicRef` found while registering, resolved once every
+/// resource is known.
+struct Site<'s> {
+    address: usize,
+    reference: &'s str,
+    resource: usize,
+    dynamic: bool,
+}
+
+/// Every schema resource, anchor and reference target of one validation.
+///
+/// Built once per validation, in one pass over the schema and the supplied
+/// documents plus one resolution per reference: time and memory are linear
+/// in their size (a resource's URI is at most as long as the `$id`s on its
+/// path, and nesting is limited). JSON-pointer fragments are not
+/// enumerated; each reference's pointer is walked once, here.
+#[derive(Debug, Default)]
+struct Registry<'s> {
+    resources: Vec<Resource<'s>>,
+    /// Absolute URI (no fragment) -> resource.
+    by_uri: HashMap<String, usize>,
+    /// Address of a resource's root schema -> resource.
+    roots: HashMap<usize, usize>,
+    /// (address of the schema object, whether it is `$dynamicRef`) -> where
+    /// the reference leads, `None` when it resolves to nothing.
+    references: HashMap<(usize, bool), Option<Target<'s>>>,
+    /// Every subschema declaring a `$dynamicAnchor`, by name: the places a
+    /// `$dynamicRef` to that name can lead.
+    dynamic_targets: HashMap<&'s str, Vec<&'s Value>>,
+    /// Whether any `$dynamicRef` consults the dynamic scope.
+    dynamic: bool,
+}
+
+fn address(value: &Value) -> usize {
+    std::ptr::from_ref(value) as usize
+}
+
+impl<'s> Registry<'s> {
+    /// Registers `root` (base URI empty) and each `(retrieval URI, document)`.
+    fn build(root: &'s Value, documents: &[(&str, &'s Value)]) -> Self {
+        let mut registry = Self::default();
+        let mut sites = Vec::new();
+        registry.register(root, "", &mut sites);
+        for (uri, document) in documents {
+            registry.register(document, uri, &mut sites);
+        }
+        for site in sites {
+            let target = registry.resolve(site.reference, site.resource, site.dynamic);
+            registry.dynamic |= target.is_some_and(|target| target.dynamic.is_some());
+            registry
+                .references
+                .insert((site.address, site.dynamic), target);
+        }
+        registry
+    }
+
+    /// Records the resources, anchors and reference sites of one document.
+    fn register(&mut self, document: &'s Value, retrieval: &str, sites: &mut Vec<Site<'s>>) {
+        let uri = without_fragment(&resolve_uri(retrieval, ""));
+        let index = self.resources.len();
+        self.by_uri.entry(uri.clone()).or_insert(index);
+        self.resources.push(Resource::new(uri, document));
+        self.roots.insert(address(document), index);
+        let mut pending: Vec<(&'s Value, usize, Role)> = vec![(document, index, Role::Schema)];
+        while let Some((node, mut resource, role)) = pending.pop() {
+            match node {
+                Value::Array(items) => {
+                    pending.extend(
+                        items
+                            .iter()
+                            .filter(|item| item.is_object() || item.is_array())
+                            .map(|item| (item, resource, role)),
+                    );
+                }
+                Value::Object(map) => {
+                    if role == Role::Schema {
+                        resource = self.identify(node, map, resource, std::ptr::eq(node, document));
+                    }
+                    for (keyword, dynamic) in [("$ref", false), ("$dynamicRef", true)] {
+                        if let Some(reference) = map.get(keyword).and_then(Value::as_str) {
+                            sites.push(Site {
+                                address: address(node),
+                                reference,
+                                resource,
+                                dynamic,
+                            });
+                        }
+                    }
+                    for (key, child) in map {
+                        if !(child.is_object() || child.is_array()) {
+                            continue;
+                        }
+                        let child_role = match role {
+                            Role::Data => Role::Data,
+                            Role::SchemaMap => Role::Schema,
+                            Role::Schema if DATA_KEYWORDS.contains(&key.as_str()) => Role::Data,
+                            Role::Schema if SCHEMA_MAP_KEYWORDS.contains(&key.as_str()) => {
+                                Role::SchemaMap
+                            }
+                            Role::Schema => Role::Schema,
+                        };
+                        pending.push((child, resource, child_role));
+                    }
+                }
+                _ => {}
             }
         }
     }
-    anchors
-}
 
-fn resolve_ref<'a>(reference: &str, ctx: &Ctx<'a, '_>) -> Option<&'a Value> {
-    resolve_reference(reference, ctx.root, &ctx.anchors)
-}
-
-fn resolve_reference<'a>(
-    reference: &str,
-    root: &'a Value,
-    anchors: &HashMap<String, Vec<String>>,
-) -> Option<&'a Value> {
-    if reference == "#" {
-        return Some(root);
-    }
-    // A fragment is percent-encoded (RFC 3986); the JSON Pointer inside it
-    // then has its own `~0`/`~1` escapes (RFC 6901).
-    let fragment = percent_decode(reference.strip_prefix('#')?);
-    if let Some(pointer) = fragment.strip_prefix('/') {
-        return pointer_get(root, pointer);
-    }
-    {
-        let name = fragment.as_ref();
-        if let Some(pointers) = anchors.get(name) {
-            for pointer in pointers {
-                if let Some(target) = pointer_get(root, pointer) {
-                    return Some(target);
+    /// Applies one schema object's `$id`, `$anchor` and `$dynamicAnchor`;
+    /// returns the resource the object belongs to.
+    fn identify(
+        &mut self,
+        node: &'s Value,
+        map: &'s Map<String, Value>,
+        mut resource: usize,
+        document_root: bool,
+    ) -> usize {
+        if let Some(id) = map.get("$id").and_then(Value::as_str) {
+            if let Some(name) = id.strip_prefix('#') {
+                // The draft-06/07 plain-name form is an anchor.
+                self.anchor(resource, name, node, false);
+            } else {
+                let base = self
+                    .resources
+                    .get(resource)
+                    .map_or("", |declared| declared.uri.as_str());
+                let uri = without_fragment(&resolve_uri(id, base));
+                if document_root {
+                    // A supplied document's own `$id` names it as well as
+                    // its retrieval URI, and is the base inside it.
+                    self.by_uri.entry(uri.clone()).or_insert(resource);
+                    if let Some(declared) = self.resources.get_mut(resource) {
+                        declared.uri = uri;
+                    }
+                } else if uri != base {
+                    let index = self.resources.len();
+                    self.by_uri.entry(uri.clone()).or_insert(index);
+                    self.resources.push(Resource::new(uri, node));
+                    self.roots.insert(address(node), index);
+                    resource = index;
                 }
             }
         }
+        if let Some(name) = map.get("$anchor").and_then(Value::as_str) {
+            self.anchor(resource, name, node, false);
+        }
+        if let Some(name) = map.get("$dynamicAnchor").and_then(Value::as_str) {
+            self.anchor(resource, name, node, true);
+        }
+        resource
     }
-    None
+
+    /// Declares a plain-name fragment in `resource`; the first declaration
+    /// of a name wins.
+    fn anchor(&mut self, resource: usize, name: &'s str, node: &'s Value, dynamic: bool) {
+        if name.is_empty() {
+            return;
+        }
+        let Some(declared) = self.resources.get_mut(resource) else {
+            return;
+        };
+        declared.anchors.entry(name).or_insert(node);
+        if dynamic {
+            declared.dynamic_anchors.entry(name).or_insert(node);
+            self.dynamic_targets.entry(name).or_default().push(node);
+        }
+    }
+
+    /// Resolves `reference` against the base URI of `resource`.
+    fn resolve(&self, reference: &str, resource: usize, dynamic: bool) -> Option<Target<'s>> {
+        let base = self.resources.get(resource)?.uri.as_str();
+        let absolute = resolve_uri(reference, base);
+        let (uri, fragment) = absolute.split_once('#').unwrap_or((absolute.as_str(), ""));
+        let mut resource = *self.by_uri.get(uri)?;
+        let declared = self.resources.get(resource)?;
+        // A fragment is percent-encoded (RFC 3986); the JSON Pointer inside
+        // it then has its own `~0`/`~1` escapes (RFC 6901).
+        let fragment = percent_decode(fragment);
+        if fragment.is_empty() {
+            return Some(Target {
+                node: declared.root,
+                resource,
+                dynamic: None,
+            });
+        }
+        if let Some(pointer) = fragment.strip_prefix('/') {
+            let mut node = declared.root;
+            for raw in pointer.split('/') {
+                let token = raw.replace("~1", "/").replace("~0", "~");
+                node = match node {
+                    Value::Object(map) => map.get(&token)?,
+                    Value::Array(items) => items.get(token.parse::<usize>().ok()?)?,
+                    _ => return None,
+                };
+                // A pointer may walk into an embedded resource.
+                if let Some(inner) = self.roots.get(&address(node)) {
+                    resource = *inner;
+                }
+            }
+            return Some(Target {
+                node,
+                resource,
+                dynamic: None,
+            });
+        }
+        let node = *declared.anchors.get(fragment.as_ref())?;
+        let dynamic = if dynamic {
+            declared
+                .dynamic_anchors
+                .get_key_value(fragment.as_ref())
+                .filter(|(_, declaring)| std::ptr::eq(**declaring, node))
+                .map(|(name, _)| *name)
+        } else {
+            None
+        };
+        Some(Target {
+            node,
+            resource,
+            dynamic,
+        })
+    }
+
+    /// Resources that declare a `$dynamicAnchor`, the only ones that can
+    /// change where a `$dynamicRef` leads.
+    fn dynamic_resources(&self) -> usize {
+        self.resources
+            .iter()
+            .filter(|resource| !resource.dynamic_anchors.is_empty())
+            .count()
+    }
+}
+
+/// The parts of a URI reference (RFC 3986, appendix B).
+#[derive(Debug, Clone, Copy)]
+struct UriParts<'u> {
+    scheme: Option<&'u str>,
+    authority: Option<&'u str>,
+    path: &'u str,
+    query: Option<&'u str>,
+    fragment: Option<&'u str>,
+}
+
+fn split_uri(text: &str) -> UriParts<'_> {
+    let (rest, fragment) = match text.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (text, None),
+    };
+    let (rest, query) = match rest.split_once('?') {
+        Some((rest, query)) => (rest, Some(query)),
+        None => (rest, None),
+    };
+    let (scheme, rest) = match rest.split_once(':') {
+        Some((scheme, after))
+            if !scheme.contains('/')
+                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        {
+            (Some(scheme), after)
+        }
+        _ => (None, rest),
+    };
+    let (authority, path) = match rest.strip_prefix("//") {
+        Some(after) => {
+            let end = after.find('/').unwrap_or(after.len());
+            (after.get(..end), after.get(end..).unwrap_or_default())
+        }
+        None => (None, rest),
+    };
+    UriParts {
+        scheme,
+        authority,
+        path,
+        query,
+        fragment,
+    }
+}
+
+/// RFC 3986 section 5.2.4: removes `.` and `..` segments.
+fn remove_dot_segments(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut output: Vec<&str> = Vec::new();
+    let mut segments = path.split('/').peekable();
+    if absolute {
+        segments.next();
+    }
+    let mut trailing = false;
+    while let Some(segment) = segments.next() {
+        let last = segments.peek().is_none();
+        match segment {
+            "." => trailing = last,
+            ".." => {
+                output.pop();
+                trailing = last;
+            }
+            _ => {
+                output.push(segment);
+                trailing = false;
+            }
+        }
+    }
+    let mut out = String::with_capacity(path.len());
+    if absolute {
+        out.push('/');
+    }
+    out.push_str(&output.join("/"));
+    if trailing && !out.ends_with('/') && !output.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// Resolves a URI reference against a base URI (RFC 3986 section 5.2).
+///
+/// An empty or relative base is tolerated: the result is then relative too,
+/// which is what an embedded `$id` under a root without one should be.
+fn resolve_uri(reference: &str, base: &str) -> String {
+    let r = split_uri(reference);
+    let b = split_uri(base);
+    let (scheme, authority, path, query) = if r.scheme.is_some() {
+        (r.scheme, r.authority, remove_dot_segments(r.path), r.query)
+    } else if r.authority.is_some() {
+        (b.scheme, r.authority, remove_dot_segments(r.path), r.query)
+    } else if r.path.is_empty() {
+        (
+            b.scheme,
+            b.authority,
+            b.path.to_owned(),
+            r.query.or(b.query),
+        )
+    } else if r.path.starts_with('/') {
+        (b.scheme, b.authority, remove_dot_segments(r.path), r.query)
+    } else {
+        let merged = if b.authority.is_some() && b.path.is_empty() {
+            format!("/{}", r.path)
+        } else {
+            let directory = b
+                .path
+                .rfind('/')
+                .and_then(|slash| b.path.get(..=slash))
+                .unwrap_or_default();
+            format!("{directory}{}", r.path)
+        };
+        (b.scheme, b.authority, remove_dot_segments(&merged), r.query)
+    };
+    let mut out = String::with_capacity(reference.len() + base.len());
+    if let Some(scheme) = scheme {
+        out.push_str(scheme);
+        out.push(':');
+    }
+    if let Some(authority) = authority {
+        out.push_str("//");
+        out.push_str(authority);
+    }
+    out.push_str(&path);
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(query);
+    }
+    if let Some(fragment) = r.fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
+}
+
+/// `uri` without its fragment, if any.
+fn without_fragment(uri: &str) -> String {
+    uri.split_once('#')
+        .map_or(uri, |(before, _)| before)
+        .to_owned()
 }
 
 /// Decodes `%XX` escapes; text that is not valid UTF-8 afterwards, or has
@@ -2139,20 +2730,6 @@ fn percent_decode(text: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     String::from_utf8(out).map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
-}
-
-/// RFC 6901 JSON-pointer get (document-local references only).
-fn pointer_get<'a>(root: &'a Value, pointer: &str) -> Option<&'a Value> {
-    let mut node = root;
-    for raw in pointer.split('/') {
-        let token = raw.replace("~1", "/").replace("~0", "~");
-        node = match node {
-            Value::Object(map) => map.get(&token)?,
-            Value::Array(arr) => arr.get(token.parse::<usize>().ok()?)?,
-            _ => return None,
-        };
-    }
-    Some(node)
 }
 
 /// Why a `format` check did not pass.
@@ -3323,11 +3900,209 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_ref_is_a_warning() {
-        let schema = json!({"$ref": "#/$defs/missing"});
-        let findings = validate(&json!(1), &schema);
-        assert!(findings.iter().any(|f| f.severity == Severity::Warning));
-        assert!(!findings.iter().any(|f| f.severity == Severity::Error));
+    fn unresolvable_references_fail_closed() {
+        for schema in [
+            json!({"$ref": "#/$defs/missing"}),
+            json!({"$ref": "#no-such-anchor"}),
+            json!({"$ref": "http://example.com/remote.json"}),
+            json!({"$dynamicRef": "#/$defs/missing"}),
+            // Neither `not` nor a passing alternative may hide it.
+            json!({"not": {"$ref": "#/$defs/missing"}}),
+            json!({"anyOf": [{"$ref": "#/$defs/missing"}, true]}),
+        ] {
+            let findings = validate(&json!(1), &schema);
+            assert!(has_errors(&findings), "{schema}: {findings:?}");
+            assert!(
+                findings.iter().any(
+                    |f| f.severity == Severity::Error && f.message.contains("does not resolve")
+                ),
+                "{schema}: {findings:?}"
+            );
+        }
+        // A reference that is never followed is not an error.
+        let unused = json!({"$defs": {"x": {"$ref": "#/$defs/missing"}}, "type": "integer"});
+        assert_eq!(validate(&json!(1), &unused), []);
+    }
+
+    #[test]
+    fn references_resolve_against_base_uris() {
+        let schema = json!({
+            "$id": "http://example.com/dir/root.json",
+            "properties": {
+                "a": {"$ref": "item.json"},
+                "b": {"$ref": "folder/inner.json#/$defs/n"},
+                "c": {"$ref": "http://example.com/dir/root.json#/$defs/s"},
+                "d": {"$ref": "/abs.json"},
+                "e": {"$ref": "urn:example:thing#/$defs/i"}
+            },
+            "$defs": {
+                "item": {"$id": "item.json", "type": "integer"},
+                "folder": {"$id": "folder/inner.json", "$defs": {"n": {"type": "null"}}},
+                "s": {"type": "string"},
+                "abs": {"$id": "http://example.com/abs.json", "type": "boolean"},
+                "urn": {"$id": "urn:example:thing", "$defs": {"i": {"$ref": "#/$defs/j"}, "j": {"type": "array"}}}
+            }
+        });
+        let valid = json!({"a": 1, "b": null, "c": "x", "d": true, "e": []});
+        assert_eq!(validate(&valid, &schema), []);
+        for (key, wrong) in [
+            ("a", json!("x")),
+            ("b", json!(1)),
+            ("c", json!(1)),
+            ("d", json!(1)),
+            ("e", json!(1)),
+        ] {
+            let mut document = valid.clone();
+            document[key] = wrong;
+            let findings = validate(&document, &schema);
+            assert_eq!(findings.len(), 1, "{key}: {findings:?}");
+            assert_eq!(findings[0].severity, Severity::Error, "{key}");
+        }
+    }
+
+    #[test]
+    fn anchors_are_scoped_to_the_resource_that_declares_them() {
+        let schema = json!({
+            "$id": "http://example.com/root",
+            "$ref": "child#a",
+            "$defs": {"A": {"$id": "child", "allOf": [
+                {"$id": "other", "$anchor": "a", "type": "number"},
+                {"$anchor": "a", "type": "string"}
+            ]}}
+        });
+        assert!(passes(r#""x""#, &schema));
+        assert!(fails("1", &schema));
+    }
+
+    #[test]
+    fn supplied_resources_resolve_remote_references() {
+        let schema = json!({
+            "$id": "http://example.com/main.json",
+            "properties": {"n": {"$ref": "defs.json#/$defs/positive"}, "t": {"$ref": "tree.json"}}
+        });
+        let defs = json!({"$defs": {"positive": {"type": "integer", "minimum": 1}}});
+        let tree = json!({
+            "type": "object",
+            "properties": {"kids": {"items": {"$ref": "#"}}, "v": {"$ref": "defs.json#/$defs/positive"}}
+        });
+        let resources = [
+            ("http://example.com/defs.json", &defs),
+            ("http://example.com/tree.json", &tree),
+        ];
+        let good = json!({"n": 1, "t": {"v": 2, "kids": [{"v": 3}, {"kids": []}]}});
+        assert_eq!(validate_with_resources(&good, &schema, &resources), []);
+        let bad = json!({"n": 1, "t": {"kids": [{"v": 0}]}});
+        let findings = validate_with_resources(&bad, &schema, &resources);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].path, "$/t/kids/0/v");
+        // Without the documents the same references do not resolve.
+        assert!(has_errors(&validate(&good, &schema)));
+    }
+
+    #[test]
+    fn dynamic_references_resolve_through_the_dynamic_scope() {
+        let schema = json!({
+            "$id": "https://example.com/root",
+            "$ref": "list",
+            "$defs": {
+                "foo": {"$dynamicAnchor": "items", "type": "string"},
+                "list": {"$id": "list", "type": "array", "items": {"$dynamicRef": "#items"},
+                         "$defs": {"items": {"$dynamicAnchor": "items"}}}
+            }
+        });
+        assert!(passes(r#"["a", "b"]"#, &schema));
+        assert!(fails(r#"["a", 1]"#, &schema));
+        // `unevaluatedProperties` sees what the dynamic target evaluated.
+        let schema = json!({
+            "$id": "https://example.com/derived",
+            "$ref": "./base",
+            "$defs": {
+                "derived": {"$dynamicAnchor": "addons", "properties": {"bar": {"type": "string"}}},
+                "base": {"$id": "./base", "unevaluatedProperties": false,
+                         "properties": {"foo": {"type": "string"}}, "$dynamicRef": "#addons",
+                         "$defs": {"default": {"$dynamicAnchor": "addons"}}}
+            }
+        });
+        assert!(passes(r#"{"foo": "a", "bar": "b"}"#, &schema));
+        assert!(fails(r#"{"foo": "a", "bar": "b", "baz": "c"}"#, &schema));
+    }
+
+    #[test]
+    fn remembered_results_are_not_reused_across_dynamic_scopes() {
+        // `list` lies on a cycle, so its result on an array is remembered.
+        // The two `anyOf` branches apply it to the same array under different
+        // dynamic scopes, where `#item` means a string or a number.
+        let schema = json!({
+            "$id": "https://example.com/root",
+            "anyOf": [{"$ref": "strings"}, {"$ref": "numbers"}],
+            "$defs": {
+                "list": {"$id": "list", "type": "array",
+                         "items": {"anyOf": [{"$dynamicRef": "#item"}, {"$ref": "list"}]},
+                         "$defs": {"item": {"$dynamicAnchor": "item", "not": true}}},
+                "strings": {"$id": "strings", "$ref": "list",
+                            "$defs": {"item": {"$dynamicAnchor": "item", "type": "string"}}},
+                "numbers": {"$id": "numbers", "$ref": "list",
+                            "$defs": {"item": {"$dynamicAnchor": "item", "type": "number"}}}
+            }
+        });
+        let outcome = run(&json!([1, [2]]), &schema, None);
+        assert_eq!(outcome.findings, []);
+        assert!(outcome.remembered > 0);
+        assert!(passes(r#"["a", ["b"]]"#, &schema));
+        assert!(fails(r#"[1, ["b"]]"#, &schema));
+        assert!(fails("[true]", &schema));
+    }
+
+    #[test]
+    fn dynamic_and_static_reference_cycles_are_stopped() {
+        // `$ref` leads to a `$dynamicRef` that leads back to the root, which
+        // never descends into the document.
+        let schema = json!({
+            "$id": "https://example.com/loop",
+            "$dynamicAnchor": "loop",
+            "allOf": [{"$ref": "#/$defs/a"}, {"$ref": "#/$defs/a"}],
+            "$defs": {"a": {"$dynamicRef": "#loop"}}
+        });
+        let Outcome {
+            findings, steps, ..
+        } = run(&json!([1]), &schema, None);
+        assert!(steps < 20, "{steps} applications");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("without end"));
+        // Here only the dynamic scope closes the cycle: `#loop` names a leaf
+        // in `inner`, but `outer`, outermost in scope, declares it too.
+        let schema = json!({
+            "$id": "https://example.com/outer",
+            "$dynamicAnchor": "loop",
+            "$ref": "inner",
+            "$defs": {"inner": {
+                "$id": "inner",
+                "allOf": [{"$dynamicRef": "#loop"}, {"$dynamicRef": "#loop"}],
+                "$defs": {"leaf": {"$dynamicAnchor": "loop", "type": "integer"}}
+            }}
+        });
+        let Outcome {
+            findings, steps, ..
+        } = run(&json!(1), &schema, None);
+        assert!(steps < 20, "{steps} applications");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("without end"));
+        // A cycle that does descend is fine and stays linear.
+        let schema = json!({
+            "$id": "https://example.com/tree",
+            "$dynamicAnchor": "node",
+            "properties": {"kids": {"items": {"$ref": "#/$defs/kid"}}, "v": {"type": "integer"}},
+            "$defs": {"kid": {"$dynamicRef": "#node"}}
+        });
+        let tree = (0..30).fold(json!({"v": 1}), |inner, _| json!({"v": 1, "kids": [inner]}));
+        let outcome = run(&tree, &schema, None);
+        assert_eq!(outcome.findings, []);
+        assert!(outcome.steps < 1_000, "{} applications", outcome.steps);
+        let tree = (0..30).fold(
+            json!({"v": "x"}),
+            |inner, _| json!({"v": 1, "kids": [inner]}),
+        );
+        assert_eq!(errors(&tree.to_string(), &schema).len(), 1);
     }
 
     #[test]
@@ -3402,8 +4177,8 @@ mod tests {
 
     #[test]
     fn flags_unsupported_and_unknown_keywords() {
-        let dynamic = validate(&json!(1), &json!({"$dynamicRef": "#recursive"}));
-        assert!(dynamic.iter().any(|f| f.severity == Severity::Warning));
+        let recursive = validate(&json!(1), &json!({"$recursiveRef": "#"}));
+        assert!(recursive.iter().any(|f| f.severity == Severity::Warning));
         let unknown = validate(&json!(1), &json!({"madeUpKeyword": 1}));
         assert!(unknown.iter().any(|f| f.severity == Severity::Warning));
     }

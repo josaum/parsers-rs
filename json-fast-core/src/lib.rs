@@ -7,7 +7,7 @@
 //! |-----------------|-------------------------|-------|
 //! | JSON (6 types)  | [`parse`], [`parse_value`], [`stringify()`], [`types`] | SIMD via sonic-rs |
 //! | JSONL / NDJSON  | [`jsonl`]               | line-delimited streaming |
-//! | JSON Schema     | [`schema`]              | draft-07 through 2020-12 constraint keywords, local `$ref`, allocation-free walk |
+//! | JSON Schema     | [`schema`]              | draft-07 through 2020-12 constraint keywords, `$ref`/`$dynamicRef` with `$id` base URIs, fail-closed on unresolvable references |
 //! | JSON-RPC 2.0    | [`jsonrpc`]             | request / response envelopes |
 //! | JSON:API        | [`jsonapi`]             | resource envelope (`data` XOR `errors`) |
 //! | JWK / JWT       | [`jwt`]                 | header/payload split + base64url decode (no crypto) |
@@ -301,7 +301,9 @@ pub fn parse_file_with_limits(
 
 /// Validate a JSON file against a schema by memory-mapping the document
 /// (feature `mmap`). Equivalent to [`schema::validate`] with the file's
-/// content parsed under default resource limits.
+/// content parsed under default resource limits, including its fail-closed
+/// handling of references that do not resolve (an error, formerly a
+/// warning).
 #[cfg(feature = "mmap")]
 pub fn validate_file(path: impl AsRef<Path>, schema: &str) -> Result<Vec<schema::Finding>> {
     let doc = parse_file(path)?;

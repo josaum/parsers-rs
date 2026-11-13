@@ -4,6 +4,26 @@ Changes a consumer of the wheels, Node packages, crates or Flight servers
 can observe. Each release also has generated notes listing every pull
 request.
 
+## Unreleased
+
+### Changed output
+
+- **json:** a `$ref` or `$dynamicRef` that resolves to nothing is now an
+  error naming the reference, so the document is not accepted, even under
+  `not` or beside a passing `anyOf` branch. It used to be a warning and was
+  skipped, which accepted the value. Nothing is fetched, so a remote
+  reference fails this way unless its document is supplied to the new
+  `json_fast_core::schema::validate_with_resources`.
+
+### Fixed
+
+- **json:** `$id` base URIs (RFC 3986, including embedded resources),
+  `$anchor` scoped to its resource, and `$dynamicRef`/`$dynamicAnchor` with
+  the 2020-12 dynamic scope are resolved; `unevaluatedProperties` and
+  `unevaluatedItems` see through `$dynamicRef`. The JSON Schema Test Suite's
+  2020-12 core cases go from 1,239 to 1,299 of 1,300. This closes the json
+  known gap listed under v2026.11.13.
+
 ## v2026.11.13
 
 Every crate's patch version moves. The headline is hardening against
