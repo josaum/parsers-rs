@@ -147,7 +147,7 @@ def test_complete_matrix_stamps_wheels_and_node_provenance(tmp_path, generator):
             node_package(tmp_path, crate, platform)
     assert generator.main(["--out", str(tmp_path), "--require-complete"]) == 0
     manifest = json.loads((tmp_path / release.MANIFEST_NAME).read_text(encoding="utf-8"))
-    assert len(manifest["artifacts"]) == 84  # 11 Python bindings x 4 targets + 10 Node bindings x 4
+    assert len(manifest["artifacts"]) == 88  # 12 Python bindings x 4 targets + 10 Node bindings x 4
     assert manifest["source"] == {"commit": "a" * 40, "dirty": False}
     for artifact in manifest["artifacts"]:
         path = tmp_path / artifact["file"]

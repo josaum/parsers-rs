@@ -37,6 +37,8 @@ members = [
   "xsd-fast-flight",
   "ontology-fast-core",
   "ontology-fast-py",
+  "mcts-fast-core",
+  "mcts-fast-py",
   "web-fast-core",
   "geo-fast-core",
   "geo-fast-py",
