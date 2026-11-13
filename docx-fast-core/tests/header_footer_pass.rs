@@ -5,6 +5,13 @@
 //! order shows in two places: a malformed document reports the error of the
 //! reference search, wherever the damage is, and fields are numbered through
 //! the headers and footers first and the body after.
+//!
+//! A field's number is one more than the count of fields already finished
+//! when it begins. It is not a unique identifier: a field nested in another
+//! begins before the outer one is finished and shares its number, and a
+//! field that is never closed numbers its runs without a `Field` to match.
+//! That is how the parser has always numbered them; the tests at the end pin
+//! it so that a change to the parse order cannot alter it unnoticed.
 
 use std::io::{Cursor, Write};
 
@@ -130,6 +137,109 @@ fn fields_are_numbered_from_one_when_the_footer_has_none() {
     assert_eq!(ids, [1, 2]);
     assert_eq!(parsed.footers.len(), 1);
 }
+
+/// Thirty-three tables, one inside the other: one more than the parser allows.
+fn tables_too_deep() -> String {
+    format!(
+        "{}{}",
+        "<w:tbl><w:tr><w:tc>".repeat(33),
+        "</w:tc></w:tr></w:tbl>".repeat(33)
+    )
+}
+
+/// Block-parser runs and reference searches spent on parsing `bytes`.
+fn work(bytes: Vec<u8>) -> (bool, u64, u64) {
+    let before = docx_fast_core::pass_counts();
+    let parsed = parse(bytes).is_ok();
+    let after = docx_fast_core::pass_counts();
+    (parsed, after.0 - before.0, after.1 - before.1)
+}
+
+#[test]
+fn a_well_formed_document_is_read_once_and_never_searched() {
+    let bytes = document(&format!("{PARAGRAPH}{SECTION}"), PLAIN_FOOTER);
+    // Body, header, footer; the references come out of the body parse.
+    assert_eq!(work(bytes), (true, 3, 0));
+}
+
+#[test]
+fn a_body_the_parser_rejects_is_not_parsed_a_second_time() {
+    let body = format!("{PARAGRAPH}{SECTION}{}", tables_too_deep());
+    let bytes = document(&body, PLAIN_FOOTER);
+    let error = format!("{:#}", parse(bytes.clone()).expect_err("too deep"));
+    assert!(error.contains("nested"), "{error}");
+    // Body (fails), then what could fail first in the original order: one
+    // reference search, the header and the footer. Not the body again.
+    assert_eq!(work(bytes), (false, 3, 1));
+}
+
+#[test]
+fn an_ill_formed_document_is_rejected_after_one_read() {
+    let bytes = document(&format!("{PARAGRAPH}{SECTION}{BREAK}"), PLAIN_FOOTER);
+    // The body parse meets the damage; that is the reference search's error
+    // too, so nothing else is read.
+    assert_eq!(work(bytes), (false, 1, 0));
+}
+
+/// A PAGE field inside the instruction of an IF field.
+const NESTED_FIELD: &str = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>IF </w:instrText></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>PAGE</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>3</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:instrText> = 1</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>outer</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#;
+/// A field that begins and is never closed.
+const UNCLOSED_FIELD: &str = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>AUTHOR</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>nobody</w:t></w:r></w:p>"#;
+
+/// The numbers of the fields, and the field number of every body run that
+/// has one, in document order (tables included).
+fn field_numbers(parsed: &DocxDocument) -> (Vec<u32>, Vec<u32>) {
+    fn runs(value: &serde_json::Value, out: &mut Vec<u32>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(id) = map.get("field_id").and_then(serde_json::Value::as_u64) {
+                    out.push(u32::try_from(id).unwrap());
+                }
+                for (key, child) in map {
+                    if key != "field_id" {
+                        runs(child, out);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| runs(item, out)),
+            _ => {}
+        }
+    }
+    let mut in_runs = Vec::new();
+    // `blocks` is an array of blocks whose runs are arrays: order is kept.
+    runs(&serde_json::to_value(&parsed.blocks).unwrap(), &mut in_runs);
+    (
+        parsed.fields.iter().map(|field| field.id).collect(),
+        in_runs,
+    )
+}
+
+#[test]
+fn nested_and_unclosed_fields_keep_their_numbers() {
+    let body = format!(
+        "{BODY_FIELD}{NESTED_FIELD}<w:tbl><w:tr><w:tc>{BODY_FIELD}</w:tc></w:tr></w:tbl>{UNCLOSED_FIELD}{SECTION}"
+    );
+    let plain = parse(document(&body, PLAIN_FOOTER)).unwrap();
+    let (fields, runs) = field_numbers(&plain);
+    assert_eq!(
+        (fields.as_slice(), runs.as_slice()),
+        (EXPECTED_FIELDS, EXPECTED_RUNS)
+    );
+
+    // One field in the footer comes first and moves every body number by one.
+    let shifted = parse(document(&body, FIELD_FOOTER)).unwrap();
+    let (shifted_fields, shifted_runs) = field_numbers(&shifted);
+    let mut expected_fields = vec![1];
+    expected_fields.extend(fields.iter().map(|id| id + 1));
+    assert_eq!(shifted_fields, expected_fields);
+    assert_eq!(
+        shifted_runs,
+        runs.iter().map(|id| id + 1).collect::<Vec<u32>>()
+    );
+}
+
+const EXPECTED_FIELDS: &[u32] = &[1, 2, 2, 4];
+const EXPECTED_RUNS: &[u32] = &[1, 2, 2, 4, 5];
 
 const EXPECTED_ERROR: &str =
     "parse header/footer refs: ill-formed document: expected `</w:p>`, but `</w:tbl>` was found";

@@ -601,6 +601,7 @@ fn header_footer_ref<R: BufRead>(
 /// ([`parse_document_blocks_with_refs`]). This pass is what that route falls
 /// back to, and its error is the one a malformed document reports.
 fn parse_header_footer_refs<R: BufRead>(reader: R) -> Result<Vec<HeaderFooterRef>> {
+    PASS_COUNTS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
     let mut reader = xml_reader(utf8_stream(reader)?);
     let mut buf = Vec::new();
     let mut refs = Vec::new();
@@ -792,14 +793,22 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
     // are parsed first and number their fields first. Finding them used to
     // take a pass of its own over the whole document part. Instead the body
     // is parsed now, collecting the references on the way, into vectors of
-    // its own, and is moved behind the headers and footers afterwards:
+    // its own, and is moved behind the headers and footers afterwards (see
+    // [`shift_field_ids`] for what that does to field numbers).
     //
-    // - if the body does not parse, the original order is followed from the
-    //   start, so the error reported is the one that order meets first;
-    // - a field's number is its place among all fields, so the body's fields
-    //   are renumbered by however many came before them
-    //   ([`shift_field_ids`]).
+    // A body that does not parse is not parsed again. The order used to be
+    // reference search, headers and footers, body, and the error reported
+    // must stay the first one that order meets:
+    //
+    // - ill-formed XML, or a reference that cannot be read, stops the
+    //   reference search at the same place it stopped the body, so that
+    //   error is known already ([`BodyFailure::ReferenceSearch`]);
+    // - any other failure belongs to the body alone. The reference search
+    //   and the headers and footers are then run to see whether one of them
+    //   fails first, and if none does the body's error is returned
+    //   (`body_error` below).
     let mut body_ahead = None;
+    let mut body_error = None;
     let header_footer_refs = if options.extract_headers {
         let mut body_fields = Vec::new();
         let mut body_revisions = Vec::new();
@@ -814,7 +823,11 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
                 body_ahead = Some((blocks, body_fields, body_revisions));
                 refs
             }
-            Err(_) => parse_header_footer_refs(Cursor::new(&*document_xml))?,
+            Err(BodyFailure::ReferenceSearch(error)) => return Err(error),
+            Err(BodyFailure::Body(error)) => {
+                body_error = Some(error);
+                parse_header_footer_refs(Cursor::new(&*document_xml))?
+            }
         }
     } else {
         Vec::new()
@@ -847,6 +860,9 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         }
     }
 
+    if let Some(error) = body_error {
+        return Err(error);
+    }
     let blocks = match body_ahead {
         Some((mut blocks, mut body_fields, body_revisions)) => {
             // Field numbers stay within `u32` however many fields there are:
@@ -1962,9 +1978,14 @@ fn parse_document_blocks<R: BufRead>(
 
 /// Adds `by` to the field number of every run in `blocks`, tables included.
 ///
-/// A field is numbered by its place among all fields of the document, in the
-/// order the parts are parsed. Blocks parsed ahead of parts that come first
-/// in that order were numbered from one, and are moved into place by this.
+/// A field's number is one more than the count of fields already finished
+/// when it begins, counted across the parts in the order they are parsed.
+/// (So a field nested in another shares the outer one's number, and a field
+/// that is never closed numbers its runs without a `Field` to match; both are
+/// kept as they are.) Every number in the body is therefore higher by exactly
+/// the count of fields finished before the body, and blocks parsed ahead of
+/// the parts that come first in that order are moved into place by adding
+/// that count.
 fn shift_field_ids(blocks: &mut [Block], by: u32) {
     for block in blocks {
         match block {
@@ -1988,17 +2009,49 @@ fn shift_field_ids(blocks: &mut [Block], by: u32) {
 
 /// [`parse_document_blocks`] for the document part, also returning the header
 /// and footer references met on the way, in document order.
+///
+/// # Errors
+///
+/// Says which of the two jobs failed; see [`BodyFailure`].
 fn parse_document_blocks_with_refs<R: BufRead>(
     reader: R,
     styles: &[Style],
     style_fonts: &StyleFonts,
     fields_out: &mut Vec<Field>,
     revisions_out: &mut Vec<Revision>,
-) -> Result<(Vec<Block>, Vec<HeaderFooterRef>)> {
+) -> std::result::Result<(Vec<Block>, Vec<HeaderFooterRef>), BodyFailure> {
     let mut parser = DocxBodyParser::new(styles, style_fonts, fields_out, revisions_out);
     parser.section_refs = Some(Vec::new());
-    let blocks = parser.parse(reader)?;
-    Ok((blocks, parser.section_refs.take().unwrap_or_default()))
+    match parser.parse(reader) {
+        Ok(blocks) => Ok((blocks, parser.section_refs.take().unwrap_or_default())),
+        Err(error) => Err(match parser.reference_search_error.take() {
+            Some(search_error) => BodyFailure::ReferenceSearch(search_error),
+            None => BodyFailure::Body(error),
+        }),
+    }
+}
+
+/// Why [`parse_document_blocks_with_refs`] failed.
+enum BodyFailure {
+    /// The document is ill-formed, or a header or footer reference cannot be
+    /// read. [`parse_header_footer_refs`] stops at the same place, and this
+    /// is the error it reports there.
+    ReferenceSearch(anyhow::Error),
+    /// Anything only the body parser objects to. The reference search may
+    /// still fail further on in the document.
+    Body(anyhow::Error),
+}
+
+thread_local! {
+    static PASS_COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// How many block-parser runs and how many header/footer reference searches
+/// this thread has started, for tests that pin the amount of work a parse
+/// does rather than its time.
+#[doc(hidden)]
+pub fn pass_counts() -> (u64, u64) {
+    PASS_COUNTS.with(std::cell::Cell::get)
 }
 
 fn collect_toc(blocks: &[Block], out: &mut Vec<TocEntry>) {
@@ -2400,6 +2453,10 @@ struct DocxBodyParser<'a> {
     revision_ids: HashSet<String>,
     /// Header and footer references met so far, when the caller wants them.
     section_refs: Option<Vec<HeaderFooterRef>>,
+    /// Set when a parse that collects references fails the way
+    /// [`parse_header_footer_refs`] would at the same place: the error that
+    /// search reports.
+    reference_search_error: Option<anyhow::Error>,
     containers: Vec<Container>,
     current_paragraph: Option<ParagraphBuilder>,
     current_run: Option<RunBuilder>,
@@ -2519,6 +2576,7 @@ impl<'a> DocxBodyParser<'a> {
             revisions_out,
             revision_ids: HashSet::new(),
             section_refs: None,
+            reference_search_error: None,
             containers: vec![Container::Doc(Vec::new())],
             current_paragraph: None,
             current_run: None,
@@ -2554,6 +2612,7 @@ impl<'a> DocxBodyParser<'a> {
     }
 
     fn parse<R: BufRead>(&mut self, reader: R) -> Result<Vec<Block>> {
+        PASS_COUNTS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
         let mut reader = xml_reader(utf8_stream(reader)?);
         let mut buf = Vec::new();
         loop {
@@ -2588,7 +2647,13 @@ impl<'a> DocxBodyParser<'a> {
                     self.handle_end(name)?;
                 }
                 Ok(Event::Eof) => break,
-                Err(err) => return Err(anyhow!("parse document: {err}")),
+                Err(err) => {
+                    if self.section_refs.is_some() {
+                        self.reference_search_error =
+                            Some(anyhow!("parse header/footer refs: {err}"));
+                    }
+                    return Err(anyhow!("parse document: {err}"));
+                }
                 _ => {}
             }
             buf.clear();
@@ -2606,8 +2671,17 @@ impl<'a> DocxBodyParser<'a> {
         name: &[u8],
     ) -> Result<()> {
         if let Some(refs) = self.section_refs.as_mut() {
-            if let Some(reference) = header_footer_ref(reader, e, name)? {
-                refs.push(reference);
+            match header_footer_ref(reader, e, name) {
+                Ok(Some(reference)) => refs.push(reference),
+                Ok(None) => {}
+                // The error is kept twice because it cannot be cloned: once
+                // as this parse's own failure, once as what the reference
+                // search would say.
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    self.reference_search_error = Some(error);
+                    return Err(anyhow!(message));
+                }
             }
         }
         Ok(())
