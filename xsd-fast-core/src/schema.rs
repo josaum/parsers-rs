@@ -446,9 +446,9 @@ impl SchemaModel {
     /// byte-identical.
     ///
     /// A recursive type, one holding an element whose inline type extends
-    /// the type itself or a type that leads back to it, is unrolled to a
-    /// fixed nesting. Below that, the inline type keeps only what it
-    /// declares itself.
+    /// the type itself or a type that leads back to it, is unrolled once:
+    /// the inline type gets its base, and the same extension met again
+    /// inside that copy keeps only what it declares itself.
     ///
     /// Idempotent in effect for the common case, but intended to run exactly
     /// once, immediately after a schema set finishes loading. A cycle is
@@ -706,25 +706,12 @@ impl CopyCost {
 /// A backstop, not the rule that ends a fold. Folding recurses once per
 /// level, and a fold can nest deeper than the schema text does: every base
 /// copied into an inline type brings its own inline types with it. A
-/// recursive type is ended by [`MAX_RECURSIVE_FOLD_DEPTH`] long before this.
-/// What is left to reach it is a long run of different named types, each
-/// with an inline child extending the next, or a model built or deserialized
-/// by a caller; such a model is refused instead of being left partly folded.
+/// recursive type does not reach this: a base is not folded again inside
+/// its own copy (see `resolve_complex_type`). What is left to reach it is a
+/// long run of different named types, each with an inline child extending
+/// the next, or a model built or deserialized by a caller; such a model is
+/// refused instead of being left partly folded.
 const MAX_INHERITANCE_NESTING: usize = 256;
-
-/// Nesting up to which a recursive type is unrolled.
-///
-/// A named type can hold an element whose inline type extends that same
-/// type, directly or through other types. That is legal, and folding it has
-/// no end: the copied base holds the inline extension again. An inline type
-/// whose base is already being folded around it is therefore folded again
-/// only above this nesting, and below it keeps the particles and attributes
-/// it declares itself. Sixteen is how deep recursion was unrolled before the
-/// fold followed bases to any depth, so a recursive schema keeps the model
-/// it had. Raising it deepens every later walk over the model (validation,
-/// Arrow derivation, `Clone`, `Drop`) and multiplies the copies a type with
-/// several recursive children costs.
-const MAX_RECURSIVE_FOLD_DEPTH: usize = 16;
 
 /// Resolve one complex type in place: fold its base, then recurse into inline
 /// children so nested `complexContent`/`extension` is resolved as well.
@@ -734,10 +721,17 @@ const MAX_RECURSIVE_FOLD_DEPTH: usize = 16;
 /// type inside the named type being resolved; it has no bearing on how long
 /// a chain of bases is followed.
 ///
-/// `folding` names the bases being folded around this type: every named type
-/// whose copied particles the walk is inside of. A base met again there is
-/// recursion, which is unrolled to [`MAX_RECURSIVE_FOLD_DEPTH`] and no
-/// further.
+/// `folding` names the bases folded into the inline types around this one:
+/// every named type whose copied particles the walk is inside of. A named
+/// type can hold an element whose inline type extends that same type,
+/// directly or through other types. That is legal, and folding it has no
+/// end by itself, because the copied base holds the inline extension again.
+/// So an inline type whose base is already in `folding` is not folded: it
+/// keeps the particles and attributes it declares itself, and its `base`.
+/// The recursion is thereby unrolled exactly once. The bases of a type that
+/// is not nested (`depth` 0) are its own content and are not named: the
+/// first inline extension inside them is still folded, whether the type is
+/// the recursive one or derives from it.
 fn resolve_complex_type<'a>(
     ct: &mut ComplexType,
     owner: Option<&str>,
@@ -752,7 +746,7 @@ fn resolve_complex_type<'a>(
     let base = ct
         .base
         .as_ref()
-        .filter(|base| depth < MAX_RECURSIVE_FOLD_DEPTH || !folding.contains(&base.local.as_str()));
+        .filter(|base| !folding.contains(&base.local.as_str()));
     if let Some(base) = base.cloned() {
         if let Some((mut base_particles, mut base_attrs)) =
             collect_base(&base.local, owner, originals, folding, budget)?
@@ -787,7 +781,11 @@ fn resolve_complex_type<'a>(
     }
 
     // Recurse into inline complex types so nested extensions are resolved too.
-    // The bases just folded stay named while their copies are walked.
+    if depth == 0 {
+        folding.truncate(outer);
+    }
+    // The bases folded into a nested type stay named while their copies
+    // are walked.
     if let Some(particles) = content_particles_mut(&mut ct.content) {
         for particle in particles {
             resolve_element_ref(&mut particle.element, originals, depth + 1, folding, budget)?;

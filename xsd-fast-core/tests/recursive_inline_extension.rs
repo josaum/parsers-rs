@@ -82,23 +82,44 @@ fn child_type(complex: &ComplexType) -> &ComplexType {
         .expect("a child element with an inline type")
 }
 
-// The recursion is unrolled several levels, as it was before bases were
-// followed to any depth, and then ends at an inline type left as written.
+// The recursion is unrolled once: the inline type gets its base, and the
+// same extension inside that copy is left as written.
 #[test]
-fn recursion_is_unrolled_some_levels_and_then_ends() {
+fn recursion_is_unrolled_once() {
     let schema =
         SchemaSet::load_bytes(SELF_RECURSIVE, ParseOptions::default()).expect("schema loads");
-    let mut complex = &schema.model().complex_types["N"];
-    assert_eq!(children(complex), ["v", "child"]);
-    for level in 1..=8 {
-        complex = child_type(complex);
-        assert_eq!(children(complex), ["v", "child", "x"], "level {level}");
-    }
-    let mut levels = 8;
-    while children(complex).contains(&"child") {
-        complex = child_type(complex);
-        levels += 1;
-        assert!(levels < 64, "the recursion does not end");
-    }
-    assert_eq!(children(complex), ["x"]);
+    let recursive = &schema.model().complex_types["N"];
+    assert_eq!(children(recursive), ["v", "child"]);
+    let unrolled = child_type(recursive);
+    assert_eq!(children(unrolled), ["v", "child", "x"]);
+    assert_eq!(children(child_type(unrolled)), ["x"]);
+}
+
+// A type derived from the recursive one is unrolled as far as it is.
+#[test]
+fn a_type_derived_from_a_recursive_one_is_unrolled_alike() {
+    let schema = SchemaSet::load_bytes(TWO_RECURSIVE_CHILDREN, ParseOptions::default())
+        .expect("schema loads");
+    let derived = &schema.model().complex_types["D"];
+    assert_eq!(children(derived), ["v", "child", "other", "d"]);
+    let unrolled = child_type(derived);
+    assert_eq!(children(unrolled), ["v", "child", "other", "x"]);
+    assert_eq!(children(child_type(unrolled)), ["x"]);
+}
+
+const TWO_RECURSIVE_CHILDREN: &[u8] = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:complexType name="N"><xs:sequence><xs:element name="v" type="xs:string"/><xs:element name="child" minOccurs="0"><xs:complexType><xs:complexContent><xs:extension base="N"><xs:sequence><xs:element name="x" type="xs:string" minOccurs="0"/></xs:sequence></xs:extension></xs:complexContent></xs:complexType></xs:element><xs:element name="other" minOccurs="0"><xs:complexType><xs:complexContent><xs:extension base="N"><xs:sequence><xs:element name="y" type="xs:string" minOccurs="0"/></xs:sequence></xs:extension></xs:complexContent></xs:complexType></xs:element></xs:sequence></xs:complexType><xs:complexType name="D"><xs:complexContent><xs:extension base="N"><xs:sequence><xs:element name="d" type="xs:string"/></xs:sequence></xs:extension></xs:complexContent></xs:complexType><xs:element name="root" type="N"/></xs:schema>"#;
+
+// Unrolling this to any depth doubles the copies with every level. Unrolled
+// once, it costs two copies.
+#[test]
+fn a_type_with_two_recursive_children_loads() {
+    let schema = SchemaSet::load_bytes(TWO_RECURSIVE_CHILDREN, ParseOptions::default())
+        .expect("schema loads");
+    let findings = schema
+        .validate(
+            b"<root><v/><child><v/><other><v/><y/></other><x/></child><other><v/></other></root>",
+            ValidateOptions::default(),
+        )
+        .expect("validation runs");
+    assert!(findings.is_empty(), "{findings:?}");
 }
