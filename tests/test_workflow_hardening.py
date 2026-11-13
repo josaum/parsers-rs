@@ -695,17 +695,18 @@ def assert_fuzz_contract(fuzz: str, ci: str | None = None, release: str | None =
         assert job_value(blocks[name], "if") == "github.event_name != 'pull_request'"
         assert len(re.findall(r"^\s*(?:- )?if:", blocks[name], re.MULTILINE)) == 1
     assert "--component miri" in blocks["miri"]
-    # Each interpreted test exists, and runs for both instruction sets.
+    # Each interpreted test exists, and runs natively on both instruction
+    # sets: x86_64 (Linux) and aarch64 (macOS). A `--target` leg cannot build.
+    assert runner_labels(blocks["miri"]) == {"ubuntu-latest", "macos-latest"}
     interpreted = re.findall(
-        r'cargo "\+\$NIGHTLY" miri test --locked -p (\S+) --test (\S+)( --target aarch64-unknown-linux-gnu)?$',
+        r'^        run: cargo "\+\$NIGHTLY" miri test --locked -p (\S+) --test (\S+)$',
         blocks["miri"],
         re.MULTILINE,
     )
-    assert len(interpreted) == 4 and len(set(interpreted)) == 4
-    assert blocks["miri"].count("miri test") == 4
-    for crate, test, _ in interpreted:
+    assert blocks["miri"].count("miri test") == len(interpreted) == 2
+    for crate, test in interpreted:
         assert (ROOT / crate / "tests" / f"{test}.rs").is_file(), f"{crate}: no test named {test}"
-    assert {(crate, test) for crate, test, _ in interpreted} == {
+    assert set(interpreted) == {
         ("xlsx-fast-core", "digit_scan"),
         ("pdf-fast-core", "obj_marker_scan"),
     }
@@ -1113,7 +1114,8 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_fuzz_contract, FUZZ, "  msrv:\n    if: github.event_name != 'pull_request'\n", "  msrv:\n    if: false\n"),
         (assert_fuzz_contract, FUZZ, "    timeout-minutes: 60\n", "    timeout-minutes: 60\n    continue-on-error: true\n"),
         (assert_fuzz_contract, FUZZ, "  miri:\n", "  rust:\n"),
-        (assert_fuzz_contract, FUZZ, "--test digit_scan --target aarch64-unknown-linux-gnu", "--test digit_scan"),
+        (assert_fuzz_contract, FUZZ, "        os: [ubuntu-latest, macos-latest]", "        os: [ubuntu-latest]"),
+        (assert_fuzz_contract, FUZZ, "--test digit_scan\n", "--test digit_scan --target aarch64-unknown-linux-gnu\n"),
         (assert_fuzz_contract, FUZZ, "--test obj_marker_scan\n", "--test absent\n"),
         (assert_installers_are_pinned, FUZZ, "cargo install cargo-fuzz --locked --version 0.13.2", "cargo install cargo-fuzz"),
         (assert_every_job_has_a_timeout, FUZZ, "    timeout-minutes: 60\n", ""),

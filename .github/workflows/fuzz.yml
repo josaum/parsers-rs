@@ -3,7 +3,7 @@
 #     from the seeds in `fuzz/seeds/` (the same documents the malformed-input
 #     smoke tests mutate; see `fuzz_seeds` in tools/mutation_smoke.rs).
 #   - `miri`: the tests of the `unsafe` SIMD scans, under the interpreter that
-#     reports an out-of-bounds or unaligned read.
+#     reports an out-of-bounds or unaligned read, on x86_64 and on aarch64.
 #   - `msrv`: the workspace builds with the `rust-version` Cargo.toml declares.
 #
 # Weekly and on request. On a pull request only `fuzz` runs, briefly, and only
@@ -87,7 +87,15 @@ jobs:
 
   miri:
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    # One leg per instruction set: the Linux runner is x86_64 and interprets
+    # the SSE2 scans, the macOS runner is aarch64 and interprets the NEON
+    # ones. Naming another target on one runner does not work: the test
+    # dependencies build C code (zstd), which needs a compiler for that target.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -97,20 +105,13 @@ jobs:
         run: rustup toolchain install "$NIGHTLY" --profile minimal --component miri --component rust-src
       # Each crate has a test of its scan small enough for the interpreter
       # (tests/digit_scan.rs, tests/obj_marker_scan.rs); the larger unit tests
-      # would take it most of an hour. The runner is x86_64, so the first
-      # command of each pair interprets the SSE2 scan and the second, by
-      # naming an aarch64 target, the NEON one. The AVX2 digit scan is not
-      # interpreted: it is chosen at run time, and Miri reports no AVX2.
+      # would take it most of an hour. The AVX2 digit scan is not interpreted:
+      # it is chosen at run time by a CPU feature the interpreter does not
+      # report.
       - name: The digit scan of xlsx-fast-core
-        run: |
-          set -euo pipefail
-          cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --test digit_scan
-          cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --test digit_scan --target aarch64-unknown-linux-gnu
+        run: cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --test digit_scan
       - name: The object marker scan of pdf-fast-core
-        run: |
-          set -euo pipefail
-          cargo "+$NIGHTLY" miri test --locked -p pdf-fast-core --test obj_marker_scan
-          cargo "+$NIGHTLY" miri test --locked -p pdf-fast-core --test obj_marker_scan --target aarch64-unknown-linux-gnu
+        run: cargo "+$NIGHTLY" miri test --locked -p pdf-fast-core --test obj_marker_scan
 
   msrv:
     if: github.event_name != 'pull_request'
