@@ -134,11 +134,23 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install "maturin==1.15.0" "pytest==9.1.1" "pyarrow==25.0.1"
+      # The release builds its manylinux x86_64 wheels through zig, whose clang
+      # refuses some C the system compiler accepts: libdeflate 1.26 did, and
+      # failed the v2026.11.13.1 tag after passing CI. The Linux leg builds
+      # the same way, with the same pins, so such a dependency fails here.
       - name: Build a wheel for every tested binding
         run: |
           set -euo pipefail
+          build_args=()
+          if [ "$RUNNER_OS" = Linux ]; then
+            python -m pip install "ziglang==0.15.2"
+            CARGO_ZIGBUILD_PYTHON_PATH="$(command -v python3)"
+            CARGO_ZIGBUILD_ZIG_PATH="$(python3 -c 'import ziglang; from pathlib import Path; print(Path(ziglang.__file__).with_name("zig"))')"
+            export CARGO_ZIGBUILD_PYTHON_PATH CARGO_ZIGBUILD_ZIG_PATH
+            build_args=(--target x86_64-unknown-linux-gnu --zig --compatibility manylinux_2_17)
+          fi
           for crate in $TESTED_BINDINGS; do
-            (cd "$crate" && maturin build --release --locked --out ../dist)
+            (cd "$crate" && maturin build --release --locked ${build_args[@]+"${build_args[@]}"} --out ../dist)
           done
           ls -1 dist
       - name: Install the wheels and run their tests

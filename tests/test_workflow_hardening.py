@@ -347,12 +347,21 @@ def assert_ci_exercises_release_paths(ci: str, release: str | None = None) -> No
     assert sorted(re.findall(r"(\S+-py)/tests", smoke["body"])) == with_tests
 
     def pins(text: str) -> set[tuple[str, str]]:
-        return set(re.findall(r'"(maturin|pytest|pyarrow)==([^"]+)"', text))
+        return set(re.findall(r'"(maturin|pytest|pyarrow|ziglang)==([^"]+)"', text))
 
-    assert {tool for tool, _ in pins(python)} == {"maturin", "pytest", "pyarrow"}
+    assert {tool for tool, _ in pins(python)} == {"maturin", "pytest", "pyarrow", "ziglang"}
     assert pins(python) == pins(release), "CI and the release must build and test with the same tools"
     assert 'python-version: "3.12"' in python
     assert "maturin build --release --locked" in python
+    # The Linux leg builds the manylinux x86_64 wheel as the release does:
+    # through zig, at the release's compatibility level.
+    assert 'if [ "$RUNNER_OS" = Linux ]; then\n            python -m pip install "ziglang==' in python
+    assert (
+        "build_args=(--target x86_64-unknown-linux-gnu --zig --compatibility manylinux_2_17)"
+        in python
+    ), "the Linux wheel leg must build through zig, as release.yml does"
+    assert 'compat: "--zig --compatibility manylinux_2_17"' in release
+    assert '${build_args[@]+"${build_args[@]}"}' in python
     assert "for crate in $TESTED_BINDINGS" in python
     assert "python -m pip install --no-index --no-deps dist/*.whl" in python
     assert "importlib.import_module" in python
@@ -982,6 +991,12 @@ def assert_dependabot_contract(dependabot: str) -> None:
         cargo,
         re.MULTILINE,
     ), "tiff 0.10 and later must be ignored until geo-fast-core keeps every sample"
+    # libdeflater 1.x does not build under the release's zig clang.
+    assert re.search(
+        r'^      - dependency-name: "libdeflater"\n        versions:\n          - ">=1"$',
+        cargo,
+        re.MULTILINE,
+    ), "libdeflater 1 and later must be ignored until it builds through zig"
     # The Arrow pin follows the consumers; every Arrow crate past it is held,
     # by one pattern, so the crates cannot drift apart.
     assert re.search(
@@ -1196,6 +1211,10 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_ci_exercises_release_paths, CI, '"pyarrow==25.0.1"', '"pyarrow"'),
         (assert_ci_exercises_release_paths, CI, ' "pytest==9.1.1"', ""),
         (assert_ci_exercises_release_paths, CI, "maturin build --release --locked", "maturin build --release"),
+        (assert_ci_exercises_release_paths, CI, " --zig --compatibility manylinux_2_17)", ")"),
+        (assert_ci_exercises_release_paths, CI, '"ziglang==0.15.2"', '"ziglang==0.14.1"'),
+        (assert_ci_exercises_release_paths, CI, '            python -m pip install "ziglang==0.15.2"\n', ""),
+        (assert_ci_exercises_release_paths, CI, '${build_args[@]+"${build_args[@]}"}', ""),
         (assert_ci_exercises_release_paths, CI, "python -I -m pytest --import-mode=importlib -q", "python -m pytest -q"),
         (assert_ci_exercises_release_paths, CI, "python -m pip install --no-index --no-deps dist/*.whl", "python -m pip install -e ."),
         (assert_ci_exercises_release_paths, CI, "        run: node scripts/smoke-node.mjs\n", "        run: node --version\n"),
@@ -1397,6 +1416,8 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_dependabot_contract, DEPENDABOT, '"mailparse"\n        versions:\n          - ">=0.16"', '"mailparse"\n        versions:\n          - ">=0.19"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "tiff"\n        versions:\n          - ">=0.10"\n', ""),
         (assert_dependabot_contract, DEPENDABOT, '"tiff"\n        versions:\n          - ">=0.10"', '"tiff"\n        versions:\n          - ">=0.12"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "libdeflater"\n        versions:\n          - ">=1"\n', ""),
+        (assert_dependabot_contract, DEPENDABOT, '"libdeflater"\n        versions:\n          - ">=1"', '"libdeflater"\n        versions:\n          - ">=2"'),
         (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "arrow*"\n', '      - dependency-name: "arrow"\n'),
         (assert_dependabot_contract, DEPENDABOT, '          - ">=59"', '          - ">=61"'),
         (assert_dependabot_contract, DEPENDABOT, "        update-types:\n", "        exclude-patterns:\n          - arrow-*\n        update-types:\n"),

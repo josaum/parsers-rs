@@ -4,7 +4,13 @@ Changes a consumer of the wheels, Node packages, crates or Flight servers
 can observe. Each release also has generated notes listing every pull
 request.
 
-## v2026.11.13.1
+## v2026.11.13.2
+
+v2026.11.13.1 was tagged but never released: its Linux x86_64 wheels did
+not build (libdeflater 1.26 under the release's zig toolchain), so nothing
+was published under it. This is that release with libdeflater back at
+0.12, the version v2026.11.13 shipped with; the crate versions below are
+the ones v2026.11.13.1 named.
 
 Every crate's patch version moves, and `xsd-fast-core` moves to 0.3.0 with
 its Python and Node packages, for a source-breaking change to its model
@@ -230,7 +236,8 @@ refusals" before upgrading a pipeline that stores parsed output.
   API, has not traced the image decoders' internals (JPEG, JPX, JBIG2,
   CCITT), and does not bound the clip paths each saved state copies.
 - **Dependencies held** (`.github/dependabot.yml` gives each reason):
-  hayro 0.6 and later, tiff 0.10 and later, mailparse 0.16 and later, napi
+  hayro 0.6 and later, tiff 0.10 and later, libdeflater 1 and later,
+  mailparse 0.16 and later, napi
   3, tiny-skia 0.12 and Arrow 59 and later.
 
 ## v2026.11.13

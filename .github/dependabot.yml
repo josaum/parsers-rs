@@ -122,6 +122,15 @@ updates:
       - dependency-name: "tiff"
         versions:
           - ">=0.10"
+      # libdeflater 1.x bundles a libdeflate whose AVX-512 VNNI adler32 does
+      # not compile under the zig clang the release builds its manylinux
+      # x86_64 wheels with ("requires target feature 'evex512'"). 1.26 passed
+      # CI, whose Linux wheel leg then built natively, and failed the
+      # v2026.11.13.1 tag. That leg now builds through zig with the release's
+      # pins, so unblocking needs only a version that passes it.
+      - dependency-name: "libdeflater"
+        versions:
+          - ">=1"
 
   - package-ecosystem: cargo
     # The repository doctors: a package outside the workspace, with its own
