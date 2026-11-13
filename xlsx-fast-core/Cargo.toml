@@ -44,3 +44,6 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 [[bench]]
 name = "parse"
 harness = false
+
+[lints]
+workspace = true

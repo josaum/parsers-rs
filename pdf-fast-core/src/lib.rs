@@ -488,6 +488,17 @@ pub struct PdfDocument {
 
 impl PdfDocument {
     /// Parse a PDF from a file path using memory mapping when possible.
+    ///
+    /// The file is mapped read-only and the mapping lives as long as the
+    /// returned document; when it cannot be mapped, it is read into memory
+    /// instead.
+    ///
+    /// The file must not be modified or truncated, by this process or any
+    /// other, while the document is alive. Nothing here can enforce that: a
+    /// truncated file makes reads of the mapping fault (`SIGBUS` on Unix), and
+    /// a modified one changes the bytes under the parsed document. Copy the
+    /// file first, or parse it with `PdfDocument::from_bytes`, when another
+    /// writer may touch it.
     #[cfg(feature = "mmap")]
     pub fn open(path: impl AsRef<Path>, options: ParseOptions) -> Result<Self> {
         let path = path.as_ref();
@@ -495,6 +506,12 @@ impl PdfDocument {
             File::open(path).with_context(|| format!("open file: {}", path.display()))?;
         ensure_file_within_document_limit(&file, options.max_document_bytes)
             .with_context(|| format!("preflight PDF file: {}", path.display()))?;
+        // SAFETY: `Mmap::map` is unsafe because the mapping is only sound
+        // while no one modifies or truncates the file, which no code here can
+        // enforce. The crate states that contract on this function: the
+        // caller must not let the file change while the document lives.
+        // Within this process the mapping is read-only and is never written
+        // through; it is owned by the document and unmapped when it drops.
         let storage = if let Ok(mmap) = unsafe { Mmap::map(&file) } {
             PdfStorage::Mmap(mmap)
         } else {
@@ -7529,10 +7546,18 @@ fn find_obj_markers_simd_x86_64(bytes: &[u8], offsets: &mut Vec<usize>) -> usize
     };
 
     let mut cursor = 0usize;
+    // SAFETY: the intrinsic needs SSE2, which is part of the x86_64 baseline
+    // this function is compiled for. It touches no memory.
     let target = unsafe { _mm_set1_epi8(b'o' as i8) };
     while cursor + 16 <= bytes.len() {
+        // SAFETY: SSE2 is baseline on x86_64. The loop condition
+        // `cursor + 16 <= bytes.len()` keeps the 16 bytes read from
+        // `bytes[cursor..]` inside the slice, and `_mm_loadu_si128` is the
+        // unaligned load, so the cast pointer needs no alignment.
         let chunk = unsafe { _mm_loadu_si128(bytes[cursor..].as_ptr() as *const __m128i) };
+        // SAFETY: SSE2 is baseline on x86_64; register-only, no memory access.
         let matches = unsafe { _mm_cmpeq_epi8(chunk, target) };
+        // SAFETY: SSE2 is baseline on x86_64; register-only, no memory access.
         let mut bitmask = unsafe { _mm_movemask_epi8(matches) } as u32;
         while bitmask != 0 {
             let trailing = bitmask.trailing_zeros() as usize;
@@ -7552,11 +7577,21 @@ fn find_obj_markers_simd_aarch64(bytes: &[u8], offsets: &mut Vec<usize>) -> usiz
     use std::arch::aarch64::{uint8x16_t, vceqq_u8, vdupq_n_u8, vld1q_u8, vst1q_u8};
 
     let mut cursor = 0usize;
+    // SAFETY: the intrinsic needs NEON, which is part of the aarch64 baseline
+    // this function is compiled for. It touches no memory.
     let target = unsafe { vdupq_n_u8(b'o') };
     while cursor + 16 <= bytes.len() {
+        // SAFETY: NEON is baseline on aarch64. The loop condition
+        // `cursor + 16 <= bytes.len()` keeps the 16 bytes read from
+        // `bytes[cursor..]` inside the slice; `vld1q_u8` has no alignment
+        // requirement.
         let chunk = unsafe { vld1q_u8(bytes[cursor..].as_ptr()) };
+        // SAFETY: NEON is baseline on aarch64; register-only, no memory access.
         let matches: uint8x16_t = unsafe { vceqq_u8(chunk, target) };
         let mut lanes = [0u8; 16];
+        // SAFETY: NEON is baseline on aarch64. `lanes` is a live, writable
+        // `[u8; 16]`, exactly the 16 bytes `vst1q_u8` stores, and the store
+        // has no alignment requirement.
         unsafe { vst1q_u8(lanes.as_mut_ptr(), matches) };
         let mut bitmask = 0u32;
         for (index, lane) in lanes.iter().enumerate() {

@@ -19,3 +19,6 @@ xsd-fast-core = { path = "../xsd-fast-core", features = ["arrow"] }
 
 [build-dependencies]
 pyo3-build-config = "0.29.3"
+
+[lints]
+workspace = true

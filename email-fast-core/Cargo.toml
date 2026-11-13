@@ -52,3 +52,6 @@ tempfile = "3.10"
 [[bench]]
 name = "parse"
 harness = false
+
+[lints]
+workspace = true

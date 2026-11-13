@@ -1824,7 +1824,9 @@ pub fn find_first_digit(bytes: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "aarch64")]
     {
         if bytes.len() >= 16 {
-            // SAFETY: NEON is baseline on aarch64.
+            // SAFETY: `find_first_digit_neon` needs a CPU with NEON, and NEON
+            // is part of the aarch64 baseline this block is compiled for. It
+            // accepts any slice.
             unsafe {
                 if let Some(idx) = find_first_digit_neon(bytes) {
                     return Some(idx);
@@ -1835,7 +1837,9 @@ pub fn find_first_digit(bytes: &[u8]) -> Option<usize> {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     {
         if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
-            // SAFETY: we gate on AVX2 support.
+            // SAFETY: `find_first_digit_avx2` needs a CPU with AVX2, which
+            // `is_x86_feature_detected!("avx2")` has just confirmed at run
+            // time. It accepts any slice.
             unsafe {
                 if let Some(idx) = find_first_digit_avx2(bytes) {
                     return Some(idx);
@@ -1845,7 +1849,9 @@ pub fn find_first_digit(bytes: &[u8]) -> Option<usize> {
         if bytes.len() >= 16
             && (cfg!(target_arch = "x86_64") || std::is_x86_feature_detected!("sse2"))
         {
-            // SAFETY: we gate on SSE2 support.
+            // SAFETY: `find_first_digit_sse2` needs a CPU with SSE2. SSE2 is
+            // part of the x86_64 baseline, and on 32-bit x86 the condition
+            // above has detected it at run time. It accepts any slice.
             unsafe {
                 if let Some(idx) = find_first_digit_sse2(bytes) {
                     return Some(idx);
@@ -1862,6 +1868,13 @@ pub fn find_first_digit(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// `find_first_digit` for aarch64, 16 bytes at a time with NEON.
+///
+/// # Safety
+///
+/// The CPU must support NEON. Every aarch64 CPU Rust targets does; the
+/// function is `unsafe` only because `#[target_feature]` makes it so. Any
+/// `bytes` is accepted: no read leaves the slice.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
@@ -1874,13 +1887,19 @@ unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
     let upper = arch::vdupq_n_u8(b'9');
 
     while i + 16 <= len {
-        let chunk = arch::vld1q_u8(ptr.add(i));
+        // SAFETY: the loop condition `i + 16 <= len` keeps the 16 bytes
+        // `ptr + i .. ptr + i + 16` inside `bytes`, so both the offset and the
+        // unaligned 16-byte load stay in bounds. `vld1q_u8` has no alignment
+        // requirement.
+        let chunk = unsafe { arch::vld1q_u8(ptr.add(i)) };
         let ge0 = arch::vcgeq_u8(chunk, lower);
         let le9 = arch::vcleq_u8(chunk, upper);
         let mask = arch::vandq_u8(ge0, le9);
         if arch::vmaxvq_u8(mask) != 0 {
             for j in 0..16 {
-                let b = *ptr.add(i + j);
+                // SAFETY: `j < 16` and `i + 16 <= len` from the loop
+                // condition, so `i + j < len` is inside `bytes`.
+                let b = unsafe { *ptr.add(i + j) };
                 if b.is_ascii_digit() {
                     return Some(i + j);
                 }
@@ -1890,7 +1909,8 @@ unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
     }
 
     while i < len {
-        let b = *ptr.add(i);
+        // SAFETY: the loop condition `i < len` keeps `ptr + i` inside `bytes`.
+        let b = unsafe { *ptr.add(i) };
         if b.is_ascii_digit() {
             return Some(i);
         }
@@ -1899,6 +1919,13 @@ unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// `find_first_digit` for x86, 16 bytes at a time with SSE2.
+///
+/// # Safety
+///
+/// The CPU must support SSE2. SSE2 is part of the x86_64 baseline; on 32-bit x86 the caller
+/// must detect it. Any `bytes` is accepted: no read leaves the
+/// slice.
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "sse2")]
 unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
@@ -1914,7 +1941,11 @@ unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
     let upper = arch::_mm_set1_epi8((b'9' + 1) as i8);
 
     while i + 16 <= len {
-        let chunk = arch::_mm_loadu_si128(ptr.add(i) as *const arch::__m128i);
+        // SAFETY: the loop condition `i + 16 <= len` keeps the 16 bytes
+        // `ptr + i .. ptr + i + 16` inside `bytes`, so both the offset and
+        // the load stay in bounds. `_mm_loadu_si128` is the unaligned load, so
+        // the cast pointer needs no alignment.
+        let chunk = unsafe { arch::_mm_loadu_si128(ptr.add(i) as *const arch::__m128i) };
         let ge0 = arch::_mm_cmpgt_epi8(chunk, lower);
         let le9 = arch::_mm_cmplt_epi8(chunk, upper);
         let mask = arch::_mm_and_si128(ge0, le9);
@@ -1927,7 +1958,8 @@ unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
     }
 
     while i < len {
-        let b = *ptr.add(i);
+        // SAFETY: the loop condition `i < len` keeps `ptr + i` inside `bytes`.
+        let b = unsafe { *ptr.add(i) };
         if b.is_ascii_digit() {
             return Some(i);
         }
@@ -1936,6 +1968,13 @@ unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// `find_first_digit` for x86, 32 bytes at a time with AVX2.
+///
+/// # Safety
+///
+/// The CPU must support AVX2, which the caller must detect at run
+/// time (`is_x86_feature_detected!("avx2")`). Any `bytes` is accepted: no read leaves the
+/// slice.
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "avx2")]
 unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
@@ -1951,7 +1990,11 @@ unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
     let upper = arch::_mm256_set1_epi8((b'9' + 1) as i8);
 
     while i + 32 <= len {
-        let chunk = arch::_mm256_loadu_si256(ptr.add(i) as *const arch::__m256i);
+        // SAFETY: the loop condition `i + 32 <= len` keeps the 32 bytes
+        // `ptr + i .. ptr + i + 32` inside `bytes`, so both the offset and
+        // the load stay in bounds. `_mm256_loadu_si256` is the unaligned load, so
+        // the cast pointer needs no alignment.
+        let chunk = unsafe { arch::_mm256_loadu_si256(ptr.add(i) as *const arch::__m256i) };
         let ge0 = arch::_mm256_cmpgt_epi8(chunk, lower);
         let le9 = arch::_mm256_cmpgt_epi8(upper, chunk);
         let mask = arch::_mm256_and_si256(ge0, le9);
@@ -1964,7 +2007,8 @@ unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
     }
 
     while i < len {
-        let b = *ptr.add(i);
+        // SAFETY: the loop condition `i < len` keeps `ptr + i` inside `bytes`.
+        let b = unsafe { *ptr.add(i) };
         if b.is_ascii_digit() {
             return Some(i);
         }
@@ -2077,13 +2121,15 @@ mod tests {
             for filler in [b'/', b':', 0xB5] {
                 for len in 0..=70usize {
                     let mut bytes = vec![filler; len];
-                    // SAFETY: `scans` holds a function only when the CPU
-                    // feature it is compiled for is present (NEON is baseline
-                    // on aarch64; SSE2 and AVX2 were detected above).
+                    // SAFETY: each scan needs only its CPU feature, and
+                    // `scans` holds a function only when that feature is
+                    // present (NEON is baseline on aarch64; SSE2 and AVX2 were
+                    // detected above). Every scan accepts any slice.
                     assert_eq!(unsafe { scan(&bytes) }, None, "{name}: len {len}");
                     for position in 0..len {
                         bytes[position] = b"059"[position % 3];
-                        // SAFETY: as above.
+                        // SAFETY: as above: the feature is present and any
+                        // slice is accepted.
                         let found = unsafe { scan(&bytes) };
                         assert_eq!(found, Some(position), "{name}: len {len}");
                         bytes[position] = filler;

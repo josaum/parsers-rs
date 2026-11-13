@@ -31,3 +31,6 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 [[bench]]
 name = "archive"
 harness = false
+
+[lints]
+workspace = true
