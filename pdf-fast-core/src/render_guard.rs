@@ -40,6 +40,8 @@
 //! | `function::type4::eval_inner` | the same: it recurses once per parsed procedure level |
 //! | array and dictionary `skip`/`read` in a content stream (one hop) | [`MAX_CONTENT_NESTING`] |
 //! | `font::cmap::CMapLexer::get_obj`, once per consecutive comment line in a font's `/Encoding` or `/ToUnicode` CMap | [`MAX_CMAP_COMMENT_RUN`] |
+//! | `function::type0::interpolate_inner`, one level per input of a sampled function and twice the work per input | [`MAX_SAMPLED_FUNCTION_INPUTS`] |
+//! | `function::type0::increment_index`, one level per input of a sampled function | the same |
 //!
 //! Bounded by the interpreter itself:
 //!
@@ -54,8 +56,6 @@
 //! | recursion | what drives it |
 //! |---|---|
 //! | array and dictionary `skip`/`read` on objects in the file itself | nesting in any object's text; it runs while the document is opened, before this module sees anything |
-//! | `function::type0::interpolate_inner` | one level per input of a sampled function, and twice the work per input |
-//! | `function::type0::increment_index` | one level per input of a sampled function |
 //!
 //! Matched by the search but not recursion: `hayro` `renderer::draw_image`
 //! (calls a different method of the same name), `hayro-font`
@@ -67,17 +67,22 @@
 //! * **A page tree the two parsers read differently.** The page-tree bound
 //!   uses this crate's parser, not the interpreter's.
 //! * **The image decoders** were not examined.
+//! * **Memory and time.** Every soft mask gets a renderer the size of the
+//!   one it is drawn in, and every tiling cell one sized by its `/XStep`
+//!   and `/YStep` at the cell's scale, which is not the page's: up to
+//!   65,535 pixels a side, so a single small pattern can ask for gigabytes.
+//!   The interpreter's saved-state stack is unbounded.
 //!
-//! Every font a stream selects, and every object it reaches, is held to
+//! Bounded beyond recursion: a sampled function's table, by
+//! [`MAX_SAMPLED_FUNCTION_ENTRIES`], and its cost per evaluation, which
+//! doubles with each input, by [`MAX_SAMPLED_FUNCTION_INPUTS`]. Every font a
+//! stream selects, and every object it reaches, is held to
 //! [`MAX_OBJECT_DEPTH`] like the resources are, although no recursion over
 //! font objects is known in the interpreter.
 //!
 //! `/UseCMap` chains need no bound: `hayro-interpret` 0.5.0 logs the key
 //! and treats the `usecmap` operator as a no-op, so it never loads a second
 //! CMap, and a chain or a cycle costs it nothing.
-//! * **Memory and time.** Every nested tiling cell and soft mask gets a
-//!   renderer the size of the page, the interpreter's saved-state stack is
-//!   unbounded, and a sampled function's cost doubles with each input.
 //!
 //! The search finds a function that names itself. A cycle through two or
 //! more other functions that was not already known would not appear here.
@@ -191,6 +196,26 @@ const MAX_CONTENT_NESTING: usize = 4_096;
 /// function, whose parser recurses once per level at about 400 bytes
 /// optimized: under 1 MiB unoptimized at this depth.
 const MAX_PROGRAM_NESTING: usize = 256;
+
+/// Most samples a sampled (Type 0) function may hold: the product of its
+/// `/Size` entries times its outputs, and the samples its stream holds.
+///
+/// The interpreter keeps every sample point in a hash map keyed by its
+/// coordinates, about 80 bytes a point with four inputs or fewer, so this
+/// many cost under 100 MiB. Real functions are far smaller: a shading or
+/// tint transform over one input has 256 to 4,096 points with three or four
+/// outputs; a three-input table of 33 points per input with three outputs
+/// holds 107,811.
+const MAX_SAMPLED_FUNCTION_ENTRIES: u64 = 1 << 20;
+
+/// Most inputs a sampled (Type 0) function may take.
+///
+/// The interpreter interpolates between the two neighbouring samples on
+/// every input, by recursion, so one evaluation reads up to 2^inputs
+/// samples, and it evaluates once a pixel for shadings and images. Eight
+/// inputs is 256 reads an evaluation; a `/DeviceN` tint transform is the
+/// only common many-input function, and eight colorants is already rare.
+const MAX_SAMPLED_FUNCTION_INPUTS: usize = 8;
 
 /// Most consecutive comment lines accepted in a font's CMap.
 ///
@@ -537,12 +562,16 @@ impl<'a> Walk<'a> {
             Object::Array(array) => return Ok(array.iter::<Object<'a>>().filter(nested).collect()),
             Object::Dict(dict) => dict,
             Object::Stream(stream) => {
-                if stream.dict().get::<u8>(&b"FunctionType"[..]) == Some(4) {
-                    // The calculator parser recurses once per `{`.
-                    if let Ok(program) = stream.decoded() {
-                        self.spend(program.len())?;
-                        check_nesting(&program, MAX_PROGRAM_NESTING)?;
+                match stream.dict().get::<u8>(&b"FunctionType"[..]) {
+                    Some(4) => {
+                        // The calculator parser recurses once per `{`.
+                        if let Ok(program) = stream.decoded() {
+                            self.spend(program.len())?;
+                            check_nesting(&program, MAX_PROGRAM_NESTING)?;
+                        }
                     }
+                    Some(0) => self.vet_sampled_function(&stream)?,
+                    _ => {}
                 }
                 stream.dict().clone()
             }
@@ -554,6 +583,66 @@ impl<'a> Walk<'a> {
             .filter_map(|key| dict.get::<Object<'a>>(key))
             .filter(nested)
             .collect())
+    }
+
+    /// Refuses a sampled (Type 0) function that would cost the interpreter
+    /// more than [`MAX_SAMPLED_FUNCTION_ENTRIES`] samples or more than
+    /// [`MAX_SAMPLED_FUNCTION_INPUTS`] inputs, or whose `/Size` overflows or
+    /// holds a zero.
+    ///
+    /// Mirrors `Type0::new`: it builds nothing without a valid
+    /// `/BitsPerSample`, a `/Size` or a non-empty `/Range`, so neither is
+    /// checked here. It reads every sample in the stream before cutting the
+    /// list to `/Size`, so the samples the stream holds are counted too.
+    fn vet_sampled_function(&mut self, stream: &Stream<'a>) -> Result<()> {
+        let dict = stream.dict();
+        let Some(bits) = dict.get::<u8>(&b"BitsPerSample"[..]) else {
+            return Ok(());
+        };
+        if !matches!(bits, 1 | 2 | 4 | 8 | 16 | 24 | 32) {
+            return Ok(());
+        }
+        let outputs = dict
+            .get::<Array<'_>>(&b"Range"[..])
+            .map_or(0, |range| range.iter::<f32>().count() / 2);
+        let Some(sizes) = dict.get::<Array<'_>>(&b"Size"[..]) else {
+            return Ok(());
+        };
+        if outputs == 0 {
+            return Ok(());
+        }
+        let over_budget =
+            || refused("a sampled function holds more samples than the interpreter may build");
+        let mut inputs = 0usize;
+        let mut entries = u64::try_from(outputs).map_err(|_| over_budget())?;
+        for size in sizes.iter::<u32>() {
+            inputs += 1;
+            if size == 0 {
+                return Err(refused("a sampled function has a /Size entry of zero"));
+            }
+            entries = entries
+                .checked_mul(u64::from(size))
+                .ok_or_else(|| refused("a sampled function's /Size overflows"))?;
+        }
+        if inputs > MAX_SAMPLED_FUNCTION_INPUTS {
+            return Err(refused(
+                "a sampled function has more inputs than the interpreter can evaluate in time",
+            ));
+        }
+        if entries > MAX_SAMPLED_FUNCTION_ENTRIES {
+            return Err(over_budget());
+        }
+        if let Ok(data) = stream.decoded() {
+            self.spend(data.len())?;
+            let held = u64::try_from(data.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(8)
+                / u64::from(bits);
+            if held > MAX_SAMPLED_FUNCTION_ENTRIES {
+                return Err(over_budget());
+            }
+        }
+        Ok(())
     }
 
     fn count_object(&mut self) -> Result<()> {

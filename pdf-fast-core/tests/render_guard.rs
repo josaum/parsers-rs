@@ -955,6 +955,58 @@ fn an_object_nested_deeply_inside_a_font_is_refused() {
     assert_renders("8 arrays under a font descriptor", &deep_object_in_font(8));
 }
 
+/// A page painting a shading whose function is a sampled function with
+/// these `/Size` entries over `inputs` inputs, one output, and `samples`
+/// bytes of 8-bit samples.
+fn sampled_function(sizes: &str, inputs: usize, samples: usize) -> Vec<u8> {
+    let domain = "0 1 ".repeat(inputs);
+    one_page(
+        SHADED_PAGE,
+        "/S sh",
+        vec![(
+            10,
+            stream(
+                &format!(
+                    "/FunctionType 0 /Domain [{domain}] /Range [0 1] /Size [{sizes}] \
+                     /BitsPerSample 8"
+                ),
+                &"A".repeat(samples),
+            ),
+        )],
+    )
+}
+
+#[test]
+fn a_sampled_function_with_sixteen_inputs_is_refused() {
+    let sizes = "2 ".repeat(16);
+    assert_refused(
+        "16 inputs of 2 samples",
+        &sampled_function(&sizes, 16, 1 << 16),
+    );
+    assert_renders("256 samples", &sampled_function("256", 1, 256));
+    assert_renders(
+        "4 inputs of 8 samples",
+        &sampled_function("8 8 8 8", 4, 4096),
+    );
+}
+
+#[test]
+fn a_sampled_function_with_a_huge_overflowing_or_empty_size_is_refused() {
+    assert_refused(
+        "one input of 4,000,000,000 samples",
+        &sampled_function("4000000000", 1, 16),
+    );
+    assert_refused(
+        "a /Size whose product overflows",
+        &sampled_function("4294967295 4294967295 4294967295", 3, 16),
+    );
+    assert_refused("a /Size of zero", &sampled_function("0", 1, 0));
+    assert_refused(
+        "a stream of 4,000,000 samples",
+        &sampled_function("2", 1, 4_000_000),
+    );
+}
+
 /// Runs the interpreter with no guard, on a thread with a chosen stack.
 ///
 /// Not a test: it exists to confirm that a fixture aborts the process and to
