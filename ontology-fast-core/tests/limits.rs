@@ -315,3 +315,35 @@ fn a_long_prefix_name_cannot_expand_the_rendered_text_past_the_allowance() {
         Ok(120)
     );
 }
+
+#[test]
+fn the_nesting_guard_may_answer_before_a_syntax_error() {
+    // Malformed before its brackets: the fourth quote ends the long string
+    // early, and the parser alone would stop there with a syntax error. The
+    // guard scans bytes before the parser runs, so this document is refused
+    // for its nesting instead. It is refused either way.
+    let text = format!(
+        "<a:a> <a:b> \"\"\"x\"\"\"\" , \"{}\" .",
+        "(".repeat(MAX_NESTING_DEPTH + 1)
+    );
+    for (name, entry) in ENTRIES {
+        assert_eq!(
+            entry(text.as_bytes(), OntologyLimits::default()),
+            Err(OntologyError::ResourceLimit {
+                resource: "nesting_depth",
+                limit: MAX_NESTING_DEPTH,
+                observed: MAX_NESTING_DEPTH + 1,
+            }),
+            "{name}"
+        );
+        // One bracket fewer and the parser reports what it always did.
+        let within = text.replacen('(', "", 1);
+        assert!(
+            matches!(
+                entry(within.as_bytes(), OntologyLimits::default()),
+                Err(OntologyError::Syntax(_))
+            ),
+            "{name}"
+        );
+    }
+}

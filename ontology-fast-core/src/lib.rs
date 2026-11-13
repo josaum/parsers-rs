@@ -63,6 +63,14 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// ontology and holds that state to a few megabytes. A document that nests
 /// deeper is refused with [`OntologyError::ResourceLimit`] naming
 /// `nesting_depth`, by every entry point, before it is parsed.
+///
+/// The guard is a scan of the bytes, not a parse, and it runs first. It
+/// counts what the parser would count in a well-formed document, so no valid
+/// document within the limit is refused. A document that is malformed before
+/// its brackets (an unterminated string followed by ten thousand `(`, say)
+/// can be refused for `nesting_depth` where the parser alone would have
+/// reported [`OntologyError::Syntax`]: it is refused either way, but the code
+/// may differ.
 pub const MAX_NESTING_DEPTH: usize = 10_000;
 
 /// Least text one document's terms may expand to, whatever its size: 256 MiB.
@@ -437,8 +445,8 @@ impl OntologyIndex {
 /// # Errors
 ///
 /// Returns [`OntologyError::Syntax`] for malformed Turtle or non-UTF-8 input,
-/// [`OntologyError::ResourceLimit`] when a budget or [`MAX_NESTING_DEPTH`] is
-/// exceeded, [`OntologyError::NamedGraph`] when a quad names a graph, and
+/// [`OntologyError::ResourceLimit`] when a budget, [`MAX_NESTING_DEPTH`] or the
+/// expanded-text allowance ([`TERM_BYTES_PER_SOURCE_BYTE`]) is exceeded, [`OntologyError::NamedGraph`] when a quad names a graph, and
 /// [`OntologyError::TripleTerm`] for an RDF 1.2 triple term. A base direction
 /// is not refused here: the text form keeps a literal's lexical form only, so
 /// direction is erased exactly as the language tag and datatype are.
@@ -558,8 +566,8 @@ pub fn parse_turtle(
 /// # Errors
 ///
 /// Returns [`OntologyError::Syntax`] for malformed Turtle or non-UTF-8 input,
-/// [`OntologyError::ResourceLimit`] when a budget or [`MAX_NESTING_DEPTH`] is
-/// exceeded, [`OntologyError::NamedGraph`] when a quad names a graph,
+/// [`OntologyError::ResourceLimit`] when a budget, [`MAX_NESTING_DEPTH`] or the
+/// expanded-text allowance ([`TERM_BYTES_PER_SOURCE_BYTE`]) is exceeded, [`OntologyError::NamedGraph`] when a quad names a graph,
 /// [`OntologyError::TripleTerm`] for an RDF 1.2 triple term, and
 /// [`OntologyError::BaseDirection`] for a literal carrying a base direction.
 pub fn parse_turtle_terms(
@@ -618,8 +626,10 @@ pub fn parse_turtle_terms(
 /// # Errors
 ///
 /// Returns [`OntologyError::ResourceLimit`] when `source` exceeds
-/// `limits.max_source_bytes` or [`MAX_NESTING_DEPTH`], and [`OntologyError::Syntax`] when the document
-/// does not parse: a table read from half a document would be a guess.
+/// `limits.max_source_bytes`, [`MAX_NESTING_DEPTH`] or the expanded-text
+/// allowance ([`TERM_BYTES_PER_SOURCE_BYTE`]), and [`OntologyError::Syntax`]
+/// when the document does not parse: a table read from half a document would
+/// be a guess.
 pub fn declared_prefixes(
     source: &[u8],
     limits: OntologyLimits,
