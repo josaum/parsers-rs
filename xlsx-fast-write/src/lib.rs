@@ -500,15 +500,24 @@ fn needs_xstring_escape(ch: char) -> bool {
     matches!(ch, '\u{0}'..='\u{8}' | '\u{b}' | '\u{c}' | '\r' | '\u{e}'..='\u{1f}' | '\u{fffe}' | '\u{ffff}')
 }
 
-/// Returns whether `rest` starts with something a reader would decode as an
-/// `_xHHHH_` escape.
+/// Returns whether the underscore `rest` starts with must be protected.
+///
+/// A reader decodes `_xHHHH_` as an escape. The closing underscore can come
+/// from the caller's text, or from this writer: a character that is itself
+/// written as an escape (a carriage return becomes `_x000D_`) puts an
+/// underscore right after `_xHHHH`. Both cases are protected.
 fn looks_like_xstring_escape(rest: &str) -> bool {
     let bytes = rest.as_bytes();
-    bytes.len() >= 7
+    let prefix = bytes.len() > 6
         && bytes[0] == b'_'
         && bytes[1] == b'x'
-        && bytes[2..6].iter().all(u8::is_ascii_hexdigit)
-        && bytes[6] == b'_'
+        && bytes[2..6].iter().all(u8::is_ascii_hexdigit);
+    // The six prefix bytes are ASCII, so index 6 is a character boundary.
+    prefix
+        && rest[6..]
+            .chars()
+            .next()
+            .is_some_and(|next| next == '_' || needs_xstring_escape(next))
 }
 
 /// Escapes cell text for the content of a `<t>` element.
@@ -517,6 +526,11 @@ fn looks_like_xstring_escape(rest: &str) -> bool {
 /// written the way Excel writes it, as `_xHHHH_` (ECMA-376 `ST_Xstring`), and
 /// an underscore that would start such an escape in the caller's own text is
 /// written `_x005F_` so readers give the text back unchanged.
+///
+/// Compatibility: Excel and xlsx-fast-core decode `_xHHHH_` in string values,
+/// but openpyxl returns these escapes literally. A consumer reading these
+/// workbooks with openpyxl sees `_x000D_` for a carriage return and
+/// `_x005F_x0041_` for the literal text `_x0041_`.
 fn xe(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (index, ch) in s.char_indices() {
@@ -906,6 +920,36 @@ mod tests {
                 .any(|b| b < 0x20 && b != b'\n' && b != b'\t'),
             "a forbidden control character was written raw"
         );
+    }
+
+    /// WHY: the character after `_xHHHH` decides whether a reader sees an
+    /// escape, and the writer may itself turn that character into something
+    /// that starts with `_` (a control character becomes `_x000D_`). Every
+    /// combination of prefix and follower must read back as written.
+    #[test]
+    fn an_escape_prefix_followed_by_any_character_reads_back() {
+        let prefixes = [
+            "_x0041", "_x000D", "_x000d", "_x005F", "_xFFFF", "_xD83D", "_x0000", "_xabcd",
+            "_xZZZZ", "_x004", "_X0041",
+        ];
+        let followers = [
+            "", "_", "__", "\r", "\n", "\t", "\u{0}", "\u{1}", "\u{1f}", "\u{fffe}", "A", "x", "0",
+            "_x0042_", "_x0042", "\r_", "_\r", "_x", "&", " ",
+        ];
+        let mut texts = Vec::new();
+        for prefix in prefixes {
+            for follower in followers {
+                texts.push(format!("{prefix}{follower}"));
+                texts.push(format!("a{prefix}{follower}b"));
+                texts.push(format!("{prefix}{prefix}{follower}"));
+            }
+        }
+        let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let (_, _, read) = round_trip("S", &borrowed);
+        assert_eq!(read.len(), texts.len());
+        for (written, read) in texts.iter().zip(&read) {
+            assert_eq!(read, written, "written {written:?}");
+        }
     }
 
     /// WHY: without `xml:space="preserve"` a reader is free to drop the
