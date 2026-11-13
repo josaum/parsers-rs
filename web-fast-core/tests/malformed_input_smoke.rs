@@ -385,6 +385,67 @@ fn the_nesting_limit_follows_the_real_tree() {
     let _ = parse_text(&"<a><table>".repeat(50_000));
 }
 
+/// Elements below the document, on the tree `scraper` builds on its own.
+fn real_depth(html: &str) -> usize {
+    let document = scraper::Html::parse_document(html);
+    let mut deepest = 0;
+    let mut pending = vec![(document.tree.root(), 0usize)];
+    while let Some((node, above)) = pending.pop() {
+        let depth = above + usize::from(node.value().is_element());
+        deepest = deepest.max(depth);
+        pending.extend(node.children().map(|child| (child, depth)));
+    }
+    deepest
+}
+
+/// Around the limit, a document is refused exactly when its real tree is
+/// deeper than the limit: including trees the builder rearranges after
+/// appending (formatting elements moved by the adoption agency, tables
+/// fostering their content) and content under `<template>`.
+#[test]
+fn the_nesting_limit_is_exact_around_the_boundary() {
+    let shapes: [fn(usize) -> String; 6] = [
+        |n| "<div>".repeat(n) + "x",
+        |n| "<div>".repeat(n) + "<b><i><p>x</b></i>y",
+        |n| "<b>".repeat(4) + &"<div>".repeat(n) + "</b></b></b></b><p>x",
+        |n| "<template>".to_owned() + &"<div>".repeat(n) + "x",
+        |n| "<div>".repeat(n) + "<table><div>x<tr><td><p>y",
+        |n| "<div>".repeat(n) + "<a>1<div><a>2<p>3</a>",
+    ];
+    for shape in shapes {
+        for n in MAX_NESTING_DEPTH - 8..MAX_NESTING_DEPTH + 3 {
+            let html = shape(n);
+            let within = real_depth(&html) <= MAX_NESTING_DEPTH;
+            let parsed = parse_text(&html);
+            assert_eq!(
+                parsed.is_ok(),
+                within,
+                "n={n}: {}",
+                &html[html.len() - 30..]
+            );
+        }
+    }
+}
+
+/// Markup that makes the tree builder clone open formatting elements into
+/// every following paragraph turns 86 KB of input into millions of
+/// elements. The parse stops while the tree is being built.
+#[test]
+fn element_amplification_is_stopped_during_tree_construction() {
+    let mut html = String::from("<p>");
+    for i in 0..200 {
+        html.push_str(&format!("<b a={i}>"));
+    }
+    html.push_str(&"<p>x".repeat(20_000));
+    assert!(matches!(
+        parse_text(&html),
+        Err(WebParseError::NodeLimitExceeded)
+    ));
+    // A few open formatting elements over many paragraphs is ordinary.
+    let ordinary = "<b><i><u>".to_owned() + &"<p>x".repeat(20_000);
+    assert_eq!(parse_text(&ordinary).expect("parses").blocks.len(), 20_000);
+}
+
 /// Long documents that are not deeply nested must not trip the nesting limit:
 /// implied end tags, void elements, self-closing SVG shapes, and markup that
 /// only appears inside a script, a comment or an attribute value.

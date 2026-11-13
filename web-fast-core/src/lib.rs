@@ -79,6 +79,19 @@ pub const MAX_NESTING_DEPTH: usize = 512;
 /// parse fails with [`WebParseError::TableSpanLimitExceeded`].
 pub const MAX_TABLE_SPAN_CELLS: usize = 1_000_000;
 
+/// Elements the tree builder may create per byte of input once it has
+/// created more than `max_nodes` of them.
+///
+/// Reading markup creates at most one element per three bytes (`<p>`). The
+/// tree builder also re-creates every open formatting element (`<b>`,
+/// `<i>`, ...) inside each following block, so 200 unclosed `<b>` with
+/// distinct attributes followed by 20,000 `<p>` turn 86 KB into 4,000,000
+/// elements. A handful of unclosed formatting elements over many short
+/// paragraphs is ordinary and stays near two elements per byte; four leaves
+/// room for that. Past both bounds the parse stops with
+/// [`WebParseError::NodeLimitExceeded`].
+const MAX_ELEMENTS_PER_INPUT_BYTE: usize = 4;
+
 /// Most bytes of `dom_path` one document may emit, over all of its blocks,
 /// links, images and tables.
 ///
@@ -383,8 +396,18 @@ fn parse_html_inner(
     // The tree builder is quadratic in nesting depth, so the limit is
     // enforced while the tree is built; the finished tree is checked again
     // because the tree builder may also move nodes after appending them.
-    let document = nesting::parse_document_within(html, MAX_NESTING_DEPTH)
-        .ok_or(WebParseError::NestingLimitExceeded)?;
+    // Elements the tree builder may create: more than the node limit and
+    // more than `MAX_ELEMENTS_PER_INPUT_BYTE` per byte of input together
+    // mean the markup is being multiplied, not read.
+    let element_limit = options
+        .max_nodes
+        .max(html.len().saturating_mul(MAX_ELEMENTS_PER_INPUT_BYTE));
+    let document = nesting::parse_document_within(html, MAX_NESTING_DEPTH, element_limit).map_err(
+        |stopped| match stopped {
+            nesting::Stopped::TooDeep => WebParseError::NestingLimitExceeded,
+            nesting::Stopped::TooManyElements => WebParseError::NodeLimitExceeded,
+        },
+    )?;
     check_tree_depth(&document)?;
     let mut budget = Budget::new(options.max_nodes, options.max_text_bytes);
 
