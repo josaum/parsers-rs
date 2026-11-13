@@ -408,14 +408,16 @@ impl SchemaModel {
     ///
     /// For every complex type whose [`base`](ComplexType::base) is set, this
     /// prepends the (transitively) resolved base's particles and attributes
-    /// ahead of the type's own. Inline complex types nested in particles are
-    /// resolved too, so inheritance works regardless of where it appears. Types
-    /// that do not inherit are left byte-identical.
+    /// ahead of the type's own. Inline complex types nested in particles, and
+    /// the inline types of global elements, are resolved too, so inheritance
+    /// works regardless of where it appears. A chain of bases is followed to
+    /// its end, however long. Types that do not inherit are left
+    /// byte-identical.
     ///
     /// Idempotent in effect for the common case, but intended to run exactly
-    /// once, immediately after a schema set finishes loading. Cycles and
-    /// self-references are bounded by a visited set and a depth cap, so a
-    /// malformed schema can never cause unbounded recursion.
+    /// once, immediately after a schema set finishes loading. A cycle is
+    /// broken at the first name met twice, and the chain walk does not
+    /// recurse, so a malformed schema can never cause unbounded recursion.
     ///
     /// Folding copies each base into every type derived from it, so the model
     /// can grow far beyond the schema text, and the copies are capped by a
@@ -460,6 +462,13 @@ impl SchemaModel {
         for (name, ct) in self.complex_types.iter_mut() {
             resolve_complex_type(ct, Some(name.as_str()), &originals, 0, &mut budget)?;
         }
+        // A global element can hold an inline type, which can extend a named
+        // type itself or hold elements whose inline types do.
+        for element in self.global_elements.values_mut() {
+            if let XsdType::Complex(inline) = &mut element.type_def {
+                resolve_complex_type(inline, None, &originals, 0, &mut budget)?;
+            }
+        }
         Ok(())
     }
 }
@@ -474,7 +483,7 @@ impl SchemaModel {
 /// ancestor's content, and an inline type that extends a named type receives
 /// a copy that can itself hold inline extensions. A schema of a few kilobytes
 /// can therefore ask for billions of copies (six inline extensions of the
-/// enclosing type, folded sixteen levels deep, is 6^16), and a base holding
+/// enclosing type, nested sixteen levels deep, is 6^16), and a base holding
 /// one large enumeration is copied whole into every type derived from it.
 ///
 /// The limit is a bound on memory. A schema set that spends all of it peaks
@@ -644,18 +653,22 @@ impl CopyCost {
     }
 }
 
-/// Maximum complex-type derivation depth chased during inheritance resolution.
+/// Deepest nesting of inline types and model groups folded in one type.
 ///
-/// Type extension chains are shallow in real schemas (schema bottoms out at two
-/// levels). The cap only exists to bound malformed/cyclic schemas; mirrors the
-/// bounded-recursion philosophy of the Arrow derivation walk.
-const MAX_INHERITANCE_DEPTH: usize = 16;
+/// The parser refuses a schema nested deeper than its own bound, which is
+/// well below this, so a loaded schema never reaches it. It exists for a
+/// model built or deserialized by a caller: folding recurses once per level,
+/// and a model nested deeper than this is refused instead of being left
+/// partly folded.
+const MAX_INHERITANCE_NESTING: usize = 256;
 
 /// Resolve one complex type in place: fold its base, then recurse into inline
 /// children so nested `complexContent`/`extension` is resolved as well.
 ///
 /// `owner` is the type's own name (for named types), used to reject a base that
-/// points straight back at the type itself.
+/// points straight back at the type itself. `depth` is the nesting of this
+/// type inside the named type being resolved; it has no bearing on how long
+/// a chain of bases is followed.
 fn resolve_complex_type(
     ct: &mut ComplexType,
     owner: Option<&str>,
@@ -663,12 +676,11 @@ fn resolve_complex_type(
     depth: usize,
     budget: &mut InheritanceBudget,
 ) -> anyhow::Result<()> {
-    // Fold the base chain into this type's content + attributes. A fresh
-    // visited stack (seeded with the owner) bounds cycles for this chain only.
+    check_inheritance_nesting(depth)?;
+    // Fold the base chain into this type's content + attributes.
     if let Some(base) = ct.base.clone() {
-        let mut visited: Vec<String> = owner.map(|s| vec![s.to_string()]).unwrap_or_default();
         if let Some((mut base_particles, mut base_attrs)) =
-            collect_base(&base.local, originals, &mut visited, depth, budget)?
+            collect_base(&base.local, owner, originals, budget)?
         {
             match &mut ct.content {
                 // The type's own particles move behind the inherited ones.
@@ -689,12 +701,21 @@ fn resolve_complex_type(
     }
 
     // Recurse into inline complex types so nested extensions are resolved too.
-    if depth < MAX_INHERITANCE_DEPTH {
-        if let Some(particles) = content_particles_mut(&mut ct.content) {
-            for particle in particles {
-                resolve_element_ref(&mut particle.element, originals, depth + 1, budget)?;
-            }
+    if let Some(particles) = content_particles_mut(&mut ct.content) {
+        for particle in particles {
+            resolve_element_ref(&mut particle.element, originals, depth + 1, budget)?;
         }
+    }
+    Ok(())
+}
+
+/// Refuses a model nested deeper than [`MAX_INHERITANCE_NESTING`].
+fn check_inheritance_nesting(depth: usize) -> anyhow::Result<()> {
+    if depth > MAX_INHERITANCE_NESTING {
+        anyhow::bail!(
+            "resource_limit: inheritance_nesting_depth: content models nest deeper than \
+             {MAX_INHERITANCE_NESTING}"
+        );
     }
     Ok(())
 }
@@ -706,9 +727,7 @@ fn resolve_element_ref(
     depth: usize,
     budget: &mut InheritanceBudget,
 ) -> anyhow::Result<()> {
-    if depth >= MAX_INHERITANCE_DEPTH {
-        return Ok(());
-    }
+    check_inheritance_nesting(depth)?;
     match element {
         ElementRef::Inline(decl) => {
             if let XsdType::Complex(inner) = &mut decl.type_def {
@@ -731,44 +750,57 @@ fn resolve_element_ref(
 /// One base's effective particles and attributes, ancestors first.
 type Inherited = (Vec<Particle>, Vec<AttributeDecl>);
 
-/// Collect a base type's effective particles and attributes, base-first,
-/// chasing the base chain transitively. Returns `None` if the base is unknown
-/// or already on the current chain (cycle).
+/// Collect a base type's effective particles and attributes, oldest ancestor
+/// first, following the whole chain of bases. Returns `None` if the base is
+/// unknown or is `owner`, the type being resolved.
 ///
-/// Everything copied here is charged to `budget`, at its [`CopyCost`], before
-/// the copy is made.
+/// The chain ends at a type with no base, at a base that is not a known
+/// complex type, or at a name already met (a cycle, which is broken there).
+/// It is as long as the schema makes it: nothing is left out for being far
+/// from the derived type. Each type on the chain costs `budget` one unit, so
+/// that the walk itself is bounded, and everything copied is charged at its
+/// [`CopyCost`] before the copy is made. A chain the budget cannot pay for is
+/// an error, never a partly inherited type.
 fn collect_base(
     base_local: &str,
+    owner: Option<&str>,
     originals: &IndexMap<String, ComplexType>,
-    visited: &mut Vec<String>,
-    depth: usize,
     budget: &mut InheritanceBudget,
 ) -> anyhow::Result<Option<Inherited>> {
-    if depth >= MAX_INHERITANCE_DEPTH || visited.iter().any(|v| v == base_local) {
+    // Nearest base first.
+    let mut chain: Vec<&ComplexType> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = owner.into_iter().collect();
+    let mut next = Some(base_local);
+    while let Some(name) = next {
+        if !seen.insert(name) {
+            break;
+        }
+        let Some((name, base)) = originals.get_key_value(name) else {
+            break;
+        };
+        // `seen` holds the map's own key from here on, which outlives `next`.
+        seen.insert(name.as_str());
+        budget.charge(CopyCost {
+            nodes: 1,
+            text_bytes: 0,
+        })?;
+        chain.push(base);
+        next = base.base.as_ref().map(|base| base.local.as_str());
+    }
+    if chain.is_empty() {
         return Ok(None);
     }
-    let Some(base) = originals.get(base_local) else {
-        return Ok(None);
-    };
-    visited.push(base_local.to_string());
 
-    // Recurse first so deeper ancestors land before this base's own members.
     let mut particles: Vec<Particle> = Vec::new();
     let mut attrs: Vec<AttributeDecl> = Vec::new();
-    if let Some(grand) = base.base.as_ref() {
-        if let Some((gp, ga)) = collect_base(&grand.local, originals, visited, depth + 1, budget)? {
-            particles.extend(gp);
-            attrs.extend(ga);
+    for base in chain.into_iter().rev() {
+        if let ContentModel::Sequence(p) = &base.content {
+            budget.charge(CopyCost::of_particles(p))?;
+            particles.extend(p.iter().cloned());
         }
+        budget.charge(CopyCost::of_attributes(&base.attributes))?;
+        attrs.extend(base.attributes.iter().cloned());
     }
-    if let ContentModel::Sequence(p) = &base.content {
-        budget.charge(CopyCost::of_particles(p))?;
-        particles.extend(p.iter().cloned());
-    }
-    budget.charge(CopyCost::of_attributes(&base.attributes))?;
-    attrs.extend(base.attributes.iter().cloned());
-
-    visited.pop();
     Ok(Some((particles, attrs)))
 }
 
