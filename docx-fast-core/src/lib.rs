@@ -2045,22 +2045,30 @@ fn utf16_big_endian(start: &[u8]) -> Option<bool> {
 /// An unpaired surrogate or a trailing odd byte becomes U+FFFD. The byte
 /// order mark and the XML declaration are dropped: the declaration names an
 /// encoding the bytes no longer have.
+///
+/// The result is built once, in a buffer of exactly the size it needs, so
+/// the part is held twice at most: as stored and as UTF-8. UTF-8 needs at
+/// most three bytes for a two-byte UTF-16 unit, so the result is never more
+/// than one and a half times the stored part, whose size the archive has
+/// already checked against the inflate limit.
 fn utf16_to_utf8(xml: &[u8], big_endian: bool) -> Vec<u8> {
-    let units = xml.chunks(2).map(|pair| match *pair {
-        [first, second] if big_endian => u16::from_be_bytes([first, second]),
-        [first, second] => u16::from_le_bytes([first, second]),
-        // Half a code unit at the end of the part: not a character.
-        _ => 0xDC00,
-    });
-    let text: String = char::decode_utf16(units)
-        .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect();
-    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
-    let text = match text.strip_prefix("<?xml") {
-        Some(rest) => rest.split_once("?>").map_or(text, |(_, body)| body),
-        None => text,
+    let chars = || {
+        let units = xml.chunks(2).map(move |pair| match *pair {
+            [first, second] if big_endian => u16::from_be_bytes([first, second]),
+            [first, second] => u16::from_le_bytes([first, second]),
+            // Half a code unit at the end of the part: not a character.
+            _ => 0xDC00,
+        });
+        char::decode_utf16(units).map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
     };
-    text.as_bytes().to_vec()
+    let mut text = String::with_capacity(chars().map(char::len_utf8).sum());
+    text.extend(chars().skip_while(|ch| *ch == '\u{FEFF}'));
+    if text.starts_with("<?xml") {
+        if let Some(end) = text.find("?>") {
+            text.drain(..end + 2);
+        }
+    }
+    text.into_bytes()
 }
 
 /// Returns a part as UTF-8, transcoding it when it is UTF-16.
