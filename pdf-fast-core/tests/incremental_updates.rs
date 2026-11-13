@@ -291,3 +291,37 @@ fn a_broken_startxref_falls_back_to_the_newest_catalog_in_the_file() {
     assert_eq!(document.pages().len(), 3);
     assert!(words(&document).contains("Three"));
 }
+
+#[test]
+fn an_object_freed_by_a_later_revision_is_gone() {
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let first = revision(
+        &mut out,
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R 12 0 R] /Count 2 >>".to_string(),
+            ),
+            (3, page(2, 4)),
+            (4, text("One")),
+            (12, page(2, 13)),
+            (13, text("Two")),
+            (9, FONT.to_string()),
+        ],
+        1,
+        None,
+        None,
+    );
+    // The second revision adds nothing and frees page object 12.
+    let table = out.len();
+    out.extend_from_slice(
+        format!(
+            "xref\n12 1\n0000000000 00001 f \ntrailer\n<< /Size 100 /Root 1 0 R /Prev {first} >>\n\
+             startxref\n{table}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    let document = open(&out);
+    assert_eq!(document.pages().len(), 1, "the freed page is still listed");
+}
