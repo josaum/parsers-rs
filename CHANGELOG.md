@@ -47,6 +47,15 @@ request.
   this page` (Python `RuntimeError`, Node `Error`), and
   `page_rasterized_png_interpreted` returns `None`. The interpreter's own
   panic message still goes to stderr through the panic hook.
+- **geo:** `parse_geotiff_bands` (and `geotiff_bands` in Python and Node)
+  returned wrong pixels for two kinds of raster instead of an error. For
+  samples of 1, 2 or 4 bits it returned the packed bytes as values. For an
+  uncompressed strip or tile storing fewer bytes than its pixels take,
+  including a sparse block (offset and length zero), it filled the pixels
+  from whatever followed in the file, for a sparse block the file's own
+  header. Both are now refused (see "New refusals"). On GDAL's 237 test
+  TIFFs, 3 rasters that returned such values are refused, and no other
+  result changes.
 
 ### New refusals
 
@@ -55,6 +64,9 @@ request.
   is zero, infinite or NaN, or whose `/Matrix` collapses the cell. On page
   one of 1,295 real files the most any pattern needed was 98,929; none is
   refused.
+- **geo:** a GeoTIFF raster whose samples are not a whole number of bytes
+  (1, 2, 4, 10 or 12 bits), and an uncompressed raster with a strip or tile
+  shorter than its pixels, including a sparse one.
 
 ## v2026.11.13
 
