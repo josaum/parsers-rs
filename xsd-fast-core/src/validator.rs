@@ -11,8 +11,8 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use quick_xml::escape::resolve_predefined_entity;
-use quick_xml::events::{BytesRef, BytesStart, Event};
-use quick_xml::Reader;
+use quick_xml::events::{BytesRef, BytesStart, BytesText, Event};
+use quick_xml::{Reader, XmlVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::parser::SchemaSet;
@@ -105,6 +105,8 @@ impl SchemaSet {
             path: Vec::new(),
             type_stack: Vec::new(),
             content_indexes: HashMap::new(),
+            entities: HashMap::new(),
+            reference_reported: false,
         };
         ctx.validate_document(xml)?;
         Ok(ctx.errors)
@@ -146,6 +148,10 @@ struct ValidationContext<'m> {
     /// The index of each content model met so far, keyed by its address in
     /// the schema model, which outlives the validation.
     content_indexes: HashMap<*const ContentModel, Rc<ContentIndex<'m>>>,
+    /// Entities the document declares in its internal DOCTYPE subset.
+    entities: HashMap<String, String>,
+    /// Whether the one finding for an ill-formed reference was recorded.
+    reference_reported: bool,
 }
 
 /// What one content model declares, arranged for lookup by child name.
@@ -194,6 +200,7 @@ impl<'m> ValidationContext<'m> {
                     };
                     self.path.push(local.clone());
                     self.report_undeclared_root(&local);
+                    self.check_attribute_references(e);
 
                     let xsd_type = self.resolve_child_type(&local);
                     let nil = says_nil(e) && self.child_is_nillable(&local);
@@ -217,6 +224,7 @@ impl<'m> ValidationContext<'m> {
                     };
                     self.path.push(local.clone());
                     self.report_undeclared_root(&local);
+                    self.check_attribute_references(e);
 
                     let xsd_type = self.resolve_child_type(&local);
                     let nil = says_nil(e) && self.child_is_nillable(&local);
@@ -245,6 +253,7 @@ impl<'m> ValidationContext<'m> {
                 // Text arrives without its references, which the reader
                 // reports as events of their own, in document order.
                 Ok(Event::Text(ref t)) => {
+                    self.check_text_references(t);
                     if let Ok(text) = t.decode() {
                         if let Some(frame) = self.type_stack.last_mut() {
                             frame.text.push_str(&text);
@@ -252,8 +261,17 @@ impl<'m> ValidationContext<'m> {
                     }
                 }
                 Ok(Event::GeneralRef(ref reference)) => {
+                    let mut resolved = String::new();
+                    if !push_reference(&mut resolved, reference, &self.entities) {
+                        self.report_reference(&resolved);
+                    }
                     if let Some(frame) = self.type_stack.last_mut() {
-                        push_reference(&mut frame.text, reference);
+                        frame.text.push_str(&resolved);
+                    }
+                }
+                Ok(Event::DocType(ref doctype)) => {
+                    if let Ok(text) = doctype.decode() {
+                        self.entities = internal_entities(&text);
                     }
                 }
                 // A CDATA section is element text written literally: it is
@@ -312,6 +330,15 @@ impl<'m> ValidationContext<'m> {
                     let name_bytes = e.name();
                     let raw = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("?");
                     self.path.push(strip_prefix(raw).to_owned());
+                    self.check_attribute_references(e);
+                }
+                Ok(Event::Empty(ref e)) => self.check_attribute_references(e),
+                Ok(Event::Text(ref t)) => self.check_text_references(t),
+                Ok(Event::GeneralRef(ref reference)) => {
+                    let mut resolved = String::new();
+                    if !push_reference(&mut resolved, reference, &self.entities) {
+                        self.report_reference(&resolved);
+                    }
                 }
                 Ok(Event::End(_)) => {
                     self.path.pop();
@@ -328,6 +355,66 @@ impl<'m> ValidationContext<'m> {
             }
             buf.clear();
         }
+    }
+
+    /// Reports a bare `&` in a piece of element text.
+    ///
+    /// References arrive as events of their own, so an `&` still inside a
+    /// text event is one that starts no reference.
+    fn check_text_references(&mut self, text: &BytesText<'_>) {
+        if !self.reference_reported && text.contains(&b'&') {
+            self.report_reference("&");
+        }
+    }
+
+    /// Reports an attribute value that holds an ill-formed reference.
+    ///
+    /// Attribute values are not validated, but a bare `&`, a character
+    /// reference to no character or an entity the document does not declare
+    /// makes the document ill-formed wherever it is written. Duplicate
+    /// checking is skipped: it is quadratic in the number of attributes.
+    fn check_attribute_references(&mut self, start: &BytesStart<'_>) {
+        if self.reference_reported {
+            return;
+        }
+        let entities = &self.entities;
+        let ill_formed = start
+            .attributes()
+            .with_checks(false)
+            .flatten()
+            .filter(|attribute| attribute.value.contains(&b'&'))
+            .any(|attribute| {
+                // Declared replacement text holds no reference, so one level
+                // of expansion is all there is.
+                attribute
+                    .normalized_value_with(XmlVersion::Implicit1_0, 1, |name| {
+                        resolve_predefined_entity(name)
+                            .or_else(|| entities.get(name).map(String::as_str))
+                    })
+                    .is_err()
+            });
+        if ill_formed {
+            self.report_reference("an attribute value");
+        }
+    }
+
+    /// Records the finding for an ill-formed reference, once per document.
+    ///
+    /// Like any parse error it is recorded whatever the limit. Reading goes
+    /// on, so one finding stands for every such reference in the document.
+    fn report_reference(&mut self, written: &str) {
+        if self.reference_reported {
+            return;
+        }
+        self.reference_reported = true;
+        self.errors.push(ValidationError {
+            severity: ValidationSeverity::Error,
+            path: self.current_path(),
+            message: format!(
+                "XML parse error: ill-formed reference in {written}: a bare `&`, a character \
+                 reference to no character, or an entity the document does not declare"
+            ),
+        });
     }
 
     /// Reports a root element that the schema does not declare.
@@ -768,27 +855,91 @@ fn strip_prefix(name: &str) -> &str {
     }
 }
 
-/// Appends what one `&...;` reference in element text stands for.
+/// Most entities taken from one document's DOCTYPE.
 ///
-/// A predefined entity (`&amp;`) or a decimal or hex character reference
-/// (`&#233;`, `&#xE9;`) becomes its character. Anything else, an entity this
-/// reader does not know or a character reference to no character (`&#0;`), is
-/// kept as it was written, so the value is refused for what it holds instead
-/// of silently losing part of itself.
-fn push_reference(text: &mut String, reference: &BytesRef<'_>) {
+/// Documents that declare entities declare a handful. The bound keeps a
+/// hostile DOCTYPE from growing the table without limit.
+const MAX_DECLARED_ENTITIES: usize = 256;
+
+/// Most bytes of replacement text one declared entity may have.
+///
+/// Every reference appends its replacement to the element's value, so this,
+/// with no nested expansion, bounds growth to a fixed factor of the input.
+const MAX_ENTITY_VALUE_BYTES: usize = 4096;
+
+/// The general entities a DOCTYPE's internal subset declares with literal text.
+///
+/// Only `<!ENTITY name "text">` is taken, the first declaration of a name
+/// winning as XML requires. Parameter entities, external entities (`SYSTEM`,
+/// `PUBLIC`; nothing is ever fetched), and replacement text that holds markup
+/// or another reference (`<`, `&`, `%`) are left out, as is anything past
+/// [`MAX_DECLARED_ENTITIES`] or longer than [`MAX_ENTITY_VALUE_BYTES`]. A
+/// reference to an entity left out is reported as undeclared.
+fn internal_entities(doctype: &str) -> HashMap<String, String> {
+    const KEYWORD: &str = "<!ENTITY";
+    let mut entities = HashMap::new();
+    let mut rest = doctype;
+    while let Some(at) = rest.find(KEYWORD) {
+        rest = &rest[at + KEYWORD.len()..];
+        let declaration = rest.trim_start();
+        let Some(name_end) = declaration.find(char::is_whitespace) else {
+            break;
+        };
+        let (name, after_name) = declaration.split_at(name_end);
+        let after_name = after_name.trim_start();
+        let Some(quote) = after_name
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\''))
+        else {
+            continue;
+        };
+        let body = &after_name[1..];
+        let Some(value_end) = body.find(quote) else {
+            break;
+        };
+        let value = &body[..value_end];
+        rest = &body[value_end + 1..];
+        let literal = !value.contains(['<', '&', '%']);
+        if name != "%"
+            && literal
+            && value.len() <= MAX_ENTITY_VALUE_BYTES
+            && entities.len() < MAX_DECLARED_ENTITIES
+        {
+            entities
+                .entry(name.to_owned())
+                .or_insert_with(|| value.to_owned());
+        }
+    }
+    entities
+}
+
+/// Appends what one `&...;` reference stands for; `false` if it stands for nothing.
+///
+/// A predefined entity (`&amp;`), a decimal or hex character reference
+/// (`&#233;`, `&#xE9;`) or an entity in `declared` becomes its text. Anything
+/// else, an entity the document does not declare or a character reference to
+/// no character (`&#0;`), is appended as it was written, so the value is
+/// refused for what it holds instead of silently losing part of itself, and
+/// the caller reports the document as ill-formed.
+fn push_reference(
+    text: &mut String,
+    reference: &BytesRef<'_>,
+    declared: &HashMap<String, String>,
+) -> bool {
     match reference.resolve_char_ref() {
         Ok(Some(character)) => {
             text.push(character);
-            return;
+            return true;
         }
         Ok(None) => {
-            let resolved = reference
-                .decode()
-                .ok()
-                .and_then(|name| resolve_predefined_entity(&name));
-            if let Some(resolved) = resolved {
-                text.push_str(resolved);
-                return;
+            if let Ok(name) = reference.decode() {
+                let resolved = resolve_predefined_entity(&name)
+                    .or_else(|| declared.get(name.as_ref()).map(String::as_str));
+                if let Some(resolved) = resolved {
+                    text.push_str(resolved);
+                    return true;
+                }
             }
         }
         Err(_) => {}
@@ -796,6 +947,7 @@ fn push_reference(text: &mut String, reference: &BytesRef<'_>) {
     text.push('&');
     text.push_str(&String::from_utf8_lossy(reference));
     text.push(';');
+    false
 }
 
 /// Joins allowed enumeration values for a finding, comma separated.

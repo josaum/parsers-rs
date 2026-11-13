@@ -253,8 +253,15 @@ fn finding_for(body: &str) -> String {
     let findings = schema
         .validate(document.as_bytes(), ValidateOptions::default())
         .expect("validation runs");
-    assert_eq!(findings.len(), 1, "{body:?}: {findings:?}");
-    findings[0].message.clone()
+    // An ill-formed reference adds a parse-error finding of its own; the
+    // value is still validated as written (see tests/ill_formed_references.rs).
+    let mut values: Vec<String> = findings
+        .into_iter()
+        .map(|finding| finding.message)
+        .filter(|message| !message.starts_with("XML parse error: "))
+        .collect();
+    assert_eq!(values.len(), 1, "{body:?}: {values:?}");
+    values.remove(0)
 }
 
 /// The finding that reports `text` as the validated value.
