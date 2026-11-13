@@ -34,7 +34,7 @@
 //! Nothing here reads a source system, signs data, or promotes a fact: parsing
 //! preserves structure and provenance, and the output is unsigned.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
 use oxttl::TurtleParser;
@@ -336,13 +336,15 @@ pub fn parse_turtle(
         let subject = match &quad.subject {
             NamedOrBlankNode::NamedNode(node) => StagedTerm::Iri(node.as_str().to_owned()),
             NamedOrBlankNode::BlankNode(node) => {
-                StagedTerm::Verbatim(blank_labels.label(node.as_str()))
+                StagedTerm::Verbatim(blank_labels.label(node.as_str()).to_owned())
             }
         };
         let object = match &quad.object {
             Term::NamedNode(node) => StagedTerm::Iri(node.as_str().to_owned()),
             Term::Literal(literal) => StagedTerm::Verbatim(literal.value().to_owned()),
-            Term::BlankNode(node) => StagedTerm::Verbatim(blank_labels.label(node.as_str())),
+            Term::BlankNode(node) => {
+                StagedTerm::Verbatim(blank_labels.label(node.as_str()).to_owned())
+            }
             Term::Triple(_) => return Err(OntologyError::TripleTerm { position: "object" }),
         };
         let candidate = StagedTriple {
@@ -410,21 +412,50 @@ pub fn parse_turtle_terms(
     source: &[u8],
     limits: OntologyLimits,
 ) -> Result<Vec<TripleTerms>, OntologyError> {
+    // Deduplication compares six numbers per statement instead of the
+    // statement's text: each distinct string is numbered once.
     let mut triples: Vec<TripleTerms> = Vec::new();
-    let mut seen: BTreeSet<TripleTerms> = BTreeSet::new();
+    let mut strings = StringNumbers::default();
+    let mut seen: HashSet<[u32; 6]> = HashSet::new();
     read_default_graph(source, limits, |quad, blank_labels| {
         let subject = match &quad.subject {
-            NamedOrBlankNode::NamedNode(node) => node.as_str().to_owned(),
+            NamedOrBlankNode::NamedNode(node) => node.as_str(),
             NamedOrBlankNode::BlankNode(node) => blank_labels.label(node.as_str()),
         };
-        let candidate = TripleTerms {
-            subject,
-            predicate: quad.predicate.as_str().to_owned(),
-            object: object_view(&quad.object, blank_labels)?,
+        let subject_number = strings.number(subject)?;
+        let subject = subject.to_owned();
+        let predicate = quad.predicate.as_str();
+        let object = object_view(&quad.object, blank_labels)?;
+        // Zero is "absent"; a present string is its number plus one.
+        let (kind, value, datatype, language) = match &object {
+            TermView::Iri(iri) => (0, strings.number(iri)?, 0, 0),
+            TermView::Blank(label) => (1, strings.number(label)?, 0, 0),
+            TermView::Literal {
+                value,
+                datatype,
+                language,
+            } => (
+                2,
+                strings.number(value)?,
+                strings.optional_number(datatype.as_deref())?,
+                strings.optional_number(language.as_deref())?,
+            ),
         };
-        if seen.insert(candidate.clone()) {
+        let key = [
+            subject_number,
+            strings.number(predicate)?,
+            kind,
+            value,
+            datatype,
+            language,
+        ];
+        if seen.insert(key) {
             enforce_statement_budget(seen.len(), limits)?;
-            triples.push(candidate);
+            triples.push(TripleTerms {
+                subject,
+                predicate: predicate.to_owned(),
+                object,
+            });
         }
         Ok(())
     })?;
@@ -536,11 +567,49 @@ struct StagedTriple {
     object: StagedTerm,
 }
 
+/// Distinct strings numbered by first appearance, for the term view's deduplication.
+#[derive(Debug, Default)]
+struct StringNumbers {
+    numbers: HashMap<String, u32>,
+    count: u32,
+}
+
+impl StringNumbers {
+    /// The number of `text`, assigning the next on first sight. Never zero.
+    fn number(&mut self, text: &str) -> Result<u32, OntologyError> {
+        if let Some(number) = self.numbers.get(text) {
+            return Ok(*number);
+        }
+        self.count = next_number(self.count)?;
+        self.numbers.insert(text.to_owned(), self.count);
+        Ok(self.count)
+    }
+
+    /// As [`Self::number`], with zero for an absent string.
+    fn optional_number(&mut self, text: Option<&str>) -> Result<u32, OntologyError> {
+        text.map_or(Ok(0), |text| self.number(text))
+    }
+}
+
+/// The number after `number`, refused once 32 bits are exhausted.
+///
+/// Row ordinals are 32-bit, so a document with this many distinct terms could
+/// not be indexed either; it is refused under the same resource name.
+fn next_number(number: u32) -> Result<u32, OntologyError> {
+    number.checked_add(1).ok_or(OntologyError::ResourceLimit {
+        resource: "index_ordinals",
+        limit: u32::MAX as usize,
+        observed: u32::MAX as usize + 1,
+    })
+}
+
 /// Render an object-position term, refusing what the view cannot carry.
 fn object_view(term: &Term, blank_labels: &mut BlankLabels) -> Result<TermView, OntologyError> {
     match term {
         Term::NamedNode(node) => Ok(TermView::Iri(node.as_str().to_owned())),
-        Term::BlankNode(node) => Ok(TermView::Blank(blank_labels.label(node.as_str()))),
+        Term::BlankNode(node) => Ok(TermView::Blank(
+            blank_labels.label(node.as_str()).to_owned(),
+        )),
         Term::Literal(literal) => literal_view(literal),
         Term::Triple(_) => Err(OntologyError::TripleTerm { position: "object" }),
     }
@@ -658,13 +727,13 @@ impl BlankLabels {
     }
 
     /// The label for the parser's blank node identifier `id`.
-    fn label(&mut self, id: &str) -> String {
-        if let Some(label) = self.labels.get(id) {
-            return label.clone();
+    fn label(&mut self, id: &str) -> &str {
+        if !self.labels.contains_key(id) {
+            let label = format!("_:d{:016x}b{}", self.scope, self.labels.len());
+            self.labels.insert(id.to_owned(), label);
         }
-        let label = format!("_:d{:016x}b{}", self.scope, self.labels.len());
-        self.labels.insert(id.to_owned(), label.clone());
-        label
+        // Present by now; the empty fallback is unreachable.
+        self.labels.get(id).map_or("", String::as_str)
     }
 }
 
