@@ -176,17 +176,21 @@ def artifact_target(path: Path) -> str:
             target = TARGET_PLATFORMS["win32-x64-msvc"]
         else:
             raise SystemExit(f"{path.name}: unsupported release platform")
-        distribution = path.name.split("-", 1)[0]
         native_suffix = ".pyd" if target.endswith("windows-msvc") else ".so"
         with zipfile.ZipFile(path) as archive:
+            # The extension sits in the package the wheel installs, named by the
+            # binding's module-name, which need not be the distribution's name
+            # (mcts-fast installs mcts_fast_py). Metadata and data directories
+            # never hold it.
             binaries = [
                 name
                 for name in archive.namelist()
-                if name.startswith(f"{distribution}/") and name.endswith(native_suffix)
+                if name.endswith(native_suffix)
+                and not name.split("/", 1)[0].endswith((".dist-info", ".data"))
             ]
             if len(binaries) != 1:
                 raise SystemExit(
-                    f"{path.name}: expected exactly one distribution native extension"
+                    f"{path.name}: expected exactly one native extension, found {len(binaries)}"
                 )
             with archive.open(binaries[0]) as native:
                 validate_native_architecture(native.read(4096), target, path)
