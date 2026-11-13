@@ -31,7 +31,7 @@
 //! | `interpret` and `draw_form_xobject` (`Do`, annotation `/AP /N`; one hop) | [`STACK_BUDGET`]; a stream beneath itself is refused |
 //! | `interpret` and `TilingPattern::interpret` (one hop) | the same |
 //! | `interpret` and `SoftMask::interpret` (one hop) | the same |
-//! | `interpret` and `Type3::render_glyph` (one hop) | glyph procedures are walked with the font's own resources only, `MAX_GLYPH_FORM_DEPTH` forms deep |
+//! | `interpret` and `Type3::render_glyph` (one hop) | glyph procedures are walked with the font's own resources only, and what they enter is charged to [`STACK_BUDGET`] |
 //! | `Resources` clone, lookup and drop (derived, one frame per level) | the same budget: the chain is as long as the nesting |
 //! | `page::resolve_pages` | `MAX_PAGE_TREE_DEPTH`, on this crate's own reading of the file |
 //! | `Function::new` and stitching functions (one hop) | [`MAX_OBJECT_DEPTH`] |
@@ -185,9 +185,6 @@ const MAX_CONTENT_NESTING: usize = 4_096;
 /// optimized: under 1 MiB unoptimized at this depth.
 const MAX_PROGRAM_NESTING: usize = 256;
 
-/// Deepest chain of forms accepted inside a Type 3 glyph procedure.
-const MAX_GLYPH_FORM_DEPTH: usize = 16;
-
 /// Identity of a stream: where its dictionary sits in the file.
 type StreamId = (usize, usize);
 
@@ -288,7 +285,8 @@ fn remember(
     }
 }
 
-/// Identity of an array, dictionary or stream, when it has bytes of its own.
+/// Identity of an array, dictionary or stream whose height may be
+/// remembered.
 fn object_id(object: &Object<'_>) -> Option<StreamId> {
     let data = match object {
         Object::Array(array) => array.data(),
@@ -296,7 +294,12 @@ fn object_id(object: &Object<'_>) -> Option<StreamId> {
         Object::Stream(stream) => stream.dict().data(),
         _ => return None,
     };
-    (!data.is_empty()).then_some((data.as_ptr() as usize, data.len()))
+    // Only an object written without any indirect reference is followed the
+    // same way from everywhere: the object model refuses a reference back
+    // into an object the lookup is already inside, so what a reference
+    // yields depends on the path. `R` is the reference keyword; a name that
+    // merely contains the letter costs a second traversal, nothing else.
+    (!data.is_empty() && !data.contains(&b'R')).then_some((data.as_ptr() as usize, data.len()))
 }
 
 fn stream_id(stream: &Stream<'_>) -> StreamId {
@@ -452,8 +455,10 @@ impl<'a> Walk<'a> {
     /// The interpreter builds functions and colour spaces by plain
     /// recursion over arrays, dictionaries and references. This follows the
     /// same graph with a stack of its own and remembers the height of every
-    /// object it has finished, so resources shared by many streams are
-    /// followed once per render. It does not follow `/Resources`, `/Parent`
+    /// object that holds no indirect reference (see `object_id`), so the
+    /// self-contained parts of shared resources are followed once per
+    /// render. An object that does hold a reference is followed again each
+    /// time it is reached. It does not follow `/Resources`, `/Parent`
     /// or a soft mask's `/G`, which lead to content streams and are bounded
     /// by the walk over those.
     fn vet_object(&mut self, root: Object<'a>) -> Result<()> {
@@ -698,7 +703,7 @@ impl<'a> Walk<'a> {
 
         let font_resources = own_resources(&font);
         let procedures = font.get::<Dict<'_>>(&b"CharProcs"[..]).unwrap_or_default();
-        let mut deepest = 0usize;
+        let mut cost = GLYPH_COST;
         for glyph in procedures.keys() {
             self.count()?;
             let Some(procedure) = procedures.get::<Stream<'a>>(glyph) else {
@@ -707,27 +712,26 @@ impl<'a> Walk<'a> {
             // Mirrors `Type3::render_glyph`: the procedure's own resources
             // come first, then the font's.
             let local = vec![own_resources(procedure.dict()), font_resources.clone()];
-            deepest = deepest.max(self.vet_glyph(&procedure, local)?);
+            cost = cost.max(GLYPH_COST.saturating_add(self.vet_glyph(&procedure, local)?));
         }
-        let cost = GLYPH_COST
-            .saturating_add(FORM_COST.saturating_mul(u32::try_from(deepest).unwrap_or(u32::MAX)));
         self.fonts.insert(memo, cost);
         frame.glyphs = Some(frame.glyphs.unwrap_or(0).max(cost));
         Ok(())
     }
 
-    /// Walks one glyph procedure and the forms it draws, using only the
-    /// resources that travel with the font. Returns the deepest chain of
-    /// forms beneath the procedure.
+    /// Walks one glyph procedure and every content stream it can enter,
+    /// using only the resources that travel with the font. Returns the stack
+    /// those streams may need beneath the procedure.
     ///
     /// A name that none of those resources define would be looked up in the
     /// stream showing the text, which is not known here, so it is refused.
-    /// So is a pattern, soft mask or Type 3 font inside a glyph.
-    fn vet_glyph(&mut self, procedure: &Stream<'a>, local: Vec<Dict<'a>>) -> Result<usize> {
+    /// A form, tiling pattern, soft-mask group or nested Type 3 font that
+    /// they do define is entered. The cost returned is the sum over every
+    /// stream entered, not the deepest path: a pattern or mask set in one
+    /// stream stays in force in the forms drawn after it, and the sum
+    /// covers every order they can stack in without modelling it.
+    fn vet_glyph(&mut self, procedure: &Stream<'a>, local: Vec<Dict<'a>>) -> Result<u32> {
         let outside = || refused("a Type 3 glyph procedure uses resources from outside its font");
-        let nested = || {
-            refused("a Type 3 glyph procedure reaches a pattern, soft mask or another Type 3 font")
-        };
         let find = |chain: &[Dict<'a>], category: &[u8], name: &[u8]| -> Option<Object<'a>> {
             chain.iter().find_map(|resources| {
                 resources
@@ -735,12 +739,12 @@ impl<'a> Walk<'a> {
                     .and_then(|dict| dict.get::<Object<'a>>(Name::new(name)))
             })
         };
-        let mut deepest = 0usize;
-        // Streams still to look inside, with their resources and depth.
-        let mut pending = vec![(procedure.clone(), local, 0usize, vec![stream_id(procedure)])];
-        while let Some((stream, chain, depth, path)) = pending.pop() {
+        let mut total = 0u32;
+        // Streams still to look inside, with their resources and the
+        // streams above them.
+        let mut pending = vec![(procedure.clone(), local, vec![stream_id(procedure)])];
+        while let Some((stream, chain, path)) = pending.pop() {
             self.count()?;
-            deepest = deepest.max(depth);
             for resources in &chain {
                 for category in [
                     &b"ColorSpace"[..],
@@ -757,52 +761,72 @@ impl<'a> Walk<'a> {
             let Some(scan) = self.scan(&stream)? else {
                 continue;
             };
+            // Each target found: the stream, the resources placed in front
+            // of this stream's chain, and what entering it costs.
+            let mut targets: Vec<(Stream<'a>, Vec<Dict<'a>>, u32)> = Vec::new();
             for name in &scan.x_objects {
                 let target = find(&chain, b"XObject", name)
                     .and_then(Object::into_stream)
                     .ok_or_else(outside)?;
-                if !has_subtype(target.dict(), b"Form") {
-                    continue;
+                if has_subtype(target.dict(), b"Form") {
+                    let own = vec![own_resources(target.dict())];
+                    targets.push((target, own, FORM_COST));
                 }
-                let id = stream_id(&target);
-                if path.contains(&id) {
-                    return Err(refused("a content stream draws itself"));
-                }
-                if depth + 1 > MAX_GLYPH_FORM_DEPTH {
-                    return Err(refused(
-                        "content streams nest deeper than the interpreter's stack allows",
-                    ));
-                }
-                let mut inner = vec![own_resources(target.dict())];
-                inner.extend(chain.iter().cloned());
-                let mut inner_path = path.clone();
-                inner_path.push(id);
-                pending.push((target, inner, depth + 1, inner_path));
             }
             for name in &scan.patterns {
                 let pattern = find(&chain, b"Pattern", name).ok_or_else(outside)?;
-                if pattern.into_stream().is_some() {
-                    return Err(nested());
+                if let Some(cell) = pattern.into_stream() {
+                    let own = vec![own_resources(cell.dict())];
+                    targets.push((cell, own, PATTERN_COST));
                 }
             }
             for name in &scan.ext_g_states {
                 let state = find(&chain, b"ExtGState", name)
                     .and_then(Object::into_dict)
                     .ok_or_else(outside)?;
-                if state.get::<Dict<'_>>(&b"SMask"[..]).is_some() {
-                    return Err(nested());
+                if let Some(group) = state
+                    .get::<Dict<'_>>(&b"SMask"[..])
+                    .and_then(|mask| mask.get::<Stream<'a>>(&b"G"[..]))
+                {
+                    let own = vec![own_resources(group.dict())];
+                    targets.push((group, own, SOFT_MASK_COST));
                 }
             }
             for name in &scan.fonts {
                 let font = find(&chain, b"Font", name)
                     .and_then(Object::into_dict)
                     .ok_or_else(outside)?;
-                if has_subtype(&font, b"Type3") {
-                    return Err(nested());
+                if !has_subtype(&font, b"Type3") {
+                    continue;
+                }
+                let font_resources = own_resources(&font);
+                let procedures = font.get::<Dict<'_>>(&b"CharProcs"[..]).unwrap_or_default();
+                for glyph in procedures.keys() {
+                    self.count()?;
+                    if let Some(inner) = procedures.get::<Stream<'a>>(glyph) {
+                        let own = vec![own_resources(inner.dict()), font_resources.clone()];
+                        targets.push((inner, own, GLYPH_COST));
+                    }
                 }
             }
+            for (target, mut own, cost) in targets {
+                let id = stream_id(&target);
+                if path.contains(&id) {
+                    return Err(refused("a content stream draws itself"));
+                }
+                total = total.saturating_add(cost);
+                if total > STACK_BUDGET {
+                    return Err(refused(
+                        "content streams nest deeper than the interpreter's stack allows",
+                    ));
+                }
+                own.extend(chain.iter().cloned());
+                let mut inner_path = path.clone();
+                inner_path.push(id);
+                pending.push((target, own, inner_path));
+            }
         }
-        Ok(deepest)
+        Ok(total)
     }
 
     /// Vets `root` and everything beneath it; `floor` is the stack already in

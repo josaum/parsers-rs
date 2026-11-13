@@ -729,6 +729,87 @@ fn a_type3_glyph_that_draws_a_local_form_renders() {
     assert_refused("glyph using the page's resources", &bytes);
 }
 
+/// A page showing one Type 3 glyph whose font carries `resources` and whose
+/// procedure is `procedure`, plus `rest`.
+fn glyph_page(resources: &str, procedure: &str, rest: Vec<(u32, Vec<u8>)>) -> Vec<u8> {
+    let mut objects = vec![
+        (10, type3_font(&format!("/Resources << {resources} >>"), 11)),
+        (11, stream("", procedure)),
+    ];
+    objects.extend(rest);
+    one_page(
+        "/Resources << /Font << /T 10 0 R >> >>",
+        "BT /T 10 Tf 10 50 Td (a) Tj ET",
+        objects,
+    )
+}
+
+#[test]
+fn a_type3_glyph_may_enter_patterns_masks_and_fonts_its_font_defines() {
+    let fill = "10 0 d0 /Pattern cs /P scn 0 0 8 8 re f";
+    assert_renders(
+        "glyph with a local tiling pattern",
+        &glyph_page(
+            "/Pattern << /P 12 0 R >>",
+            fill,
+            vec![(12, tiling("/Resources << >>", "0 0 4 4 re f"))],
+        ),
+    );
+    assert_refused(
+        "glyph whose local pattern fills with itself",
+        &glyph_page(
+            "/Pattern << /P 12 0 R >>",
+            fill,
+            vec![(12, tiling("", "/Pattern cs /P scn 0 0 4 4 re f"))],
+        ),
+    );
+
+    let mask = "/ExtGState << /G << /SMask << /S /Luminosity /G 12 0 R >> >> >>";
+    let group = |body: &str| form("/Group << /S /Transparency /CS /DeviceGray >>", body);
+    assert_renders(
+        "glyph with a local soft mask",
+        &glyph_page(
+            mask,
+            "10 0 d0 /G gs 0 0 8 8 re f",
+            vec![(12, group("1 g 0 0 8 8 re f"))],
+        ),
+    );
+    assert_refused(
+        "glyph whose local soft mask masks itself",
+        &glyph_page(
+            mask,
+            "10 0 d0 /G gs 0 0 8 8 re f",
+            vec![(12, group("/G gs 0 0 8 8 re f"))],
+        ),
+    );
+
+    let show = "10 0 d0 BT /U 10 Tf (a) Tj ET";
+    assert_renders(
+        "glyph showing a glyph of a second local Type 3 font",
+        &glyph_page(
+            "/Font << /U 12 0 R >>",
+            show,
+            vec![
+                (12, type3_font("/Resources << >>", 13)),
+                (13, stream("", "10 0 d0 0 0 8 8 re f")),
+            ],
+        ),
+    );
+    assert_refused(
+        "glyph showing a font only the page defines",
+        &one_page(
+            "/Resources << /Font << /T 10 0 R /U 12 0 R >> >>",
+            "BT /T 10 Tf 10 50 Td (a) Tj ET",
+            vec![
+                (10, type3_font("", 11)),
+                (11, stream("", show)),
+                (12, type3_font("/Resources << >>", 13)),
+                (13, stream("", "10 0 d0 0 0 8 8 re f")),
+            ],
+        ),
+    );
+}
+
 #[test]
 fn a_form_stamped_300_times_renders_and_keeps_rendering() {
     let content = "/F1 Do\n".repeat(300);
