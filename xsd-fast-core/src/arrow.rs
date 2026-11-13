@@ -370,6 +370,13 @@ impl Derivation<'_> {
         prefix: &str,
         fields: &mut Vec<Field>,
     ) -> Result<()> {
+        // A type that declares nothing makes its element a marker: all the
+        // element says is that it is there. It keeps a text column, as an
+        // element of an unknown type does, so the marker is not dropped and
+        // a parent holding it keeps its shape.
+        if declares_nothing(ct) {
+            return self.emit_leaf(prefix.to_string(), None, fields);
+        }
         // Attributes first.
         if self.opts.include_attributes {
             self.emit_attributes(ct, prefix, fields)?;
@@ -555,6 +562,20 @@ impl Derivation<'_> {
         force_nullable(&mut fields[start..]);
         Ok(())
     }
+}
+
+/// Whether a complex type has no attributes and no particles.
+///
+/// True for `<xs:complexType/>`, for the open-and-closed form with nothing
+/// inside, and for a model group that holds no particle. A type with simple
+/// content has a text value and is not empty in this sense.
+fn declares_nothing(ct: &ComplexType) -> bool {
+    let no_particles = match &ct.content {
+        ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p.is_empty(),
+        ContentModel::SimpleContent(_) => false,
+        ContentModel::Empty => true,
+    };
+    no_particles && ct.attributes.is_empty()
 }
 
 /// Marks every field nullable: a choice selects at most one branch, so none
