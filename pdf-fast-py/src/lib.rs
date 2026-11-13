@@ -7,10 +7,11 @@ use pdf_fast_core::{OcrTextRun, ParseOptions, PdfDocument};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyCapsule, PyList, PyString};
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fmt::Write;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// OCR intake after Python → Rust conversion.
 ///
@@ -1147,15 +1148,75 @@ fn record_batch_to_ipc_bytes(batch: &arrow::record_batch::RecordBatch) -> PyResu
     Ok(out.into_inner())
 }
 
+/// The raw Arrow C Data pointer pairs handed to Python and not yet released,
+/// as `array pointer -> schema pointer`.
+///
+/// `release_arrow_c_data_py` takes two integers from Python. Freeing whatever
+/// address it is given would let any Python caller corrupt the heap with two
+/// made-up numbers, or free one pair twice. It frees only a pair recorded here
+/// by `issue_c_data`, and removes the pair as it does, so each pair is freed
+/// at most once.
+static ISSUED_C_DATA: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
 fn record_batch_to_c_data(batch: arrow::record_batch::RecordBatch) -> PyResult<(usize, usize)> {
     let struct_array = StructArray::from(batch);
     let data_type = struct_array.data_type().clone();
     let data = struct_array.to_data();
     let ffi_array = FFI_ArrowArray::new(&data);
     let ffi_schema = FFI_ArrowSchema::try_from(&data_type).map_err(to_py_err)?;
+    Ok(issue_c_data(ffi_array, ffi_schema))
+}
+
+/// Boxes an exported array and schema, records the pair in
+/// `ISSUED_C_DATA`, and returns the two addresses.
+///
+/// Kept free of pyo3 so the unit tests can call it: the test binary does
+/// not link against Python.
+fn issue_c_data(ffi_array: FFI_ArrowArray, ffi_schema: FFI_ArrowSchema) -> (usize, usize) {
     let array_ptr = Box::into_raw(Box::new(ffi_array)) as usize;
     let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
-    Ok((array_ptr, schema_ptr))
+    // A map operation cannot leave the map half-changed, so a poisoned lock
+    // still guards a consistent map.
+    ISSUED_C_DATA
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(array_ptr, schema_ptr);
+    (array_ptr, schema_ptr)
+}
+
+/// Frees a pointer pair that `issue_c_data` issued and that has not been
+/// released yet.
+///
+/// # Errors
+///
+/// Returns a message, and frees nothing, when either pointer is null or the
+/// pair is not an issued, unreleased pair.
+fn release_issued_c_data(array_ptr: usize, schema_ptr: usize) -> Result<(), &'static str> {
+    if array_ptr == 0 || schema_ptr == 0 {
+        return Err("null Arrow C Data pointer");
+    }
+    {
+        let mut issued = ISSUED_C_DATA.lock().unwrap_or_else(PoisonError::into_inner);
+        if issued.get(&array_ptr) != Some(&schema_ptr) {
+            return Err(
+                "Arrow C Data pointers were not returned by a *_c_data call, \
+                 or were already released",
+            );
+        }
+        issued.remove(&array_ptr);
+    }
+    // SAFETY: the pair was in `ISSUED_C_DATA`, so `issue_c_data` made both
+    // integers with `Box::into_raw` from a `Box<FFI_ArrowArray>`
+    // and a `Box<FFI_ArrowSchema>`, and no earlier release has freed them:
+    // the pair is removed under the lock just above, so only one caller can
+    // reach this point for it. A pair that PyArrow imported is still a live
+    // allocation; the import moved the contents out and set each `release`
+    // callback to null, so dropping the structs frees only the two boxes.
+    unsafe {
+        drop(Box::from_raw(array_ptr as *mut FFI_ArrowArray));
+        drop(Box::from_raw(schema_ptr as *mut FFI_ArrowSchema));
+    }
+    Ok(())
 }
 
 fn record_batch_to_arrow_c_array_capsules<'py>(
@@ -1370,9 +1431,16 @@ fn record_batch_from_arrow_c_array(value: &Bound<'_, PyAny>) -> PyResult<RecordB
     let schema_ptr = schema_capsule.pointer_checked(Some(SCHEMA_NAME))?;
     let array_ptr = array_capsule.pointer_checked(Some(ARRAY_NAME))?;
 
-    // SAFETY: Capsule pointers are Arrow C Data structs produced by the
-    // producer. We move them onto the stack and empty the capsule payloads so
-    // the capsule destructors become no-ops; `from_ffi` then owns the buffers.
+    // SAFETY: `pointer_checked` returned non-null pointers from capsules
+    // named `arrow_schema` and `arrow_array`. Under the Arrow PyCapsule
+    // Interface those names mean the capsules hold a live, aligned, initialized
+    // `ArrowSchema` and `ArrowArray`, which are what `FFI_ArrowSchema` and
+    // `FFI_ArrowArray` lay out; Python code cannot make such a capsule around
+    // another pointer without ctypes or other native code. `ptr::read` moves
+    // each struct out, and `ptr::write` leaves an empty struct (null
+    // `release`) behind, which the interface defines as "moved": the capsule
+    // destructors then free nothing, so each struct is released exactly once,
+    // by the copy we hold.
     let (ffi_array, ffi_schema) = unsafe {
         let schema_raw = schema_ptr.as_ptr() as *mut FFI_ArrowSchema;
         let array_raw = array_ptr.as_ptr() as *mut FFI_ArrowArray;
@@ -1382,6 +1450,9 @@ fn record_batch_from_arrow_c_array(value: &Bound<'_, PyAny>) -> PyResult<RecordB
         std::ptr::write(array_raw, FFI_ArrowArray::empty());
         (ffi_array, ffi_schema)
     };
+    // SAFETY: `from_ffi` needs a schema and an array that follow the C Data
+    // Interface and describe the same data. Both came from one
+    // `__arrow_c_array__` call, whose protocol promises exactly that pair.
     let data = unsafe { from_ffi(ffi_array, &ffi_schema) }.map_err(to_py_err)?;
     array_data_to_record_batch(data)
 }
@@ -1401,8 +1472,12 @@ fn record_batch_from_arrow_c_stream(value: &Bound<'_, PyAny>) -> PyResult<Record
     const STREAM_NAME: &CStr = c"arrow_array_stream";
     let stream_ptr = capsule.pointer_checked(Some(STREAM_NAME))?;
 
-    // SAFETY: Capsule holds an FFI_ArrowArrayStream. `from_raw` moves ownership
-    // out and empties the capsule payload so its destructor becomes a no-op.
+    // SAFETY: `pointer_checked` returned a non-null pointer from a capsule
+    // named `arrow_array_stream`, which under the Arrow PyCapsule Interface
+    // holds a live, aligned, initialized `ArrowArrayStream`, valid for reads
+    // and writes: what `FFI_ArrowArrayStream::from_raw` requires. `from_raw`
+    // moves the stream out and nulls its `release` callback, so the capsule's
+    // destructor frees nothing and the reader releases the stream once.
     let mut reader = unsafe {
         let raw = stream_ptr.as_ptr() as *mut FFI_ArrowArrayStream;
         let stream = FFI_ArrowArrayStream::from_raw(raw);
@@ -1445,8 +1520,15 @@ fn record_batch_from_pyarrow_export(value: &Bound<'_, PyAny>) -> PyResult<Record
                 "ocr_runs Arrow export failed via _export_to_c: {err}"
             ))
         })?;
-    // SAFETY: pointers were filled by PyArrow's `_export_to_c` into our stack
-    // FFI structs; ownership of the buffers transfers to `from_ffi`.
+    // SAFETY: `from_ffi` needs structs that follow the C Data Interface and
+    // describe the same data. Both start empty, and only `_export_to_c` can
+    // change them: Python code without ctypes or other native code cannot
+    // write through the two addresses. PyArrow's `_export_to_c` fills them
+    // with one exported array and its schema. An object that leaves them
+    // untouched hands `from_ffi` an empty schema, whose null format it rejects
+    // with a panic before reading anything else. Native code that writes
+    // something else breaks the protocol it claims to implement; nothing here
+    // can detect that.
     let data = unsafe { from_ffi(ffi_array, &ffi_schema) }.map_err(to_py_err)?;
     array_data_to_record_batch(data)
 }
@@ -1866,18 +1948,15 @@ fn utf8_prefix_at_most_bytes(s: &str, max_bytes: usize) -> &str {
     }
 }
 
+/// Frees a pointer pair returned by a deprecated `*_c_data` call.
+///
+/// Only pairs this module issued and has not freed yet are accepted; any
+/// other pair, including one released before, raises `ValueError` and frees
+/// nothing. After a release, the pointers must not be passed to PyArrow's
+/// `_import_from_c`.
 #[pyfunction]
 fn release_arrow_c_data_py(array_ptr: usize, schema_ptr: usize) -> PyResult<()> {
-    if array_ptr == 0 || schema_ptr == 0 {
-        return Err(PyValueError::new_err("null Arrow C Data pointer"));
-    }
-    // SAFETY: pointers must come from `record_batch_to_c_data` and must not
-    // have been imported into PyArrow or freed already.
-    unsafe {
-        drop(Box::from_raw(array_ptr as *mut FFI_ArrowArray));
-        drop(Box::from_raw(schema_ptr as *mut FFI_ArrowSchema));
-    }
-    Ok(())
+    release_issued_c_data(array_ptr, schema_ptr).map_err(PyValueError::new_err)
 }
 
 fn collect_page_dimensions(doc: &PdfDocument) -> Vec<PageDimensionData> {
@@ -2024,10 +2103,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_pdf_source_within_limit, ocr_runs_from_record_batch_inner, validate_ocr_record_batch,
+        ensure_pdf_source_within_limit, issue_c_data, ocr_runs_from_record_batch_inner,
+        release_issued_c_data, validate_ocr_record_batch,
     };
+    use arrow::array::Array;
     use arrow::array::{ArrayRef, Float32Array, Float64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
@@ -2043,6 +2125,22 @@ mod tests {
         let px_y: ArrayRef = Arc::new(Float32Array::from(vec![20.0_f32, 40.0]));
         let px_height: ArrayRef = Arc::new(Float32Array::from(vec![12.0_f32, 12.0]));
         RecordBatch::try_new(schema, vec![text, px_x, px_y, px_height]).unwrap()
+    }
+
+    #[test]
+    fn releases_only_issued_c_data_pairs_and_each_once() {
+        let data = arrow::array::StructArray::from(sample_batch()).to_data();
+        let schema = FFI_ArrowSchema::try_from(data.data_type()).unwrap();
+        let (array_ptr, schema_ptr) = issue_c_data(FFI_ArrowArray::new(&data), schema);
+        // Made-up or mismatched pointers are refused and free nothing.
+        assert!(release_issued_c_data(0, schema_ptr).is_err());
+        assert!(release_issued_c_data(array_ptr, 0).is_err());
+        assert!(release_issued_c_data(array_ptr, array_ptr).is_err());
+        assert!(release_issued_c_data(schema_ptr, array_ptr).is_err());
+        assert!(release_issued_c_data(0x1000, 0x2000).is_err());
+        // The issued pair is freed once; a second release is refused.
+        assert_eq!(release_issued_c_data(array_ptr, schema_ptr), Ok(()));
+        assert!(release_issued_c_data(array_ptr, schema_ptr).is_err());
     }
 
     #[test]

@@ -212,9 +212,21 @@ def test_deprecated_c_data_pointers_import_or_release(pdf_path: str) -> None:
         array_ptr, schema_ptr = call()
         imported = MODULE._import_record_batch_from_c(array_ptr, schema_ptr)
         assert imported.schema.names
+        # Importing freed the pair, so a second release is refused.
+        with pytest.raises(ValueError):
+            MODULE.release_arrow_c_data(array_ptr, schema_ptr)
     # Pointers that are not imported are freed through the release helper.
     array_ptr, schema_ptr = calls[0]()
     assert MODULE.release_arrow_c_data(array_ptr, schema_ptr) is None
+    with pytest.raises(ValueError):
+        MODULE.release_arrow_c_data(array_ptr, schema_ptr)
+
+
+def test_releasing_pointers_this_module_did_not_issue_frees_nothing() -> None:
+    # Two made-up integers used to be passed to Box::from_raw.
+    for array_ptr, schema_ptr in [(1, 2), (0x1000, 0x2000), (0, 0)]:
+        with pytest.raises(ValueError):
+            MODULE.release_arrow_c_data(array_ptr, schema_ptr)
 
 
 def test_fast_pdf_page_scanner_reuses_one_open_document(pdf_path: str) -> None:

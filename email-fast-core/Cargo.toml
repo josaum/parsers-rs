@@ -42,7 +42,7 @@ base64 = "0.22"
 encoding_rs = "0.8"
 # HTML named character references (the full table from the HTML standard) for
 # `html_to_text`; already in the workspace lockfile through html5ever.
-web_atoms = "0.2"
+web_atoms = "0.3"
 regex = { workspace = true }
 
 [dev-dependencies]
@@ -52,3 +52,6 @@ tempfile = "3.10"
 [[bench]]
 name = "parse"
 harness = false
+
+[lints]
+workspace = true

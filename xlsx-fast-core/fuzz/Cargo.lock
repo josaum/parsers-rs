@@ -583,6 +583,7 @@ name = "ooxml-archive"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "chrono",
  "flate2",
  "memmap2",
  "quick-xml",

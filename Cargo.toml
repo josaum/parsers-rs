@@ -85,3 +85,13 @@ license = "MIT OR Apache-2.0"
 # consumer of this repository.
 repository = "https://github.com/josaum/parsers-rs"
 rust-version = "1.94"
+
+# Lints every member inherits through `[lints] workspace = true`. Each `unsafe`
+# block, and each `unsafe impl`, says why it is sound in a `// SAFETY:`
+# comment, and an `unsafe fn` marks each unsafe operation in its body with a
+# block of its own, so that operation carries the same comment.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"

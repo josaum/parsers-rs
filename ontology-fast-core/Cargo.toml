@@ -26,3 +26,6 @@ criterion = { version = "0.8", default-features = false }
 [[bench]]
 name = "turtle_reader"
 harness = false
+
+[lints]
+workspace = true

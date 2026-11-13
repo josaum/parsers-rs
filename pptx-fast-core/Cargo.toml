@@ -36,9 +36,15 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# Reads the same property parts as this crate, so tests can hold the two to
+# the same output.
+docx-fast-core = { path = "../docx-fast-core" }
 tempfile = "3.10"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [[bench]]
 name = "parse"
 harness = false
+
+[lints]
+workspace = true

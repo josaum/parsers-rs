@@ -49,12 +49,21 @@
 //! The parser uses a state machine (`DocxBodyParser`) to handle nested
 //! XML structures. Tables can contain paragraphs, which can contain
 //! runs, which can contain text, comments, and revisions.
+//!
+//! # Files on disk
+//!
+//! Functions that take a path memory-map the file. It must not be modified
+//! or truncated, by this process or any other, while it is being read: a
+//! truncated file can make reads of the mapping fault (`SIGBUS` on Unix),
+//! and a modified one can change the bytes under the parser. Functions that
+//! take bytes have no such requirement.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::DateTime;
 use ooxml_archive::{
-    parse_relationships, part_dir, relationship_matches, relationship_target, rels_path_for_part,
-    resolve_part, source_part_from_rels, OoxmlArchive, PartReader, RelEntry, Relationships,
+    parse_relationships, parse_simple_props, part_dir, relationship_matches, relationship_target,
+    rels_path_for_part, resolve_part, source_part_from_rels, OoxmlArchive, PartReader, RelEntry,
+    Relationships,
 };
 use quick_xml::events::{BytesRef, BytesText, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -1154,10 +1163,10 @@ fn parse_metadata(archive: &DocxArchive, max_inflate: usize) -> Result<Metadata>
     let mut metadata = Metadata::default();
 
     if let Ok(xml) = read_part_bytes(archive, "docProps/core.xml", max_inflate) {
-        metadata.core = parse_simple_props(&xml)?;
+        metadata.core = parse_simple_props(&utf8_xml(&xml))?;
     }
     if let Ok(xml) = read_part_bytes(archive, "docProps/app.xml", max_inflate) {
-        metadata.app = parse_simple_props(&xml)?;
+        metadata.app = parse_simple_props(&utf8_xml(&xml))?;
     }
     if let Ok(xml) = read_part_bytes(archive, "docProps/custom.xml", max_inflate) {
         metadata.custom = parse_custom_props(&xml)?;
@@ -1242,155 +1251,6 @@ fn store_property(
         }
     }
     value.clear();
-}
-
-/// Reads `docProps/core.xml` or `docProps/app.xml`.
-///
-/// Every child of the root that holds text is a property, named by its
-/// local name (`Company`, `title`). The root element itself is not one.
-///
-/// A property whose value is nested, as the vectors of `docProps/app.xml`
-/// are (`TitlesOfParts`, `HeadingPairs`), keeps the name of the property:
-/// the elements inside it (`vt:vector`, `vt:variant`, `vt:lpstr`, `vt:i4`)
-/// say how the value is typed and are not properties. Its value is the text
-/// of every item, in document order, one per line. So `TitlesOfParts` with
-/// two `vt:lpstr` items reads `"First\nSecond"`, where it used to appear
-/// under the key `lpstr` holding the last item only.
-///
-/// An item is an element inside the property that holds no other element
-/// and is not one of the containers `vt:vector`, `vt:array` and
-/// `vt:variant`. Every item is one line, an empty one included, so the
-/// number of lines is the number of items and the pairs of `HeadingPairs`
-/// can be matched with `TitlesOfParts` again: three items of which only the
-/// second has text read `"\nScope\n"`. A property with one empty item reads
-/// `""`; a property with no item is not stored. A line break inside an item
-/// (`\r\n`, `\n` or `\r`) reads as one space, so that a line is never part
-/// of an item; the break itself is not recoverable.
-///
-/// A property that is not nested is not touched by any of this: its text is
-/// stored as it is, line breaks included, and not at all when it is empty.
-fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
-    let mut buf = Vec::new();
-    let mut out: HashMap<String, String> = HashMap::new();
-    let mut current_key: Option<String> = None;
-    // The child of the root being read, and whether the text now collected
-    // stands in an element nested inside it.
-    let mut property: Option<String> = None;
-    let mut nested = false;
-    // Whether the element now open is a nested item: inside a property, not
-    // a container, and with no element met inside it so far.
-    let mut item_open = false;
-    let mut value = String::new();
-    let mut depth = 0usize;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
-                if current_key.is_some() {
-                    value.push_str(&character_data(&event).unwrap_or_default());
-                }
-            }
-            Ok(event) => {
-                if item_open && matches!(event, Event::End(_)) {
-                    // The end of an item: its text is a line whatever it is.
-                    if let Some(key) = current_key.take() {
-                        push_nested_item(&mut out, key, &nested_item_line(&value));
-                    }
-                    value.clear();
-                }
-                let before_element = matches!(event, Event::Start(_) | Event::Empty(_));
-                let mut stored = HashMap::new();
-                store_property(&mut stored, &mut current_key, &mut value, before_element);
-                for (key, text) in stored {
-                    if nested {
-                        // Text beside the items, inside a container.
-                        push_nested_item(&mut out, key, &single_line(&text));
-                    } else {
-                        out.insert(key, text);
-                    }
-                }
-                match event {
-                    Event::Start(e) => {
-                        let raw = e.name().as_ref().to_vec();
-                        let name = local_name(&raw);
-                        if depth == 1 {
-                            property = Some(String::from_utf8_lossy(name).to_string());
-                        }
-                        if depth > 0 {
-                            current_key.clone_from(&property);
-                            nested = depth > 1;
-                        }
-                        item_open = depth > 1 && !is_property_container(name);
-                        depth += 1;
-                    }
-                    Event::Empty(e) => {
-                        // A self-closing element inside a property is an
-                        // item with no text.
-                        let raw = e.name().as_ref().to_vec();
-                        if depth > 1 && !is_property_container(local_name(&raw)) {
-                            if let Some(key) = property.clone() {
-                                push_nested_item(&mut out, key, "");
-                            }
-                        }
-                        item_open = false;
-                    }
-                    Event::End(_) => {
-                        item_open = false;
-                        current_key = None;
-                        depth = depth.saturating_sub(1);
-                        if depth <= 1 {
-                            property = None;
-                        }
-                    }
-                    Event::Eof => break,
-                    _ => {}
-                }
-            }
-            Err(err) => return Err(anyhow!("parse props: {err}")),
-        }
-        buf.clear();
-    }
-    Ok(out)
-}
-
-/// Whether an element inside a property groups items instead of being one.
-fn is_property_container(local: &[u8]) -> bool {
-    matches!(local, b"vector" | b"array" | b"variant")
-}
-
-/// Adds one item of a nested property as a line of its own.
-fn push_nested_item(out: &mut HashMap<String, String>, key: String, text: &str) {
-    match out.get_mut(&key) {
-        Some(items) => {
-            items.push('\n');
-            items.push_str(text);
-        }
-        None => {
-            out.insert(key, text.to_string());
-        }
-    }
-}
-
-/// The line that stands for one nested item.
-///
-/// Nothing but whitespace with a line break in it is the layout of an
-/// element with no content, and reads as empty. Any other line break in the
-/// item reads as one space: lines separate items, so an item cannot hold
-/// one.
-fn nested_item_line(value: &str) -> String {
-    let is_layout = value.contains(['\r', '\n'])
-        && value
-            .chars()
-            .all(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'));
-    if is_layout {
-        return String::new();
-    }
-    normalize_datetime(&single_line(value))
-}
-
-/// `value` with every line break (`\r\n`, `\n` or `\r`) read as one space.
-fn single_line(value: &str) -> String {
-    value.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
 /// Reads `docProps/custom.xml`.

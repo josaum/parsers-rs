@@ -38,6 +38,7 @@ REBUILT_BY_RELEASE = {"python-bindings": "wheels", "node-bindings": "node"}
 SKIP_INPUT = "skip_binding_jobs"
 # The doctors are a package outside the workspace; this is its own lockfile.
 DOCTORS_LOCK = ".leio-code/rust-doctors/Cargo.lock"
+DOCTORS_MANIFEST = ".leio-code/rust-doctors/Cargo.toml"
 # The checks branch protection requires, as ci.yml job names. A job with a
 # matrix reports once per leg, so these seven jobs are the twelve required
 # checks. Renaming or removing one leaves its check pending on every pull
@@ -526,10 +527,20 @@ def assert_audit_contract(audit: str) -> None:
     }
     assert (ROOT / DOCTORS_LOCK).is_file()
     blocks = jobs(audit)
-    assert set(blocks) == set(expected) | {"cargo-deny"}, (
-        "one audit job per lockfile, the policy check, and nothing else"
+    # The policy check, once per package: the workspace, and the doctors'
+    # package with its own lockfile, against the same deny.toml.
+    deny_checks = {
+        "cargo-deny": "cargo deny --locked check",
+        "cargo-deny-doctors": (
+            f"cargo deny --locked --manifest-path {DOCTORS_MANIFEST} --config {DENY_CONFIG} check"
+        ),
+    }
+    assert (ROOT / DOCTORS_MANIFEST).is_file()
+    assert set(blocks) == set(expected) | set(deny_checks), (
+        "one audit job per lockfile, one policy check per package, and nothing else"
     )
-    assert_deny_job(blocks["cargo-deny"])
+    deny_versions = {name: assert_deny_job(blocks[name], check) for name, check in deny_checks.items()}
+    assert len(set(deny_versions.values())) == 1, "both policy checks must use the same cargo-deny"
     assert DENY_CONFIG in listed, "a change to the policy must run the policy check"
     versions = set()
     for name, block in blocks.items():
@@ -556,8 +567,11 @@ def assert_audit_contract(audit: str) -> None:
         assert not (ROOT / config).exists(), f"{config} can hide an advisory from the audit"
 
 
-def assert_deny_job(block: str) -> None:
-    """The licence, source and duplicate policy in deny.toml is checked as written."""
+def assert_deny_job(block: str, check: str) -> str:
+    """The licence, source and duplicate policy in deny.toml is checked as written.
+
+    Returns the pinned cargo-deny version the job installs.
+    """
     assert (ROOT / DENY_CONFIG).is_file(), "cargo-deny has no policy to check"
     install = re.findall(
         r"^ +run: cargo install cargo-deny --locked --version ([0-9]+\.[0-9]+\.[0-9]+)$",
@@ -568,10 +582,12 @@ def assert_deny_job(block: str) -> None:
     # Every check, against the lockfile as committed, with no flag that
     # downgrades or leaves out a finding.
     checks = re.findall(r"^ +run: (cargo deny\b.*)$", block, re.MULTILINE)
-    assert checks == ["cargo deny --locked check"], f"cargo-deny: {checks}"
+    assert checks == [check], f"cargo-deny: {checks}"
     assert job_value(block, "needs") is None, "cargo-deny: must not wait for another job"
     assert job_value(block, "if") is None, "cargo-deny: can be skipped"
     assert not re.search(r"^\s*(?:- )?if:", block, re.MULTILINE), "cargo-deny: a step can be skipped"
+    assert "continue-on-error" not in block, "cargo-deny: a finding can be ignored"
+    return install[0]
 
 
 # The crates that may carry MPL-2.0 (file-level copyleft), all behind
@@ -796,6 +812,51 @@ def assert_ci_jobs(ci: str) -> None:
     assert_rustdoc_job(blocks["rustdoc"], ci)
 
 
+# Features that gate code but need something CI does not have: pdf-fast-py's
+# and pdf-fast-node's `reading-order` compiles only with a layout crate a
+# consumer supplies.
+FEATURES_NOT_BUILT_IN_CI = {"pdf-fast-py/reading-order", "pdf-fast-node/reading-order"}
+
+
+def gated_features(ci: str) -> set[str]:
+    """`crate/feature` for every feature that gates code in a crate's `src` or
+    `tests` and that neither a default build nor `ARROW_FEATURES` turns on."""
+    arrow = re.search(r"^  ARROW_FEATURES: (\S+)$", ci, re.MULTILINE)
+    assert arrow is not None
+    covered = set(arrow[1].split(","))
+    found = set()
+    for manifest in sorted(ROOT.glob("*/Cargo.toml")):
+        package = tomllib.loads(read(manifest)).get("package")
+        if package is None:
+            continue
+        features = tomllib.loads(read(manifest)).get("features", {})
+        default = set(features.get("default", []))
+        sources = [*manifest.parent.glob("src/**/*.rs"), *manifest.parent.glob("tests/**/*.rs")]
+        used = {name for path in sources for name in re.findall(r'feature\s*=\s*"([^"]+)"', read(path))}
+        for name in used & set(features) - default:
+            if f"{package['name']}/{name}" not in covered:
+                found.add(f"{package['name']}/{name}")
+    return found
+
+
+def assert_gated_features_are_built_and_tested(ci: str) -> None:
+    """A feature that gates code is linted and tested in the `rust` job.
+
+    Without this, code behind such a feature (the WMS and WFS clients, the
+    memory-mapped JSON reader, the glyph catalog) compiles in nobody's
+    build until a consumer turns it on.
+    """
+    rust = jobs(ci)["rust"]
+    assert re.search(r"^  RUSTFLAGS: -D warnings$", ci, re.MULTILINE), "lints must deny warnings"
+    for gated in sorted(gated_features(ci) - FEATURES_NOT_BUILT_IN_CI):
+        crate, feature = gated.split("/")
+        for command in (
+            f"cargo clippy -p {crate} --all-targets --locked --features {feature}",
+            f"cargo test -p {crate} --locked --features {feature}",
+        ):
+            assert f"      - run: {command}\n" in rust, f"{gated}: the rust job must run `{command}`"
+
+
 def assert_rustdoc_job(docs: str, ci: str) -> None:
     """Not a required check, yet on purpose a gate: every pull request and every release.
 
@@ -885,6 +946,27 @@ def assert_dependabot_contract(dependabot: str) -> None:
         cargo,
         re.MULTILINE,
     ), "pyo3 0.30 and later must be ignored while the wheels support Python 3.8"
+    # The consumer shells load napi 2 builds, and napi-derive 3 only works with
+    # the napi 3 runtime: neither major may arrive on its own.
+    for crate in ("napi", "napi-derive"):
+        assert re.search(
+            rf'^      - dependency-name: "{re.escape(crate)}"\n        versions:\n          - ">=3"$',
+            cargo,
+            re.MULTILINE,
+        ), f"{crate} 3 and later must be ignored while the consumer shells load napi 2 builds"
+    # tiny-skia 0.12 changes rendered pixels; it waits for a reviewed change.
+    assert re.search(
+        r'^      - dependency-name: "tiny-skia"\n        versions:\n          - ">=0\.12"$',
+        cargo,
+        re.MULTILINE,
+    ), "tiny-skia 0.12 and later must be ignored until its rendering change is accepted"
+    # The Arrow pin follows the consumers; every Arrow crate past it is held,
+    # by one pattern, so the crates cannot drift apart.
+    assert re.search(
+        r'^      - dependency-name: "arrow\*"\n        versions:\n          - ">=59"$',
+        cargo,
+        re.MULTILINE,
+    ), "Arrow 59 and later must be ignored while the consumers stay on 58"
 
 
 def workflow_id(path: Path) -> str:
@@ -979,6 +1061,18 @@ def test_every_fuzz_target_is_declared_and_seeded():
 
 def test_the_required_checks_keep_their_names():
     assert_ci_jobs(read(CI))
+
+
+def test_feature_gated_code_is_linted_and_tested():
+    assert_gated_features_are_built_and_tested(read(CI))
+
+
+def test_the_feature_scan_finds_the_gated_features():
+    # The scan must keep finding what it guards; an empty result would make
+    # the contract above pass vacuously.
+    found = gated_features(read(CI))
+    assert {"geo-fast-core/http", "json-fast-core/mmap", "pdf-fast-core/glyph-catalog"} <= found
+    assert FEATURES_NOT_BUILT_IN_CI <= found
 
 
 SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -1171,6 +1265,17 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_audit_contract, AUDIT, "        run: cargo deny --locked check\n", "        run: cargo deny --locked check || true\n"),
         (assert_audit_contract, AUDIT, "  cargo-deny:\n", "  cargo-deny:\n    if: github.event_name == 'schedule'\n"),
         (assert_audit_contract, AUDIT, "      - deny.toml\n", ""),
+        # The doctors' policy check dropped, pointed at the workspace, given another
+        # policy, softened, gated, made to wait, or installed at another version.
+        (assert_audit_contract, AUDIT, "\n  cargo-deny-doctors:\n", "\n  cargo-deny-doctors-off:\n"),
+        (assert_audit_contract, AUDIT, "--manifest-path .leio-code/rust-doctors/Cargo.toml --config", "--manifest-path Cargo.toml --config"),
+        (assert_audit_contract, AUDIT, "--config deny.toml check\n", "--config doctors-deny.toml check\n"),
+        (assert_audit_contract, AUDIT, " --manifest-path .leio-code/rust-doctors/Cargo.toml --config deny.toml check\n", " --manifest-path .leio-code/rust-doctors/Cargo.toml --config deny.toml check licenses\n"),
+        (assert_audit_contract, AUDIT, "--config deny.toml check\n", "--config deny.toml check || true\n"),
+        (assert_audit_contract, AUDIT, "  cargo-deny-doctors:\n", "  cargo-deny-doctors:\n    if: github.event_name == 'schedule'\n"),
+        (assert_audit_contract, AUDIT, "  cargo-deny-doctors:\n", "  cargo-deny-doctors:\n    needs: cargo-deny\n"),
+        (assert_audit_contract, AUDIT, "  cargo-deny-doctors:\n", "  cargo-deny-doctors:\n    continue-on-error: true\n"),
+        (assert_audit_contract, AUDIT, "        run: cargo install cargo-deny --locked --version 0.20.2\n      - name: Check the doctors'", "        run: cargo install cargo-deny --locked --version 0.20.1\n      - name: Check the doctors'"),
         (assert_installers_are_pinned, AUDIT, "cargo install cargo-deny --locked --version", "cargo install cargo-deny --version"),
         (assert_no_audit_in_the_release_path, CI, "      - run: cargo fmt --all --check", "      - run: cargo deny check"),
         (assert_deny_policy, ROOT / DENY_CONFIG, 'unknown-registry = "deny"', 'unknown-registry = "warn"'),
@@ -1231,6 +1336,13 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         # A required check renamed, removed or given a display name; an undeclared job; a silent doc build.
         (assert_ci_jobs, CI, "\n  lean-formal:\n", "\n  lean:\n"),
         (assert_ci_jobs, CI, "\n  rust:\n", "\n  rust:\n    name: Rust\n"),
+        (assert_gated_features_are_built_and_tested, CI, "      - run: cargo test -p geo-fast-core --locked --features http\n", ""),
+        (assert_gated_features_are_built_and_tested, CI, "      - run: cargo clippy -p geo-fast-core --all-targets --locked --features http\n", ""),
+        (assert_gated_features_are_built_and_tested, CI, "      - run: cargo clippy -p json-fast-core --all-targets --locked --features mmap\n", ""),
+        (assert_gated_features_are_built_and_tested, CI, "      - run: cargo test -p json-fast-core --locked --features mmap\n", ""),
+        (assert_gated_features_are_built_and_tested, CI, "      - run: cargo clippy -p pdf-fast-core --all-targets --locked --features glyph-catalog\n", ""),
+        (assert_gated_features_are_built_and_tested, CI, "      - run: cargo test -p pdf-fast-core --locked --features glyph-catalog\n", ""),
+        (assert_gated_features_are_built_and_tested, CI, "  RUSTFLAGS: -D warnings\n", "  RUSTFLAGS: -W warnings\n"),
         (assert_ci_jobs, CI, "        os: [macos-latest, windows-latest]", "        os: [macos-latest]"),
         (assert_ci_jobs, CI, "\n  rustdoc:\n", "\n  docs:\n"),
         (assert_ci_jobs, CI, "      RUSTDOCFLAGS: -D warnings", "      RUSTDOCFLAGS: --cap-lints warn"),
@@ -1249,6 +1361,14 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_dependabot_contract, DEPENDABOT, "      arrow-major:", "      arrow-anything:"),
         (assert_dependabot_contract, DEPENDABOT, '          - "arrow-*"\n', ""),
         (assert_dependabot_contract, DEPENDABOT, '          - ">=0.30"', '          - ">=0.31"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "napi"\n        versions:\n          - ">=3"\n', ""),
+        (assert_dependabot_contract, DEPENDABOT, '"napi"\n        versions:\n          - ">=3"', '"napi"\n        versions:\n          - ">=4"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "napi-derive"\n', '      - dependency-name: "napi-build"\n'),
+        (assert_dependabot_contract, DEPENDABOT, '"napi-derive"\n        versions:\n          - ">=3"', '"napi-derive"\n        versions:\n          - ">=3.1"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "tiny-skia"\n', '      - dependency-name: "tiny-skia-path"\n'),
+        (assert_dependabot_contract, DEPENDABOT, '          - ">=0.12"', '          - ">=0.13"'),
+        (assert_dependabot_contract, DEPENDABOT, '      - dependency-name: "arrow*"\n', '      - dependency-name: "arrow"\n'),
+        (assert_dependabot_contract, DEPENDABOT, '          - ">=59"', '          - ">=61"'),
         (assert_dependabot_contract, DEPENDABOT, "        update-types:\n", "        exclude-patterns:\n          - arrow-*\n        update-types:\n"),
         (assert_dependabot_contract, DEPENDABOT, "      cargo-minor-and-patch:\n", "      arrow:\n        patterns:\n          - arrow-*\n      cargo-minor-and-patch:\n"),
     ],

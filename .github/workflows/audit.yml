@@ -12,7 +12,8 @@
 #
 # `cargo-deny` checks the policy in deny.toml on the same triggers: which
 # licences a dependency may carry, that every crate comes from crates.io, and
-# the advisories once more through a second tool.
+# the advisories once more through a second tool. It checks the doctors'
+# package against the same deny.toml, in a job of its own.
 name: audit
 
 on:
@@ -83,3 +84,21 @@ jobs:
         run: cargo install cargo-deny --locked --version 0.20.2
       - name: Check advisories, licences, duplicate versions and sources against deny.toml
         run: cargo deny --locked check
+
+  cargo-deny-doctors:
+    # The doctors' package and lockfile, against the same deny.toml. A job of
+    # its own like the audits above: a finding in the workspace must not hide
+    # one in the doctors, nor the other way round.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - name: Check the doctors' advisories, licences, duplicate versions and sources against deny.toml
+        run: cargo deny --locked --manifest-path .leio-code/rust-doctors/Cargo.toml --config deny.toml check

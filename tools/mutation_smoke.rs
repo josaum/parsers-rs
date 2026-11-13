@@ -30,6 +30,7 @@
 #![allow(dead_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -70,7 +71,10 @@ impl CappedAllocator {
         if live > ALLOCATION_CAP_BYTES && !REPORTING_CAP.swap(true, Ordering::SeqCst) {
             // `abort` does not allocate, so this is safe to call from inside
             // the allocator; a panic here would try to allocate its message.
-            eprintln!(
+            // `eprintln!` panics when stderr cannot be written (a closed
+            // pipe), so the write's error is ignored instead.
+            let _ = writeln!(
+                std::io::stderr(),
                 "mutation_smoke: allocation cap exceeded ({size} byte request, {live} bytes live); \
                  a parser allocated without bound on malformed input"
             );

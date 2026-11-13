@@ -15,6 +15,7 @@ use quick_xml::{Reader, XmlVersion};
 use reqwest::Client;
 
 use crate::error::GeoError;
+use crate::http_body::read_body_within;
 use crate::types::BBox;
 use crate::xml_text::TextRun;
 
@@ -101,7 +102,24 @@ impl WmsClient {
     }
 
     /// Fetch a rendered map tile as raw bytes (PNG by default).
+    ///
+    /// The response may be no longer than an image of `width` by `height`
+    /// pixels can reasonably be: see [`MAX_MAP_RESPONSE_BYTES`] for how that
+    /// limit follows from the size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeoError::Validation`], before any connection is made, when
+    /// `width` x `height` x 4 bytes is more than [`MAX_MAP_RESPONSE_BYTES`].
+    /// Returns [`GeoError::Http`] when the request fails, the server answers
+    /// with an error status, or the response is longer than its limit.
     pub async fn get_map(&self, bbox: &BBox, width: u32, height: u32) -> Result<Vec<u8>, GeoError> {
+        let max = map_response_limit(width, height).ok_or_else(|| {
+            GeoError::Validation(format!(
+                "WMS GetMap of {width} x {height} pixels could be larger than \
+                 {MAX_MAP_RESPONSE_BYTES} bytes"
+            ))
+        })?;
         let url = self.get_map_url(bbox, width, height, None);
         let resp = self
             .client
@@ -116,10 +134,7 @@ impl WmsClient {
                 resp.status()
             )));
         }
-        resp.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| GeoError::Http(e.to_string()))
+        read_body_within(resp, max, "WMS GetMap").await
     }
 
     /// Fetch and parse `GetCapabilities`, returning a list of available layers.
@@ -133,8 +148,29 @@ impl WmsClient {
     /// A document whose layers inherit more reference systems than
     /// [`MAX_INHERITED_CRS_BYTES`] allows is not an error: its later layers
     /// come back without the reference systems of their ancestors, and
-    /// nothing in the result says which. See [`parse_capabilities_xml`].
+    /// nothing in the result says which;
+    /// [`get_capabilities_with_report`](Self::get_capabilities_with_report)
+    /// does. See [`parse_capabilities_xml`].
     pub async fn get_capabilities(&self) -> Result<Vec<WmsLayer>, GeoError> {
+        parse_capabilities_xml(&self.capabilities_document().await?)
+    }
+
+    /// Fetch `GetCapabilities` and report layers whose inherited list was cut.
+    ///
+    /// The layers are those [`get_capabilities`](Self::get_capabilities)
+    /// returns. See [`parse_capabilities_xml_with_report`].
+    ///
+    /// # Errors
+    ///
+    /// As [`get_capabilities`](Self::get_capabilities).
+    pub async fn get_capabilities_with_report(&self) -> Result<WmsCapabilities, GeoError> {
+        parse_capabilities_xml_with_report(&self.capabilities_document().await?)
+    }
+
+    /// Fetches the `GetCapabilities` document, read within
+    /// [`MAX_CAPABILITIES_RESPONSE_BYTES`] and decoded in the character set
+    /// the response names.
+    async fn capabilities_document(&self) -> Result<String, GeoError> {
         let url = self.capabilities_url();
         let response = self
             .client
@@ -147,11 +183,13 @@ impl WmsClient {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let body = read_body_within(response, MAX_CAPABILITIES_RESPONSE_BYTES).await?;
-        let xml = decode_body(content_type.as_deref(), &body);
-        drop(body);
-
-        parse_capabilities_xml(&xml)
+        let body = read_body_within(
+            response,
+            MAX_CAPABILITIES_RESPONSE_BYTES,
+            "WMS GetCapabilities",
+        )
+        .await?;
+        Ok(decode_body(content_type.as_deref(), &body))
     }
 }
 
@@ -168,35 +206,50 @@ impl WmsClient {
 /// twice, once as bytes and once as text.
 pub const MAX_CAPABILITIES_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
-/// Reads the body of `response`, refusing one longer than `max` bytes.
+/// Smallest limit [`WmsClient::get_map`] puts on a response: 1 MiB.
 ///
-/// The length is checked before each piece is kept, so no more than `max`
-/// bytes and the piece in hand are ever held.
-async fn read_body_within(
-    mut response: reqwest::Response,
-    max: usize,
-) -> Result<Vec<u8>, GeoError> {
-    let too_large = || {
-        GeoError::Http(format!(
-            "WMS GetCapabilities response is larger than {max} bytes"
-        ))
-    };
-    let announced = response.content_length();
-    if announced.is_some_and(|length| usize::try_from(length).map_or(true, |length| length > max)) {
-        return Err(too_large());
+/// For a small image the fixed parts of the file outweigh its pixels: the
+/// headers of the format, a palette, an embedded color profile, GeoTIFF
+/// tags. A server that cannot draw the map answers with a
+/// `ServiceException` XML document instead, of a few kilobytes. Neither is
+/// in proportion to the pixel count, so no request is limited to less than
+/// this. Raising it lets a tiny request bring back more; lowering it may
+/// refuse a valid small tile that carries metadata.
+pub const MAP_RESPONSE_FLOOR_BYTES: usize = 1024 * 1024;
+
+/// Largest response [`WmsClient::get_map`] reads, and the largest map it
+/// asks for: 256 MiB.
+///
+/// The limit on one response follows from the size requested. An image of
+/// `width` x `height` pixels holds at most 4 bytes a pixel (8-bit RGBA, or
+/// one 32-bit sample) before it is encoded; the encoding adds little to
+/// that (PNG one filter byte a row and a few bytes for each 64 KiB stored
+/// block, an uncompressed TIFF its headers), and JPEG carries 3 channels,
+/// not 4. The limit is therefore `width` x `height` x 4 plus an eighth,
+/// never less than [`MAP_RESPONSE_FLOOR_BYTES`] and never more than this.
+///
+/// A request whose `width` x `height` x 4 alone is more than this is
+/// refused with [`GeoError::Validation`] before any connection is made:
+/// a square map of 8,192 pixels a side is the largest asked for. Above
+/// that, the image alone would be a quarter of a gigabyte. Formats with more than 4 bytes a pixel, such as
+/// 64-bit or multi-band floating-point GeoTIFF, are not covered by the
+/// derivation and may be refused once they pass it.
+pub const MAX_MAP_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
+/// The longest response [`WmsClient::get_map`] accepts for a map of
+/// `width` x `height` pixels; `None` when the request is too large to make.
+///
+/// See [`MAX_MAP_RESPONSE_BYTES`] for the derivation.
+fn map_response_limit(width: u32, height: u32) -> Option<usize> {
+    let ceiling = u64::try_from(MAX_MAP_RESPONSE_BYTES).ok()?;
+    let floor = u64::try_from(MAP_RESPONSE_FLOOR_BYTES).ok()?;
+    let pixels = u64::from(width).checked_mul(u64::from(height))?;
+    let raw = pixels.checked_mul(4)?;
+    if raw > ceiling {
+        return None;
     }
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(piece) = response
-        .chunk()
-        .await
-        .map_err(|e| GeoError::Http(e.to_string()))?
-    {
-        if piece.len() > max.saturating_sub(body.len()) {
-            return Err(too_large());
-        }
-        body.extend_from_slice(&piece);
-    }
-    Ok(body)
+    let limit = raw.saturating_add(raw / 8).clamp(floor, ceiling);
+    usize::try_from(limit).ok()
 }
 
 /// Decodes a response body as [`reqwest::Response::text`] does.
@@ -245,19 +298,73 @@ fn decode_body(content_type: Option<&str>, body: &[u8]) -> String {
 /// so a small document with many layers under a long list would grow into
 /// a very large result. The copies are limited to
 /// [`MAX_INHERITED_CRS_BYTES`] for the whole document, and inheritance of
-/// reference systems stops, silently, where that is spent. A layer whose
+/// reference systems stops where that is spent. A layer whose
 /// copy no longer fits is still returned, with its name, its title, the
 /// reference systems it declares itself and the bounding box it inherits,
 /// but without the reference systems of its ancestors; the layers in it
 /// inherit that shortened list. The result does not say which layers were
-/// cut short, so a caller cannot detect it today: a [`WmsLayer::crs_list`]
-/// shorter than that of the layers before it under the same parent is the
-/// only sign.
+/// cut short: [`parse_capabilities_xml_with_report`] reads the same layers
+/// and lists those.
 ///
 /// # Errors
 ///
 /// Returns [`GeoError::Xml`] when `xml` is not well-formed.
 pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
+    read_capabilities(xml, false).map(|capabilities| capabilities.layers)
+}
+
+/// Reads a capabilities document and reports layers whose inherited list was cut.
+///
+/// [`WmsCapabilities::layers`] is what [`parse_capabilities_xml`] returns
+/// for the same document. [`WmsCapabilities::inherited_crs_cut`] lists,
+/// in document order, every layer whose [`WmsLayer::crs_list`] lacks
+/// reference systems of its ancestors because [`MAX_INHERITED_CRS_BYTES`]
+/// was spent: the layers that were refused their copy, and every layer
+/// inside one of them, since those inherit the shortened list.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Xml`] when `xml` is not well-formed.
+pub fn parse_capabilities_xml_with_report(xml: &str) -> Result<WmsCapabilities, GeoError> {
+    read_capabilities(xml, true)
+}
+
+/// The layers of a capabilities document, with those whose inheritance was cut.
+///
+/// Returned by [`parse_capabilities_xml_with_report`] and
+/// [`WmsClient::get_capabilities_with_report`].
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct WmsCapabilities {
+    /// The named layers, as [`parse_capabilities_xml`] returns them.
+    pub layers: Vec<WmsLayer>,
+    /// The layers, in document order, whose [`WmsLayer::crs_list`] lacks
+    /// reference systems of their ancestors because
+    /// [`MAX_INHERITED_CRS_BYTES`] was spent; empty when none does.
+    pub inherited_crs_cut: Vec<LayerRef>,
+}
+
+/// A `<Layer>` of a capabilities document, by name or by position.
+///
+/// [`WmsCapabilities::inherited_crs_cut`] names layers this way. More
+/// ways may be added, such as one that tells apart layers sharing a name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LayerRef {
+    /// A layer with a name: the one in [`WmsCapabilities::layers`] with
+    /// this [`WmsLayer::name`]. A document may give two layers the same
+    /// name, and then this does not say which of them it is.
+    Named(String),
+    /// A layer without a name, a group, which is not in
+    /// [`WmsCapabilities::layers`]: its position among all the `<Layer>`
+    /// elements of the document, in the order they open, counting from 0.
+    Unnamed(usize),
+}
+
+/// What [`parse_capabilities_xml`] and
+/// [`parse_capabilities_xml_with_report`] do; `report` says whether the
+/// layers that were cut are listed.
+fn read_capabilities(xml: &str, report: bool) -> Result<WmsCapabilities, GeoError> {
     let mut reader = Reader::from_str(xml);
     // The reader does not trim: a value arrives in pieces (see `TextRun`),
     // and trimming each piece would close up `a &amp; b` to `a&b`. A `&` that
@@ -411,7 +518,7 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
         }
     }
 
-    Ok(resolve_inheritance(layers))
+    Ok(resolve_inheritance(layers, report))
 }
 
 /// Most bytes [`parse_capabilities_xml`] spends on the copies of inherited
@@ -426,9 +533,9 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
 /// counted for it: the layer keeps the reference systems it declares
 /// itself and still inherits its bounding box, and the layers in it
 /// inherit that shortened list. A later layer with a shorter list to
-/// inherit may still be given it. This is silent: the document is not
-/// refused, and nothing in a [`WmsLayer`] says its list was cut short, so
-/// a caller cannot detect it today.
+/// inherit may still be given it. The document is not refused, and nothing
+/// in a [`WmsLayer`] says its list was cut short;
+/// [`parse_capabilities_xml_with_report`] lists the layers that were.
 ///
 /// As a measure, under a root layer that lists 6000 `EPSG:` codes the
 /// first 340 layers are given the list and the ones after them are not.
@@ -445,8 +552,10 @@ pub const MAX_INHERITED_CRS_BYTES: usize = 64 * 1024 * 1024;
 /// reference system or a box after a child has closed.
 ///
 /// The records are resolved where they are: a second list of them would
-/// double what a document of many small layers costs.
-fn resolve_inheritance(mut layers: Vec<LayerRecord>) -> Vec<WmsLayer> {
+/// double what a document of many small layers costs. The layers whose
+/// inherited list was cut are listed only when `report` is set, so
+/// [`parse_capabilities_xml`] does not pay for copies of their names.
+fn resolve_inheritance(mut layers: Vec<LayerRecord>, report: bool) -> WmsCapabilities {
     let mut budget = MAX_INHERITED_CRS_BYTES;
     for at in 0..layers.len() {
         let (before, rest) = layers.split_at_mut(at);
@@ -475,13 +584,17 @@ fn resolve_inheritance(mut layers: Vec<LayerRecord>) -> Vec<WmsLayer> {
         if let Some(parent) = parent {
             // Charged before the copy is made. A list that does not fit is
             // not copied, and not looked at either.
-            let inherited: &[String] = match budget.checked_sub(parent.crs_bytes) {
+            let (inherited, refused): (&[String], bool) = match budget.checked_sub(parent.crs_bytes)
+            {
                 Some(left) => {
                     budget = left;
-                    &parent.crs_list
+                    (&parent.crs_list, false)
                 }
-                None => &[],
+                None => (&[], true),
             };
+            // Cut when refused its copy, or when the copy is of a list that
+            // was itself cut.
+            declared.crs_cut = refused || parent.crs_cut;
             declared.crs_list = merge_crs(inherited, own);
             declared.geographic = declared.geographic.or(parent.geographic);
             declared.bounding = declared.bounding.or(parent.bounding);
@@ -490,6 +603,11 @@ fn resolve_inheritance(mut layers: Vec<LayerRecord>) -> Vec<WmsLayer> {
         }
         declared.crs_bytes = copy_cost(&declared.crs_list);
     }
+    let inherited_crs_cut = if report {
+        cut_layers(&layers)
+    } else {
+        Vec::new()
+    };
     // Counted first: a list grown as it is filled is for a while held twice.
     let named = layers
         .iter()
@@ -503,7 +621,29 @@ fn resolve_inheritance(mut layers: Vec<LayerRecord>) -> Vec<WmsLayer> {
             .filter_map(|record| record.declared)
             .filter_map(|declared| declared.into_layer()),
     );
-    returned
+    WmsCapabilities {
+        layers: returned,
+        inherited_crs_cut,
+    }
+}
+
+/// The resolved `layers` whose inherited reference systems were cut, in
+/// the order they opened.
+fn cut_layers(layers: &[LayerRecord]) -> Vec<LayerRef> {
+    layers
+        .iter()
+        .enumerate()
+        .filter_map(|(at, record)| {
+            let declared = record.declared.as_deref()?;
+            declared.crs_cut.then(|| {
+                if declared.name.is_empty() {
+                    LayerRef::Unnamed(at)
+                } else {
+                    LayerRef::Named(declared.name.clone())
+                }
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -614,6 +754,9 @@ struct Declared {
     /// What a copy of `crs_list` counts for against
     /// [`MAX_INHERITED_CRS_BYTES`].
     crs_bytes: usize,
+    /// Whether `crs_list` lacks reference systems of the layer's ancestors
+    /// because the budget was spent, here or above.
+    crs_cut: bool,
     /// Geographic box: the layer's own, or once resolved the one it
     /// inherits.
     geographic: Option<BBox>,
@@ -702,6 +845,7 @@ fn read_box(layers: &mut [LayerRecord], record: usize, element: &BytesStart<'_>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_body::test_server::{local_client, ok_response, serve_once};
 
     const SAMPLE_CAPS: &str = r#"<?xml version="1.0"?>
     <WMS_Capabilities version="1.3.0">
@@ -1162,6 +1306,94 @@ mod tests {
         );
     }
 
+    /// The names of `layers`, as a report gives them.
+    fn named(layers: impl IntoIterator<Item = String>) -> Vec<LayerRef> {
+        layers.into_iter().map(LayerRef::Named).collect()
+    }
+
+    /// The report of a document is that of the layers
+    /// [`parse_capabilities_xml`] returns for it.
+    fn read_with_report(xml: &str) -> WmsCapabilities {
+        let capabilities = parse_capabilities_xml_with_report(xml).expect("capabilities");
+        let plain = parse_capabilities_xml(xml).expect("capabilities");
+        let summary = |layers: &[WmsLayer]| -> Vec<(String, Vec<String>, Option<BBox>)> {
+            layers
+                .iter()
+                .map(|layer| (layer.name.clone(), layer.crs_list.clone(), layer.bbox))
+                .collect()
+        };
+        assert_eq!(summary(&capabilities.layers), summary(&plain));
+        capabilities
+    }
+
+    /// Nothing cut, nothing reported.
+    #[test]
+    fn report_is_empty_when_no_inherited_list_is_cut() {
+        for xml in [
+            NESTED_CAPS.to_owned(),
+            SAMPLE_CAPS.to_owned(),
+            wide_capabilities(6000, 340),
+        ] {
+            let capabilities = read_with_report(&xml);
+            assert!(!capabilities.layers.is_empty());
+            assert_eq!(capabilities.inherited_crs_cut, []);
+        }
+    }
+
+    /// The cut used to be silent: under 6,000 reference systems the 341st
+    /// layer and the ones after it are named, and only they.
+    #[test]
+    fn report_names_the_layers_past_the_budget() {
+        for children in [341, 3000] {
+            let capabilities = read_with_report(&wide_capabilities(6000, children));
+            assert_eq!(capabilities.layers.len(), children);
+            assert_eq!(
+                capabilities.inherited_crs_cut,
+                named((340..children).map(|child| format!("l{child}")))
+            );
+        }
+    }
+
+    /// A layer inside a cut one inherits the shortened list, so it is
+    /// reported too, even where its own copy fitted. A group without a
+    /// name is reported by its position.
+    #[test]
+    fn report_names_the_layers_inside_a_cut_one() {
+        let mut xml = String::from("<C>");
+        for level in 0..3000 {
+            xml.push_str(&format!("<Layer><Name>n{level}</Name><CRS>c{level}</CRS>"));
+        }
+        xml.push_str(&"</Layer>".repeat(3000));
+        xml.push_str("</C>");
+        let capabilities = read_with_report(&xml);
+        let cut = capabilities
+            .layers
+            .iter()
+            .position(|layer| layer.crs_list.len() == 1 && layer.name != "n0")
+            .expect("a layer that was cut");
+        assert_eq!(
+            capabilities.inherited_crs_cut,
+            named((cut..3000).map(|level| format!("n{level}")))
+        );
+
+        // A root (0) with 670 children that fit (1 to 670), then a group
+        // (671) that does not, with a named layer (672) in it.
+        let long = "x".repeat(100_000);
+        let mut xml = format!("<C><Layer><CRS>{long}</CRS>");
+        xml.push_str(&"<Layer><Name>n</Name></Layer>".repeat(670));
+        xml.push_str(
+            "<Layer><Title>group</Title><CRS>g</CRS>\
+             <Layer><Name>inside</Name></Layer></Layer></Layer></C>",
+        );
+        let capabilities = read_with_report(&xml);
+        assert_eq!(capabilities.layers.len(), 671);
+        assert_eq!(capabilities.layers[670].crs_list, ["g"]);
+        assert_eq!(
+            capabilities.inherited_crs_cut,
+            [LayerRef::Unnamed(671), LayerRef::Named("inside".into())]
+        );
+    }
+
     #[test]
     fn inherited_reference_systems_within_the_budget_are_returned() {
         let layers = parse_capabilities_xml(&wide_capabilities(6000, 200)).expect("capabilities");
@@ -1254,56 +1486,126 @@ mod tests {
         assert_eq!(summary, vec![("x", vec!["A".to_string()])]);
     }
 
-    /// Serves `response` to the first connection on a local port and
-    /// returns the address to ask.
-    fn serve_once(response: Vec<u8>) -> String {
+    /// A client for the server at `base_url` that ignores any proxy.
+    fn local_wms(base_url: String) -> WmsClient {
+        WmsClient {
+            base_url,
+            layers: vec!["l".into()],
+            crs: "EPSG:4326".into(),
+            client: local_client(),
+        }
+    }
+
+    /// `get_map` of `width` x `height` pixels from a server that answers
+    /// with `response`.
+    async fn map_from(response: Vec<u8>, width: u32, height: u32) -> Result<Vec<u8>, GeoError> {
+        let bbox = BBox::new(-1.0, -1.0, 1.0, 1.0);
+        local_wms(serve_once(response))
+            .get_map(&bbox, width, height)
+            .await
+    }
+
+    /// Whether `result` is the refusal of a `GetMap` response over `max`.
+    fn map_refused(result: &Result<Vec<u8>, GeoError>, max: usize) -> bool {
+        matches!(
+            result,
+            Err(GeoError::Http(message))
+                if *message == format!("WMS GetMap response is larger than {max} bytes")
+        )
+    }
+
+    /// The limit grows with the map, between the floor and the ceiling,
+    /// and a map too large for the ceiling has none. There used to be no
+    /// limit at all.
+    #[test]
+    fn map_response_limit_follows_the_requested_size() {
+        assert_eq!(map_response_limit(0, 0), Some(MAP_RESPONSE_FLOOR_BYTES));
+        assert_eq!(map_response_limit(1, 1), Some(MAP_RESPONSE_FLOOR_BYTES));
+        assert_eq!(map_response_limit(256, 256), Some(MAP_RESPONSE_FLOOR_BYTES));
+        // 300,000 pixels, 1,200,000 bytes and an eighth more.
+        assert_eq!(map_response_limit(600, 500), Some(1_350_000));
+        assert_eq!(map_response_limit(4096, 4096), Some(75_497_472));
+        // Within the ceiling before the eighth is added, and capped by it.
+        assert_eq!(map_response_limit(8192, 8192), Some(MAX_MAP_RESPONSE_BYTES));
+        assert_eq!(map_response_limit(8192, 8193), None);
+        assert_eq!(map_response_limit(u32::MAX, u32::MAX), None);
+        assert_eq!(
+            map_response_limit(u32::MAX, 0),
+            Some(MAP_RESPONSE_FLOOR_BYTES)
+        );
+    }
+
+    /// The image used to be read whole, whatever its length.
+    #[tokio::test]
+    async fn get_map_response_over_its_limit_is_refused() {
+        // 600 x 500 pixels: 1,350,000 bytes.
+        let max = 1_350_000;
+        // Announced: refused on the header, before the body is sent.
+        let announced =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\nxx", max + 1).into_bytes();
+        assert!(map_refused(&map_from(announced, 600, 500).await, max));
+        // Not announced: refused while reading.
+        let unannounced = ok_response(&vec![b'x'; max + 1], false);
+        assert!(map_refused(&map_from(unannounced, 600, 500).await, max));
+        // Exactly the limit is read, announced or not.
+        for announced in [false, true] {
+            let exact = ok_response(&vec![b'x'; max], announced);
+            let image = map_from(exact, 600, 500).await.expect("image");
+            assert_eq!(image.len(), max);
+        }
+
+        // A tiny map is limited by the floor.
+        let floor = MAP_RESPONSE_FLOOR_BYTES;
+        let over = ok_response(&vec![b'x'; floor + 1], false);
+        assert!(map_refused(&map_from(over, 1, 1).await, floor));
+        let exact = ok_response(&vec![b'x'; floor], false);
+        assert_eq!(map_from(exact, 1, 1).await.expect("image").len(), floor);
+    }
+
+    /// A map too large for [`MAX_MAP_RESPONSE_BYTES`] is refused without
+    /// asking the server: it used to be requested, and read whole.
+    #[tokio::test]
+    async fn get_map_too_large_is_refused_before_connecting() {
         use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("address");
+        let connected = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&connected);
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
+                seen.store(true, Ordering::SeqCst);
                 let mut request = [0u8; 4096];
                 let _ = stream.read(&mut request);
-                // The client hangs up on a body it refuses.
-                let _ = stream.write_all(&response);
+                let _ = stream.write_all(&ok_response(b"png", true));
             }
         });
-        format!("http://{address}")
+        let bbox = BBox::new(-1.0, -1.0, 1.0, 1.0);
+        let result = local_wms(format!("http://{address}"))
+            .get_map(&bbox, 8192, 8193)
+            .await;
+        let expected = format!(
+            "WMS GetMap of 8192 x 8193 pixels could be larger than {MAX_MAP_RESPONSE_BYTES} bytes"
+        );
+        assert!(
+            matches!(&result, Err(GeoError::Validation(message)) if *message == expected),
+            "{result:?}"
+        );
+        assert!(!connected.load(Ordering::SeqCst));
     }
 
-    fn local_client() -> Client {
-        Client::builder().no_proxy().build().expect("client")
-    }
-
-    async fn read_within(response: Vec<u8>, max: usize) -> Result<Vec<u8>, GeoError> {
-        let url = serve_once(response);
-        let response = local_client().get(&url).send().await.expect("response");
-        read_body_within(response, max).await
-    }
-
-    /// The body used to be read whole, whatever its length.
+    /// The client reports the cut as the parser does.
     #[tokio::test]
-    async fn response_body_over_the_cap_is_refused() {
-        let refused = |result: Result<Vec<u8>, GeoError>| match result {
-            Err(GeoError::Http(message)) => message.contains("larger than 1000 bytes"),
-            _ => false,
-        };
-        // Announced: refused on the header.
-        let mut announced = b"HTTP/1.1 200 OK\r\nContent-Length: 1001\r\n\r\n".to_vec();
-        announced.extend_from_slice(&[b'x'; 1001]);
-        assert!(refused(read_within(announced, 1000).await));
-
-        // Not announced, 4 MB sent until the connection closes: refused
-        // while reading.
-        let mut unannounced = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
-        unannounced.extend_from_slice(&vec![b'x'; 4 << 20]);
-        assert!(refused(read_within(unannounced, 1000).await));
-
-        // Exactly the cap is read.
-        let mut exact = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
-        exact.extend_from_slice(&[b'x'; 1000]);
-        let body = read_within(exact, 1000).await.expect("body");
-        assert_eq!(body, vec![b'x'; 1000]);
+    async fn get_capabilities_with_report_names_the_cut_layers() {
+        let xml = wide_capabilities(6000, 341);
+        let capabilities = local_wms(serve_once(ok_response(xml.as_bytes(), true)))
+            .get_capabilities_with_report()
+            .await
+            .expect("capabilities");
+        assert_eq!(capabilities.layers.len(), 341);
+        assert_eq!(capabilities.inherited_crs_cut, named(["l340".to_owned()]));
     }
 
     /// The response is still decoded in the character set it names.
@@ -1331,13 +1633,10 @@ mod tests {
         )
         .into_bytes();
         response.extend_from_slice(body);
-        let client = WmsClient {
-            base_url: serve_once(response),
-            layers: Vec::new(),
-            crs: "EPSG:4326".into(),
-            client: local_client(),
-        };
-        let layers = client.get_capabilities().await.expect("capabilities");
+        let layers = local_wms(serve_once(response))
+            .get_capabilities()
+            .await
+            .expect("capabilities");
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].title, "Café");
     }
