@@ -5,6 +5,9 @@
 #[path = "../../tools/mutation_smoke.rs"]
 mod smoke;
 
+#[path = "../../tools/fuzz_package.rs"]
+mod fuzz_package;
+
 use docx_fast_core::{parse_docx_bytes, Block, DocxDocument, ParseOptions};
 use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
@@ -456,4 +459,49 @@ fn the_fuzz_corpus_holds_these_seeds() {
             ("docx_document_xml", "document.xml", document),
         ],
     );
+}
+
+/// The `docx_document_xml` fuzz target swaps its input in as `word/document.xml`. This
+/// checks the swap with the helper the target uses: text changed in that part
+/// must change what the parser returns, or the target would be fuzzing nothing.
+#[test]
+fn the_part_fuzz_target_reaches_the_reader_of_its_part() {
+    let name = "word/document.xml";
+    let target = include_str!("../fuzz/fuzz_targets/docx_document_xml.rs");
+    assert!(
+        target.contains(&format!("\"{name}\"")),
+        "the fuzz target no longer replaces {name}"
+    );
+    let seed = package(&seed_parts(), None, CompressionMethod::Stored);
+    let parts = fuzz_package::parts(&seed);
+    let original = parts
+        .iter()
+        .find(|(part, _)| part == name)
+        .expect("the seed has the part")
+        .1
+        .clone();
+    let text = String::from_utf8(original.clone()).expect("the seed part is UTF-8");
+    assert!(
+        text.contains("<w:t>noted</w:t>"),
+        "the seed part lost its marker text"
+    );
+    let changed = text.replacen("<w:t>noted</w:t>", "<w:t>FUZZMARKER</w:t>", 1);
+    let read = |body: &[u8]| {
+        let parsed = parse_docx_bytes(
+            fuzz_package::with_part(&parts, name, body),
+            ParseOptions::default(),
+        )
+        .expect("the rebuilt package parses");
+        serde_json::to_string(&parsed).expect("the result serializes")
+    };
+    assert!(!read(&original).contains("FUZZMARKER"));
+    assert!(read(changed.as_bytes()).contains("FUZZMARKER"));
+}
+
+#[test]
+#[should_panic(expected = "the seed package has no part called word/absent.xml")]
+fn a_part_fuzz_target_that_names_a_missing_part_is_a_harness_error() {
+    let seed = package(&seed_parts(), None, CompressionMethod::Stored);
+    let parts = fuzz_package::parts(&seed);
+    let _ = fuzz_package::with_part(&parts, "word/absent.xml", b"<w:document/>");
 }

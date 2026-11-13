@@ -5,6 +5,9 @@
 #[path = "../../tools/mutation_smoke.rs"]
 mod smoke;
 
+#[path = "../../tools/fuzz_package.rs"]
+mod fuzz_package;
+
 use pptx_fast_core::{parse_pptx_bytes, ParseOptions};
 use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
@@ -356,4 +359,41 @@ fn the_fuzz_corpus_holds_these_seeds() {
             ("pptx_slide_xml", "slide1.xml", slide),
         ],
     );
+}
+
+/// The `pptx_slide_xml` fuzz target swaps its input in as `ppt/slides/slide1.xml`. This
+/// checks the swap with the helper the target uses: text changed in that part
+/// must change what the parser returns, or the target would be fuzzing nothing.
+#[test]
+fn the_part_fuzz_target_reaches_the_reader_of_its_part() {
+    let name = "ppt/slides/slide1.xml";
+    let target = include_str!("../fuzz/fuzz_targets/pptx_slide_xml.rs");
+    assert!(
+        target.contains(&format!("\"{name}\"")),
+        "the fuzz target no longer replaces {name}"
+    );
+    let seed = package(&seed_parts(), None, CompressionMethod::Stored);
+    let parts = fuzz_package::parts(&seed);
+    let original = parts
+        .iter()
+        .find(|(part, _)| part == name)
+        .expect("the seed has the part")
+        .1
+        .clone();
+    let text = String::from_utf8(original.clone()).expect("the seed part is UTF-8");
+    assert!(
+        text.contains("&amp; tea"),
+        "the seed part lost its marker text"
+    );
+    let changed = text.replacen("&amp; tea", "&amp; FUZZMARKER", 1);
+    let read = |body: &[u8]| {
+        let parsed = parse_pptx_bytes(
+            fuzz_package::with_part(&parts, name, body),
+            ParseOptions::default(),
+        )
+        .expect("the rebuilt package parses");
+        serde_json::to_string(&parsed).expect("the result serializes")
+    };
+    assert!(!read(&original).contains("FUZZMARKER"));
+    assert!(read(changed.as_bytes()).contains("FUZZMARKER"));
 }

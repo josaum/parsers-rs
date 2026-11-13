@@ -5,6 +5,9 @@
 #[path = "../../tools/mutation_smoke.rs"]
 mod smoke;
 
+#[path = "../../tools/fuzz_package.rs"]
+mod fuzz_package;
+
 use std::io::{Cursor, Write};
 use xlsx_fast_core::{parse_xlsx_bytes, parse_xlsx_to_writer, CellValue, ParseOptions};
 use zip::write::SimpleFileOptions;
@@ -435,4 +438,41 @@ fn the_fuzz_corpus_holds_these_seeds() {
             ("xlsx_sheet_xml", "sheet1.xml", sheet),
         ],
     );
+}
+
+/// The `xlsx_sheet_xml` fuzz target swaps its input in as `xl/worksheets/sheet1.xml`. This
+/// checks the swap with the helper the target uses: text changed in that part
+/// must change what the parser returns, or the target would be fuzzing nothing.
+#[test]
+fn the_part_fuzz_target_reaches_the_reader_of_its_part() {
+    let name = "xl/worksheets/sheet1.xml";
+    let target = include_str!("../fuzz/fuzz_targets/xlsx_sheet_xml.rs");
+    assert!(
+        target.contains(&format!("\"{name}\"")),
+        "the fuzz target no longer replaces {name}"
+    );
+    let seed = package(&seed_parts(), None, CompressionMethod::Stored);
+    let parts = fuzz_package::parts(&seed);
+    let original = parts
+        .iter()
+        .find(|(part, _)| part == name)
+        .expect("the seed has the part")
+        .1
+        .clone();
+    let text = String::from_utf8(original.clone()).expect("the seed part is UTF-8");
+    assert!(
+        text.contains("<v>42.5</v>"),
+        "the seed part lost its marker text"
+    );
+    let changed = text.replacen("<v>42.5</v>", "<v>7777.25</v>", 1);
+    let read = |body: &[u8]| {
+        let parsed = parse_xlsx_bytes(
+            fuzz_package::with_part(&parts, name, body),
+            ParseOptions::default(),
+        )
+        .expect("the rebuilt package parses");
+        serde_json::to_string(&parsed).expect("the result serializes")
+    };
+    assert!(!read(&original).contains("7777.25"));
+    assert!(read(changed.as_bytes()).contains("7777.25"));
 }

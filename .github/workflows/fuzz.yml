@@ -69,9 +69,22 @@ jobs:
         working-directory: ${{ matrix.crate }}
         run: |
           set -euo pipefail
+          # cargo-fuzz has no --locked. This fails instead when the committed
+          # fuzz/Cargo.lock no longer matches the manifests, so the versions
+          # fuzzed are the versions reviewed.
+          cargo "+$NIGHTLY" metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+          # The list is taken first, so that a failure to list fails the step,
+          # and counted against the target files: a loop over nothing passes.
+          targets="$(cargo "+$NIGHTLY" fuzz list)"
+          expected="$(find fuzz/fuzz_targets -name '*.rs' | wc -l)"
+          listed="$(printf '%s\n' "$targets" | grep -c . || true)"
+          if [ "$listed" -eq 0 ] || [ "$listed" -ne "$expected" ]; then
+            echo "$listed fuzz targets are listed; fuzz/fuzz_targets holds $expected" >&2
+            exit 1
+          fi
           # Every target runs even after one fails, so one run names them all.
           failed=0
-          for target in $(cargo "+$NIGHTLY" fuzz list); do
+          for target in $targets; do
             mkdir -p "fuzz/corpus/$target"
             cargo "+$NIGHTLY" fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
               -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=25 || failed=1
@@ -103,13 +116,14 @@ jobs:
           persist-credentials: false
       - name: Install the dated nightly with Miri
         run: rustup toolchain install "$NIGHTLY" --profile minimal --component miri --component rust-src
-      # Each crate has a test of its scan small enough for the interpreter
-      # (tests/digit_scan.rs, tests/obj_marker_scan.rs); the larger unit tests
-      # would take it most of an hour. The AVX2 digit scan is not interpreted:
-      # it is chosen at run time by a CPU feature the interpreter does not
-      # report.
+      # Each crate has a test of its scan small enough for the interpreter:
+      # `vector_digit_scans_find_the_digit_at_every_position` calls the SSE2
+      # and NEON functions directly, and tests/obj_marker_scan.rs the marker
+      # scan. The larger unit tests would take it most of an hour. The AVX2
+      # digit scan is expected not to be interpreted: the test calls it only
+      # when the CPU feature is detected at run time.
       - name: The digit scan of xlsx-fast-core
-        run: cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --test digit_scan
+        run: cargo "+$NIGHTLY" miri test --locked -p xlsx-fast-core --lib vector_digit_scans
       - name: The object marker scan of pdf-fast-core
         run: cargo "+$NIGHTLY" miri test --locked -p pdf-fast-core --test obj_marker_scan
 

@@ -57,10 +57,8 @@ field can be changed by the caller; a `const` cannot.
 | | Nested table depth | 32 | `MAX_TABLE_DEPTH` |
 | | `basedOn` style links followed | 64 | `MAX_STYLE_CHAIN` |
 | `xlsx-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `xlsx-fast-core/src/lib.rs` |
-| | Text bytes in one Arrow batch | 64 MiB | `MAX_BATCH_TEXT_BYTES`, `xlsx-fast-core/src/arrow.rs` |
 | `pptx-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `pptx-fast-core/src/lib.rs` |
-| `email-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `email-fast-core/src/lib.rs` |
-| | One attachment / all attachments | 100 MiB / 100 MiB | `ParseOptions::max_attachment_size`, `max_total_attachment_bytes` |
+| `email-fast-core` | One attachment / all attachments | 100 MiB / 100 MiB | `ParseOptions::max_attachment_size`, `max_total_attachment_bytes`, `email-fast-core/src/lib.rs` |
 | | MIME nesting depth | 32 | `MAX_MIME_DEPTH` |
 | | Header-decoding work per message | 3,000,000,000 characters walked | `MAX_HEADER_DECODE_COST` |
 | | Multipart boundary length | 200 bytes | `MAX_BOUNDARY_LEN` |
@@ -86,6 +84,12 @@ field can be changed by the caller; a `const` cannot.
 `pdf-fast-core` has limits of its own; they are documented next to the
 constants in that crate and are not repeated here.
 
+Two names that look like limits and are not: `ParseOptions::max_inflate` in
+`email-fast-core` is accepted and has no effect, because that crate inflates
+nothing; and `MAX_BATCH_TEXT_BYTES` in `xlsx-fast-core/src/arrow.rs` (64 MiB)
+is the size at which an Arrow batch is closed, which a batch passes by up to
+one cell, not a bound on the input.
+
 **What is tested.** Every core crate has `tests/malformed_input_smoke.rs`: a
 deterministic, fixed-seed byte mutator over valid seed documents
 (`tools/mutation_smoke.rs`) that fails on any panic, runs under an allocator
@@ -94,10 +98,21 @@ deeply nested inputs to the parser on a 256 KiB thread stack
 (`SMALL_STACK_BYTES`). The workspace tests run on Linux, macOS and Windows on
 every pull request (`rust` and `rust-platforms` in `.github/workflows/ci.yml`).
 Coverage-guided libFuzzer targets live in the `fuzz/` directory of each of
-those crates except `pdf-fast-core` and `ontology-fast-core`, start from the
-same seed documents, and run on a schedule in `.github/workflows/fuzz.yml`,
-together with Miri over the tests of the `unsafe` SIMD scans and a build on
-the minimum supported Rust version.
+those crates except `pdf-fast-core` and `ontology-fast-core`, and start from
+the same seed documents. They cover the in-memory readers built with default
+features. They do not cover the Arrow writers (the `arrow` feature), the
+memory-mapped and path-based readers, or `geo-fast-core`'s HTTP clients; the
+smoke tests above are what exercises the Arrow writers. The targets run weekly
+in `.github/workflows/fuzz.yml`, and for a few seconds on a pull request that
+changes a fuzz crate.
+
+The same workflow runs, weekly and not on pull requests, a build with the
+minimum supported Rust version and Miri over the hand-written SIMD scans:
+the SSE2 and NEON versions of `find_first_digit` (`xlsx-fast-core`) and of
+`find_obj_markers_simd` (`pdf-fast-core`). The AVX2 version of
+`find_first_digit` is not interpreted by Miri, and no other `unsafe` code is:
+the remaining blocks are memory maps and the Arrow C data interface of the
+Python bindings.
 
 **What is not guaranteed.**
 
@@ -108,7 +123,8 @@ the minimum supported Rust version.
 - On malformed input the goal is an error or a partial result, never a panic,
   stack overflow or unbounded allocation. What a parser extracts from a
   damaged file is not specified and may change between versions.
-- Fuzzing and mutation testing find bugs; they do not prove there are none.
+- Fuzzing and mutation testing find bugs; they do not prove there are none,
+  and the readers listed above as not fuzzed have no fuzzing at all.
 - No sandboxing and no constant-time behaviour. A caller that parses hostile
   files should still isolate the process and set its own time limit.
 - The minimum supported Rust version is the `rust-version` in `Cargo.toml`
@@ -218,6 +234,17 @@ Verify consumer pin integrity in CI with:
 python3 vendor/parsers-rs/src/scripts/verify_consumer_pin.py --vendor vendor/parsers-rs
 python3 vendor/parsers-rs/src/scripts/consumer_surface_check.py --dist dist --consumer .
 ```
+
+## Third-party licences
+
+`web-fast-core` links four crates under the Mozilla Public License 2.0, through
+its HTML parser `scraper`: `cssparser`, `cssparser-macros`, `selectors` and
+`dtoa-short`. They are used unmodified, at the versions `Cargo.lock` records,
+and their source is published on crates.io (`https://crates.io/crates/<name>`)
+and in the `servo/rust-cssparser`, `servo/stylo` and `upsuper/dtoa-short`
+repositories on GitHub. MPL-2.0 asks a distributor of a binary that contains
+them to say where that source is; it puts no condition on the rest of the
+code. `deny.toml` allows MPL-2.0 for these four crates and for no other.
 
 ## License
 

@@ -1982,6 +1982,48 @@ mod tests {
         assert!(checked > 80_000, "checked {checked} inputs");
     }
 
+    /// Calls each vectorized scan directly. `find_first_digit` falls back to
+    /// a scalar scan when the vector function returns `None`, so a vector
+    /// path that missed a digit would be invisible through it. Small enough
+    /// for Miri: `cargo +nightly miri test -p xlsx-fast-core --lib vector_digit_scans`.
+    #[test]
+    fn vector_digit_scans_find_the_digit_at_every_position() {
+        type Scan = (&'static str, unsafe fn(&[u8]) -> Option<usize>);
+        let mut scans: Vec<Scan> = Vec::new();
+        #[cfg(target_arch = "aarch64")]
+        scans.push(("neon", super::find_first_digit_neon));
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        {
+            // The same conditions under which `find_first_digit` calls them.
+            if cfg!(target_arch = "x86_64") || std::is_x86_feature_detected!("sse2") {
+                scans.push(("sse2", super::find_first_digit_sse2));
+            }
+            if std::is_x86_feature_detected!("avx2") {
+                scans.push(("avx2", super::find_first_digit_avx2));
+            }
+        }
+        for (name, scan) in scans {
+            // `/` and `:` are the neighbours of the digits in ASCII; 0xB5 is
+            // a digit with the high bit set.
+            for filler in [b'/', b':', 0xB5] {
+                for len in 0..=70usize {
+                    let mut bytes = vec![filler; len];
+                    // SAFETY: `scans` holds a function only when the CPU
+                    // feature it is compiled for is present (NEON is baseline
+                    // on aarch64; SSE2 and AVX2 were detected above).
+                    assert_eq!(unsafe { scan(&bytes) }, None, "{name}: len {len}");
+                    for position in 0..len {
+                        bytes[position] = b"059"[position % 3];
+                        // SAFETY: as above.
+                        let found = unsafe { scan(&bytes) };
+                        assert_eq!(found, Some(position), "{name}: len {len}");
+                        bytes[position] = filler;
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn parse_cell_ref_basic() {
         assert_eq!(parse_cell_ref_bytes(b"A1"), Some((1, 1)));

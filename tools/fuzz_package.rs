@@ -36,9 +36,16 @@ pub fn parts(seed: &[u8]) -> Vec<(String, Vec<u8>)> {
 ///
 /// # Panics
 ///
-/// Panics if the in-memory ZIP writer fails, which it does not for names
+/// Panics if no part is called `name`: the target would then parse the same
+/// unchanged package on every run and report coverage for none of its input.
+/// That is a mistake in the harness, never a property of the input. Also
+/// panics if the in-memory ZIP writer fails, which it does not for names
 /// taken from a valid package.
 pub fn with_part(parts: &[(String, Vec<u8>)], name: &str, body: &[u8]) -> Vec<u8> {
+    assert!(
+        parts.iter().any(|(part, _)| part == name),
+        "the seed package has no part called {name}"
+    );
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     for (part, original) in parts {
