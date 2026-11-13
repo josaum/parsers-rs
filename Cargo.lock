@@ -1533,6 +1533,7 @@ version = "0.2.3"
 dependencies = [
  "byteorder",
  "criterion",
+ "encoding_rs",
  "quick-xml 0.41.0",
  "reqwest",
  "serde",

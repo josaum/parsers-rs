@@ -126,7 +126,8 @@ impl WmsClient {
     ///
     /// # Errors
     ///
-    /// Returns [`GeoError::Http`] when the request fails, and whatever
+    /// Returns [`GeoError::Http`] when the request fails or the response is
+    /// longer than [`MAX_CAPABILITIES_RESPONSE_BYTES`], and whatever
     /// [`parse_capabilities_xml`] returns for the document.
     ///
     /// A document whose layers inherit more reference systems than
@@ -135,18 +136,87 @@ impl WmsClient {
     /// nothing in the result says which. See [`parse_capabilities_xml`].
     pub async fn get_capabilities(&self) -> Result<Vec<WmsLayer>, GeoError> {
         let url = self.capabilities_url();
-        let xml = self
+        let response = self
             .client
             .get(&url)
             .send()
             .await
-            .map_err(|e| GeoError::Http(e.to_string()))?
-            .text()
-            .await
             .map_err(|e| GeoError::Http(e.to_string()))?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = read_body_within(response, MAX_CAPABILITIES_RESPONSE_BYTES).await?;
+        let xml = decode_body(content_type.as_deref(), &body);
+        drop(body);
 
         parse_capabilities_xml(&xml)
     }
+}
+
+/// Largest `GetCapabilities` response [`WmsClient::get_capabilities`]
+/// reads: 128 MiB.
+///
+/// The server decides how long its response is, so the body is counted as
+/// it arrives and the request fails with [`GeoError::Http`] once it would
+/// pass this size; a response that announces a longer body in
+/// `Content-Length` fails before any of it is read. The largest
+/// capabilities documents public servers publish are tens of megabytes
+/// (catalogues with tens of thousands of layers); the limit is a few times
+/// that, so none of them is refused. While the body is decoded it is held
+/// twice, once as bytes and once as text.
+pub const MAX_CAPABILITIES_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Reads the body of `response`, refusing one longer than `max` bytes.
+///
+/// The length is checked before each piece is kept, so no more than `max`
+/// bytes and the piece in hand are ever held.
+async fn read_body_within(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, GeoError> {
+    let too_large = || {
+        GeoError::Http(format!(
+            "WMS GetCapabilities response is larger than {max} bytes"
+        ))
+    };
+    let announced = response.content_length();
+    if announced.is_some_and(|length| usize::try_from(length).map_or(true, |length| length > max)) {
+        return Err(too_large());
+    }
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(piece) = response
+        .chunk()
+        .await
+        .map_err(|e| GeoError::Http(e.to_string()))?
+    {
+        if piece.len() > max.saturating_sub(body.len()) {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&piece);
+    }
+    Ok(body)
+}
+
+/// Decodes a response body as [`reqwest::Response::text`] does.
+///
+/// The character set is the `charset` parameter of `content_type`, UTF-8
+/// when there is none or it names no known encoding. A byte order mark
+/// overrides it, and bytes that are not valid become U+FFFD.
+fn decode_body(content_type: Option<&str>, body: &[u8]) -> String {
+    let label = content_type.and_then(|value| {
+        value.split(';').skip(1).find_map(|parameter| {
+            let (key, charset) = parameter.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case("charset")
+                .then(|| charset.trim().trim_matches('"'))
+        })
+    });
+    let encoding = label
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    encoding.decode(body).0.into_owned()
 }
 
 // ── XML capabilities parser ───────────────────────────────────────────────────
@@ -1086,5 +1156,93 @@ mod tests {
             .map(|layer| (layer.name.as_str(), layer.crs_list.clone()))
             .collect();
         assert_eq!(summary, vec![("x", vec!["A".to_string()])]);
+    }
+
+    /// Serves `response` to the first connection on a local port and
+    /// returns the address to ask.
+    fn serve_once(response: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                // The client hangs up on a body it refuses.
+                let _ = stream.write_all(&response);
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn local_client() -> Client {
+        Client::builder().no_proxy().build().expect("client")
+    }
+
+    async fn read_within(response: Vec<u8>, max: usize) -> Result<Vec<u8>, GeoError> {
+        let url = serve_once(response);
+        let response = local_client().get(&url).send().await.expect("response");
+        read_body_within(response, max).await
+    }
+
+    /// The body used to be read whole, whatever its length.
+    #[tokio::test]
+    async fn response_body_over_the_cap_is_refused() {
+        let refused = |result: Result<Vec<u8>, GeoError>| match result {
+            Err(GeoError::Http(message)) => message.contains("larger than 1000 bytes"),
+            _ => false,
+        };
+        // Announced: refused on the header.
+        let mut announced = b"HTTP/1.1 200 OK\r\nContent-Length: 1001\r\n\r\n".to_vec();
+        announced.extend_from_slice(&[b'x'; 1001]);
+        assert!(refused(read_within(announced, 1000).await));
+
+        // Not announced, 4 MB sent until the connection closes: refused
+        // while reading.
+        let mut unannounced = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        unannounced.extend_from_slice(&vec![b'x'; 4 << 20]);
+        assert!(refused(read_within(unannounced, 1000).await));
+
+        // Exactly the cap is read.
+        let mut exact = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        exact.extend_from_slice(&[b'x'; 1000]);
+        let body = read_within(exact, 1000).await.expect("body");
+        assert_eq!(body, vec![b'x'; 1000]);
+    }
+
+    /// The response is still decoded in the character set it names.
+    #[tokio::test]
+    async fn capabilities_are_decoded_in_the_declared_character_set() {
+        assert_eq!(
+            decode_body(Some("text/xml; charset=ISO-8859-1"), b"Caf\xe9"),
+            "Café"
+        );
+        assert_eq!(
+            decode_body(Some("text/xml;Charset=\"utf-8\""), "Café".as_bytes()),
+            "Café"
+        );
+        assert_eq!(
+            decode_body(Some("text/xml"), b"Caf\xc3\xa9 \xff"),
+            "Café \u{fffd}"
+        );
+        assert_eq!(decode_body(None, b"\xef\xbb\xbfa"), "a");
+
+        let body = b"<C><Layer><Name>n</Name><Title>Caf\xe9</Title></Layer></C>";
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=iso-8859-1\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        let client = WmsClient {
+            base_url: serve_once(response),
+            layers: Vec::new(),
+            crs: "EPSG:4326".into(),
+            client: local_client(),
+        };
+        let layers = client.get_capabilities().await.expect("capabilities");
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].title, "Café");
     }
 }

@@ -15,7 +15,7 @@ name = "geo_fast_core"
 
 [features]
 default = []
-http = ["dep:reqwest", "dep:tokio"]
+http = ["dep:reqwest", "dep:tokio", "dep:encoding_rs"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -32,6 +32,13 @@ quick-xml = "0.41"
 version = "0.13"
 default-features = false
 features = ["json", "native-tls-no-alpn", "charset", "http2", "system-proxy"]
+optional = true
+
+# Already built for reqwest's `charset` feature: it decodes a capabilities
+# response in the character set its `Content-Type` names, as
+# `reqwest::Response::text` does, once the body has been read under a cap.
+[dependencies.encoding_rs]
+version = "0.8"
 optional = true
 
 [dependencies.tokio]
