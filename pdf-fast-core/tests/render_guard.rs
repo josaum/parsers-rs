@@ -846,6 +846,450 @@ fn a_repeated_kids_entry_does_not_move_the_guard_off_the_rendered_page() {
     ));
 }
 
+/// A page that shows text in a Type 0 font (object 10) whose `/Encoding`
+/// is the CMap stream object 20; `cmaps` supplies object 20 and any others.
+fn type0_page(cmaps: Vec<(u32, Vec<u8>)>) -> Vec<u8> {
+    let font = b"<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding 20 0 R \
+        /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X \
+        /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+        /FontDescriptor << /Type /FontDescriptor /FontName /X /Flags 4 \
+        /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+        /CapHeight 700 /StemV 80 >> >>] >>"
+        .to_vec();
+    let mut rest = vec![(10, font)];
+    rest.extend(cmaps);
+    one_page(
+        "/Resources << /Font << /F1 10 0 R >> >>",
+        "BT /F1 12 Tf 10 10 Td <0102> Tj ET 0 0 10 10 re f",
+        rest,
+    )
+}
+
+const CMAP_BODY: &str = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+    1 begincodespacerange <00> <FF> endcodespacerange \
+    1 begincidrange <00> <FF> 0 endcidrange endcmap end end";
+
+/// `count` CMaps from object 20 on, each naming the next with both
+/// `/UseCMap` and `usecmap`; with `cycle` the last names the first.
+fn usecmap_chain(count: u32, cycle: bool) -> Vec<u8> {
+    let mut cmaps = Vec::new();
+    for index in 0..count {
+        let number = 20 + index;
+        let next = if index + 1 < count {
+            Some(number + 1)
+        } else if cycle {
+            Some(20)
+        } else {
+            None
+        };
+        let (dict, body) = match next {
+            Some(next) => (
+                format!("/Type /CMap /CMapName /C{number} /UseCMap {next} 0 R"),
+                format!("/C{next} usecmap {CMAP_BODY}"),
+            ),
+            None => (
+                format!("/Type /CMap /CMapName /C{number}"),
+                CMAP_BODY.to_string(),
+            ),
+        };
+        cmaps.push((number, stream(&dict, &body)));
+    }
+    type0_page(cmaps)
+}
+
+/// A Type 0 font whose CMap opens with `comments` consecutive comment lines.
+fn cmap_with_comments(comments: usize) -> Vec<u8> {
+    let body = format!("{}{CMAP_BODY}", "%\n".repeat(comments));
+    type0_page(vec![(20, stream("/Type /CMap /CMapName /C", &body))])
+}
+
+#[test]
+fn usecmap_chains_and_cycles_render_because_the_interpreter_never_follows_them() {
+    // hayro-interpret 0.5.0 only logs `/UseCMap` and treats `usecmap` as a
+    // no-op, so neither a cycle nor a long chain costs it anything.
+    assert_renders("two CMaps using each other", &usecmap_chain(2, true));
+    assert_renders("a chain of 1,000 CMaps", &usecmap_chain(1_000, false));
+}
+
+#[test]
+fn a_cmap_opening_with_a_million_comment_lines_is_refused() {
+    // The CMap lexer calls itself once per consecutive comment line.
+    assert_refused("a million comment lines", &cmap_with_comments(1_000_000));
+    assert_renders("twenty comment lines", &cmap_with_comments(20));
+}
+
+/// A page showing text in a Type 1 font whose descriptor holds a chain of
+/// `depth` arrays, each the next object; nothing but the font reaches them.
+fn deep_object_in_font(depth: u32) -> Vec<u8> {
+    let mut rest = vec![
+        (
+            10,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FontDescriptor 11 0 R >>"
+                .to_vec(),
+        ),
+        (
+            11,
+            b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 \
+              /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+              /CapHeight 700 /StemV 80 /Extra 12 0 R >>"
+                .to_vec(),
+        ),
+    ];
+    for level in 0..depth {
+        rest.push((12 + level, format!("[{} 0 R]", 13 + level).into_bytes()));
+    }
+    rest.push((12 + depth, b"[0]".to_vec()));
+    one_page(
+        "/Resources << /Font << /F1 10 0 R >> >>",
+        "BT /F1 12 Tf 10 10 Td (a) Tj ET",
+        rest,
+    )
+}
+
+#[test]
+fn an_object_nested_deeply_inside_a_font_is_refused() {
+    assert_refused(
+        "1,000 arrays under a font descriptor",
+        &deep_object_in_font(1_000),
+    );
+    assert_renders("8 arrays under a font descriptor", &deep_object_in_font(8));
+}
+
+/// A page painting a shading whose function is a sampled function with
+/// these `/Size` entries over `inputs` inputs, one output, and `samples`
+/// bytes of 8-bit samples.
+fn sampled_function(sizes: &str, inputs: usize, samples: usize) -> Vec<u8> {
+    let domain = "0 1 ".repeat(inputs);
+    one_page(
+        SHADED_PAGE,
+        "/S sh",
+        vec![(
+            10,
+            stream(
+                &format!(
+                    "/FunctionType 0 /Domain [{domain}] /Range [0 1] /Size [{sizes}] \
+                     /BitsPerSample 8"
+                ),
+                &"A".repeat(samples),
+            ),
+        )],
+    )
+}
+
+#[test]
+fn a_sampled_function_with_sixteen_inputs_is_refused() {
+    let sizes = "2 ".repeat(16);
+    assert_refused(
+        "16 inputs of 2 samples",
+        &sampled_function(&sizes, 16, 1 << 16),
+    );
+    assert_renders("256 samples", &sampled_function("256", 1, 256));
+    assert_renders(
+        "4 inputs of 8 samples",
+        &sampled_function("8 8 8 8", 4, 4096),
+    );
+}
+
+#[test]
+fn a_sampled_function_with_a_huge_overflowing_or_empty_size_is_refused() {
+    assert_refused(
+        "one input of 4,000,000,000 samples",
+        &sampled_function("4000000000", 1, 16),
+    );
+    assert_refused(
+        "a /Size whose product overflows",
+        &sampled_function("4294967295 4294967295 4294967295", 3, 16),
+    );
+    assert_refused("a /Size of zero", &sampled_function("0", 1, 0));
+    assert_refused(
+        "a stream of 4,000,000 samples",
+        &sampled_function("2", 1, 4_000_000),
+    );
+}
+
+#[test]
+fn a_million_saved_graphics_states_are_refused() {
+    let content = format!("{}0 0 10 10 re f", "q\n".repeat(1_000_000));
+    assert_refused("a million q", &one_page("", &content, Vec::new()));
+    let nested = format!("{}0 0 10 10 re f{}", "q ".repeat(100), " Q".repeat(100));
+    assert_renders("a hundred nested q", &one_page("", &nested, Vec::new()));
+}
+
+#[test]
+fn saved_graphics_states_add_up_across_nested_forms() {
+    // Each stream alone is under the bound; the form is drawn inside the
+    // page's 3,000 saved states and adds 3,000 of its own.
+    let page = format!("{}/F1 Do", "q ".repeat(3_000));
+    let inner = format!("{}0 0 10 10 re f", "q ".repeat(3_000));
+    assert_refused(
+        "3,000 q on the page, 3,000 in its form",
+        &one_page(
+            PAGE_DRAWS_F1,
+            &page,
+            vec![(10, form("/Resources << >>", &inner))],
+        ),
+    );
+}
+
+#[test]
+fn the_guards_own_decoding_never_refuses_a_page_whatever_the_document_budget() {
+    // A real file was refused once the guard also read font CMaps: its
+    // content streams alone took 99% of what the document budget had left
+    // after the render's own reserve. The guard's decoding is overhead and
+    // must not compete with the render for that budget.
+    let cmap = format!("{CMAP_BODY}{}", " ".repeat(2 * 1024 * 1024));
+    let bytes = type0_page(vec![(20, stream("/Type /CMap /CMapName /C", &cmap))]);
+    let mut rendered = 0;
+    for step in 1..=96 {
+        let options = ParseOptions {
+            max_total_decoded_bytes: step * 128 * 1024,
+            ..ParseOptions::default()
+        };
+        let Ok(document) = PdfDocument::from_slice(&bytes, options) else {
+            continue;
+        };
+        match document.page_rasterized_png_interpreted_checked(0, 72.0) {
+            Ok(Some(_)) => rendered += 1,
+            Ok(None) => {}
+            Err(error) => assert!(
+                !error.to_string().contains("interpreted render refused"),
+                "budget {} KiB: {error}",
+                step * 128
+            ),
+        }
+    }
+    assert!(rendered > 0, "no budget in the sweep rendered the page");
+}
+
+/// A page drawing an image XObject that declares `width` x `height` 8-bit
+/// grey pixels but holds only 16 bytes of samples.
+fn declared_image(width: u32, height: u32) -> Vec<u8> {
+    one_page(
+        "/Resources << /XObject << /I 10 0 R >> >>",
+        "q 50 0 0 50 0 0 cm /I Do Q",
+        vec![(
+            10,
+            stream(
+                &format!(
+                    "/Type /XObject /Subtype /Image /Width {width} /Height {height} \
+                     /ColorSpace /DeviceGray /BitsPerComponent 8"
+                ),
+                &"A".repeat(16),
+            ),
+        )],
+    )
+}
+
+/// The same as an inline image.
+fn declared_inline_image(width: u32, height: u32) -> Vec<u8> {
+    let content = format!(
+        "q 50 0 0 50 0 0 cm BI /W {width} /H {height} /CS /G /BPC 8 ID {} EI Q",
+        "A".repeat(16)
+    );
+    one_page("", &content, Vec::new())
+}
+
+#[test]
+fn images_declaring_more_pixels_than_the_render_may_decode_are_refused() {
+    // This crate already reserves an image XObject's declared RGBA size
+    // against the document budget before rendering, so the guard is only
+    // reached here with a budget large enough to hold that reservation.
+    let options = ParseOptions {
+        max_total_decoded_bytes: 8 << 30,
+        ..ParseOptions::default()
+    };
+    let document =
+        PdfDocument::from_slice(&declared_image(20_000, 20_000), options).expect("parses");
+    let error = match document.page_rasterized_png_interpreted_checked(0, 72.0) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a 20,000 x 20,000 image XObject: the interpreted renderer accepted it"),
+    };
+    assert!(
+        error.contains("interpreted render refused"),
+        "a 20,000 x 20,000 image XObject: unexpected error {error}"
+    );
+    assert_refused(
+        "a 20,000 x 20,000 inline image",
+        &declared_inline_image(20_000, 20_000),
+    );
+    assert_renders("a 4 x 4 image XObject", &declared_image(4, 4));
+    assert_renders("a 4 x 4 inline image", &declared_inline_image(4, 4));
+}
+
+/// A page filled with one tiling pattern whose 1 x 1 cell repeats every
+/// `step` units.
+fn sparse_tiling(step: u32) -> Vec<u8> {
+    one_page(
+        "/Resources << /Pattern << /P 10 0 R >> >>",
+        "/Pattern cs /P scn 0 0 100 100 re f",
+        vec![(
+            10,
+            stream(
+                &format!(
+                    "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                     /BBox [0 0 1 1] /XStep {step} /YStep {step} /Resources << >>"
+                ),
+                "0 0 1 1 re f",
+            ),
+        )],
+    )
+}
+
+#[test]
+fn a_tiling_cell_larger_than_the_render_may_hold_is_refused() {
+    // The interpreter sizes a cell's renderer from its step, not the page:
+    // this one was 8,000 x 8,000 pixels at 72 dpi, 287 MB at peak, and
+    // 2.95 GB at 300 dpi.
+    assert_refused(
+        "a 1 x 1 cell repeating every 8,000 units",
+        &sparse_tiling(8_000),
+    );
+    assert_renders("a 1 x 1 cell repeating every 2 units", &sparse_tiling(2));
+    assert_renders("8 nested tiling cells", &tiling_pattern(8));
+}
+
+/// A page showing text in `count` Type 0 fonts that share one CMap of
+/// `cmap_bytes` of Flate-compressed text, object 99.
+fn many_compressed_cmaps(count: u32, cmap_bytes: usize) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder
+        .write_all(format!("{CMAP_BODY}{}", " ".repeat(cmap_bytes)).as_bytes())
+        .expect("compresses");
+    let packed = encoder.finish().expect("compresses");
+    let mut fonts = String::new();
+    let mut content = String::from("BT ");
+    let mut rest = Vec::new();
+    for index in 0..count {
+        let font = 100 + 2 * index;
+        fonts.push_str(&format!("/F{index} {font} 0 R "));
+        content.push_str(&format!("/F{index} 12 Tf <01> Tj "));
+        rest.push((
+            font,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding 99 0 R \
+                 /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                 /FontDescriptor << /Type /FontDescriptor /FontName /X /Flags 4 \
+                 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+                 /CapHeight 700 /StemV 80 >> >>] >>"
+                .as_bytes()
+                .to_vec(),
+        ));
+    }
+    let mut cmap = format!(
+        "<< /Type /CMap /Filter /FlateDecode /Length {} >>\nstream\n",
+        packed.len()
+    )
+    .into_bytes();
+    cmap.extend_from_slice(&packed);
+    cmap.extend_from_slice(b"\nendstream");
+    rest.push((99, cmap));
+    content.push_str("ET");
+    one_page(
+        &format!("/Resources << /Font << {fonts}>> >>"),
+        &content,
+        rest,
+    )
+}
+
+#[test]
+fn the_guard_decodes_no_more_than_the_callers_decode_limit() {
+    // The file decodes to about 128 KiB, within the caller's 1 MiB limit,
+    // but the guard reads the shared CMap once per font: 8 MiB in all. It
+    // must stop at the caller's limit and refuse.
+    let limit = 1024 * 1024;
+    let options = ParseOptions {
+        max_total_decoded_bytes: limit,
+        ..ParseOptions::default()
+    };
+    let document =
+        PdfDocument::from_slice(&many_compressed_cmaps(64, 128 * 1024), options).expect("parses");
+    let error = match document.page_rasterized_png_interpreted_checked(0, 72.0) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("the guard decoded past the caller's 1 MiB limit"),
+    };
+    let decoded: usize = error
+        .split("after decoding ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|number| number.parse().ok())
+        .unwrap_or_else(|| panic!("no decoded-byte count in: {error}"));
+    // One CMap past the limit at most: each stream is counted once decoded.
+    assert!(decoded <= limit + 1024 * 1024, "decoded {decoded} bytes");
+}
+
+/// A page whose colour spaces break two bounds at once: `/A` nests 100
+/// `/Indexed` spaces, `/B` has a 16-input sampled tint transform.
+fn two_broken_colour_spaces() -> Vec<u8> {
+    let mut rest = Vec::new();
+    for level in 0..100u32 {
+        rest.push((
+            20 + level,
+            format!("[/Indexed {} 0 R 0 <00>]", 21 + level).into_bytes(),
+        ));
+    }
+    rest.push((120, b"/DeviceGray".to_vec()));
+    rest.push((
+        200,
+        stream(
+            &format!(
+                "/FunctionType 0 /Domain [{}] /Range [0 1] /Size [{}] /BitsPerSample 8",
+                "0 1 ".repeat(16),
+                "2 ".repeat(16)
+            ),
+            &"A".repeat(1 << 16),
+        ),
+    ));
+    one_page(
+        "/Resources << /ColorSpace << /A 20 0 R /B [/Separation /X /DeviceGray 200 0 R] >> >>",
+        "0 0 10 10 re f",
+        rest,
+    )
+}
+
+#[test]
+fn a_page_breaking_two_bounds_gives_the_same_reason_in_every_process() {
+    const CHILD: &str = "RENDER_GUARD_REASON_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let reason = match interpreted(&two_broken_colour_spaces()) {
+            Err(error) => error.to_string(),
+            Ok(_) => "accepted".to_string(),
+        };
+        println!("REASON {reason}");
+        return;
+    }
+    // Dictionary keys come back in hash-map order, which changes between
+    // processes, so the check runs in fresh processes.
+    let exe = std::env::current_exe().expect("test binary");
+    let mut reasons = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        let output = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "a_page_breaking_two_bounds_gives_the_same_reason_in_every_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("runs the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let reason = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once("REASON ")
+                    .map(|(_, reason)| reason.to_string())
+            })
+            .unwrap_or_else(|| panic!("no reason reported: {stdout}"));
+        reasons.insert(reason);
+    }
+    assert_eq!(
+        reasons.len(),
+        1,
+        "reasons differ between processes: {reasons:?}"
+    );
+}
+
 /// Runs the interpreter with no guard, on a thread with a chosen stack.
 ///
 /// Not a test: it exists to confirm that a fixture aborts the process and to
