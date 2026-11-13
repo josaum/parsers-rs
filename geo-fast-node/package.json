@@ -1,6 +1,6 @@
 {
   "name": "geo-fast-node",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "High-performance GIS N-API bindings, full parity with geo-fast-py",
   "main": "index.js",
   "types": "index.d.ts",

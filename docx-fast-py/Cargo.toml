@@ -1,6 +1,6 @@
 [package]
 name = "docx-fast-py"
-version = "0.2.10"
+version = "0.2.11"
 edition.workspace = true
 authors.workspace = true
 description = "Python bindings for docx-fast-core"

@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "ooxml-archive"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "pptx-fast-core"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "chrono",
