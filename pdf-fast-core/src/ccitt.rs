@@ -370,6 +370,31 @@ mod tests {
     }
 
     #[test]
+    fn encoded_byte_align_starts_each_row_on_a_byte() {
+        // Group 3 1D: each row `1011` `011` (4 white, 4 black) plus one fill bit.
+        // Group 4: row 1 H, white 2, black 6; row 2 V0 V0; each padded to a byte.
+        let cases: [(i64, &[u8], [u8; 8]); 2] = [
+            (0, &[0xB6, 0xB6], [W, W, W, W, B, B, B, B]),
+            (-1, &[0x2E, 0x40, 0xC0], [W, W, B, B, B, B, B, B]),
+        ];
+        for (k, raw, row) in cases {
+            let aligned = image(
+                8,
+                2,
+                &[
+                    ("K", PdfValue::Integer(k)),
+                    ("EncodedByteAlign", PdfValue::Bool(true)),
+                ],
+            );
+            assert_eq!(decode(raw, &aligned), [row; 2].concat(), "K {k}");
+
+            let unaligned = image(8, 2, &[("K", PdfValue::Integer(k))]);
+            let pixels = decode_ccitt_to_luma(raw, &unaligned).map(|luma| luma.pixels);
+            assert_ne!(pixels.ok(), Some([row; 2].concat()), "K {k}");
+        }
+    }
+
+    #[test]
     fn padding_stays_white_when_black_is_1() {
         // `/Columns 4` inside an 8-pixel `/Width`, and 3 rows for 2 coded rows.
         // Row 1 and 2: 2 white `0111`, 2 black `11`.
