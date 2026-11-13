@@ -76,9 +76,10 @@ pub const MAX_VALIDATION_NESTING_DEPTH: usize = crate::DEFAULT_MAX_NESTING_DEPTH
 /// worst-case depth is worked out before validating, from the longest chain
 /// of subschemas and the document's depth. Up to
 /// [`INLINE_APPLICATION_DEPTH`] it runs on the caller's stack; beyond that it
-/// runs, once, on a thread whose stack is that depth (at most this limit)
-/// times `STACK_BYTES_PER_APPLICATION`: at most 64 MiB of address space,
-/// touched only as far as the recursion goes.
+/// runs, once, on a worker thread that each calling thread starts on first
+/// need and keeps: its stack is this limit times
+/// `STACK_BYTES_PER_APPLICATION`, 64 MiB of address space, touched only as
+/// far as the recursion goes.
 pub const MAX_APPLICATION_DEPTH: usize = 2_048;
 
 /// Nested applications the caller's own stack is trusted with.
@@ -568,25 +569,100 @@ fn run(document: &Value, schema: &Value, budget: Option<u64>) -> Outcome {
     if worst_depth <= INLINE_APPLICATION_DEPTH {
         return run_on_this_stack(document, schema, budget, anchors, &shape.cyclic);
     }
-    let stack_bytes = worst_depth.min(MAX_APPLICATION_DEPTH) * STACK_BYTES_PER_APPLICATION;
     let cyclic = &shape.cyclic;
-    std::thread::scope(|scope| {
-        let spawned = std::thread::Builder::new()
-            .stack_size(stack_bytes)
-            .spawn_scoped(scope, move || {
-                run_on_this_stack(document, schema, budget, anchors, cyclic)
-            });
-        match spawned {
-            Ok(handle) => match handle.join() {
-                Ok(mut outcome) => {
-                    outcome.spawned = true;
-                    outcome
-                }
-                Err(_) => Outcome::stopped(VALIDATION_THREAD_FAILED),
-            },
-            Err(_) => Outcome::stopped(NO_VALIDATION_THREAD),
+    let outcome =
+        on_large_stack(move || run_on_this_stack(document, schema, budget, anchors, cyclic));
+    match outcome {
+        Ok(mut outcome) => {
+            outcome.spawned = true;
+            outcome
         }
-    })
+        Err(reason) => Outcome::stopped(reason),
+    }
+}
+
+/// A unit of work handed to the large-stack thread.
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+thread_local! {
+    /// This thread's large-stack worker, started on first need and stopped
+    /// when the thread exits (dropping the sender ends the worker's loop).
+    /// Nothing is shared between calling threads.
+    static LARGE_STACK_WORKER: std::cell::RefCell<Option<std::sync::mpsc::Sender<Job>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Starts a parked thread whose stack holds [`MAX_APPLICATION_DEPTH`]
+/// applications (64 MiB of address space, touched only as far as used).
+fn start_large_stack_worker() -> Option<std::sync::mpsc::Sender<Job>> {
+    let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+    std::thread::Builder::new()
+        .name("json-schema-validation".to_owned())
+        .stack_size(MAX_APPLICATION_DEPTH * STACK_BYTES_PER_APPLICATION)
+        .spawn(move || {
+            for job in queue {
+                // A panicking job must not take the worker with it; the
+                // caller learns of it because its reply never arrives.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            }
+        })
+        .ok()?;
+    Some(jobs)
+}
+
+/// Runs `work` on this thread's large-stack worker and waits for it.
+///
+/// Starting a thread per validation cost more than a shallow validation
+/// itself, so each calling thread keeps one worker and reuses it.
+///
+/// # Errors
+///
+/// Returns the message to report when the worker cannot be started or
+/// `work` panics. A panic leaves the worker usable for later calls.
+fn on_large_stack<'env, T: Send + 'env>(
+    work: impl FnOnce() -> T + Send + 'env,
+) -> Result<T, &'static str> {
+    let (reply, result) = std::sync::mpsc::sync_channel::<T>(1);
+    let job: Box<dyn FnOnce() + Send + 'env> = Box::new(move || {
+        let _ = reply.send(work());
+    });
+    // SAFETY: only the lifetime bound of the boxed closure changes. The
+    // closure borrows data that lives for `'env`, which outlives this call,
+    // and this function does not return until the closure is gone: every
+    // path below ends by dropping the closure unrun on this thread or by
+    // `result.recv()`, which returns only after the worker has run the
+    // closure to completion (a reply arrives) or has dropped it, either
+    // unrun or by unwinding out of it (the reply sender it owns is dropped).
+    let job: Job = unsafe {
+        std::mem::transmute::<Box<dyn FnOnce() + Send + 'env>, Box<dyn FnOnce() + Send + 'static>>(
+            job,
+        )
+    };
+    let sent = LARGE_STACK_WORKER.try_with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let mut job = job;
+        // A worker whose thread is gone is replaced once.
+        for _ in 0..2 {
+            if slot.is_none() {
+                *slot = start_large_stack_worker();
+            }
+            let Some(jobs) = slot.as_ref() else {
+                return false;
+            };
+            match jobs.send(job) {
+                Ok(()) => return true,
+                Err(std::sync::mpsc::SendError(returned)) => {
+                    job = returned;
+                    *slot = None;
+                }
+            }
+        }
+        false
+    });
+    if !matches!(sent, Ok(true)) {
+        return Err(NO_VALIDATION_THREAD);
+    }
+    result.recv().map_err(|_| VALIDATION_THREAD_FAILED)
 }
 
 /// Validates on the current thread's stack.
@@ -2900,6 +2976,24 @@ mod tests {
         assert!(fails("1e308", &schema));
         assert!(passes("1e308", &json!({"multipleOf": 1e300})));
         assert!(passes("7.5", &json!({"multipleOf": 2.5})));
+    }
+
+    #[test]
+    fn a_panic_on_the_large_stack_is_an_error_and_the_worker_survives() {
+        let borrowed = String::from("borrowed");
+        assert_eq!(on_large_stack(|| borrowed.len()), Ok(8));
+        let name = || std::thread::current().name().map(str::to_owned);
+        let worker = on_large_stack(name).expect("runs");
+        let failed: Result<(), _> = on_large_stack(|| panic!("inside the worker"));
+        assert_eq!(failed, Err(VALIDATION_THREAD_FAILED));
+        // Same worker, still serving; and another thread gets its own.
+        assert_eq!(on_large_stack(name), Ok(worker.clone()));
+        assert_ne!(name(), worker);
+        let other = std::thread::spawn(move || on_large_stack(|| std::thread::current().id()))
+            .join()
+            .expect("joins")
+            .expect("runs");
+        assert_ne!(Ok(other), on_large_stack(|| std::thread::current().id()));
     }
 
     #[test]
