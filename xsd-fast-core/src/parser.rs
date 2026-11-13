@@ -663,7 +663,12 @@ fn parse_complex_type_into(
                         // end tag, so they are not taken for children of the
                         // complex type.
                         let inline_type = parse_attribute_children(reader, ns_map)?;
-                        push_attribute_decl(&attrs, inline_type, &mut complex_type.attributes);
+                        push_attribute_decl(
+                            &attrs,
+                            inline_type,
+                            ns_map,
+                            &mut complex_type.attributes,
+                        );
                         depth -= 1;
                     }
                     "annotation" => {
@@ -675,7 +680,7 @@ fn parse_complex_type_into(
             }
             Tag::Empty { local, attrs } => {
                 if local == "attribute" {
-                    push_attribute_decl(&attrs, None, &mut complex_type.attributes);
+                    push_attribute_decl(&attrs, None, ns_map, &mut complex_type.attributes);
                 }
             }
             Tag::End { .. } => {
@@ -779,14 +784,10 @@ fn declared_type(
     ns_map: &HashMap<String, String>,
 ) -> Option<Box<XsdType>> {
     let type_attr = attrs.get("type")?;
-    let (prefix, type_local) = split_prefix(type_attr);
-    let named_like_builtin = is_xs_primitive(type_attr, ns_map);
-    let xs_is_default = ns_map
-        .get("")
-        .is_some_and(|uri| XS_URIS.contains(&uri.as_str()));
-    Some(Box::new(if !named_like_builtin {
+    let (_, type_local) = split_prefix(type_attr);
+    Some(Box::new(if !is_xs_primitive(type_attr, ns_map) {
         XsdType::Ref(QName::local(type_local))
-    } else if prefix.is_none() && !xs_is_default {
+    } else if is_unprefixed_builtin_name(type_attr, ns_map) {
         XsdType::Ref(QName {
             namespace: Some(UNPREFIXED_BUILTIN_NAME.to_owned()),
             local: type_local.to_owned(),
@@ -794,6 +795,110 @@ fn declared_type(
     } else {
         builtin_type(type_local)
     }))
+}
+
+/// Whether `type_ref` is a built-in name that may mean the schema's own type.
+///
+/// True for a built-in name written without a prefix where XML Schema is not
+/// the default namespace. Which type it means is known once every file is
+/// loaded; see [`settle_unprefixed_builtin_names`].
+fn is_unprefixed_builtin_name(type_ref: &str, ns_map: &HashMap<String, String>) -> bool {
+    let xs_is_default = ns_map
+        .get("")
+        .is_some_and(|uri| XS_URIS.contains(&uri.as_str()));
+    split_prefix(type_ref).0.is_none() && !xs_is_default && is_xs_primitive(type_ref, ns_map)
+}
+
+/// The kind of the simple type a `base` or attribute `type` names.
+///
+/// A name that may mean the schema's own type is kept, marked with
+/// [`UNPREFIXED_BUILTIN_NAME`], as a kind for
+/// [`settle_unprefixed_builtin_names`] to decide. Any other name goes by its
+/// local part: a built-in kind, or the name itself.
+fn named_simple_kind(type_ref: &str, ns_map: &HashMap<String, String>) -> SimpleTypeKind {
+    let local = split_prefix(type_ref).1;
+    if is_unprefixed_builtin_name(type_ref, ns_map) {
+        SimpleTypeKind::Other(format!("{UNPREFIXED_BUILTIN_NAME}{local}"))
+    } else {
+        SimpleTypeKind::from_local(local)
+    }
+}
+
+/// The schema set's own types that are named like built-ins.
+struct OwnTypes {
+    /// Names of the simple and complex types.
+    names: HashSet<String>,
+    /// The simple types as parsed, before any of them is settled.
+    simple: HashMap<String, SimpleTypeDef>,
+}
+
+/// Longest chain of own types, each restricting the next, that is followed.
+///
+/// Real chains are one or two long. The bound, with the check for a name met
+/// twice, keeps a cyclic schema from being followed for ever.
+const MAX_OWN_TYPE_CHAIN: usize = 8;
+
+/// Decides a simple type whose kind is a marked built-in name.
+///
+/// Where the schema set declares a simple type of that name, the type takes
+/// its kind and every facet it does not state itself, following a chain of
+/// such types. Where it does not, or the name leads back to `own_name` (the
+/// type being settled), the name is the built-in. Other types are left alone.
+fn settle_simple_type(simple: &mut SimpleTypeDef, own_name: Option<&str>, own: &OwnTypes) {
+    let SimpleTypeKind::Other(marked) = &simple.kind else {
+        return;
+    };
+    let Some(first) = marked.strip_prefix(UNPREFIXED_BUILTIN_NAME) else {
+        return;
+    };
+    let mut name = first.to_owned();
+    let mut seen: Vec<String> = own_name.map(str::to_owned).into_iter().collect();
+    for _ in 0..MAX_OWN_TYPE_CHAIN {
+        let Some(base) = own.simple.get(&name).filter(|_| !seen.contains(&name)) else {
+            break;
+        };
+        inherit_facets(&mut simple.facets, &base.facets);
+        seen.push(name);
+        match &base.kind {
+            SimpleTypeKind::Other(next) if next.starts_with(UNPREFIXED_BUILTIN_NAME) => {
+                name = next[UNPREFIXED_BUILTIN_NAME.len()..].to_owned();
+            }
+            kind => {
+                simple.kind = kind.clone();
+                return;
+            }
+        }
+    }
+    simple.kind = SimpleTypeKind::from_local(&name);
+}
+
+/// Fills each facet `facets` does not state from `base`.
+fn inherit_facets(facets: &mut SimpleFacets, base: &SimpleFacets) {
+    if facets.enumerations.is_empty() {
+        facets.enumerations.clone_from(&base.enumerations);
+    }
+    fn inherit<T: Clone>(own: &mut Option<T>, base: &Option<T>) {
+        if own.is_none() {
+            own.clone_from(base);
+        }
+    }
+    inherit(&mut facets.pattern, &base.pattern);
+    inherit(&mut facets.min_length, &base.min_length);
+    inherit(&mut facets.max_length, &base.max_length);
+    inherit(&mut facets.min_inclusive, &base.min_inclusive);
+    inherit(&mut facets.max_inclusive, &base.max_inclusive);
+    inherit(&mut facets.min_exclusive, &base.min_exclusive);
+    inherit(&mut facets.max_exclusive, &base.max_exclusive);
+    inherit(&mut facets.total_digits, &base.total_digits);
+    inherit(&mut facets.fraction_digits, &base.fraction_digits);
+}
+
+/// Settles a complex type: its attributes and everything in its content.
+fn settle_complex_type(complex_type: &mut ComplexType, own: &OwnTypes) {
+    for attribute in &mut complex_type.attributes {
+        settle_simple_type(&mut attribute.type_def, None, own);
+    }
+    settle_content(&mut complex_type.content, own);
 }
 
 /// The built-in simple type called `local`, with no facets.
@@ -822,35 +927,49 @@ const UNPREFIXED_BUILTIN_NAME: &str = "\0unprefixed-builtin-name";
 fn settle_unprefixed_builtin_names(model: &mut SchemaModel) {
     let is_builtin_name =
         |name: &&String| !matches!(SimpleTypeKind::from_local(name), SimpleTypeKind::Other(_));
-    let own: HashSet<String> = model
+    let names: HashSet<String> = model
         .simple_types
         .keys()
         .chain(model.complex_types.keys())
         .filter(is_builtin_name)
         .cloned()
         .collect();
+    let simple = model
+        .simple_types
+        .iter()
+        .filter(|(name, _)| names.contains(*name))
+        .map(|(name, simple)| (name.clone(), simple.clone()))
+        .collect();
+    let own = OwnTypes { names, simple };
+    for (name, simple) in &mut model.simple_types {
+        settle_simple_type(simple, Some(name), &own);
+    }
     for element in model.global_elements.values_mut() {
         settle_type(&mut element.type_def, &own);
     }
     for complex_type in model.complex_types.values_mut() {
-        settle_content(&mut complex_type.content, &own);
+        settle_complex_type(complex_type, &own);
     }
 }
 
 /// Settles one declared type, and the types declared inside it.
 ///
 /// The recursion follows the nesting of the model, which the parser bounds.
-fn settle_type(declared: &mut XsdType, own: &HashSet<String>) {
+fn settle_type(declared: &mut XsdType, own: &OwnTypes) {
     let builtin = match declared {
         XsdType::Ref(name) if name.namespace.as_deref() == Some(UNPREFIXED_BUILTIN_NAME) => {
             name.namespace = None;
-            (!own.contains(&name.local)).then(|| builtin_type(&name.local))
+            (!own.names.contains(&name.local)).then(|| builtin_type(&name.local))
         }
         XsdType::Complex(complex_type) => {
-            settle_content(&mut complex_type.content, own);
+            settle_complex_type(complex_type, own);
             None
         }
-        XsdType::Ref(_) | XsdType::Simple(_) => None,
+        XsdType::Simple(simple) => {
+            settle_simple_type(simple, None, own);
+            None
+        }
+        XsdType::Ref(_) => None,
     };
     if let Some(builtin) = builtin {
         *declared = builtin;
@@ -858,7 +977,11 @@ fn settle_type(declared: &mut XsdType, own: &HashSet<String>) {
 }
 
 /// Settles the types of the elements declared in one content model.
-fn settle_content(content: &mut ContentModel, own: &HashSet<String>) {
+fn settle_content(content: &mut ContentModel, own: &OwnTypes) {
+    if let ContentModel::SimpleContent(simple) = content {
+        settle_simple_type(simple, None, own);
+        return;
+    }
     let (ContentModel::Sequence(particles)
     | ContentModel::All(particles)
     | ContentModel::Choice(particles)) = content
@@ -914,9 +1037,10 @@ fn push_choice_group(
 fn push_attribute_decl(
     attrs: &HashMap<String, String>,
     inline_type: Option<SimpleTypeDef>,
+    ns_map: &HashMap<String, String>,
     attributes: &mut Vec<AttributeDecl>,
 ) {
-    if let Some(attr_decl) = parse_attribute_decl(attrs, inline_type) {
+    if let Some(attr_decl) = parse_attribute_decl(attrs, inline_type, ns_map) {
         attributes.push(attr_decl);
     }
 }
@@ -1028,7 +1152,7 @@ fn simple_extension_content(
     }
     Some(ContentModel::SimpleContent(Box::new(SimpleTypeDef {
         name: None,
-        kind: SimpleTypeKind::from_local(split_prefix(base).1),
+        kind: named_simple_kind(base, ns_map),
         facets: SimpleFacets::default(),
     })))
 }
@@ -1055,8 +1179,7 @@ fn parse_simple_type(
                 match local {
                     "restriction" => {
                         if let Some(base) = attrs.get("base") {
-                            let (_, base_local) = split_prefix(base);
-                            kind = SimpleTypeKind::from_local(base_local);
+                            kind = named_simple_kind(base, ns_map);
                         }
                         parse_facets(reader, &mut facets)?;
                     }
@@ -1081,8 +1204,7 @@ fn parse_simple_type(
                 if local == "restriction" {
                     let attrs = collect_attrs(e);
                     if let Some(base) = attrs.get("base") {
-                        let (_, base_local) = split_prefix(base);
-                        kind = SimpleTypeKind::from_local(base_local);
+                        kind = named_simple_kind(base, ns_map);
                     }
                 }
             }
@@ -1103,7 +1225,6 @@ fn parse_simple_type(
         buf.clear();
     }
 
-    let _ = ns_map;
     Ok(SimpleTypeDef {
         name: None,
         kind,
@@ -1170,16 +1291,16 @@ fn parse_facets(reader: &mut Reader<&[u8]>, facets: &mut SimpleFacets) -> Result
 fn parse_attribute_decl(
     attrs: &HashMap<String, String>,
     inline_type: Option<SimpleTypeDef>,
+    ns_map: &HashMap<String, String>,
 ) -> Option<AttributeDecl> {
     let name = attrs.get("name")?.clone();
     let required = attrs.get("use").is_some_and(|u| u == "required");
     let default = attrs.get("default").cloned();
     let fixed = attrs.get("fixed").cloned();
     let type_def = if let Some(type_attr) = attrs.get("type") {
-        let (_, local) = split_prefix(type_attr);
         SimpleTypeDef {
             name: None,
-            kind: SimpleTypeKind::from_local(local),
+            kind: named_simple_kind(type_attr, ns_map),
             facets: SimpleFacets::default(),
         }
     } else {
