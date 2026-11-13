@@ -3,6 +3,8 @@
 //! This module defines the in-memory representation of a parsed XSD schema.
 //! Only the subset needed for Arrow derivation and simple-type validation is modelled.
 
+use std::sync::Arc;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -235,22 +237,32 @@ pub struct SimpleTypeDef {
     ///
     /// On a list, `min_length` and `max_length` count items, as XML Schema
     /// measures the length of a list.
-    pub facets: SimpleFacets,
+    ///
+    /// Shared, not copied, between a named type and the types that restrict
+    /// it without adding facets of their own. Serialized as the facets
+    /// themselves.
+    pub facets: Arc<SimpleFacets>,
     /// The type of each item when this is an `xs:list`, or a restriction of
     /// one.
     ///
     /// `None` for every other type, and for a model serialized before the
     /// field existed. Left out of the serialized form when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub list_item: Option<Box<SimpleTypeDef>>,
+    pub list_item: Option<Arc<SimpleTypeDef>>,
     /// The member types when this is an `xs:union`, or a restriction of one,
     /// in the order they are written: `memberTypes` first, then the inline
     /// members.
     ///
     /// Empty for every other type, and for a model serialized before the
     /// field existed. Left out of the serialized form when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub union_members: Vec<SimpleTypeDef>,
+    #[serde(default, skip_serializing_if = "no_members")]
+    pub union_members: Arc<Vec<SimpleTypeDef>>,
+}
+
+/// Whether a union has no members; decides when
+/// [`SimpleTypeDef::union_members`] is left out of the serialized form.
+fn no_members(members: &Arc<Vec<SimpleTypeDef>>) -> bool {
+    members.is_empty()
 }
 
 impl SimpleTypeDef {
@@ -259,9 +271,9 @@ impl SimpleTypeDef {
         Self {
             name: None,
             kind,
-            facets: SimpleFacets::default(),
+            facets: Arc::default(),
             list_item: None,
-            union_members: Vec::new(),
+            union_members: Arc::default(),
         }
     }
 
@@ -587,7 +599,24 @@ impl SchemaModel {
         // chasing reads from this immutable view, which makes the pass
         // order-independent and prevents double-folding when a base type is
         // itself resolved later in the same pass.
-        let originals = self.complex_types.clone();
+        //
+        // Only a type some type names as its base is ever looked up there,
+        // so only those are copied.
+        let mut bases = std::collections::HashSet::new();
+        for ct in self.complex_types.values() {
+            collect_base_names(ct, &mut bases);
+        }
+        for element in self.global_elements.values() {
+            if let XsdType::Complex(ct) = &element.type_def {
+                collect_base_names(ct, &mut bases);
+            }
+        }
+        let originals: IndexMap<String, ComplexType> = self
+            .complex_types
+            .iter()
+            .filter(|(name, _)| bases.contains(name.as_str()))
+            .map(|(name, ct)| (name.clone(), ct.clone()))
+            .collect();
         let mut budget = FoldBudget {
             required: InheritanceBudget {
                 remaining: MAX_INHERITED_NODES,
@@ -622,6 +651,40 @@ impl SchemaModel {
             }
         }
         Ok(())
+    }
+}
+
+/// Adds the name of every base that `ct` or an inline type inside it names.
+///
+/// The recursion follows the nesting of the model, which the parser bounds.
+fn collect_base_names<'m>(ct: &'m ComplexType, bases: &mut std::collections::HashSet<&'m str>) {
+    if let Some(base) = &ct.base {
+        bases.insert(base.local.as_str());
+    }
+    collect_content_base_names(&ct.content, bases);
+}
+
+/// [`collect_base_names`] for the inline types of one content model.
+fn collect_content_base_names<'m>(
+    content: &'m ContentModel,
+    bases: &mut std::collections::HashSet<&'m str>,
+) {
+    let (ContentModel::Sequence(particles)
+    | ContentModel::All(particles)
+    | ContentModel::Choice(particles)) = content
+    else {
+        return;
+    };
+    for particle in particles {
+        match &particle.element {
+            ElementRef::Inline(decl) => {
+                if let XsdType::Complex(inner) = &decl.type_def {
+                    collect_base_names(inner, bases);
+                }
+            }
+            ElementRef::Group(group) => collect_content_base_names(group, bases),
+            ElementRef::Ref(_) | ElementRef::Any(_) => {}
+        }
     }
 }
 

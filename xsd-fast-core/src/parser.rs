@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
@@ -490,6 +491,8 @@ impl Loader {
             attribute_groups: &self.attribute_groups,
             global_attributes: &self.global_attributes,
             remaining: MAX_EXPANDED_NODES,
+            text_remaining: MAX_EXPANDED_TEXT_BYTES,
+            walks: 0,
         };
         expansion.expand_model(&mut self.model);
         settle_unprefixed_builtin_names(&mut self.model);
@@ -796,7 +799,7 @@ fn parse_particles(
                             Some(declared) => declared,
                             None => parse_inline_type(reader, ns_map, depth + 1)?,
                         };
-                        push_inline_particle(&attrs, type_def, &mut particles);
+                        push_inline_particle(&attrs, *type_def, &mut particles);
                     }
                 }
                 "sequence" => {
@@ -825,7 +828,7 @@ fn parse_particles(
                     } else if attrs.contains_key("name") {
                         let type_def =
                             declared_type(&attrs, ns_map).unwrap_or_else(unbounded_string_type);
-                        push_inline_particle(&attrs, type_def, &mut particles);
+                        push_inline_particle(&attrs, *type_def, &mut particles);
                     }
                 }
             }
@@ -993,9 +996,15 @@ struct OwnTypes {
 /// followed.
 const MAX_OWN_TYPE_CHAIN: usize = 64;
 
-/// The kind each own simple type settles to, worked out once per name.
+/// The kind each own simple type settles to, worked out once per name, and
+/// each own simple type settled, for the types that name it to share.
 struct SimpleKinds<'a> {
     own: &'a OwnTypes,
+    /// Each named simple type settled so far: `None` while it is being
+    /// settled, so a name met again is a cycle and is not followed.
+    settled: HashMap<String, Option<Arc<SimpleTypeDef>>>,
+    /// Units [`MAX_SETTLE_COPY_UNITS`] still allows.
+    remaining: usize,
     /// The settled kind of each name met so far: `None` inside the outer
     /// option while it is being worked out, so a name met again is a cycle;
     /// `None` inside the inner one when the name settles to no kind of its
@@ -1004,6 +1013,37 @@ struct SimpleKinds<'a> {
 }
 
 impl SimpleKinds<'_> {
+    /// The settled form of the own simple type `name`; `None` when there is
+    /// no such type, it is being settled (a cycle), or the chain of types
+    /// leading here is longer than [`MAX_OWN_TYPE_CHAIN`].
+    fn settled_named(&mut self, name: &str, chain: usize) -> Option<Arc<SimpleTypeDef>> {
+        if chain >= MAX_OWN_TYPE_CHAIN {
+            return None;
+        }
+        if let Some(known) = self.settled.get(name) {
+            return known.clone();
+        }
+        let own = self.own;
+        let (name, written) = own.simple.get_key_value(name)?;
+        let mut simple = written.clone();
+        self.settled.insert(name.clone(), None);
+        settle_simple_type_at(&mut simple, Some(name), self, chain, 0);
+        let simple = Arc::new(simple);
+        self.settled.insert(name.clone(), Some(Arc::clone(&simple)));
+        Some(simple)
+    }
+
+    /// Spends `units`; `false`, with nothing spent, when they are not left.
+    fn charge(&mut self, units: usize) -> bool {
+        match self.remaining.checked_sub(units) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The kind of a simple type as parsed: a union's shared member kind, a
     /// string for a list, the settled kind of the type a marked kind names.
     ///
@@ -1082,7 +1122,7 @@ fn settle_simple_type(
     own_name: Option<&str>,
     kinds: &mut SimpleKinds<'_>,
 ) {
-    settle_simple_type_at(simple, own_name, kinds, 0);
+    settle_simple_type_at(simple, own_name, kinds, 0, 0);
 }
 
 /// [`settle_simple_type`] for a type nested `depth` lists or unions deep.
@@ -1093,6 +1133,7 @@ fn settle_simple_type_at(
     simple: &mut SimpleTypeDef,
     own_name: Option<&str>,
     kinds: &mut SimpleKinds<'_>,
+    chain: usize,
     depth: usize,
 ) {
     let fallback = marked_reference(&simple.kind).map(|(_, fallback)| fallback);
@@ -1103,40 +1144,97 @@ fn settle_simple_type_at(
         }
         _ => None,
     };
-    let own = kinds.own;
-    let mut next = marked_reference(&simple.kind).map(|(name, _)| name.to_owned());
-    let mut seen: Vec<String> = own_name.map(str::to_owned).into_iter().collect();
-    for _ in 0..MAX_OWN_TYPE_CHAIN {
-        let Some(name) = next.take() else {
-            break;
-        };
-        let Some(base) = own.simple.get(&name).filter(|_| !seen.contains(&name)) else {
-            break;
-        };
-        inherit_facets(&mut simple.facets, &base.facets);
-        if depth == 0 {
-            if simple.list_item.is_none() {
-                simple.list_item.clone_from(&base.list_item);
+    let mut own_items = true;
+    let mut own_members = true;
+    let base_name = marked_reference(&simple.kind).map(|(name, _)| name.to_owned());
+    if let Some(base_name) = base_name.filter(|base| own_name != Some(base.as_str())) {
+        if let Some(base) = kinds.settled_named(&base_name, chain + 1) {
+            // The base is settled already: what it holds is shared, and
+            // copied only where the type adds facets of its own.
+            if facets_unset(&simple.facets) {
+                simple.facets = Arc::clone(&base.facets);
+            } else if !facets_unset(&base.facets)
+                && kinds.charge(inherit_cost(&simple.facets, &base.facets))
+            {
+                inherit_facets(Arc::make_mut(&mut simple.facets), &base.facets);
             }
-            if simple.union_members.is_empty() {
-                simple.union_members.clone_from(&base.union_members);
+            if simple.list_item.is_none() && base.list_item.is_some() {
+                simple.list_item.clone_from(&base.list_item);
+                own_items = false;
+            }
+            if simple.union_members.is_empty() && !base.union_members.is_empty() {
+                simple.union_members = Arc::clone(&base.union_members);
+                own_members = false;
             }
         }
-        seen.push(name);
-        next = marked_reference(&base.kind).map(|(name, _)| name.to_owned());
     }
     if let Some(kind) = kind {
         simple.kind = kind;
     }
     if depth < MAX_SIMPLE_TYPE_NESTING {
-        if let Some(item) = &mut simple.list_item {
-            settle_simple_type_at(item, None, kinds, depth + 1);
+        if let Some(item) = simple.list_item.as_mut().filter(|_| own_items) {
+            settle_simple_type_at(Arc::make_mut(item), None, kinds, chain, depth + 1);
         }
-        for member in &mut simple.union_members {
-            settle_simple_type_at(member, None, kinds, depth + 1);
+        if own_members && !simple.union_members.is_empty() {
+            for member in Arc::make_mut(&mut simple.union_members) {
+                settle_simple_type_at(member, None, kinds, chain, depth + 1);
+            }
         }
     }
 }
+
+/// Whether no facet is stated.
+fn facets_unset(facets: &SimpleFacets) -> bool {
+    facets.is_empty()
+        && facets.min_exclusive.is_none()
+        && facets.max_exclusive.is_none()
+        && facets.total_digits.is_none()
+        && facets.fraction_digits.is_none()
+}
+
+/// Budget units [`inherit_facets`] spends copying from `base` what `facets`
+/// does not state: one per enumeration value, and one per
+/// [`COPY_TEXT_BYTES_PER_UNIT`] bytes of copied text.
+fn inherit_cost(facets: &SimpleFacets, base: &SimpleFacets) -> usize {
+    let mut values = 0usize;
+    let mut bytes = 0usize;
+    if facets.enumerations.is_empty() {
+        values = base.enumerations.len();
+        for value in &base.enumerations {
+            bytes = bytes.saturating_add(value.value.len());
+            bytes = bytes.saturating_add(value.documentation.as_ref().map_or(0, String::len));
+        }
+    }
+    for (own, base) in [
+        (&facets.pattern, &base.pattern),
+        (&facets.min_inclusive, &base.min_inclusive),
+        (&facets.max_inclusive, &base.max_inclusive),
+        (&facets.min_exclusive, &base.min_exclusive),
+        (&facets.max_exclusive, &base.max_exclusive),
+    ] {
+        if own.is_none() {
+            bytes = bytes.saturating_add(base.as_ref().map_or(0, String::len));
+        }
+    }
+    values
+        .saturating_add(1)
+        .saturating_add(bytes / COPY_TEXT_BYTES_PER_UNIT)
+}
+
+/// Bytes of copied text charged as one unit of [`MAX_SETTLE_COPY_UNITS`]
+/// and [`MAX_EXPANDED_NODES`], as inheritance folding charges text.
+const COPY_TEXT_BYTES_PER_UNIT: usize = 256;
+
+/// Most that copying facets into types that add facets of their own may
+/// spend in one schema set, in units of one enumeration value or
+/// [`COPY_TEXT_BYTES_PER_UNIT`] bytes.
+///
+/// A type that adds no facet of its own shares its base's and copies
+/// nothing. One that adds some gets a copy holding both, and a schema can
+/// ask for a copy of a large enumeration per such type. Past this bound the
+/// type keeps only the facets it states, as every type did before chains of
+/// named types were followed. The size is that of the inheritance budgets.
+const MAX_SETTLE_COPY_UNITS: usize = 1 << 18;
 
 /// Deepest nesting of list items and union members read and settled.
 ///
@@ -1233,10 +1331,15 @@ fn settle_unprefixed_builtin_names(model: &mut SchemaModel) {
     };
     let mut kinds = SimpleKinds {
         own: &own,
+        settled: HashMap::new(),
+        remaining: MAX_SETTLE_COPY_UNITS,
         kinds: HashMap::new(),
     };
     for (name, simple) in &mut model.simple_types {
-        settle_simple_type(simple, Some(name), &mut kinds);
+        match kinds.settled_named(name, 0) {
+            Some(settled) => *simple = SimpleTypeDef::clone(&settled),
+            None => settle_simple_type(simple, Some(name), &mut kinds),
+        }
     }
     for element in model.global_elements.values_mut() {
         settle_type(&mut element.type_def, &mut kinds);
@@ -1294,7 +1397,7 @@ fn settle_content(content: &mut ContentModel, kinds: &mut SimpleKinds<'_>) {
 /// Appends the particle for a named `<xs:element>` whose type is `type_def`.
 fn push_inline_particle(
     attrs: &HashMap<String, String>,
-    type_def: Box<XsdType>,
+    type_def: XsdType,
     particles: &mut Vec<Particle>,
 ) {
     let Some(name) = attrs.get("name") else {
@@ -1305,7 +1408,7 @@ fn push_inline_particle(
         occurrence,
         element: ElementRef::Inline(Box::new(ElementDecl {
             name: QName::local(name.as_str()),
-            type_def: *type_def,
+            type_def,
             occurrence,
             nillable: attrs.get("nillable").is_some_and(|v| v == "true"),
             documentation: None,
@@ -1731,7 +1834,7 @@ fn parse_simple_type_at(
     }
 
     simple.kind = kind;
-    simple.facets = facets;
+    simple.facets = Arc::new(facets);
     Ok(simple)
 }
 
@@ -1803,9 +1906,9 @@ fn set_parts(
 ) {
     let mut parts = parts.into_iter();
     if local == "list" {
-        simple.list_item = parts.next().map(Box::new);
+        simple.list_item = parts.next().map(Arc::new);
     } else {
-        simple.union_members = parts.collect();
+        simple.union_members = Arc::new(parts.collect());
     }
 }
 
@@ -1957,6 +2060,39 @@ const MAX_EXPANDED_NODES: usize = 1 << 18;
 /// followed. A group met again on the chain adds nothing more.
 const MAX_ATTRIBUTE_GROUP_NESTING: usize = 32;
 
+/// The state of expanding the attribute group references of one type.
+struct GroupWalk<'a, 'w> {
+    /// The groups being walked, outermost first.
+    chain: &'w mut Vec<&'a str>,
+    /// The groups walked so far for this type.
+    visited: &'w mut HashSet<&'a str>,
+    /// The attribute names the type has so far.
+    seen: &'w mut HashSet<String>,
+}
+
+/// What copying one attribute costs [`Expansion`]: a unit, and a unit per
+/// [`COPY_TEXT_BYTES_PER_UNIT`] bytes of the text it owns; and those bytes.
+/// Its facets are shared with the original, not copied.
+fn attribute_copy_cost(attribute: &AttributeDecl) -> (usize, usize) {
+    let mut bytes = attribute.name.len();
+    for text in [&attribute.default, &attribute.fixed] {
+        bytes = bytes.saturating_add(text.as_ref().map_or(0, String::len));
+    }
+    (
+        1usize.saturating_add(bytes / COPY_TEXT_BYTES_PER_UNIT),
+        bytes,
+    )
+}
+
+/// Most bytes of attribute names, defaults and fixed values that expanding
+/// attribute references and attribute groups may copy in one schema set.
+///
+/// Every reference copies its attribute's text, so a long default or fixed
+/// value referenced by many types is copied once per type. Real attributes
+/// hold a few dozen bytes; 16 MiB is several hundred thousand of them. Past
+/// it, an attribute whose text does not fit is left out, without an error.
+const MAX_EXPANDED_TEXT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Replaces group references with what the groups hold.
 struct Expansion<'a> {
     /// Named attribute groups, as written.
@@ -1965,6 +2101,11 @@ struct Expansion<'a> {
     global_attributes: &'a HashMap<String, AttributeDecl>,
     /// Attributes and particles that may still be copied.
     remaining: usize,
+    /// Bytes of attribute text that may still be copied; see
+    /// [`MAX_EXPANDED_TEXT_BYTES`].
+    text_remaining: usize,
+    /// Attribute groups walked so far, for tests to bound the work.
+    walks: usize,
 }
 
 impl<'a> Expansion<'a> {
@@ -2012,6 +2153,23 @@ impl<'a> Expansion<'a> {
         }
     }
 
+    /// Charges copying `attribute`; `false`, with nothing charged, when the
+    /// budget cannot pay for it. Running out of units ends the expansion;
+    /// an attribute whose text does not fit is left out alone.
+    fn charge_copy(&mut self, attribute: &AttributeDecl) -> bool {
+        let (units, bytes) = attribute_copy_cost(attribute);
+        let Some(text_remaining) = self.text_remaining.checked_sub(bytes) else {
+            return false;
+        };
+        let Some(remaining) = self.remaining.checked_sub(units) else {
+            self.remaining = 0;
+            return false;
+        };
+        self.remaining = remaining;
+        self.text_remaining = text_remaining;
+        true
+    }
+
     /// Appends the global attribute a reference names, with the `use`,
     /// `default` and `fixed` the reference states, unless `seen` holds its
     /// name, the attribute is not declared, or the budget is spent.
@@ -2027,10 +2185,12 @@ impl<'a> Expansion<'a> {
         let Some(global) = self.global_attributes.get(name) else {
             return;
         };
-        if self.remaining == 0 || seen.contains(&global.name) {
+        if seen.contains(&global.name) {
             return;
         }
-        self.remaining -= 1;
+        if !self.charge_copy(global) {
+            return;
+        }
         seen.insert(global.name.clone());
         let mut attribute = global.clone();
         attribute.referenced = true;
@@ -2057,9 +2217,15 @@ impl<'a> Expansion<'a> {
             .collect();
         let mut expanded = Vec::with_capacity(attributes.len());
         let mut chain = Vec::new();
+        let mut visited = HashSet::new();
         for attribute in attributes {
             if let Some(group) = attribute_group_ref(&attribute) {
-                self.append_attribute_group(group, &mut chain, &mut seen, &mut expanded);
+                let mut walk = GroupWalk {
+                    chain: &mut chain,
+                    visited: &mut visited,
+                    seen: &mut seen,
+                };
+                self.append_attribute_group(group, &mut walk, &mut expanded);
             } else if attribute_ref(&attribute).is_some() {
                 self.append_referenced(&attribute, &mut seen, &mut expanded);
             } else {
@@ -2069,41 +2235,53 @@ impl<'a> Expansion<'a> {
         expanded
     }
 
-    /// Appends the attributes of the group `name` that `seen` does not hold.
+    /// Appends the attributes of the group `name` that `walk.seen` does not
+    /// hold.
+    ///
+    /// Each group is walked at most once per type: a group met again, on
+    /// its own chain or through another group, has nothing left to add.
+    /// Every walk is charged one unit and every attribute copied its
+    /// [`attribute_copy_cost`], so the work is bounded by the budget.
     fn append_attribute_group(
         &mut self,
         name: &str,
-        chain: &mut Vec<&'a str>,
-        seen: &mut HashSet<String>,
+        walk: &mut GroupWalk<'a, '_>,
         expanded: &mut Vec<AttributeDecl>,
     ) {
-        if chain.len() >= MAX_ATTRIBUTE_GROUP_NESTING || chain.contains(&name) {
+        if walk.chain.len() >= MAX_ATTRIBUTE_GROUP_NESTING || self.remaining == 0 {
             return;
         }
         let groups = self.attribute_groups;
         let Some((name, attributes)) = groups.get_key_value(name) else {
             return;
         };
-        chain.push(name.as_str());
+        if !walk.visited.insert(name.as_str()) {
+            return;
+        }
+        self.remaining -= 1;
+        self.walks += 1;
+        walk.chain.push(name.as_str());
         for attribute in attributes {
             match attribute_group_ref(attribute) {
-                Some(inner) => self.append_attribute_group(inner, chain, seen, expanded),
+                Some(inner) => self.append_attribute_group(inner, walk, expanded),
                 None if attribute_ref(attribute).is_some() => {
-                    self.append_referenced(attribute, seen, expanded);
+                    self.append_referenced(attribute, walk.seen, expanded);
                 }
                 None => {
-                    if self.remaining == 0 || seen.contains(&attribute.name) {
+                    if walk.seen.contains(&attribute.name) {
                         continue;
                     }
-                    self.remaining -= 1;
-                    seen.insert(attribute.name.clone());
+                    if !self.charge_copy(attribute) {
+                        continue;
+                    }
+                    walk.seen.insert(attribute.name.clone());
                     let mut attribute = attribute.clone();
                     attribute.referenced = true;
                     expanded.push(attribute);
                 }
             }
         }
-        chain.pop();
+        walk.chain.pop();
     }
 }
 
@@ -2272,4 +2450,56 @@ fn skip_element(reader: &mut Reader<&[u8]>, tag: &str) -> Result<()> {
         buf.clear();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Attribute groups walked to expand a chain of `depth` groups, each
+    /// naming the next `fan_out` times, referenced from one type.
+    fn walks_for_fan_out(depth: usize, fan_out: usize) -> usize {
+        let mut schema = String::from(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:t="urn:t" targetNamespace="urn:t">"#,
+        );
+        for level in 0..depth {
+            schema.push_str(&format!(r#"<xs:attributeGroup name="g{level}">"#));
+            for _ in 0..fan_out {
+                schema.push_str(&format!(r#"<xs:attributeGroup ref="t:g{}"/>"#, level + 1));
+            }
+            schema.push_str(&format!(
+                r#"<xs:attribute name="a{level}"/></xs:attributeGroup>"#
+            ));
+        }
+        schema.push_str(&format!(r#"<xs:attributeGroup name="g{depth}"/>"#));
+        schema.push_str(
+            r#"<xs:complexType name="T"><xs:attributeGroup ref="t:g0"/></xs:complexType></xs:schema>"#,
+        );
+        let options = ParseOptions::default();
+        let mut loader = Loader::new(None, &options);
+        loader
+            .parse_bytes(schema.as_bytes())
+            .expect("schema parses");
+        let mut expansion = Expansion {
+            attribute_groups: &loader.attribute_groups,
+            global_attributes: &loader.global_attributes,
+            remaining: MAX_EXPANDED_NODES,
+            text_remaining: MAX_EXPANDED_TEXT_BYTES,
+            walks: 0,
+        };
+        let mut model = std::mem::take(&mut loader.model);
+        expansion.expand_model(&mut model);
+        // Only the first 32 groups of the chain are followed.
+        let expected = depth.min(MAX_ATTRIBUTE_GROUP_NESTING);
+        assert_eq!(model.complex_types["T"].attributes.len(), expected);
+        expansion.walks
+    }
+
+    #[test]
+    fn each_attribute_group_is_walked_once_per_type() {
+        for fan_out in [2, 3] {
+            let walks = walks_for_fan_out(31, fan_out);
+            assert!(walks <= 32, "fan-out {fan_out}: {walks} walks");
+        }
+    }
 }
