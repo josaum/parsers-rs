@@ -826,14 +826,24 @@ impl DecodeBudget {
 
     /// Takes `bytes` from the budget, or fails if fewer remain.
     fn charge(&mut self, bytes: usize) -> Result<()> {
-        self.remaining = self.remaining.checked_sub(bytes).ok_or_else(|| {
-            anyhow!(
-                "the cross-reference and object streams decode to more than \
-                 {} times the file's length",
-                DECODE_MULTIPLE
-            )
-        })?;
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
+            .ok_or_else(|| self.exhausted())?;
         Ok(())
+    }
+
+    /// Takes up to `bytes` from the budget, for work already done.
+    fn spend(&mut self, bytes: usize) {
+        self.remaining = self.remaining.saturating_sub(bytes);
+    }
+
+    fn exhausted(&self) -> anyhow::Error {
+        anyhow!(
+            "the cross-reference and object streams decode to more than \
+             {} times the file's length",
+            DECODE_MULTIPLE
+        )
     }
 }
 
@@ -1285,19 +1295,42 @@ fn decode_stream(dictionary: &[u8], raw: &[u8], budget: &mut DecodeBudget) -> Re
 }
 
 /// Inflates zlib data, failing as soon as it passes what `budget` allows.
+///
+/// The buffer grows geometrically but never past the budget, so a stream cut
+/// off at the budget has held at most the budget, not twice it. What a
+/// failed stream inflated is spent, so many failing streams cannot each
+/// inflate the whole budget again.
 fn inflate(raw: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     use std::io::Read;
-    // One byte past the budget is enough to know it is exceeded.
-    let limit = u64::try_from(budget.remaining)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut decoded = Vec::new();
-    flate2::read::ZlibDecoder::new(raw)
-        .take(limit)
-        .read_to_end(&mut decoded)
-        .map_err(|error| anyhow!("its FlateDecode data is corrupt: {error}"))?;
-    #[cfg(test)]
-    work::add(&work::INFLATED_BYTES, decoded.len());
+    let mut decoder = flate2::read::ZlibDecoder::new(raw);
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let read = match decoder.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) => {
+                budget.spend(decoded.len());
+                return Err(anyhow!("its FlateDecode data is corrupt: {error}"));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        let length = decoded.len().saturating_add(read);
+        #[cfg(test)]
+        work::add(&work::INFLATED_BYTES, read);
+        if length > budget.remaining {
+            budget.spend(budget.remaining);
+            return Err(budget.exhausted());
+        }
+        if decoded.capacity() < length {
+            let target = length
+                .max(decoded.len().saturating_mul(2))
+                .min(budget.remaining);
+            decoded.reserve_exact(target.saturating_sub(decoded.len()));
+        }
+        decoded.extend_from_slice(chunk.get(..read).unwrap_or_default());
+    }
     budget.charge(decoded.len())?;
     Ok(decoded)
 }
@@ -3220,8 +3253,9 @@ mod tests {
         assert!(message.contains("more than"), "{message}");
         let inflated = work::take(&work::INFLATED_BYTES);
         let budget = 16 * pdf.len() + 64 * 1024;
+        // Inflating stops within one 16 KiB read of the budget.
         assert!(
-            inflated > 0 && inflated <= budget + 1,
+            inflated > 0 && inflated <= budget + 16 * 1024,
             "{inflated} bytes inflated"
         );
     }
