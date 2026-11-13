@@ -1345,20 +1345,28 @@ impl StyleFonts {
     }
 }
 
-/// Reads the three `w:rFonts` attributes this crate tells fonts apart by.
+/// Reads the `w:rFonts` attributes this crate tells fonts apart by.
+///
+/// Each script class has a named font (`w:ascii`) and a theme font
+/// (`w:asciiTheme`). When the theme attribute is present it is the one in
+/// use and the named font is ignored (ECMA-376 part 1, 17.3.2.26). A theme
+/// font is an ordinary text font, never one of the symbol fonts.
 fn font_choice<R: BufRead>(
     reader: &Reader<R>,
     e: &quick_xml::events::BytesStart<'_>,
 ) -> Result<symbol::FontChoice> {
-    let slot = |key: &[u8]| -> Result<symbol::FontSlot> {
+    let slot = |key: &[u8], theme_key: &[u8]| -> Result<symbol::FontSlot> {
+        if attr_value(reader, e, theme_key)?.is_some() {
+            return Ok(symbol::FontSlot::Plain);
+        }
         Ok(symbol::FontSlot::from_name(
             attr_value(reader, e, key)?.as_deref(),
         ))
     };
     Ok(symbol::FontChoice {
-        ascii: slot(b"ascii")?,
-        high_ansi: slot(b"hAnsi")?,
-        complex_script: slot(b"cs")?,
+        ascii: slot(b"ascii", b"asciiTheme")?,
+        high_ansi: slot(b"hAnsi", b"hAnsiTheme")?,
+        complex_script: slot(b"cs", b"cstheme")?,
     })
 }
 

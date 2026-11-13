@@ -328,3 +328,38 @@ fn the_old_properties_of_a_tracked_format_change_are_not_the_run_font() {
     };
     assert_eq!(fourth.style_id, None);
 }
+
+#[test]
+fn a_theme_font_is_an_ordinary_font() {
+    let theme = r#"w:asciiTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi" w:cstheme="minorBidi""#;
+    let styles = [
+        style("paragraph", "Marks", "", None, WINGDINGS),
+        // A style whose theme font replaces the font of the style it is
+        // based on.
+        style("paragraph", "Body", "", Some("Marks"), theme),
+    ]
+    .concat();
+    let body = [
+        // The run's theme font replaces the paragraph style's Wingdings.
+        format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Marks"/></w:pPr><w:r><w:rPr><w:rFonts {theme}/></w:rPr><w:t>Hello {pua}</w:t></w:r></w:p>"#,
+            pua = '\u{F04A}'
+        ),
+        // A theme font wins over a named font in the same slot.
+        format!(
+            r#"<w:p><w:r><w:rPr><w:rFonts {WINGDINGS} {theme}/></w:rPr><w:t>Hello</w:t></w:r></w:p>"#
+        ),
+        r#"<w:p><w:pPr><w:pStyle w:val="Body"/></w:pPr><w:r><w:t>Hello</w:t></w:r></w:p>"#
+            .to_string(),
+        // Only the ASCII slot is a theme font; the high-ANSI slot inherits.
+        format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Marks"/></w:pPr><w:r><w:rPr><w:rFonts w:asciiTheme="minorHAnsi"/></w:rPr><w:t>J{high}</w:t></w:r></w:p>"#,
+            high = '\u{FC}'
+        ),
+    ]
+    .concat();
+    assert_eq!(
+        paragraphs(&parse(&body, &styles)),
+        ["Hello \u{F04A}", "Hello", "Hello", "J\u{2713}"]
+    );
+}
