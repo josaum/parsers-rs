@@ -36,7 +36,7 @@ serde_json = "1.0"
 mailparse = "0.15"
 charset = "0.1"
 quoted_printable = "0.5"
-base64 = "0.22"
+base64 = "0.23"
 
 # MSG file parsing (OLE Compound File Binary — raw FAT/mini-FAT, no crate)
 encoding_rs = "0.8"
