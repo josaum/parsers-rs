@@ -28,7 +28,7 @@ cannot look fast.
 
 | Crate | Group | Input |
 |---|---|---|
-| `xlsx-fast-core` | `xlsx_200k_cells` | One sheet, 20,000 rows by 10 columns: 10,000 distinct shared strings, numbers, dates, formulas, booleans, inline strings. 8.9 MB of XML, 1.3 MB zipped, 15.1 MB of JSON. |
+| `xlsx-fast-core` | `xlsx_200k_cells` | One sheet, 20,000 rows by 10 columns: a table of 10,000 shared strings (3,000 of them referenced), numbers, dates, formulas, booleans, inline strings. 8.9 MB of XML, 1.3 MB zipped, 15.1 MB of JSON. |
 | `docx-fast-core` | `docx_2000_paragraphs` | 2,000 paragraphs of three runs, 100 tables, 200 footnotes, 80 comments, tracked insertions and deletions. 1.2 MB of XML, 2.0 MB of JSON. |
 | `pptx-fast-core` | `pptx_200_slides` | 200 slides, each with a title, a five-paragraph body, a 4x4 table and a notes slide (603 parts). 0.8 MB of XML. |
 | `email-fast-core` | `email_2mb_multipart`, `email_mbox_5000_messages`, `email_msg_fixture` | A 2.0 MB multipart message with plain and HTML bodies and two base64 attachments; a 2.0 MB mbox of 5,000 messages; an 8.7 kB `.msg` from the crate's fixture writer. |
@@ -71,7 +71,12 @@ Apple M1 (8 cores), 16 GB, macOS 26.5.2, rustc 1.98.1, release profile.
 idle machine would give and carry the noise shown. They are a floor to
 improve on, not a target.
 
-Criterion medians, with the 95% interval criterion reported:
+Criterion medians, with the 95% interval criterion reported. Each row is one
+run. The docx rows are this branch (the faster of two runs; the other gave
+37.1 ms and 31.7 ms while a compile was running beside it). The xlsx rows
+were taken with the build before the date change, which wall-clock time
+cannot tell apart from this branch. The pptx, email and archive crates have
+no source change.
 
 | Benchmark | Median | Interval | Throughput | Items per second |
 |---|---|---|---|---|
@@ -104,22 +109,24 @@ One parse plus JSON as a whole process:
 | xlsx, 200,000 cells | 1.262e9 | 51.5 MB |
 | docx, 2,000 paragraphs | 152.0 M | 11.8-13.2 MB |
 
-Neither parser holds a decompressed part twice: a part is inflated once into
-one buffer and read from it, and a UTF-16 part is the only case that is
-transcoded into a second buffer.
+From reading the code, neither parser holds a decompressed part twice: a
+part is inflated once into one buffer and read from it, and a UTF-16 part is
+the only case that is transcoded into a second buffer.
 
 ### Where the time goes
 
-Share of samples (macOS `sample`, self time) in the benchmark named, taken
-before the two optimizations listed further down:
+Share of samples (macOS `sample`) in the benchmark named, taken before the
+two optimizations listed further down. Shares for a pass or a stage include
+what it calls; shares for a single function (`memmove`, malloc, inflate) are
+its own time:
 
 - **xlsx, `json`**: XML event reading (27%); JSON serialization (21%, of
   which string escaping 8%); cell value decoding (17%, of which date
-  formatting 6% and re-checking shared strings as UTF-8 4%); attribute
+  formatting 6%); attribute
   iteration and decoding (12%); inflate (5%). Counted across those, `memmove`
   was 12% of self time, as the cell vector and the output buffer grow.
 - **docx, `json`**: the body pass (55%); a second full pass over the
-  document part that only collects header and footer references (21%); JSON
+  document part that only collects header and footer references (was 21%); JSON
   serialization (14%); notes (5%); inflate (2%). Across those, malloc and
   free were about 30% of all samples.
 - **pptx, `json`**: XML event reading (15%); inflate (12%, of which 8% is
@@ -151,7 +158,8 @@ Looked at and left alone, because the gain was within the noise of the
 measure used:
 
 - xlsx: keeping the shared-string table as a `String` so a lookup does not
-  re-validate UTF-8. 0.5% to 1% fewer instructions.
+  re-validate UTF-8. `from_utf8` was 4% of samples, but the change saved only
+  0.5% to 1% of instructions.
 - xlsx: a fast path for attribute values that need no normalization. The
   existing path already borrows; an estimated 2% at most.
 
