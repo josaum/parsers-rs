@@ -51,7 +51,7 @@ GetFlightInfo cmd �
 GetFlightInfo cmd 
     InvalidArgument: missing flight descriptor path
 PollFlightInfo book.xlsx without a bearer
-    Unimplemented: poll_flight_info
+    Unauthenticated: missing authorization metadata
 PollFlightInfo book.xlsx
     Unimplemented: poll_flight_info
 GetSchema book.xlsx without a bearer

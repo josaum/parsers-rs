@@ -41,7 +41,7 @@ GetFlightInfo cmd mail.eml
 GetFlightInfo cmd 
     path=cmd: tickets=[""] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
 PollFlightInfo mail.eml without a bearer
-    Unimplemented: poll_flight_info
+    Unauthenticated: missing authorization metadata
 PollFlightInfo mail.eml
     Unimplemented: poll_flight_info
 GetSchema mail.eml without a bearer
@@ -83,7 +83,7 @@ DoPut without a bearer
 DoPut
     Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
 DoExchange descriptor mail.eml without a bearer
-    Unimplemented: DoExchange not implemented
+    Unauthenticated: missing authorization metadata
 DoExchange descriptor mail.eml
     Unimplemented: DoExchange not implemented
 DoExchange no message

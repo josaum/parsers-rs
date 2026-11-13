@@ -165,8 +165,9 @@ impl FlightService for EmailFlightService {
 
     async fn poll_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
+        self.authorize(&request)?;
         Err(Status::unimplemented(POLL_FLIGHT_INFO_UNSUPPORTED))
     }
 
@@ -317,8 +318,9 @@ impl FlightService for EmailFlightService {
 
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        self.authorize(&request)?;
         Err(Status::unimplemented("DoExchange not implemented"))
     }
 

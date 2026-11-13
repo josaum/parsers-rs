@@ -399,8 +399,9 @@ impl<P: TableParser> FlightService for TableFlightService<P> {
 
     async fn poll_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
+        self.authorize(&request)?;
         Err(Status::unimplemented("poll_flight_info"))
     }
 

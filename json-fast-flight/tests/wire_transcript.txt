@@ -64,7 +64,7 @@ GetFlightInfo cmd �
 GetFlightInfo cmd 
     InvalidArgument: missing flight descriptor path
 PollFlightInfo data.jsonl without a bearer
-    Unimplemented: poll_flight_info
+    Unauthenticated: missing authorization metadata
 PollFlightInfo data.jsonl
     Unimplemented: poll_flight_info
 GetSchema data.jsonl without a bearer
@@ -124,7 +124,7 @@ DoPut without a bearer
 DoPut
     Unimplemented: json-fast-flight is reader-only (use json-fast-zerobus for writes)
 DoExchange descriptor data.jsonl without a bearer
-    Unimplemented: do_exchange
+    Unauthenticated: missing authorization metadata
 DoExchange descriptor data.jsonl
     Unimplemented: do_exchange
 DoExchange no message
