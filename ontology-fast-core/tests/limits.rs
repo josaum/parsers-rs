@@ -6,6 +6,7 @@
 
 use ontology_fast_core::{
     declared_prefixes, parse_turtle, parse_turtle_terms, OntologyError, OntologyLimits,
+    MAX_NESTING_DEPTH,
 };
 
 type Entry = fn(&[u8], OntologyLimits) -> Result<usize, OntologyError>;
@@ -160,4 +161,35 @@ fn rendering_does_not_test_every_prefix_against_every_term() {
         elapsed < std::time::Duration::from_secs(10),
         "rendering took {elapsed:?}"
     );
+}
+
+#[test]
+fn nesting_passes_at_the_limit_and_refuses_one_level_more() {
+    let nested = |open: &str, close: &str, depth: usize| {
+        format!(
+            "<a:a> <a:b> {}1{} .",
+            open.repeat(depth),
+            close.repeat(depth)
+        )
+        .into_bytes()
+    };
+    for (open, close) in [("(", ")"), ("[<a:b> ", "]")] {
+        let at_limit = nested(open, close, MAX_NESTING_DEPTH);
+        let over_limit = nested(open, close, MAX_NESTING_DEPTH + 1);
+        for (name, entry) in ENTRIES {
+            assert!(
+                entry(&at_limit, OntologyLimits::default()).is_ok(),
+                "{name}: {open:?} nested to the limit"
+            );
+            assert_eq!(
+                entry(&over_limit, OntologyLimits::default()),
+                Err(OntologyError::ResourceLimit {
+                    resource: "nesting_depth",
+                    limit: MAX_NESTING_DEPTH,
+                    observed: MAX_NESTING_DEPTH + 1,
+                }),
+                "{name}: {open:?} nested one level past the limit"
+            );
+        }
+    }
 }

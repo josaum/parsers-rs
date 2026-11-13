@@ -20,6 +20,7 @@ use std::fmt::Write as _;
 
 use ontology_fast_core::{
     declared_prefixes, parse_turtle, parse_turtle_terms, OntologyError, OntologyLimits,
+    MAX_NESTING_DEPTH,
 };
 
 #[global_allocator]
@@ -120,5 +121,32 @@ fn one_byte_past_the_default_source_budget_is_refused_before_it_is_copied() {
                 observed: limits.max_source_bytes + 1,
             })
         );
+    }
+}
+
+#[test]
+fn unclosed_brackets_filling_the_source_budget_are_refused_before_parsing() {
+    // Opening brackets cost the parser state and no statement, so only the
+    // nesting limit stands between this document and the allocator's cap.
+    let limits = OntologyLimits::default();
+    for open in [&b"("[..], b"[<a:b> ", b"<<", b"<a:c> {| <a:b> "] {
+        let mut source = b"<a:a> <a:b> ".to_vec();
+        while source.len() + open.len() <= limits.max_source_bytes {
+            source.extend_from_slice(open);
+        }
+        for refused in [
+            parse_turtle(&source, limits).map(|_| ()),
+            parse_turtle_terms(&source, limits).map(|_| ()),
+            declared_prefixes(&source, limits).map(|_| ()),
+        ] {
+            assert_eq!(
+                refused,
+                Err(OntologyError::ResourceLimit {
+                    resource: "nesting_depth",
+                    limit: MAX_NESTING_DEPTH,
+                    observed: MAX_NESTING_DEPTH + 1,
+                })
+            );
+        }
     }
 }

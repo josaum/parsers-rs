@@ -53,6 +53,17 @@ pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 /// datatype: a recorded contract difference, not a parse failure.
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
+/// Deepest nesting of brackets one document may use.
+///
+/// The Turtle parser keeps a few hundred bytes of state for every `[ ... ]`,
+/// `( ... )`, `<< ... >>` or `{| ... |}` it is inside, so a megabyte of opening
+/// brackets would otherwise cost hundreds of megabytes before a single
+/// statement is read. Ten thousand levels is far beyond any authored
+/// ontology and holds that state to a few megabytes. A document that nests
+/// deeper is refused with [`OntologyError::ResourceLimit`] naming
+/// `nesting_depth`, by every entry point, before it is parsed.
+pub const MAX_NESTING_DEPTH: usize = 10_000;
+
 /// Fail-closed resource budget for one parse.
 #[derive(Clone, Copy, Debug)]
 pub struct OntologyLimits {
@@ -393,8 +404,8 @@ impl OntologyIndex {
 /// # Errors
 ///
 /// Returns [`OntologyError::Syntax`] for malformed Turtle or non-UTF-8 input,
-/// [`OntologyError::ResourceLimit`] when a budget is exceeded,
-/// [`OntologyError::NamedGraph`] when a quad names a graph, and
+/// [`OntologyError::ResourceLimit`] when a budget or [`MAX_NESTING_DEPTH`] is
+/// exceeded, [`OntologyError::NamedGraph`] when a quad names a graph, and
 /// [`OntologyError::TripleTerm`] for an RDF 1.2 triple term. A base direction
 /// is not refused here: the text form keeps a literal's lexical form only, so
 /// direction is erased exactly as the language tag and datatype are.
@@ -505,8 +516,8 @@ pub fn parse_turtle(
 /// # Errors
 ///
 /// Returns [`OntologyError::Syntax`] for malformed Turtle or non-UTF-8 input,
-/// [`OntologyError::ResourceLimit`] when a budget is exceeded,
-/// [`OntologyError::NamedGraph`] when a quad names a graph,
+/// [`OntologyError::ResourceLimit`] when a budget or [`MAX_NESTING_DEPTH`] is
+/// exceeded, [`OntologyError::NamedGraph`] when a quad names a graph,
 /// [`OntologyError::TripleTerm`] for an RDF 1.2 triple term, and
 /// [`OntologyError::BaseDirection`] for a literal carrying a base direction.
 pub fn parse_turtle_terms(
@@ -582,7 +593,7 @@ pub fn parse_turtle_terms(
 /// # Errors
 ///
 /// Returns [`OntologyError::ResourceLimit`] when `source` exceeds
-/// `limits.max_source_bytes`, and [`OntologyError::Syntax`] when the document
+/// `limits.max_source_bytes` or [`MAX_NESTING_DEPTH`], and [`OntologyError::Syntax`] when the document
 /// does not parse: a table read from half a document would be a guess.
 pub fn declared_prefixes(
     source: &[u8],
@@ -612,6 +623,13 @@ fn read_default_graph(
     // the bytes of each term but steps over a comment without decoding it, so
     // the document as a whole is checked here, for both views alike.
     std::str::from_utf8(source).map_err(|error| OntologyError::Syntax(error.to_string()))?;
+    if nests_deeper_than(source, MAX_NESTING_DEPTH) {
+        return Err(OntologyError::ResourceLimit {
+            resource: "nesting_depth",
+            limit: MAX_NESTING_DEPTH,
+            observed: MAX_NESTING_DEPTH + 1,
+        });
+    }
     let mut blank_labels = BlankLabels::for_document(source);
     let mut parser = TurtleParser::new().for_slice(source);
     // `by_ref`: the parser is read again after the last triple, for the
@@ -628,6 +646,93 @@ fn read_default_graph(
         .prefixes()
         .map(|(prefix, namespace)| (prefix.to_owned(), namespace.to_owned()))
         .collect())
+}
+
+/// Whether `source` opens more than `limit` brackets inside one another.
+///
+/// A scan of the bytes, not a parse: it steps over what cannot hold a bracket
+/// (comments, quoted strings, IRIs and escaped characters) and counts `(`,
+/// `[`, `{` and `<<` against `)`, `]`, `}` and `>>`. It follows the Turtle
+/// tokenizer for as long as the document is well formed, and the parser stops
+/// at the first token that is not, so the count is the parser's own depth for
+/// every byte the parser would go on to read.
+fn nests_deeper_than(source: &[u8], limit: usize) -> bool {
+    let mut depth = 0_usize;
+    let mut at = 0_usize;
+    while let Some(byte) = source.get(at).copied() {
+        at += 1;
+        match byte {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            // An escaped character in a prefixed name, `ex:a\(b`.
+            b'\\' => at += 1,
+            b'#' => {
+                while source
+                    .get(at)
+                    .is_some_and(|next| !matches!(next, b'\n' | b'\r'))
+                {
+                    at += 1;
+                }
+            }
+            b'<' if source.get(at) == Some(&b'<') => {
+                at += 1;
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b'<' => {
+                // An IRI reference runs to `>`; it cannot hold white space or
+                // any of the other bytes that end the scan here.
+                while let Some(next) = source.get(at).copied() {
+                    if next <= b' '
+                        || matches!(next, b'<' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`')
+                    {
+                        break;
+                    }
+                    at += 1;
+                    if next == b'>' {
+                        break;
+                    }
+                }
+            }
+            b'>' if source.get(at) == Some(&b'>') => {
+                at += 1;
+                depth = depth.saturating_sub(1);
+            }
+            b'"' | b'\'' => at = end_of_string(source, at, byte),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The offset just past the quoted string whose opening `quote` ends at `at`.
+fn end_of_string(source: &[u8], mut at: usize, quote: u8) -> usize {
+    let long = source.get(at) == Some(&quote) && source.get(at + 1) == Some(&quote);
+    if long {
+        at += 2;
+    }
+    while let Some(byte) = source.get(at).copied() {
+        at += 1;
+        if byte == b'\\' {
+            at += 1;
+        } else if long {
+            if byte == quote && source.get(at) == Some(&quote) && source.get(at + 1) == Some(&quote)
+            {
+                return at + 2;
+            }
+        } else if byte == quote || byte == b'\n' || byte == b'\r' {
+            // A short string ends at its quote and cannot span a line.
+            return at;
+        }
+    }
+    at
 }
 
 /// Refuse the first distinct statement beyond `limits.max_statements`.
@@ -1188,5 +1293,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_nesting_scan_counts_brackets_only_where_the_tokenizer_would() {
+        let deeper_than = |text: &str, limit| nests_deeper_than(text.as_bytes(), limit);
+        assert!(deeper_than("<a:a> <a:b> ( [ <a:b> ( 1 ) ] ) .", 2));
+        assert!(!deeper_than("<a:a> <a:b> ( [ <a:b> ( 1 ) ] ) .", 3));
+        // Siblings do not nest.
+        assert!(!deeper_than("<a:a> <a:b> ( 1 ) , ( 2 ) , [ ] , ( 3 ) .", 1));
+        // Brackets in a comment, a string, a long string, an IRI and an
+        // escaped local name are text, not structure.
+        for inert in [
+            "# ((((\n<a:a> <a:b> ( 1 ) .",
+            "<a:a> <a:b> \"((((\" , '[[[[' , ( \"\\\"((\" ) .",
+            "<a:a> <a:b> \"\"\"((\n\"(\"\"((\\\"\"\"((\"\"\" , ( '''[['[''' ) .",
+            "<a:((((> <a:[[> ( <a:(> ) .",
+            "@prefix e: <a:> . e:a\\(\\(\\( e:b ( e:c\\( ) .",
+            "<a:a> <a:b> \"\" , ( '' ) .",
+        ] {
+            assert!(deeper_than(inert, 0), "{inert}");
+            assert!(!deeper_than(inert, 1), "{inert}");
+        }
+        // Reified triples and annotation blocks nest like brackets do.
+        assert!(deeper_than(
+            "<< << <a:a> <a:b> <a:c> >> <a:b> <a:c> >> <a:b> 1 .",
+            1
+        ));
+        assert!(!deeper_than(
+            "<< <a:a> <a:b> <a:c> >> <a:b> << <a:a> <a:b> 2 >> .",
+            1
+        ));
+        assert!(deeper_than(
+            "<a:a> <a:b> 1 {| <a:b> 2 {| <a:b> 3 |} |} .",
+            1
+        ));
     }
 }
