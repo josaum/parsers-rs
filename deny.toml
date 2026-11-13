@@ -1,0 +1,90 @@
+# Supply-chain policy for `cargo deny check`, run by audit.yml next to
+# `cargo audit`. Four questions about what Cargo.lock resolves: is there a
+# known advisory, is every licence one this project can ship under, is a crate
+# banned or duplicated, and does everything come from crates.io.
+#
+# Every setting is as strict as the lockfile passes today. Where it is weaker
+# than "deny", the comment beside it says what stops it and lists the findings.
+
+[graph]
+# Optional features are part of what a consumer can build (the `arrow` and
+# `http` features), so their dependencies are judged too.
+all-features = true
+
+[advisories]
+# No advisory is ignored. A finding is answered by upgrading the dependency.
+# A vulnerability, an unsound crate and an unmaintained crate all fail.
+ignore = []
+# A version withdrawn from crates.io by its author fails as well.
+yanked = "deny"
+
+[licenses]
+# The workspace is distributed as `MIT OR Apache-2.0`. A dependency passes when
+# its licence expression can be satisfied from this list alone; where a crate
+# offers a choice (`MIT OR Apache-2.0`, `Unlicense OR MIT`,
+# `Apache-2.0 OR LGPL-2.1-or-later`), the listed alternative is the one taken.
+# The list is exactly what the lockfile needs: remove any entry and the check
+# fails. Nothing here is copyleft over the combined work.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  # Apache-2.0 plus a linking exception that only adds permissions
+  # (target-lexicon, wasi, wasip2, wit-bindgen).
+  "Apache-2.0 WITH LLVM-exception",
+  # Permissive, attribution only: zerocopy, arrayref, zstd-sys (BSD-2-Clause);
+  # encoding_rs, tiny-skia, moxcms, pxfm, matchit, zstd, aws-lc-sys
+  # (BSD-3-Clause); aws-lc-rs, scraper, ego-tree, libloading, simple_asn1,
+  # untrusted (ISC); bytemuck, foldhash, miniz_oxide, zlib-rs, zune-jpeg (Zlib).
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  # Permissive with no attribution condition: adler2, mailparse,
+  # quoted_printable (0BSD); constant_time_eq, dunce, tiny-keccak (CC0-1.0, a
+  # public-domain dedication).
+  "0BSD",
+  "CC0-1.0",
+  # The Unicode data tables inside unicode-ident and the ICU4X crates (icu_*,
+  # zerovec, yoke, litemap, tinystr, writeable, potential_utf). Permissive,
+  # notice required.
+  "Unicode-3.0",
+  # File-level copyleft: a change to one of these crates' own files must be
+  # published, but it does not reach code that only links them. They are used
+  # unmodified, from crates.io: cssparser, cssparser-macros, selectors and
+  # dtoa-short, all behind web-fast-core's HTML parser.
+  "MPL-2.0",
+]
+# How sure the licence-text matcher must be before it names a licence.
+confidence-threshold = 0.93
+
+[licenses.private]
+# The repository doctors are an unpublished tool with no licence field.
+ignore = true
+
+[bans]
+# Two versions of one crate in the lockfile. This cannot be "deny" today:
+# every duplicate below is pulled in by a dependency's own dependency, and
+# goes away only when that dependency moves. Today's duplicates:
+#   base64 0.22.1, 0.23.1          bitflags 1.3.2, 2.13.2
+#   core-foundation 0.9.4, 0.10.1  foldhash 0.1.5, 0.2.0
+#   getrandom 0.2.17, 0.3.4, 0.4.3 hashbrown 0.15.5, 0.17.1
+#   miniz_oxide 0.8.9, 0.9.1       moxcms 0.7.11, 0.8.1
+#   png 0.17.16, 0.18.1            r-efi 5.3.0, 6.0.0
+#   rand_core 0.6.4, 0.9.5, 0.10.1 syn 2.0.119, 3.0.10
+# Raise this to "deny" (with a `skip` entry per unavoidable crate) once the
+# list is short enough to keep by hand.
+multiple-versions = "warn"
+# A dependency with no version requirement. This cannot be "deny" today: the
+# binding and Flight crates name their sibling core crates by path alone
+# (`docx-fast-core = { path = "../docx-fast-core" }`), which cargo-deny counts
+# as a wildcard for any crate that is not `publish = false`. No dependency
+# from crates.io is a wildcard.
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+# Everything comes from crates.io: no other registry and no git dependency.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
