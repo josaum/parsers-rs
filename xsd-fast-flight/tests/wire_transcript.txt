@@ -23,17 +23,17 @@ GetFlightInfo order.xsd?
 GetFlightInfo sub/Upper.XSD
     path=sub/Upper.XSD tickets=["sub/Upper.XSD"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
 GetFlightInfo sub\Upper.XSD
-    NotFound: XSD file not found
+    NotFound: file not found
 GetFlightInfo notes.txt
     path=notes.txt tickets=["notes.txt"] total_bytes=12 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
 GetFlightInfo missing.xsd
-    NotFound: XSD file not found
+    NotFound: file not found
 GetFlightInfo ../outside.xsd
-    PermissionDenied: path escapes root
+    NotFound: file not found
 GetFlightInfo link.xsd
-    PermissionDenied: path escapes root
+    NotFound: file not found
 GetFlightInfo <base>/outside.xsd
-    PermissionDenied: path escapes root
+    NotFound: file not found
 GetFlightInfo parts ["sub", "Upper.XSD?element=order"]
     path=sub/Upper.XSD?element=order tickets=["sub/Upper.XSD?element=order"] total_bytes=699 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
 GetFlightInfo parts ["sub", "..", "order.xsd"]
@@ -71,21 +71,21 @@ DoGet order.xsd?element=order&map_dates=true&batch=1
 DoGet sub/Upper.XSD?element=order
     messages=2 bytes=1000 fnv=d766d52dd8e50a0e batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
 DoGet sub\Upper.XSD?element=order
-    NotFound: XSD file not found
+    NotFound: file not found
 DoGet notes.txt?element=order
     Internal: External error: element 'order' not found in global elements
 DoGet missing.xsd?element=order
-    NotFound: XSD file not found
+    NotFound: file not found
 DoGet missing.xsd
-    NotFound: XSD file not found
+    NotFound: file not found
 DoGet ../outside.xsd?element=order
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoGet sub/../order.xsd?element=order
     messages=2 bytes=1000 fnv=d766d52dd8e50a0e batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
 DoGet link.xsd?element=order
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoGet <base>/outside.xsd?element=order
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoGet 
     InvalidArgument: ticket must specify ?element=<name>
 DoGet �
@@ -101,11 +101,11 @@ DoExchange descriptor order.xsd?element=order
 DoExchange descriptor order.xsd
     InvalidArgument: ticket must specify ?element=<name>
 DoExchange descriptor missing.xsd?element=order
-    NotFound: XSD file not found
+    NotFound: file not found
 DoExchange app_metadata order.xsd?element=order&max_depth=1
     messages=2 bytes=1000 fnv=20d640502ce74872 batches=1 rows=4 columns=["path", "arrow_type", "nullable"]
 DoExchange app_metadata ../outside.xsd?element=order
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoExchange an empty message
     InvalidArgument: exchange requires descriptor or app_metadata path
 DoExchange no message
@@ -129,11 +129,11 @@ DoAction list_elements {bad
 DoAction list_elements {"root":"notes.txt"}
     ["[]"]
 DoAction list_elements {"root":"missing.xsd"}
-    NotFound: XSD file not found
+    NotFound: file not found
 DoAction list_elements {"root":"../outside.xsd"}
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoAction list_elements {"root":"link.xsd"}
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoAction list_elements 
     ["Internal: mmap: ."]
 DoAction describe {"root":"order.xsd","element":"order"} without a bearer
@@ -149,12 +149,52 @@ DoAction describe {"element":"order"}
 DoAction describe order.xsd
     InvalidArgument: JSON parse error: expected value at line 1 column 1
 DoAction describe {"root":"missing.xsd","element":"order"}
-    NotFound: XSD file not found
+    NotFound: file not found
 DoAction describe {"root":"../outside.xsd","element":"order"}
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoAction unknown 
     Unimplemented: unknown action: unknown
 ListActions without a bearer
     Unauthenticated: missing authorization metadata
 ListActions
     ["list_elements: List global element names for an XSD file", "describe: Derive Arrow schema description for a root element", "parsers.flight.codec_capabilities.v1: cached codec capabilities"]
+GetFlightInfo <base>/probe-nope.xsd
+    NotFound: file not found
+GetFlightInfo <base>/probe-outside.xsd
+    NotFound: file not found
+GetFlightInfo ../probe-nope.xsd
+    NotFound: file not found
+GetFlightInfo ../probe-outside.xsd
+    NotFound: file not found
+GetFlightInfo probe-dangling.xsd
+    NotFound: file not found
+GetFlightInfo probe-link.xsd
+    NotFound: file not found
+GetFlightInfo ..%2fprobe-outside.xsd
+    NotFound: file not found
+GetFlightInfo probe\u{0}nul.xsd
+    NotFound: file not found
+GetFlightInfo probe-dir
+    path=probe-dir tickets=["probe-dir"] total_bytes=64 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+GetFlightInfo 
+    path= tickets=[""] total_bytes=288 total_records=-1 schema_len=256 schema_fnv=1afb8237d01cd844
+DoGet <base>/probe-nope.xsd
+    NotFound: file not found
+DoGet <base>/probe-outside.xsd
+    NotFound: file not found
+DoGet ../probe-nope.xsd
+    NotFound: file not found
+DoGet ../probe-outside.xsd
+    NotFound: file not found
+DoGet probe-dangling.xsd
+    NotFound: file not found
+DoGet probe-link.xsd
+    NotFound: file not found
+DoGet ..%2fprobe-outside.xsd
+    NotFound: file not found
+DoGet probe\u{0}nul.xsd
+    NotFound: file not found
+DoGet probe-dir
+    InvalidArgument: ticket must specify ?element=<name>
+DoGet 
+    InvalidArgument: ticket must specify ?element=<name>

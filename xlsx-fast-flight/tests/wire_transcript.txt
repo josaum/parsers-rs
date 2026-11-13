@@ -33,11 +33,11 @@ GetFlightInfo sub\Upper.XLSX
 GetFlightInfo missing.xlsx
     NotFound: file not found
 GetFlightInfo ../outside.xlsx
-    PermissionDenied: path escapes root
+    NotFound: file not found
 GetFlightInfo link.xlsx
-    PermissionDenied: path escapes root
+    NotFound: file not found
 GetFlightInfo <base>/outside.xlsx
-    PermissionDenied: path escapes root
+    NotFound: file not found
 GetFlightInfo parts ["sub", "Upper.XLSX?batch=2"]
     path=sub/Upper.XLSX?batch=2 tickets=["sub/Upper.XLSX"] total_bytes=2142 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
 GetFlightInfo parts ["sub", "..", "book.xlsx"]
@@ -89,13 +89,13 @@ DoGet notes.txt
 DoGet missing.xlsx
     NotFound: file not found
 DoGet ../outside.xlsx
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoGet sub/../book.xlsx
     messages=2 bytes=2808 fnv=db37e02937d3972f batches=1 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
 DoGet link.xlsx
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoGet <base>/outside.xlsx
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoGet 
     Internal: External error: <os error>
 DoGet �
@@ -117,7 +117,7 @@ DoExchange descriptor missing.xlsx
 DoExchange app_metadata book.xlsx?batch=1
     messages=5 bytes=8624 fnv=627c847a43403048 batches=4 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
 DoExchange app_metadata ../outside.xlsx
-    PermissionDenied: path escapes root
+    NotFound: file not found
 DoExchange an empty message
     InvalidArgument: exchange requires descriptor or app_metadata path
 DoExchange no message
@@ -132,3 +132,43 @@ ListActions without a bearer
     Unauthenticated: missing authorization metadata
 ListActions
     ["parsers.flight.codec_capabilities.v1: cached codec capabilities"]
+GetFlightInfo <base>/probe-nope.xlsx
+    NotFound: file not found
+GetFlightInfo <base>/probe-outside.xlsx
+    NotFound: file not found
+GetFlightInfo ../probe-nope.xlsx
+    NotFound: file not found
+GetFlightInfo ../probe-outside.xlsx
+    NotFound: file not found
+GetFlightInfo probe-dangling.xlsx
+    NotFound: file not found
+GetFlightInfo probe-link.xlsx
+    NotFound: file not found
+GetFlightInfo ..%2fprobe-outside.xlsx
+    NotFound: file not found
+GetFlightInfo probe\u{0}nul.xlsx
+    NotFound: file not found
+GetFlightInfo probe-dir
+    path=probe-dir tickets=["probe-dir"] total_bytes=64 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+GetFlightInfo 
+    path= tickets=[""] total_bytes=288 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+DoGet <base>/probe-nope.xlsx
+    NotFound: file not found
+DoGet <base>/probe-outside.xlsx
+    NotFound: file not found
+DoGet ../probe-nope.xlsx
+    NotFound: file not found
+DoGet ../probe-outside.xlsx
+    NotFound: file not found
+DoGet probe-dangling.xlsx
+    NotFound: file not found
+DoGet probe-link.xlsx
+    NotFound: file not found
+DoGet ..%2fprobe-outside.xlsx
+    NotFound: file not found
+DoGet probe\u{0}nul.xlsx
+    NotFound: file not found
+DoGet probe-dir
+    Internal: External error: <os error>
+DoGet 
+    Internal: External error: <os error>

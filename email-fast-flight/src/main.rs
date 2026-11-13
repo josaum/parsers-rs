@@ -99,23 +99,10 @@ impl EmailFlightService {
         self.auth_verifier.verify_metadata(request.metadata())
     }
 
+    /// The regular file below the root that `path` names; every other
+    /// path gets the one shared `NotFound`.
     fn resolve_path(&self, path: &str) -> Result<PathBuf, Status> {
-        let full_path = self.root.join(path);
-
-        // Security: ensure path is within root
-        let canonical = full_path
-            .canonicalize()
-            .map_err(|e| Status::invalid_argument(format!("Invalid path: {}", e)))?;
-        let root_canonical = self
-            .root
-            .canonicalize()
-            .map_err(|e| Status::internal(format!("Root path error: {}", e)))?;
-
-        if !canonical.starts_with(&root_canonical) {
-            return Err(Status::permission_denied("Path outside root directory"));
-        }
-
-        Ok(canonical)
+        flight_ipc_config::resolve_path(&self.root, Path::new(path))
     }
 
     fn list_email_files(&self, dir: &Path) -> Result<Vec<PathBuf>, Status> {
@@ -234,11 +221,7 @@ impl FlightService for EmailFlightService {
         let descriptor = request.into_inner();
         let path = descriptor.path.join("/");
 
-        let full_path = self.resolve_path(&path)?;
-
-        if !full_path.exists() {
-            return Err(Status::not_found(format!("File not found: {}", path)));
-        }
+        self.resolve_path(&path)?;
 
         let endpoint = FlightEndpoint {
             ticket: Some(Ticket {
@@ -466,8 +449,10 @@ mod read_only_flight_contract_tests {
     use futures::StreamExt;
 
     fn capability_test_service() -> EmailFlightService {
+        // A directory that exists: a root that cannot be resolved is an
+        // internal error, not a missing file.
         EmailFlightService::new(
-            PathBuf::new(),
+            std::env::temp_dir(),
             ParseOptions::default(),
             required_auth_verifier(),
         )
@@ -555,7 +540,7 @@ mod read_only_flight_contract_tests {
         let Err(error) = FlightService::get_flight_info(&service, request).await else {
             panic!("missing test file must reach path validation");
         };
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.code(), tonic::Code::NotFound);
     }
 }
 
@@ -588,6 +573,25 @@ Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 Hello from the wire test.\r\n";
 
+    fn service(root: &Path) -> EmailFlightService {
+        EmailFlightService::new(
+            root.to_path_buf(),
+            ParseOptions::default(),
+            required_auth_verifier(),
+        )
+        .expect("service")
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_root_is_answered_like_a_missing_one() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).expect("directories");
+        let mut wire = Wire::start(service(&root), base.path()).await;
+        wire.assert_outside_paths_look_missing(base.path(), "eml")
+            .await;
+    }
+
     #[tokio::test]
     async fn every_rpc_answers_as_it_did_before_the_shared_server() {
         let base = tempfile::tempdir().expect("tempdir");
@@ -602,13 +606,7 @@ Hello from the wire test.\r\n";
         let outside = base.path().join("outside.eml");
         let outside = outside.to_string_lossy();
 
-        let service = EmailFlightService::new(
-            root.clone(),
-            ParseOptions::default(),
-            required_auth_verifier(),
-        )
-        .expect("service");
-        let mut wire = Wire::start(service, base.path()).await;
+        let mut wire = Wire::start(service(&root), base.path()).await;
 
         wire.handshake(false).await;
         wire.handshake(true).await;
@@ -676,6 +674,7 @@ Hello from the wire test.\r\n";
         wire.do_action("unknown", "", true, true).await;
         wire.list_actions(false).await;
         wire.list_actions(true).await;
+        wire.path_probes(&root, base.path(), "eml").await;
 
         assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
         assert_eq!(

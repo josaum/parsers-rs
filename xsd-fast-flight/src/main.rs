@@ -27,7 +27,7 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use flight_ipc_config::{
-    capability_json, do_put_unsupported, parse_writer_policies_for_process,
+    capability_json, do_put_unsupported, parse_writer_policies_for_process, resolve_path,
     root_relative_error_text, root_relative_status, split_query, FlightIpcDirection,
     FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction, ParserRoute,
     CAPABILITY_ACTION,
@@ -577,24 +577,6 @@ fn ticket_to_request(root: &Path, ticket: &Ticket) -> Result<(PathBuf, FlightQue
     resolve_path(root, Path::new(path_str)).map(|p| (p, query))
 }
 
-fn resolve_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let canon = joined
-        .canonicalize()
-        .map_err(|_| Status::not_found("XSD file not found"))?;
-    let root_canon = root
-        .canonicalize()
-        .map_err(|_| Status::internal("failed to resolve root"))?;
-    if !canon.starts_with(&root_canon) {
-        return Err(Status::permission_denied("path escapes root"));
-    }
-    Ok(canon)
-}
-
 fn path_to_ticket(root: &Path, path: &Path, query: &FlightQuery) -> String {
     let rel = if let Ok(rc) = root.canonicalize() {
         if let Ok(r) = path.strip_prefix(&rc) {
@@ -895,6 +877,36 @@ mod wire_parity_tests {
 </xs:schema>
 "#;
 
+    fn service(root: &Path) -> XsdFlightService {
+        XsdFlightService {
+            root: root.to_path_buf(),
+            parse_options: ParseOptions {
+                max_includes: 64,
+                map_date_types: true,
+                ..ParseOptions::default()
+            },
+            arrow_options: ArrowOptions {
+                max_depth: 8,
+                map_date_types: true,
+                include_attributes: true,
+                batch_size: 64,
+            },
+            write_options: IpcWriteOptions::default(),
+            capability_body: b"{}".to_vec(),
+            auth_verifier: required_auth_verifier(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_root_is_answered_like_a_missing_one() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).expect("directories");
+        let mut wire = Wire::start(service(&root), base.path()).await;
+        wire.assert_outside_paths_look_missing(base.path(), "xsd")
+            .await;
+    }
+
     #[tokio::test]
     async fn every_rpc_answers_as_it_did_before_the_shared_server() {
         let base = tempfile::tempdir().expect("tempdir");
@@ -910,24 +922,7 @@ mod wire_parity_tests {
         let outside = outside.to_string_lossy();
         let outside_order = format!("{outside}?element=order");
 
-        let service = XsdFlightService {
-            root: root.clone(),
-            parse_options: ParseOptions {
-                max_includes: 64,
-                map_date_types: true,
-                ..ParseOptions::default()
-            },
-            arrow_options: ArrowOptions {
-                max_depth: 8,
-                map_date_types: true,
-                include_attributes: true,
-                batch_size: 64,
-            },
-            write_options: IpcWriteOptions::default(),
-            capability_body: b"{}".to_vec(),
-            auth_verifier: required_auth_verifier(),
-        };
-        let mut wire = Wire::start(service, base.path()).await;
+        let mut wire = Wire::start(service(&root), base.path()).await;
 
         wire.handshake(false).await;
         wire.handshake(true).await;
@@ -1046,6 +1041,7 @@ mod wire_parity_tests {
         wire.do_action("unknown", "", true, true).await;
         wire.list_actions(false).await;
         wire.list_actions(true).await;
+        wire.path_probes(&root, base.path(), "xsd").await;
 
         assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
         assert_eq!(

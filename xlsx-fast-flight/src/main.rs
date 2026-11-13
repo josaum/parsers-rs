@@ -891,6 +891,16 @@ mod wire_parity_tests {
     }
 
     #[tokio::test]
+    async fn a_path_outside_the_root_is_answered_like_a_missing_one() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).expect("directories");
+        let mut wire = Wire::start(service(&root), base.path()).await;
+        wire.assert_outside_paths_look_missing(base.path(), "xlsx")
+            .await;
+    }
+
+    #[tokio::test]
     async fn every_rpc_answers_as_it_did_before_the_shared_server() {
         let base = tempfile::tempdir().expect("tempdir");
         let root = base.path().join("root");
@@ -991,6 +1001,7 @@ mod wire_parity_tests {
         wire.do_action("unknown", "", true, true).await;
         wire.list_actions(false).await;
         wire.list_actions(true).await;
+        wire.path_probes(&root, base.path(), "xlsx").await;
 
         assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
         assert_eq!(

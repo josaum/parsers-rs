@@ -15,9 +15,9 @@ use flight_ipc_config::ParserRoute;
 mod flight_auth_test_support;
 
 #[cfg(test)]
-use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
+use arrow_flight::flight_service_server::FlightService;
 #[cfg(test)]
-use arrow_flight::{Action, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, Ticket};
+use arrow_flight::{Action, Empty, FlightDescriptor};
 #[cfg(test)]
 use arrow_ipc::writer::IpcWriteOptions;
 #[cfg(test)]
@@ -137,7 +137,9 @@ mod read_only_flight_contract_tests {
 
     fn capability_test_service() -> DocxFlightService {
         DocxFlightService {
-            root: PathBuf::new(),
+            // A directory that exists: a root that cannot be resolved is an
+            // internal error, not a missing file.
+            root: std::env::temp_dir(),
             parse_options: ParseOptions {
                 max_inflate: 128 * 1024 * 1024,
                 ..ParseOptions::default()
@@ -209,104 +211,30 @@ mod read_only_flight_contract_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
+#[path = "../../flight-ipc-config/test-support/wire.rs"]
+mod flight_wire_test_support;
+
+#[cfg(all(test, unix))]
 mod wire_parity_tests {
-    //! What a Flight client sees from this server, pinned as text.
+    //! What a Flight client sees from this server, pinned as text in
+    //! `tests/wire_transcript.txt`.
     //!
-    //! The expectations were captured from the server as it stood before the
-    //! docx and pptx servers were moved onto one shared implementation, so a
-    //! change to any answer below is a change in behaviour, not in structure.
-    //! The fixture is the minimal document `docx-fast-core`'s own tests build
-    //! (`tests/parser_integration.rs`), written as a stored archive.
+    //! A change to any answer in the transcript is a change in behaviour,
+    //! not in structure. The fixture is the minimal document
+    //! `docx-fast-core`'s own tests build (`tests/parser_integration.rs`),
+    //! written as a stored archive. Unix only: the probes include symbolic
+    //! links.
     use super::*;
-    use crate::flight_auth_test_support::{required_auth_verifier, with_valid_bearer};
-    use arrow_flight::flight_service_client::FlightServiceClient;
-    use std::fmt::Write as _;
-    use tonic::transport::server::TcpIncoming;
-    use tonic::transport::Channel;
+    use crate::flight_auth_test_support::required_auth_verifier;
+    use crate::flight_wire_test_support::Wire;
 
     const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/minimal.docx");
 
-    const EXPECTED: &str = r#"ListFlights without a bearer
-    Unauthenticated: missing authorization metadata
-ListFlights
-    2 flights
-    path=minimal.docx tickets=["minimal.docx"] total_bytes=1204 total_records=-1 schema_len=768 schema_fnv=ae21ca40a19657b6
-    path=sub/Upper.DOCX tickets=["sub/Upper.DOCX"] total_bytes=1204 total_records=-1 schema_len=768 schema_fnv=ae21ca40a19657b6
-GetFlightInfo without a bearer
-    Unauthenticated: missing authorization metadata
-GetFlightInfo minimal.docx
-    path=minimal.docx tickets=["minimal.docx"] total_bytes=1204 total_records=-1 schema_len=768 schema_fnv=ae21ca40a19657b6
-GetFlightInfo minimal.docx?table=metadata
-    path=minimal.docx?table=metadata tickets=["minimal.docx"] total_bytes=1204 total_records=-1 schema_len=256 schema_fnv=8e01a2d3ba4b5fd8
-GetFlightInfo minimal.docx?table=no_such_table
-    InvalidArgument: unknown table
-GetFlightInfo sub/Upper.DOCX
-    path=sub/Upper.DOCX tickets=["sub/Upper.DOCX"] total_bytes=1204 total_records=-1 schema_len=768 schema_fnv=ae21ca40a19657b6
-GetFlightInfo missing.docx
-    NotFound: file not found
-GetFlightInfo ../minimal.docx
-    NotFound: file not found
-DoGet without a bearer
-    Unauthenticated: missing authorization metadata
-DoGet minimal.docx
-    messages=2 bytes=2812 fnv=ea48e40955674597 batches=1 rows=3 columns=["paragraph_id", "owner_kind", "owner_id", "block_index", "para_xml_id", "style_id", "style_name", "outline_level", "num_id", "num_level", "toc_level", "text"]
-DoGet minimal.docx?table=metadata
-    messages=1 bytes=196 fnv=7ddb901585f5ee7c batches=0 rows=0 columns=[]
-DoGet minimal.docx?table=paragraphs&batch=1
-    messages=4 bytes=6988 fnv=e45cf4cd242e9f09 batches=3 rows=3 columns=["paragraph_id", "owner_kind", "owner_id", "block_index", "para_xml_id", "style_id", "style_name", "outline_level", "num_id", "num_level", "toc_level", "text"]
-DoGet minimal.docx?table=no_such_table
-    InvalidArgument: unknown table
-DoGet sub/Upper.DOCX
-    messages=2 bytes=2812 fnv=ea48e40955674597 batches=1 rows=3 columns=["paragraph_id", "owner_kind", "owner_id", "block_index", "para_xml_id", "style_id", "style_name", "outline_level", "num_id", "num_level", "toc_level", "text"]
-DoGet notes.txt
-    Internal: External error: open zip archive
-DoGet missing.docx
-    NotFound: file not found
-DoGet ../minimal.docx
-    NotFound: file not found
-DoPut without a bearer
-    Unauthenticated: missing authorization metadata
-DoPut
-    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
-"#;
+    const EXPECTED: &str = include_str!("../tests/wire_transcript.txt");
 
-    fn fnv1a(parts: &[&[u8]]) -> u64 {
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in parts.iter().flat_map(|part| part.iter()) {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash
-    }
-
-    fn status_line(status: &Status) -> String {
-        format!("{:?}: {}", status.code(), status.message())
-    }
-
-    fn info_line(info: &FlightInfo) -> String {
-        let path = info
-            .flight_descriptor
-            .as_ref()
-            .map(|descriptor| descriptor.path.join("/"))
-            .unwrap_or_default();
-        let tickets: Vec<String> = info
-            .endpoint
-            .iter()
-            .filter_map(|endpoint| endpoint.ticket.as_ref())
-            .map(|ticket| String::from_utf8_lossy(&ticket.ticket).into_owned())
-            .collect();
-        format!(
-            "path={path} tickets={tickets:?} total_bytes={} total_records={} schema_len={} schema_fnv={:016x}",
-            info.total_bytes,
-            info.total_records,
-            info.schema.len(),
-            fnv1a(&[&info.schema]),
-        )
-    }
-
-    async fn client_for(root: &Path) -> FlightServiceClient<Channel> {
-        let service = DocxFlightService {
+    fn service(root: &Path) -> DocxFlightService {
+        DocxFlightService {
             root: root.to_path_buf(),
             parse_options: ParseOptions {
                 max_inflate: 128 * 1024 * 1024,
@@ -316,144 +244,32 @@ DoPut
             write_options: IpcWriteOptions::default(),
             capability_body: b"{}".to_vec(),
             auth_verifier: required_auth_verifier(),
-        };
-        let incoming =
-            TcpIncoming::bind("127.0.0.1:0".parse().expect("loopback address")).expect("bind");
-        let addr = incoming.local_addr().expect("local address");
-        tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(FlightServiceServer::new(service))
-                .serve_with_incoming(incoming),
-        );
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .expect("endpoint")
-            .connect()
-            .await
-            .expect("connect");
-        FlightServiceClient::new(channel)
-    }
-
-    async fn list_flights(
-        client: &mut FlightServiceClient<Channel>,
-        request: Request<Criteria>,
-    ) -> String {
-        let mut stream = match client.list_flights(request).await {
-            Ok(response) => response.into_inner(),
-            Err(status) => return status_line(&status),
-        };
-        // Directory order belongs to the operating system, not to the server.
-        let mut lines = Vec::new();
-        loop {
-            match stream.message().await {
-                Ok(Some(info)) => lines.push(info_line(&info)),
-                Ok(None) => break,
-                Err(status) => lines.push(status_line(&status)),
-            }
-        }
-        lines.sort();
-        format!("{} flights\n    {}", lines.len(), lines.join("\n    "))
-    }
-
-    async fn get_flight_info(
-        client: &mut FlightServiceClient<Channel>,
-        request: Request<FlightDescriptor>,
-    ) -> String {
-        match client.get_flight_info(request).await {
-            Ok(response) => info_line(&response.into_inner()),
-            Err(status) => status_line(&status),
-        }
-    }
-
-    async fn do_get(client: &mut FlightServiceClient<Channel>, request: Request<Ticket>) -> String {
-        let mut stream = match client.do_get(request).await {
-            Ok(response) => response.into_inner(),
-            Err(status) => return status_line(&status),
-        };
-        let mut messages = Vec::new();
-        loop {
-            match stream.message().await {
-                Ok(Some(message)) => messages.push(message),
-                Ok(None) => break,
-                Err(status) => return status_line(&status),
-            }
-        }
-        let parts: Vec<&[u8]> = messages
-            .iter()
-            .flat_map(|message| {
-                [
-                    message.data_header.as_ref(),
-                    message.app_metadata.as_ref(),
-                    message.data_body.as_ref(),
-                ]
-            })
-            .collect();
-        let bytes: usize = parts.iter().map(|part| part.len()).sum();
-        let batches = arrow_flight::utils::flight_data_to_batches(&messages).expect("decode");
-        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-        let columns: Vec<String> = batches
-            .first()
-            .map(|batch| {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        format!(
-            "messages={} bytes={bytes} fnv={:016x} batches={} rows={rows} columns={columns:?}",
-            messages.len(),
-            fnv1a(&parts),
-            batches.len(),
-        )
-    }
-
-    async fn do_put(client: &mut FlightServiceClient<Channel>, authorized: bool) -> String {
-        let request = Request::new(futures::stream::iter(vec![FlightData::default()]));
-        let request = if authorized {
-            with_valid_bearer(request)
-        } else {
-            request
-        };
-        match client.do_put(request).await {
-            Ok(_) => "accepted".to_owned(),
-            Err(status) => status_line(&status),
         }
     }
 
     #[tokio::test]
+    async fn a_path_outside_the_root_is_answered_like_a_missing_one() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).expect("directories");
+        let mut wire = Wire::start(service(&root), base.path()).await;
+        wire.assert_outside_paths_look_missing(base.path(), "docx")
+            .await;
+    }
+
+    #[tokio::test]
     async fn list_get_info_do_get_and_do_put_answer_as_before_the_shared_server() {
-        let root = tempfile::tempdir().expect("tempdir");
-        std::fs::write(root.path().join("minimal.docx"), FIXTURE).expect("fixture");
-        std::fs::write(root.path().join("notes.txt"), b"not a document").expect("other file");
-        std::fs::create_dir(root.path().join("sub")).expect("subdirectory");
-        std::fs::write(root.path().join("sub").join("Upper.DOCX"), FIXTURE).expect("nested");
-        let mut client = client_for(root.path()).await;
-        let descriptor = |path: &str| FlightDescriptor::new_path(vec![path.to_owned()]);
-        let ticket = |path: &str| Ticket::new(path.to_owned());
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("directories");
+        std::fs::write(root.join("minimal.docx"), FIXTURE).expect("fixture");
+        std::fs::write(root.join("notes.txt"), b"not a document").expect("other file");
+        std::fs::write(root.join("sub").join("Upper.DOCX"), FIXTURE).expect("nested");
+        let mut wire = Wire::start(service(&root), base.path()).await;
 
-        let mut seen = String::new();
-        let mut record = |call: &str, answer: String| {
-            writeln!(seen, "{call}\n    {answer}").expect("write to a string");
-        };
-
-        record(
-            "ListFlights without a bearer",
-            list_flights(&mut client, Request::new(Criteria::default())).await,
-        );
-        record(
-            "ListFlights",
-            list_flights(
-                &mut client,
-                with_valid_bearer(Request::new(Criteria::default())),
-            )
-            .await,
-        );
-        record(
-            "GetFlightInfo without a bearer",
-            get_flight_info(&mut client, Request::new(descriptor("minimal.docx"))).await,
-        );
+        wire.list_flights(false).await;
+        wire.list_flights(true).await;
+        wire.get_flight_info("minimal.docx", false).await;
         for path in [
             "minimal.docx",
             "minimal.docx?table=metadata",
@@ -462,19 +278,9 @@ DoPut
             "missing.docx",
             "../minimal.docx",
         ] {
-            record(
-                &format!("GetFlightInfo {path}"),
-                get_flight_info(
-                    &mut client,
-                    with_valid_bearer(Request::new(descriptor(path))),
-                )
-                .await,
-            );
+            wire.get_flight_info(path, true).await;
         }
-        record(
-            "DoGet without a bearer",
-            do_get(&mut client, Request::new(ticket("minimal.docx"))).await,
-        );
+        wire.do_get(b"minimal.docx", false).await;
         for path in [
             "minimal.docx",
             "minimal.docx?table=metadata",
@@ -485,14 +291,17 @@ DoPut
             "missing.docx",
             "../minimal.docx",
         ] {
-            record(
-                &format!("DoGet {path}"),
-                do_get(&mut client, with_valid_bearer(Request::new(ticket(path)))).await,
-            );
+            wire.do_get(path.as_bytes(), true).await;
         }
-        record("DoPut without a bearer", do_put(&mut client, false).await);
-        record("DoPut", do_put(&mut client, true).await);
+        wire.do_put(false).await;
+        wire.do_put(true).await;
+        wire.path_probes(&root, base.path(), "docx").await;
 
-        assert_eq!(seen, EXPECTED, "\n{seen}");
+        assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
     }
 }

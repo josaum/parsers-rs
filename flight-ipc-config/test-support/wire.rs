@@ -168,6 +168,19 @@ impl Wire {
 
     fn record(&mut self, call: &str, bearer: bool, answer: String) {
         let suffix = if bearer { "" } else { " without a bearer" };
+        // A probe may carry a control character such as NUL; the transcript
+        // stays text.
+        let call: String = call
+            .chars()
+            .flat_map(|c| {
+                if c.is_control() {
+                    c.escape_default().collect::<Vec<char>>()
+                } else {
+                    vec![c]
+                }
+            })
+            .collect();
+        let call = call.as_str();
         if self
             .placeholders
             .iter()
@@ -311,6 +324,87 @@ impl Wire {
         let answer = drain_data(self.client.do_get(request).await).await;
         let call = format!("DoGet {}", String::from_utf8_lossy(ticket));
         self.record(&call, bearer, answer);
+    }
+
+    /// GetFlightInfo and DoGet, with a bearer, for paths a caller must not
+    /// be able to tell apart: outside the root and missing, outside and
+    /// present, a dangling link, a link to a file outside, a percent-encoded
+    /// `..`, a NUL, a directory and the empty path.
+    #[cfg(unix)]
+    pub async fn path_probes(&mut self, root: &Path, base: &Path, extension: &str) {
+        let outside = base.join(format!("probe-outside.{extension}"));
+        std::fs::write(&outside, b"outside").expect("outside file");
+        std::os::unix::fs::symlink(&outside, root.join(format!("probe-link.{extension}")))
+            .expect("link to the outside file");
+        std::os::unix::fs::symlink(
+            base.join("probe-nope"),
+            root.join(format!("probe-dangling.{extension}")),
+        )
+        .expect("dangling link");
+        std::fs::create_dir(root.join("probe-dir")).expect("directory");
+        let probes = [
+            base.join(format!("probe-nope.{extension}"))
+                .to_string_lossy()
+                .into_owned(),
+            outside.to_string_lossy().into_owned(),
+            format!("../probe-nope.{extension}"),
+            format!("../probe-outside.{extension}"),
+            format!("probe-dangling.{extension}"),
+            format!("probe-link.{extension}"),
+            format!("..%2fprobe-outside.{extension}"),
+            format!("probe\0nul.{extension}"),
+            "probe-dir".to_owned(),
+            String::new(),
+        ];
+        for probe in &probes {
+            self.get_flight_info(probe, true).await;
+        }
+        for probe in &probes {
+            self.do_get(probe.as_bytes(), true).await;
+        }
+    }
+
+    /// The GetFlightInfo and DoGet answers for `path`, with a bearer.
+    async fn answers(&mut self, path: &str) -> [String; 2] {
+        let descriptor = FlightDescriptor::new_path(vec![path.to_owned()]);
+        let info = match self
+            .client
+            .get_flight_info(Self::request(descriptor, true))
+            .await
+        {
+            Ok(response) => info_line(&response.into_inner()),
+            Err(status) => status_line(&status),
+        };
+        let ticket = Ticket::new(path.as_bytes().to_vec());
+        let data = drain_data(self.client.do_get(Self::request(ticket, true)).await).await;
+        [info, data]
+    }
+
+    /// Panics unless a file outside the root is answered byte for byte like
+    /// a missing one, outside the root and inside it, on GetFlightInfo and
+    /// DoGet: a caller must not learn what exists on the server.
+    pub async fn assert_outside_paths_look_missing(&mut self, base: &Path, extension: &str) {
+        let present = base.join(format!("present.{extension}"));
+        std::fs::write(&present, b"outside").expect("outside file");
+        let absent = base.join(format!("absent.{extension}"));
+        let missing_inside = self.answers(&format!("absent.{extension}")).await;
+        for answer in &missing_inside {
+            assert!(answer.starts_with("NotFound: "), "{answer}");
+        }
+        for (there, gone) in [
+            (
+                present.to_string_lossy().into_owned(),
+                absent.to_string_lossy().into_owned(),
+            ),
+            (
+                format!("../present.{extension}"),
+                format!("../absent.{extension}"),
+            ),
+        ] {
+            let there_answers = self.answers(&there).await;
+            assert_eq!(there_answers, self.answers(&gone).await, "{there} / {gone}");
+            assert_eq!(there_answers, missing_inside, "{there}");
+        }
     }
 
     /// DoPut with one empty message.

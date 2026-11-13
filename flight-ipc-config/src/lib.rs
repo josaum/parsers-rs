@@ -490,24 +490,49 @@ pub enum FlightIpcConfigError {
 // binaries (docx-fast-flight, pptx-fast-flight).  Do not diverge them here.
 // ---------------------------------------------------------------------------
 
-/// Canonicalize `path` (joined under `root` when relative) and reject any
-/// resolution that escapes the Flight root.
+/// The one message for every path this server will not serve.
+///
+/// Clients may match on it. It never carries operating system error text,
+/// which would tell a missing file from an unreadable one.
+pub const FILE_NOT_FOUND: &str = "file not found";
+
+/// The one answer for every path this server will not serve.
+///
+/// A missing file, a file outside the root, a dangling link and a path
+/// that cannot be read all get this `NotFound`, so an answer never says
+/// what exists on the server.
+pub fn file_not_found() -> Status {
+    Status::not_found(FILE_NOT_FOUND)
+}
+
+/// Resolves `path` to its canonical path below `root`.
+///
+/// A relative `path` is taken below `root`. Links are followed, and the
+/// file they lead to must itself be below the root.
+///
+/// The same file system calls are made, in the same order, whether or not
+/// the path exists and wherever it leads: the root is resolved, then the
+/// path. Only then is the answer chosen, so the work done does not depend
+/// on what was found. What remains is the cost of those calls themselves: resolving a path that exists walks all of
+/// it, and resolving one that does not stops at the first missing name.
+///
+/// # Errors
+///
+/// [`file_not_found`] when `path` is missing, leads outside the root or
+/// cannot be examined; the cases are deliberately not told apart. `Internal` when the root itself cannot be resolved.
 pub fn resolve_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
+    let root_canon = root
+        .canonicalize()
+        .map_err(|_| Status::internal("failed to resolve root"))?;
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         root.join(path)
     };
-    let canon = joined
-        .canonicalize()
-        .map_err(|_| Status::not_found("file not found"))?;
-    let root_canon = root
-        .canonicalize()
-        .map_err(|_| Status::internal("failed to resolve root"))?;
-    if !canon.starts_with(&root_canon) {
-        return Err(Status::permission_denied("path escapes root"));
+    match joined.canonicalize() {
+        Ok(canon) if canon.starts_with(&root_canon) => Ok(canon),
+        _ => Err(file_not_found()),
     }
-    Ok(canon)
 }
 
 /// Split `input` on the first `?` into a `(path, query)` pair, zero-copy.
@@ -1103,12 +1128,24 @@ mod tests {
         let resolved = resolve_path(&root, Path::new("inside.txt")).expect("inside resolves");
         assert_eq!(resolved, inside_file.canonicalize().expect("canon"));
 
-        let err = resolve_path(&root, &outside_file).expect_err("escape must fail");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        let err = resolve_path(&root, Path::new("../outside/outside.txt"))
-            .expect_err("relative escape must fail");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-
+        // Outside the root, a file that is there and one that is not are
+        // answered alike, and like a missing file inside the root.
+        let missing = resolve_path(&root, Path::new("missing.txt")).expect_err("missing");
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+        for probe in [
+            outside_file.clone(),
+            outside.join("missing.txt"),
+            PathBuf::from("../outside/outside.txt"),
+            PathBuf::from("../outside/missing.txt"),
+            PathBuf::from("../outside"),
+            PathBuf::from(".."),
+            PathBuf::from("nul\0.txt"),
+            PathBuf::from("inside.txt/child"),
+        ] {
+            let err = resolve_path(&root, &probe).expect_err("must fail");
+            assert_eq!(err.code(), missing.code(), "{probe:?}");
+            assert_eq!(err.message(), missing.message(), "{probe:?}");
+        }
         std::fs::remove_dir_all(&base).expect("cleanup");
     }
 

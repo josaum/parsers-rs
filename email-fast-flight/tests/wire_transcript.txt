@@ -13,23 +13,23 @@ GetFlightInfo mail.eml without a bearer
 GetFlightInfo mail.eml
     path=mail.eml tickets=["mail.eml"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
 GetFlightInfo mail.eml?batch=1
-    InvalidArgument: Invalid path: <os error>
+    NotFound: file not found
 GetFlightInfo sub/Upper.EML
     path=sub/Upper.EML tickets=["sub/Upper.EML"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
 GetFlightInfo sub\Upper.EML
-    InvalidArgument: Invalid path: <os error>
+    NotFound: file not found
 GetFlightInfo notes.txt
     path=notes.txt tickets=["notes.txt"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
 GetFlightInfo sub
     path=sub tickets=["sub"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
 GetFlightInfo missing.eml
-    InvalidArgument: Invalid path: <os error>
+    NotFound: file not found
 GetFlightInfo ../outside.eml
-    PermissionDenied: Path outside root directory
+    NotFound: file not found
 GetFlightInfo link.eml
-    PermissionDenied: Path outside root directory
+    NotFound: file not found
 GetFlightInfo <base>/outside.eml
-    PermissionDenied: Path outside root directory
+    NotFound: file not found
 GetFlightInfo 
     path= tickets=[""] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
 GetFlightInfo parts ["sub", "Upper.EML"]
@@ -55,25 +55,25 @@ DoGet mail.eml without a bearer
 DoGet mail.eml
     messages=2 bytes=3280 fnv=adf6b53864f3d380 batches=1 rows=1 columns=["message_id", "from_address", "from_name", "to_addresses", "cc_addresses", "subject", "date", "body_text", "body_html", "has_attachments", "attachment_count", "in_reply_to", "references", "priority"]
 DoGet mail.eml?batch=1
-    InvalidArgument: Invalid path: <os error>
+    NotFound: file not found
 DoGet sub/Upper.EML
     messages=2 bytes=3280 fnv=adf6b53864f3d380 batches=1 rows=1 columns=["message_id", "from_address", "from_name", "to_addresses", "cc_addresses", "subject", "date", "body_text", "body_html", "has_attachments", "attachment_count", "in_reply_to", "references", "priority"]
 DoGet sub\Upper.EML
-    InvalidArgument: Invalid path: <os error>
+    NotFound: file not found
 DoGet notes.txt
     Internal: Failed to parse email: Cannot detect email format for: notes.txt
 DoGet sub
     Internal: Failed to parse email: <os error>
 DoGet missing.eml
-    InvalidArgument: Invalid path: <os error>
+    NotFound: file not found
 DoGet ../outside.eml
-    PermissionDenied: Path outside root directory
+    NotFound: file not found
 DoGet sub/../mail.eml
     messages=2 bytes=3280 fnv=adf6b53864f3d380 batches=1 rows=1 columns=["message_id", "from_address", "from_name", "to_addresses", "cc_addresses", "subject", "date", "body_text", "body_html", "has_attachments", "attachment_count", "in_reply_to", "references", "priority"]
 DoGet link.eml
-    PermissionDenied: Path outside root directory
+    NotFound: file not found
 DoGet <base>/outside.eml
-    PermissionDenied: Path outside root directory
+    NotFound: file not found
 DoGet 
     Internal: Failed to parse email: <os error>
 DoGet �
@@ -98,3 +98,43 @@ ListActions without a bearer
     Unauthenticated: missing authorization metadata
 ListActions
     ["parsers.flight.codec_capabilities.v1: cached codec capabilities"]
+GetFlightInfo <base>/probe-nope.eml
+    NotFound: file not found
+GetFlightInfo <base>/probe-outside.eml
+    NotFound: file not found
+GetFlightInfo ../probe-nope.eml
+    NotFound: file not found
+GetFlightInfo ../probe-outside.eml
+    NotFound: file not found
+GetFlightInfo probe-dangling.eml
+    NotFound: file not found
+GetFlightInfo probe-link.eml
+    NotFound: file not found
+GetFlightInfo ..%2fprobe-outside.eml
+    NotFound: file not found
+GetFlightInfo probe\u{0}nul.eml
+    NotFound: file not found
+GetFlightInfo probe-dir
+    path=probe-dir tickets=["probe-dir"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+GetFlightInfo 
+    path= tickets=[""] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+DoGet <base>/probe-nope.eml
+    NotFound: file not found
+DoGet <base>/probe-outside.eml
+    NotFound: file not found
+DoGet ../probe-nope.eml
+    NotFound: file not found
+DoGet ../probe-outside.eml
+    NotFound: file not found
+DoGet probe-dangling.eml
+    NotFound: file not found
+DoGet probe-link.eml
+    NotFound: file not found
+DoGet ..%2fprobe-outside.eml
+    NotFound: file not found
+DoGet probe\u{0}nul.eml
+    NotFound: file not found
+DoGet probe-dir
+    Internal: Failed to parse email: <os error>
+DoGet 
+    Internal: Failed to parse email: <os error>
