@@ -45,7 +45,7 @@ bumpalo     = "3.17"
 # adler32 does not compile under the zig clang the release builds its
 # manylinux x86_64 wheels with ("requires target feature 'evex512'"), which
 # failed the v2026.11.13.1 release. See the hold in .github/dependabot.yml.
-libdeflater = "0.12"
+libdeflater = "0.14"
 memchr      = "2.7"
 
 # ── Optional ─────────────────────────────────────────────────────────────
