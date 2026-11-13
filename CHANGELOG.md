@@ -1,0 +1,123 @@
+# Changelog
+
+Changes a consumer of the wheels, Node packages, crates or Flight servers
+can observe. Each release also has generated notes listing every pull
+request.
+
+## v2026.11.13
+
+Every crate's patch version moves. The headline is hardening against
+malformed and hostile input across all parsers, plus several long-standing
+correctness bugs. Read "Changed output" and "New refusals" before upgrading
+a pipeline that stores parsed output.
+
+### Fixed
+
+- **pdf:** an incrementally saved PDF was read as its oldest revision: page
+  count, text, tables and rendering all came from the first catalog in the
+  file. The newest revision is read now (#58).
+- **pdf:** a Type 3 font glyph that shows itself aborted the process with a
+  stack overflow (#59).
+- **json:** `uniqueItems` was applied to every array, so any array with a
+  repeated value failed any schema that reached it (#45).
+- **Node bindings:** a Rust panic ended the Node process. In nine of the
+  ten packages it is now a thrown error (`json-fast-node` not yet). Two
+  functions of `pdf-fast-write-node` were declared but not exported (#55).
+- **Python bindings:** pip refused every wheel on Python 3.8 although the
+  wheels are built for it. The GIL is released around parsing in nine of
+  the ten packages (`json_fast` not yet) (#55).
+- **email:** attachment file names could escape the output directory;
+  `max_total_attachment_bytes` was accepted by the Python binding and
+  ignored (#25, #55).
+- **docx, pptx, email:** the same file could give different JSON, NDJSON and
+  Arrow bytes on each parse (#57).
+- **Flight servers:** an authenticated caller could tell whether a file
+  outside the served root exists; `DoPut` and `PollFlightInfo` answered
+  without a bearer token; error text could name the server's root (#61).
+- **xlsx-write:** sheet names could be invalid or duplicated (#62).
+- **pdf-write:** a small malformed source could produce gigabytes of output
+  (#62).
+- **geo:** a nested WMS capabilities document was collapsed into one layer
+  (#60).
+
+### Changed output
+
+- **pdf:** page count and text change for incrementally saved files.
+- **web:** table rows change shape for nested tables, empty cells and
+  `rowspan`/`colspan`; a table reports only its own rows.
+- **xsd (Arrow):** inherited elements and attributes, restriction
+  attributes and typed text for `simpleContent` restrictions add columns;
+  some leaf columns become structs; many columns become nullable; in a few
+  schemas a path moves one level deeper. On 451 real schemas total column
+  paths grow by 0.2 percent and none is lost.
+- **xsd (validation):** a required child inherited from a base type is now
+  reported when missing; children of an optional nested sequence are no
+  longer reported.
+- **docx:** `HeadingPairs` and `TitlesOfParts` keep every item, one per
+  line; the keys `lpstr`, `i4` and `lpwstr` are gone. Symbol fonts inherited
+  from a style map to the right characters. Attribute values that are not
+  well-formed are read leniently instead of rejecting the document.
+- **docx, pptx, email:** map keys are written in sorted order.
+- **geo:** `SarMetadata.sensor` holds the platform name (for example
+  `SENTINEL-1A`), not the instrument name. WMS layers carry inherited
+  reference systems and bounding boxes.
+- **python `geo_fast`:** new functions only; `geotiff_bands` returns one
+  `bytes` object of little-endian f32 per band.
+- **Flight:** a path that cannot be served answers `NotFound "file not
+  found"` on every server, including paths outside the root (was
+  `PermissionDenied`), directories and the empty path. `DoPut` and
+  `PollFlightInfo` without a bearer answer `Unauthenticated`.
+- **xlsx-write:** sheet names are cut to 31 UTF-16 units, cleaned and made
+  unique; `Sheet::name` returns the name written. NaN and infinite numbers
+  are written as `#NUM!`.
+
+### New refusals
+
+Inputs that were accepted, or that crashed or hung, and now return an error:
+
+- **pdf:** a page that runs more than 16 MiB of nested Type 3 glyph
+  procedure in one content stream (checked readers only; unchecked readers
+  return what they read). Pages the render guard cannot bound are refused
+  by the interpreted renderer (#43).
+- **json:** validation stops with a single error when a work budget,
+  nesting limit (64) or pattern budget is spent. A caller-raised nesting
+  limit is capped at 128.
+- **web:** documents nested deeper than 512 elements.
+- **ontology:** more than 32 nested triple terms, more than 10,000 open
+  brackets, or expanded term text over `max(256 MiB, 64 x source bytes)`.
+- **xsd:** nothing that loaded before is refused; some schemas that were
+  refused now load.
+- **xlsx-write:** a cell outside the sheet grid, text over 32,767
+  characters, a formula over 8,192, a JSON spec nested deeper than 32
+  levels.
+- **pdf-write:** encrypted sources, page-tree cycles, an object left
+  unclosed, more than 16 MiB of repeated page dictionaries.
+- **geo:** a WMS capabilities response over 128 MiB.
+- **Node:** `geotiffBands` and the page-extraction functions reject numbers
+  a cast would silently bend (negative, fractional, non-finite).
+
+### Public Rust API
+
+- **xsd-fast-core:** `ComplexType` gains the public fields `derivation`,
+  `prohibited_attributes` and `empty_in_source`; struct literals of it
+  break. Older serialized models still load.
+- **ooxml-archive:** `part_names` yields names in byte order.
+- **flight-ipc-config:** `resolve_path` refuses anything but a regular file.
+- New constants for each limit above, and new functions in geo, xsd, email,
+  pdf-write and xlsx-write. No existing function signature changed.
+
+### Known gaps
+
+- **json:** `$anchor`, `$id` base URIs, `$dynamicRef` and remote references
+  are not resolved; such a `$ref` produces a warning and is skipped, so the
+  schema accepts the value.
+- **pdf:** three documented cases where text extraction and the renderer
+  read different copies of an object in a malformed file. A glyph procedure
+  is re-read for every code shown, so very long procedures shown many times
+  are slow.
+- **geo:** reference-system inheritance stops, without a signal, after
+  64 MiB of copies; WFS responses and `get_map` have no size limit.
+- **pdf-write:** sources with compressed cross-reference or object streams
+  are not supported.
+- **CI:** the geo crate's tests with the `http` feature and one PDF test
+  file behind the `glyph-catalog` feature do not run in CI.

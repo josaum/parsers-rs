@@ -1,6 +1,6 @@
 {
   "name": "pdf-fast-node",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "High-performance PDF parser/table/text N-API bindings, full parity with the Rust core using Arrow IPC Buffers",
   "main": "index.js",
   "types": "index.d.ts",

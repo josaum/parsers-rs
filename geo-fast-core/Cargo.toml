@@ -1,6 +1,6 @@
 [package]
 name = "geo-fast-core"
-version = "0.2.3"
+version = "0.2.4"
 edition.workspace = true
 authors.workspace = true
 description = "GIS format parser: GeoTIFF, Shapefile, GeoJSON, WMS/WFS client"

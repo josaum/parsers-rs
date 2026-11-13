@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "email-fast"
-version = "0.2.9"
+version = "0.2.10"
 description = "High-performance email parser for .eml, .msg, and mbox formats"
 requires-python = ">=3.8"
 readme = "README.md"

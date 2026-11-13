@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "json-fast"
-version = "0.1.9"
+version = "0.1.10"
 description = "SIMD-accelerated JSON/JSONL parsing and JSON-family helpers powered by Rust"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
