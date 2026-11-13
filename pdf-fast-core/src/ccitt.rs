@@ -10,14 +10,6 @@ use image::ImageEncoder;
 /// any allocation so a hostile `/Width` and `/Height` are refused up front.
 const MAX_PIXELS: u64 = 100_000_000;
 
-/// Luma for pixels the stream does not code: columns past `/Columns` and rows
-/// after the last decoded row.
-///
-/// hayro-ccitt 0.2 left `/BlackIs1` inversion to the decoder, and this module
-/// padded with the post-inversion white value, so padding is always `0xFF`
-/// regardless of `/BlackIs1`. Kept so decoded output does not change.
-const PADDING: u8 = 0xFF;
-
 pub(crate) struct CcittLumaImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -174,8 +166,10 @@ impl GraySink {
 
     fn finish(mut self) -> Vec<u8> {
         let expected = (self.width as usize).saturating_mul(self.height as usize);
-        // Within the capacity reserved in `new`, so this never reallocates.
-        self.pixels.resize(expected, PADDING);
+        // Rows the stream did not code are coded white, the page behind the
+        // image. Within the capacity reserved in `new`, so this never
+        // reallocates.
+        self.pixels.resize(expected, self.white);
         self.pixels
     }
 }
@@ -190,7 +184,8 @@ impl Decoder for GraySink {
         let start = self.pixels.len();
         // Fewer than `height` rows are pushed here, so this stays within the
         // capacity reserved in `new`.
-        self.pixels.resize(start.saturating_add(width), PADDING);
+        // Columns past `/Columns` are coded white, like rows not coded.
+        self.pixels.resize(start.saturating_add(width), self.white);
         if let Some(row) = self.pixels.get_mut(start..start.saturating_add(coded)) {
             row.fill(self.white);
             // Changes alternate white-to-black and black-to-white; an odd count
@@ -395,7 +390,11 @@ mod tests {
     }
 
     #[test]
-    fn padding_stays_white_when_black_is_1() {
+    fn padding_is_coded_white_when_black_is_1() {
+        // Under `/BlackIs1 true` coded white is sample 0x00 (`B` here) and
+        // coded black 0xFF (`W`). Columns and rows the stream does not code
+        // are coded white, so they read as the image's background under any
+        // `/Decode`; padding them 0xFF painted them as ink.
         // `/Columns 4` inside an 8-pixel `/Width`, and 3 rows for 2 coded rows.
         // Row 1 and 2: 2 white `0111`, 2 black `11`.
         let raw = [0x7D, 0xF0];
@@ -411,7 +410,7 @@ mod tests {
         );
         assert_eq!(
             decode(&raw, &image),
-            [[B, B, W, W, W, W, W, W], [B, B, W, W, W, W, W, W], [W; 8]].concat()
+            [[B, B, W, W, B, B, B, B], [B, B, W, W, B, B, B, B], [B; 8]].concat()
         );
     }
 
