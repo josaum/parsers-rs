@@ -1305,7 +1305,7 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_release_waits_for_ci, RELEASE, "'+refs/heads/main:refs/remotes/origin/main'", "'+refs/heads/*:refs/remotes/origin/*'"),
         # A wheel uploaded from a leg where nothing installed and imported it.
         (assert_release_waits_for_ci, RELEASE, "          python -m pip install --no-index --no-deps dist/*.whl\n", ""),
-        (assert_release_waits_for_ci, RELEASE, "          python -I -c \"import importlib, os; [importlib.import_module", "          python -I -c \"import importlib, os; [importlib.util.find_spec"),
+        (assert_release_waits_for_ci, RELEASE, "from binding_modules import import_name; [importlib.import_module", "from binding_modules import import_name; [importlib.util.find_spec"),
         (assert_release_waits_for_ci, RELEASE, "        if: matrix.target != 'aarch64-unknown-linux-gnu'\n        shell: bash\n        run: |\n          set -euo pipefail\n          read -r -a built_bindings", "        if: matrix.target == 'x86_64-unknown-linux-gnu'\n        shell: bash\n        run: |\n          set -euo pipefail\n          read -r -a built_bindings"),
         (assert_release_waits_for_ci, RELEASE, '          test "${#built_wheels[@]}" -eq "${#built_bindings[@]}"\n', ""),
         # A CI job that can be skipped outside a release, or a third one inside it.
