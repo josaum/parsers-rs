@@ -519,3 +519,31 @@ fn a_spec_date_serial_outside_the_date_range_is_a_plain_number() {
         ]
     );
 }
+
+/// WHY: Excel compares sheet names ignoring case, and Rust lower-cases a
+/// capital sigma at the end of a word to the final form, so two names that
+/// differ only by case were both written as they were.
+#[test]
+fn names_differing_only_by_the_case_of_a_sigma_are_made_unique() {
+    let mut workbook = Workbook::new();
+    let names: Vec<String> = [
+        "\u{3a3}\u{391}\u{3a3}",
+        "\u{3c3}\u{3b1}\u{3c3}",
+        "\u{3c3}\u{3b1}\u{3c2}",
+        "STRASSE",
+        "stra\u{df}e",
+    ]
+    .into_iter()
+    .map(|requested| workbook.add_sheet(requested).name().to_string())
+    .collect();
+    assert_eq!(
+        names,
+        [
+            "\u{3a3}\u{391}\u{3a3}",
+            "\u{3c3}\u{3b1}\u{3c3} (2)",
+            "\u{3c3}\u{3b1}\u{3c2} (3)",
+            "STRASSE",
+            "stra\u{df}e",
+        ]
+    );
+}

@@ -26,7 +26,9 @@
 //!
 //! - **Sheet names** are made valid by [`Workbook::add_sheet`] (31 characters,
 //!   no `[ ] : * ? / \`, unique ignoring case); [`Sheet::name`] returns the
-//!   name actually used.
+//!   name actually used. A tab, line feed or carriage return in a name is
+//!   kept and written as a character reference (`&#9;`, `&#10;`, `&#13;`);
+//!   whether Excel opens a workbook with such a name has not been checked.
 //! - **A workbook with no sheet** is written with one empty sheet.
 //! - **A cell outside the grid** (1,048,576 rows, 16,384 columns), **text
 //!   over 32,767 characters** and **a formula over 8,192** make
@@ -318,6 +320,17 @@ fn truncate_utf16(name: &str, limit: usize) -> &str {
     name
 }
 
+/// Returns the form of `name` under which two sheet names are the same.
+///
+/// Excel compares sheet names ignoring case. Lower-casing alone is not
+/// enough: Rust writes a capital sigma at the end of a word as the final
+/// form `\u{3c2}`, so `\u{3a3}\u{391}\u{3a3}` and `\u{3c3}\u{3b1}\u{3c3}`
+/// would count as different names. The final form is folded to `\u{3c3}`.
+/// No character is expanded, so `STRASSE` and `stra\u{df}e` stay distinct.
+fn sheet_name_key(name: &str) -> String {
+    name.to_lowercase().replace('\u{3c2}', "\u{3c3}")
+}
+
 /// Makes `name` one Excel accepts, apart from uniqueness.
 ///
 /// `position` is the one-based position of the sheet, used to name a sheet
@@ -387,7 +400,7 @@ impl Workbook {
     /// Returns a valid sheet name no other sheet uses, and records it.
     fn unique_sheet_name(&mut self, requested: &str) -> String {
         let base = valid_sheet_name(requested, self.sheets.len() + 1);
-        if self.taken_names.insert(base.to_lowercase()) {
+        if self.taken_names.insert(sheet_name_key(&base)) {
             return base;
         }
         // A suffix ` (N)` is added to the name cut to leave room for it. The
@@ -398,7 +411,7 @@ impl Workbook {
         loop {
             let room = MAX_SHEET_NAME_CHARS.saturating_sub(SUFFIX_FRAME_CHARS + digits);
             let stem = truncate_utf16(&base, room);
-            let counter = self.next_suffix.entry(stem.to_lowercase()).or_insert(2);
+            let counter = self.next_suffix.entry(sheet_name_key(stem)).or_insert(2);
             let needed = counter.to_string().len();
             if needed > digits {
                 // The numbers that fit this stem are used up; a longer
@@ -408,7 +421,7 @@ impl Workbook {
             }
             let name = format!("{stem} ({counter})");
             *counter = counter.saturating_add(1);
-            if self.taken_names.insert(name.to_lowercase()) {
+            if self.taken_names.insert(sheet_name_key(&name)) {
                 return name;
             }
         }
