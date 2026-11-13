@@ -53,8 +53,8 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::DateTime;
 use ooxml_archive::{
-    parse_relationships, part_dir, rels_path_for_part, resolve_part, source_part_from_rels,
-    OoxmlArchive, PartReader, RelEntry, Relationships,
+    parse_relationships, parse_simple_props, part_dir, rels_path_for_part, resolve_part,
+    source_part_from_rels, OoxmlArchive, PartReader, RelEntry, Relationships,
 };
 use quick_xml::encoding::Decoder;
 use quick_xml::escape::resolve_predefined_entity;
@@ -1372,51 +1372,6 @@ fn parse_metadata(archive: &PptxArchive, max_inflate: usize) -> Result<Metadata>
         metadata.custom = parse_custom_props(&xml)?;
     }
     Ok(metadata)
-}
-
-/// Reads core or extended properties: element name to element text.
-///
-/// A property is an element that holds text and no child element. The root
-/// element is not a property, and neither is the whitespace an indented part
-/// has between its elements.
-fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let mut reader = xml_reader(Cursor::new(xml));
-    let mut buf = Vec::new();
-    let mut out = HashMap::new();
-    let mut depth = 0usize;
-    // The innermost open element, while it has no child element, and the
-    // character data read since its start tag. A value arrives in pieces
-    // (text, references, CDATA).
-    let mut pending: Option<(String, String)> = None;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                depth += 1;
-                // Whatever the parent held so far was not a value.
-                pending = (depth > 1).then(|| {
-                    let name = e.name();
-                    let key = String::from_utf8_lossy(local_name(name.as_ref())).into_owned();
-                    (key, String::new())
-                });
-            }
-            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
-                if let (Some((_, value)), Some(piece)) = (pending.as_mut(), character_data(&event))
-                {
-                    value.push_str(&piece);
-                }
-            }
-            Ok(Event::Empty(_)) => pending = None,
-            Ok(Event::End(_)) => {
-                depth = depth.saturating_sub(1);
-                store_prop(&mut out, pending.take());
-            }
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(anyhow!("parse props: {err}")),
-            _ => {}
-        }
-        buf.clear();
-    }
-    Ok(out)
 }
 
 /// Reads custom properties: property name to the text of its value element.

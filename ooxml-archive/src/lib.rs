@@ -21,6 +21,10 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+mod properties;
+
+pub use properties::parse_simple_props;
+
 /// Transitional Office Open XML officeDocument relationship type.
 pub const REL_OFFICE_DOCUMENT: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
@@ -508,13 +512,14 @@ fn normalize_join(base_dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
-/// Creates the XML reader for a relationships part.
+/// Creates the XML reader for a relationships or property part.
 fn xml_reader<R: BufRead>(input: R) -> Reader<R> {
     let mut reader = Reader::from_reader(input);
     let config = reader.config_mut();
+    // Whitespace is text: trimming would delete the spaces around a reference.
     config.trim_text(false);
-    // Only attributes are read here, so a bare `&` in the text between
-    // elements, which is not well-formed, must not cost the relationships.
+    // A bare `&` is not well-formed, but real tools write it ("AT&T"). It is
+    // kept as text instead of costing the relationships or the properties.
     config.allow_dangling_amp = true;
     reader
 }

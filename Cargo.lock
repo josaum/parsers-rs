@@ -2678,6 +2678,7 @@ name = "ooxml-archive"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "chrono",
  "criterion",
  "flate2",
  "memmap2",
@@ -3055,6 +3056,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "criterion",
+ "docx-fast-core",
  "ooxml-archive",
  "quick-xml 0.41.0",
  "serde",
