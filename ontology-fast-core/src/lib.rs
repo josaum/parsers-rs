@@ -520,7 +520,7 @@ pub fn parse_turtle(
     // statements repeat it. The stage is deduplicated and held to the
     // statement budget, which keeps retained memory bounded by the same
     // ceiling as the result.
-    let mut terms = StagedTerms::default();
+    let mut terms: StagedTerms = StagedTerms::default();
     let mut staged: Vec<[u32; 3]> = Vec::new();
     let mut staged_seen: HashSet<[u32; 3]> = HashSet::new();
     let term_budget = term_byte_budget(source.len());
@@ -974,6 +974,15 @@ enum TermKind {
 /// This table is keyed on the 64-bit hash instead and leaves the text with
 /// the caller: a lookup hashes its key once, then asks the caller whether a
 /// candidate number really is that key.
+///
+/// Keys that share a 64-bit hash are chained, newest first, and a lookup
+/// walks the chain: a key not seen before is compared with every earlier key
+/// of its hash. With the standard library's randomly keyed hasher a chain
+/// longer than one is a 64-bit collision nobody can aim for, so a lookup is
+/// one comparison. Under total collision (every key one hash, which only a
+/// test's hasher produces) the walk is linear per lookup and numbering `n`
+/// distinct keys costs `n * (n - 1) / 2` comparisons: quadratic, and left so
+/// rather than restructured.
 #[derive(Debug, Default)]
 struct Numbers<S = RandomState> {
     state: S,
@@ -1021,14 +1030,14 @@ impl<S: BuildHasher> Numbers<S> {
 
 /// The distinct terms of one document, numbered by first appearance.
 #[derive(Debug, Default)]
-struct StagedTerms {
-    numbers: Numbers,
+struct StagedTerms<S = RandomState> {
+    numbers: Numbers<S>,
     /// The kind and the full text of each term, at the index of its number.
     kinds: Vec<TermKind>,
     texts: Vec<String>,
 }
 
-impl StagedTerms {
+impl<S: BuildHasher> StagedTerms<S> {
     /// The number of the term `text` of kind `kind`, assigning the next on first sight.
     fn number(&mut self, kind: TermKind, text: &str) -> Result<u32, OntologyError> {
         let (kinds, texts) = (&self.kinds, &self.texts);
@@ -1766,6 +1775,69 @@ mod tests {
                 [1, 2, 0, 3, 0, 0],
             ]
         );
+    }
+
+    #[test]
+    fn terms_that_share_a_hash_still_get_their_own_numbers() {
+        let mut terms = StagedTerms {
+            numbers: Numbers {
+                state: OneHash,
+                latest: HashMap::new(),
+                earlier: Vec::new(),
+            },
+            kinds: Vec::new(),
+            texts: Vec::new(),
+        };
+        // The same text under each kind is three terms, not one.
+        let kinds = [TermKind::Iri, TermKind::Verbatim, TermKind::Predicate];
+        let count = 300_u32;
+        for round in 0..2 {
+            for n in 0..count {
+                let kind = kinds[n as usize % kinds.len()];
+                let text = format!("a:{}", n / 3);
+                // The second round meets every term again, under its number.
+                assert_eq!(terms.number(kind, &text), Ok(n), "round {round}");
+            }
+        }
+        assert_eq!(terms.texts.len(), count as usize);
+        let rendered = terms
+            .render(&Abbreviator::new(&BTreeMap::new()), usize::MAX)
+            .expect("within the budget");
+        assert_eq!(rendered[0], "<a:0>");
+        assert_eq!(rendered[1], "a:0");
+        assert_eq!(rendered[2], "<a:0>");
+    }
+
+    #[test]
+    fn a_chain_of_one_hash_costs_one_comparison_per_earlier_key() {
+        let mut numbers = Numbers {
+            state: OneHash,
+            latest: HashMap::new(),
+            earlier: Vec::new(),
+        };
+        let comparisons = std::cell::Cell::new(0_usize);
+        let count = 400_usize;
+        let mut keys: Vec<usize> = Vec::new();
+        for key in 0..count {
+            let number = numbers.number(key, |known| {
+                comparisons.set(comparisons.get() + 1);
+                keys[known as usize] == key
+            });
+            assert_eq!(number, Ok((u32::try_from(key).expect("small"), true)));
+            keys.push(key);
+        }
+        // Total collision: a new key is compared with every earlier one and
+        // no more, which is the documented quadratic worst case.
+        assert_eq!(comparisons.get(), count * (count - 1) / 2);
+        // A key already numbered is found from the newest end of the chain.
+        comparisons.set(0);
+        let newest = count - 1;
+        let found = numbers.number(newest, |known| {
+            comparisons.set(comparisons.get() + 1);
+            keys[known as usize] == newest
+        });
+        assert_eq!(found, Ok((u32::try_from(newest).expect("small"), false)));
+        assert_eq!(comparisons.get(), 1);
     }
 
     #[test]
