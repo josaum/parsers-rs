@@ -614,7 +614,11 @@ fn whitespace_between_property_elements_is_not_a_value() {
         );
         assert_eq!(
             sorted(&doc.metadata.app),
-            [("Company", "Acme & Co"), ("Pages", "3"), ("lpstr", "Title")],
+            [
+                ("Company", "Acme & Co"),
+                ("Pages", "3"),
+                ("TitlesOfParts", "Title")
+            ],
             "app with gap {gap:?}"
         );
         assert_eq!(
@@ -624,4 +628,44 @@ fn whitespace_between_property_elements_is_not_a_value() {
         );
         assert_eq!(doc.page_count, Some(3));
     }
+}
+
+// A property whose value is a vector is keyed by the property, not by the
+// type of its items, and holds every item, one per line, in document order.
+#[test]
+fn a_nested_app_property_is_keyed_by_the_property_that_holds_it() {
+    let app = [
+        &format!("<Properties {APP_NS}>"),
+        "<Company>Acme</Company>",
+        "<HeadingPairs><vt:vector size=\"4\" baseType=\"variant\">",
+        "<vt:variant><vt:lpstr>Title</vt:lpstr></vt:variant>",
+        "<vt:variant><vt:i4>1</vt:i4></vt:variant>",
+        "<vt:variant><vt:lpstr>Headings</vt:lpstr></vt:variant>",
+        "<vt:variant><vt:i4>2</vt:i4></vt:variant>",
+        "</vt:vector></HeadingPairs>",
+        "<TitlesOfParts><vt:vector size=\"3\" baseType=\"lpstr\">",
+        "<vt:lpstr>Report</vt:lpstr><vt:lpstr>Scope</vt:lpstr><vt:lpstr>R&amp;D</vt:lpstr>",
+        "</vt:vector></TitlesOfParts>",
+        "<AppVersion>16.0000</AppVersion>",
+        "</Properties>",
+    ]
+    .concat()
+    .into_bytes();
+    let bytes = package(&[
+        (
+            "word/document.xml",
+            w_part("document", "<w:body><w:p/></w:body>"),
+        ),
+        ("docProps/app.xml", app),
+    ]);
+    let doc = parse_docx_bytes(bytes, ParseOptions::default()).expect("document parses");
+    assert_eq!(
+        sorted(&doc.metadata.app),
+        [
+            ("AppVersion", "16.0000"),
+            ("Company", "Acme"),
+            ("HeadingPairs", "Title\n1\nHeadings\n2"),
+            ("TitlesOfParts", "Report\nScope\nR&D"),
+        ]
+    );
 }

@@ -1132,13 +1132,25 @@ fn store_property(
 
 /// Reads `docProps/core.xml` or `docProps/app.xml`.
 ///
-/// Every element below the root that holds text is a property, named by its
-/// local name. The root element itself is not one.
+/// Every child of the root that holds text is a property, named by its
+/// local name (`Company`, `title`). The root element itself is not one.
+///
+/// A property whose value is nested, as the vectors of `docProps/app.xml`
+/// are (`TitlesOfParts`, `HeadingPairs`), keeps the name of the property:
+/// the elements inside it (`vt:vector`, `vt:variant`, `vt:lpstr`, `vt:i4`)
+/// say how the value is typed and are not properties. Its value is the text
+/// of every item, in document order, one per line. So `TitlesOfParts` with
+/// two `vt:lpstr` items reads `"First\nSecond"`, where it used to appear
+/// under the key `lpstr` holding the last item only.
 fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
     let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
-    let mut out = HashMap::new();
+    let mut out: HashMap<String, String> = HashMap::new();
     let mut current_key: Option<String> = None;
+    // The child of the root being read, and whether the text now collected
+    // stands in an element nested inside it.
+    let mut property: Option<String> = None;
+    let mut nested = false;
     let mut value = String::new();
     let mut depth = 0usize;
     loop {
@@ -1150,19 +1162,38 @@ fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
             }
             Ok(event) => {
                 let before_element = matches!(event, Event::Start(_) | Event::Empty(_));
-                store_property(&mut out, &mut current_key, &mut value, before_element);
+                let mut stored = HashMap::new();
+                store_property(&mut stored, &mut current_key, &mut value, before_element);
+                for (key, text) in stored {
+                    match out.get_mut(&key).filter(|_| nested) {
+                        Some(items) => {
+                            items.push('\n');
+                            items.push_str(&text);
+                        }
+                        None => {
+                            out.insert(key, text);
+                        }
+                    }
+                }
                 match event {
                     Event::Start(e) => {
-                        if depth > 0 {
+                        if depth == 1 {
                             let raw = e.name().as_ref().to_vec();
                             let key = local_name(&raw);
-                            current_key = Some(String::from_utf8_lossy(key).to_string());
+                            property = Some(String::from_utf8_lossy(key).to_string());
+                        }
+                        if depth > 0 {
+                            current_key.clone_from(&property);
+                            nested = depth > 1;
                         }
                         depth += 1;
                     }
                     Event::End(_) => {
                         current_key = None;
                         depth = depth.saturating_sub(1);
+                        if depth <= 1 {
+                            property = None;
+                        }
                     }
                     Event::Eof => break,
                     _ => {}
