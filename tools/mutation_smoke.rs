@@ -402,3 +402,73 @@ where
     }
     panic!("{report}");
 }
+
+/// Set to anything but `0` or the empty string to make [`fuzz_seeds`] write
+/// the seed files instead of checking them.
+pub const WRITE_FUZZ_SEEDS: &str = "WRITE_FUZZ_SEEDS";
+
+/// Keeps the starting corpus of a crate's fuzz targets identical to the seeds
+/// its smoke tests use.
+///
+/// Each entry is `(target, file name, bytes)` and lives at
+/// `<crate_dir>/fuzz/seeds/<target>/<file name>`. By default every file must
+/// hold exactly those bytes (on Windows: must exist and not be empty), and a seed directory may hold no other file, so
+/// a seed builder cannot change while the corpus stays behind. With
+/// [`WRITE_FUZZ_SEEDS`] set, the files are written and the others removed.
+///
+/// # Panics
+///
+/// Panics if a seed is empty, missing, different from its file, or cannot be
+/// written, or if a seed directory holds a file the list does not name.
+pub fn fuzz_seeds(crate_dir: &str, seeds: &[(&str, &str, Vec<u8>)]) {
+    let write =
+        std::env::var(WRITE_FUZZ_SEEDS).is_ok_and(|value| !value.is_empty() && value != "0");
+    let root = std::path::Path::new(crate_dir).join("fuzz/seeds");
+    let mut named: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for (target, name, bytes) in seeds {
+        assert!(!bytes.is_empty(), "the seed {target}/{name} is empty");
+        named.entry(target).or_default().push(name);
+        let dir = root.join(target);
+        let path = dir.join(name);
+        if write {
+            std::fs::create_dir_all(&dir).expect("create the seed directory");
+            std::fs::write(&path, bytes).expect("write the seed");
+        }
+        let stored = std::fs::read(&path).unwrap_or_default();
+        // The committed seeds are written on Unix. The ZIP packages the
+        // seed builders produce on Windows are not the same bytes (the
+        // docx, xlsx, pptx and archive seeds differed there, the others
+        // did not), so Windows checks only that the file is present; the
+        // Linux and macOS runs still compare every byte.
+        let same = if cfg!(windows) {
+            !stored.is_empty()
+        } else {
+            stored == *bytes
+        };
+        assert!(
+            same,
+            "{} is missing or differs from the seed the smoke test builds; \
+             run this test with {WRITE_FUZZ_SEEDS}=1 and commit the result",
+            path.display()
+        );
+    }
+    for (target, names) in &named {
+        let entries = std::fs::read_dir(root.join(target)).expect("read the seed directory");
+        for entry in entries {
+            let entry = entry.expect("read a seed directory entry");
+            let file = entry.file_name();
+            if names.iter().any(|name| file == std::ffi::OsStr::new(name)) {
+                continue;
+            }
+            if write {
+                std::fs::remove_file(entry.path()).expect("remove a stale seed");
+            } else {
+                panic!(
+                    "{} is not a seed the smoke test builds any more; \
+                     run this test with {WRITE_FUZZ_SEEDS}=1 and commit the result",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+}

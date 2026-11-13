@@ -51,14 +51,14 @@ fn js_error(err: impl std::fmt::Display) -> Error {
 }
 
 /// Parse a PPTX file and return the whole presentation as a JSON value.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_pptx_js(path: String, options: Option<ParseOptionsJs>) -> Result<serde_json::Value> {
     let doc = parse_pptx(path, to_parse_options(options)).map_err(js_error)?;
     serde_json::to_value(&doc).map_err(js_error)
 }
 
 /// Parse a PPTX file and write one NDJSON record per slide element to `out_path`.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_pptx_ndjson_js(
     path: String,
     out_path: String,
@@ -71,7 +71,7 @@ pub fn parse_pptx_ndjson_js(
 ///
 /// `options` bounds the inflate budget used while reading the archive; the
 /// consumer shells were built without that parameter, so it stays optional.
-#[napi]
+#[napi(catch_unwind)]
 pub fn extract_pptx_images_js(
     path: String,
     out_dir: String,
@@ -89,7 +89,7 @@ pub fn extract_pptx_images_js(
 /// Same output as [`parse_pptx_arrow_dataset_js`] without the path list; the
 /// core crate dropped its `parse_pptx_to_arrow_ipc` wrapper, and this keeps
 /// the JavaScript surface the consumer shells were built against.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_pptx_arrow_ipc_js(
     path: String,
     out_dir: String,
@@ -107,7 +107,7 @@ pub fn parse_pptx_arrow_ipc_js(
 }
 
 /// Parse a PPTX file into an Arrow dataset under `out_dir` and return the written files.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_pptx_arrow_dataset_js(
     path: String,
     out_dir: String,

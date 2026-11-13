@@ -472,3 +472,24 @@ fn pathological_patterns_are_bounded() {
         }
     }
 }
+
+/// The seeds above are also the starting corpus of the fuzz targets in
+/// `fuzz/`; `WRITE_FUZZ_SEEDS=1` writes them out again after a seed changes.
+#[test]
+fn the_fuzz_corpus_holds_these_seeds() {
+    let text = |seed: &str| seed.as_bytes().to_vec();
+    smoke::fuzz_seeds(
+        env!("CARGO_MANIFEST_DIR"),
+        &[
+            ("json_parse", "document.json", text(DOCUMENT)),
+            ("json_parse", "lines.jsonl", text(JSONL)),
+            ("json_parse", "rpc-request.json", text(RPC_REQUEST)),
+            ("json_parse", "rpc-response.json", text(RPC_RESPONSE)),
+            ("json_parse", "jsonapi.json", text(API)),
+            ("json_parse", "token.jwt", text(JWT)),
+            ("json_parse", "linked-data.jsonld", text(LD)),
+            ("json_schema_validate", "schema.json", text(SCHEMA)),
+            ("json_schema_validate", "document.json", text(DOCUMENT)),
+        ],
+    );
+}
