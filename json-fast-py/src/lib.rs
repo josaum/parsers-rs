@@ -188,13 +188,37 @@ fn json_type(py: Python<'_>, s: &str) -> PyResult<&'static str> {
 /// Validate a JSON document against a JSON Schema; returns a list of findings.
 ///
 /// Each finding is `{"severity": "error"|"warning", "path", "message"}`.
+/// `resources` maps a URI to the JSON text of another schema document that a
+/// `$ref` may name. Nothing is fetched: a reference that resolves neither in
+/// the schema nor in `resources` is an error finding.
 #[pyfunction]
-fn validate<'py>(py: Python<'py>, s: &str, schema: &str) -> PyResult<Vec<Bound<'py, PyAny>>> {
+#[pyo3(signature = (s, schema, *, resources=None))]
+fn validate<'py>(
+    py: Python<'py>,
+    s: &str,
+    schema: &str,
+    resources: Option<Bound<'py, PyDict>>,
+) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    // Copied with the GIL held, in the dict's order.
+    let mut supplied: Vec<(String, String)> = Vec::new();
+    if let Some(resources) = resources {
+        for (uri, text) in resources.iter() {
+            supplied.push((uri.extract()?, text.extract()?));
+        }
+    }
     let findings = py
         .detach(|| -> Result<_, JsonError> {
             let doc: Value = json_fast_core::parse(s)?;
             let sch: Value = json_fast_core::parse(schema)?;
-            Ok(json_fast_core::schema::validate(&doc, &sch))
+            let parsed = supplied
+                .iter()
+                .map(|(uri, text)| Ok((uri.as_str(), json_fast_core::parse(text)?)))
+                .collect::<Result<Vec<(&str, Value)>, JsonError>>()?;
+            let documents: Vec<(&str, &Value)> =
+                parsed.iter().map(|(uri, value)| (*uri, value)).collect();
+            Ok(json_fast_core::schema::validate_with_resources(
+                &doc, &sch, &documents,
+            ))
         })
         .map_err(err)?;
     findings

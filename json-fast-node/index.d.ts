@@ -16,8 +16,16 @@ export interface SchemaFinding {
   message: string;
 }
 
-/** Validate a JSON document against a JSON Schema; returns an array of findings. */
-export declare function validate(s: string, schema: string): SchemaFinding[];
+/**
+ * Validate a JSON document against a JSON Schema; returns an array of findings.
+ * `resources` maps a URI to the JSON text of another schema document a `$ref`
+ * may name. Nothing is fetched: a reference that resolves nowhere is an error.
+ */
+export declare function validate(
+  s: string,
+  schema: string,
+  resources?: Record<string, string>,
+): SchemaFinding[];
 
 /** Parse and validate a JSON-RPC 2.0 request envelope. */
 export declare function jsonRpcRequest(s: string): any;

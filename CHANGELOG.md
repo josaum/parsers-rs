@@ -13,7 +13,20 @@ request.
   `not` or beside a passing `anyOf` branch. It used to be a warning and was
   skipped, which accepted the value. Nothing is fetched, so a remote
   reference fails this way unless its document is supplied to the new
-  `json_fast_core::schema::validate_with_resources`.
+  `json_fast_core::schema::validate_with_resources`, or to the new optional
+  `resources` argument of `json_fast.validate` (Python, keyword-only, a dict
+  from URI to schema text) and of `validate` in `json-fast-node` (a trailing
+  object from URI to schema text). References to the JSON Schema
+  meta-schemas (`json_fast_core::schema::WELL_KNOWN_META_SCHEMAS`) stay a
+  warning and are skipped.
+- **json:** an `$id` or anchor inside `enum`, `const`, `default`,
+  `examples` or an unknown keyword no longer identifies a schema. Two
+  resources with one URI: the first in document order is used, with a
+  warning. Under a draft-04/06/07 `$schema`, an object holding `$ref` sets
+  no base URI and no anchor.
+- **json:** validation stops with an error when resolving `$id`s and
+  references needs more than 16 bytes of URI text per byte of schema text
+  (plus 1 MiB), as a long base URI under many relative `$id`s would.
 
 ### Fixed
 

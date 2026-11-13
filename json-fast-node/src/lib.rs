@@ -4,6 +4,8 @@
 //! types, JSONL/NDJSON streaming, JSON Schema validation, JSON-RPC 2.0,
 //! JSON:API, JWT split, and JSON-LD context peek.
 
+use std::collections::HashMap;
+
 use json_fast_core::jsonl;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -45,20 +47,42 @@ pub fn json_type(s: String) -> Result<String> {
 }
 
 /// Validate a JSON document against a JSON Schema; returns an array of findings.
+///
+/// `resources` maps a URI to the JSON text of another schema document that a
+/// `$ref` may name. Nothing is fetched: a reference that resolves neither in
+/// the schema nor in `resources` is an error finding.
 #[napi(catch_unwind)]
-pub fn validate(s: String, schema: String) -> Result<Vec<Value>> {
+pub fn validate(
+    s: String,
+    schema: String,
+    resources: Option<HashMap<String, String>>,
+) -> Result<Vec<Value>> {
     let doc: Value = json_fast_core::parse(&s).map_err(err)?;
     let sch: Value = json_fast_core::parse(&schema).map_err(err)?;
-    Ok(json_fast_core::schema::validate(&doc, &sch)
+    let mut supplied = resources
+        .unwrap_or_default()
         .into_iter()
-        .map(|f| {
-            json!({
-                "severity": f.severity.as_str(),
-                "path": f.path,
-                "message": f.message,
+        .map(|(uri, text)| Ok((uri, json_fast_core::parse(&text).map_err(err)?)))
+        .collect::<Result<Vec<(String, Value)>>>()?;
+    // An object's key order is not kept by the map; sorting makes the
+    // choice between two documents claiming one URI deterministic.
+    supplied.sort_by(|a, b| a.0.cmp(&b.0));
+    let documents: Vec<(&str, &Value)> = supplied
+        .iter()
+        .map(|(uri, value)| (uri.as_str(), value))
+        .collect();
+    Ok(
+        json_fast_core::schema::validate_with_resources(&doc, &sch, &documents)
+            .into_iter()
+            .map(|f| {
+                json!({
+                    "severity": f.severity.as_str(),
+                    "path": f.path,
+                    "message": f.message,
+                })
             })
-        })
-        .collect())
+            .collect(),
+    )
 }
 
 /// Parse and validate a JSON-RPC 2.0 request envelope.
@@ -145,14 +169,49 @@ mod tests {
     }
 
     #[test]
+    fn validate_takes_supplied_schema_documents_and_fails_closed() {
+        let schema = r#"{"$ref": "https://example.com/positive.json"}"#.to_owned();
+        let resources = HashMap::from([(
+            "https://example.com/positive.json".to_owned(),
+            r#"{"type": "integer", "minimum": 1}"#.to_owned(),
+        )]);
+        let errors = |findings: Vec<Value>| -> Vec<Value> {
+            findings
+                .into_iter()
+                .filter(|finding| finding["severity"] == "error")
+                .collect()
+        };
+        let run = |document: &str, resources: Option<HashMap<String, String>>| {
+            validate(document.to_owned(), schema.clone(), resources).unwrap()
+        };
+        assert_eq!(
+            errors(run("3", Some(resources.clone()))),
+            Vec::<Value>::new()
+        );
+        assert!(!errors(run("0", Some(resources))).is_empty());
+        let unresolved = errors(run("3", None));
+        assert!(
+            unresolved[0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("does not resolve")),
+            "{unresolved:?}"
+        );
+        let broken = HashMap::from([(
+            "https://example.com/positive.json".to_owned(),
+            "{".to_owned(),
+        )]);
+        assert!(validate("3".to_owned(), schema.clone(), Some(broken)).is_err());
+    }
+
+    #[test]
     fn validate_reports_findings_as_plain_objects() {
         let schema = r#"{"type":"object","properties":{"value":{"type":"number"}}}"#;
-        let ok = validate(r#"{"value":3.1}"#.to_owned(), schema.to_owned()).unwrap();
+        let ok = validate(r#"{"value":3.1}"#.to_owned(), schema.to_owned(), None).unwrap();
         assert!(
             ok.iter().all(|finding| finding["severity"] != "error"),
             "{ok:?}"
         );
-        let bad = validate(r#"{"value":"x"}"#.to_owned(), schema.to_owned()).unwrap();
+        let bad = validate(r#"{"value":"x"}"#.to_owned(), schema.to_owned(), None).unwrap();
         let finding = bad
             .iter()
             .find(|finding| finding["severity"] == "error")

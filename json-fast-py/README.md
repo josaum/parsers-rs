@@ -51,7 +51,8 @@ JSON Schema validation covers the draft-07 through 2020-12 constraint keywords
 with `$id` base URIs and anchors, boolean schemas, and a bounded `format`
 assertion set). A reference that does not resolve inside the schema, including
 any remote one (nothing is fetched), is an error, so the document is not
-accepted. Unknown formats and unknown keywords are surfaced as warnings, never
+accepted, unless `validate(..., resources={uri: schema_text})` supplies the
+document; references to the JSON Schema meta-schemas stay warnings. Unknown formats and unknown keywords are surfaced as warnings, never
 silent passes. BSON, JSON5, and HJSON remain out of scope. Parse and validation
 failures remain caller-visible rather than yielding a partial result.
 
