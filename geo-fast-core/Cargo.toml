@@ -22,11 +22,16 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 byteorder = "1"
 tiff = "0.9"
-quick-xml = "0.36"
+quick-xml = "0.41"
 
+# reqwest 0.13 changed its default TLS backend from native-tls to rustls. The
+# features below are the ones 0.12's defaults enabled: the platform's own TLS
+# library (without ALPN, as before), charset decoding, HTTP/2 and the system
+# proxy settings.
 [dependencies.reqwest]
-version = "0.12"
-features = ["json"]
+version = "0.13"
+default-features = false
+features = ["json", "native-tls-no-alpn", "charset", "http2", "system-proxy"]
 optional = true
 
 [dependencies.tokio]
