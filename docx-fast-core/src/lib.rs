@@ -64,7 +64,7 @@ use ooxml_archive::utf8::LossyUtf8;
 use ooxml_archive::{
     parse_relationships, parse_simple_props, part_dir, relationship_matches, relationship_target,
     rels_path_for_part, resolve_part, source_part_from_rels, OoxmlArchive, PartReader, RelEntry,
-    Relationships, DEFAULT_MAX_INFLATE,
+    Relationships,
 };
 use quick_xml::events::{BytesRef, BytesText, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -3263,7 +3263,7 @@ mod tests {
         let mut revisions = Vec::new();
         parse_document_blocks(
             Cursor::new(xml),
-            DEFAULT_MAX_INFLATE,
+            ooxml_archive::DEFAULT_MAX_INFLATE,
             &[],
             &StyleFonts::default(),
             &mut fields,
