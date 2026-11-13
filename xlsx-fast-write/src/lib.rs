@@ -297,6 +297,51 @@ const END_DATE_SERIAL: f64 = 2_958_466.0;
 /// Widest column Excel accepts, in character units.
 const MAX_COLUMN_WIDTH: f64 = 255.0;
 
+/// Deepest nesting of arrays and objects a JSON spec may have.
+///
+/// A spec nests five deep (the spec, `sheets`, a sheet, `rows`, a row, a
+/// cell). The JSON reader recurses once per level, and how much stack a
+/// level costs depends on which of its features the rest of the build turns
+/// on, so the depth is checked before the reader sees the text.
+const MAX_SPEC_NESTING_DEPTH: usize = 32;
+
+/// Refuses a JSON spec nested deeper than [`MAX_SPEC_NESTING_DEPTH`].
+///
+/// Brackets inside strings do not count. The scan does not validate the
+/// JSON; the reader does that afterwards.
+fn check_spec_nesting(json: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in json.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > MAX_SPEC_NESTING_DEPTH {
+                    return Err(format!(
+                        "the workbook spec nests deeper than {MAX_SPEC_NESTING_DEPTH} levels"
+                    )
+                    .into());
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// A workbook.
 pub struct Workbook {
     sheets: Vec<Sheet>,
@@ -817,6 +862,7 @@ impl Workbook {
         json: &str,
         path: impl AsRef<Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        check_spec_nesting(json)?;
         let spec: WorkbookSpec = serde_json::from_str(json)?;
         let wb = Workbook::from_spec(spec);
         wb.save(path)?;
@@ -825,6 +871,7 @@ impl Workbook {
 
     /// Parse a JSON workbook spec and return the `.xlsx` bytes.
     pub fn write_json_spec_to_bytes(json: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        check_spec_nesting(json)?;
         let spec: WorkbookSpec = serde_json::from_str(json)?;
         let wb = Workbook::from_spec(spec);
         let mut buf = std::io::Cursor::new(Vec::new());

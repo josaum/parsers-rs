@@ -144,3 +144,24 @@ fn deep_and_large_specs_are_bounded_on_a_small_stack() {
         });
     }
 }
+
+/// A spec is refused by its nesting before the JSON reader recurses into it,
+/// and brackets inside a string are not nesting.
+#[test]
+fn a_spec_nested_past_the_limit_is_refused_by_name() {
+    let deep = smoke::nested(b"[", b"1", b"]", 33);
+    let text = String::from_utf8(deep).expect("ascii");
+    let error = Workbook::write_json_spec_to_bytes(&text).expect_err("too deep");
+    assert_eq!(
+        error.to_string(),
+        "the workbook spec nests deeper than 32 levels"
+    );
+
+    let brackets = "[".repeat(1_000);
+    let quoted = format!(
+        r#"{{"sheets":[{{"name":"S","rows":[[{{"v":"{brackets}"}},{{"v":"a\"[[[b"}}]]}}]}}"#
+    );
+    if let Err(error) = Workbook::write_json_spec_to_bytes(&quoted) {
+        panic!("brackets in strings were counted or the spec is wrong: {error}");
+    }
+}
