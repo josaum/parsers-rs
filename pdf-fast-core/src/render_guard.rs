@@ -74,13 +74,14 @@
 //!   Each saved graphics state copies the clip paths in force, and the
 //!   number of those is not bounded.
 //!
-//! Bounded beyond recursion: the pixels an image XObject, its soft mask or
-//! an inline image declares, and the pixels of the tiling cell renderers
-//! held at once along one path of nested patterns, each by
+//! Bounded beyond recursion: the copies of its cell a tiling pattern needs
+//! to cover the page, by `MAX_TILING_COPIES`; the pixels an image XObject,
+//! its soft mask or an inline image declares, and the pixels of the tiling
+//! cell renderers held at once along one path of nested patterns, each by
 //! [`image_pixel_budget`] (a cell is sized by `cell_pixels`, at the largest
 //! scale the interpreter allows, since the transform is not known before
-//! rendering); the interpreter's
-//! saved-state stack, by [`MAX_SAVED_STATES`]; a sampled function's table, by
+//! rendering); the interpreter's saved-state stack, by
+//! [`MAX_SAVED_STATES`]; a sampled function's table, by
 //! [`MAX_SAMPLED_FUNCTION_ENTRIES`], and its cost per evaluation, which
 //! doubles with each input, by [`MAX_SAMPLED_FUNCTION_INPUTS`]. Every font a
 //! stream selects, and every object it reaches, is held to
@@ -266,6 +267,18 @@ pub(crate) fn image_pixel_budget(page_pixels: u64) -> u64 {
         .max(IMAGE_PIXEL_FLOOR)
 }
 
+/// Most copies of one tiling cell a pattern may need to cover the page.
+///
+/// The count is the page's area over the area of one cell step, both at the
+/// render's resolution, so the resolution cancels out. The interpreter
+/// cannot place the copies at less than a pixel apart, and a step it rounds
+/// to no pixels at all fails inside it, so a pattern needing a vast number
+/// of copies is refused before it runs. On 2026-11-13, page one of 1,295
+/// real files used tiling patterns 133 times (in 30 files); the median use
+/// needed about 3 copies and the most needed 98,929. This is a hundred
+/// times that, so it refuses only steps far below a point on a full page.
+const MAX_TILING_COPIES: f64 = 10_000_000.0;
+
 /// Pixels an image dictionary declares, read as the interpreter reads them:
 /// `/W` or `/Width` times `/H` or `/Height`; zero when either is missing.
 fn declared_pixels(dict: &Dict<'_>) -> u64 {
@@ -303,6 +316,33 @@ fn cell_pixels(dict: &Dict<'_>) -> u64 {
         }
     };
     side(&b"XStep"[..], 0, 2).saturating_mul(side(&b"YStep"[..], 1, 3))
+}
+
+/// How many copies of a tiling cell it takes to cover `fill_area` square
+/// points: the area over that of one step, `|XStep × YStep|` scaled by the
+/// determinant of the pattern's `/Matrix`.
+///
+/// A missing step builds no pattern in the interpreter, so it counts none.
+/// A zero, infinite or NaN step, or a matrix that collapses the cell, counts
+/// as infinitely many. The transform the pattern is drawn under is not known
+/// before rendering; the page's own area at the pattern's own scale stands
+/// for it.
+fn tiling_copies(dict: &Dict<'_>, fill_area: f64) -> f64 {
+    let step = |key: &[u8]| dict.get::<f32>(key).map(f64::from);
+    let (Some(x_step), Some(y_step)) = (step(&b"XStep"[..]), step(&b"YStep"[..])) else {
+        return 0.0;
+    };
+    let [a, b, c, d, _, _] = dict
+        .get::<[f32; 6]>(&b"Matrix"[..])
+        .map_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], |matrix| {
+            matrix.map(f64::from)
+        });
+    let cell = (x_step * y_step * (a * d - b * c)).abs();
+    if cell.is_finite() && cell > 0.0 {
+        fill_area / cell
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// A dictionary's keys in byte order.
@@ -543,6 +583,9 @@ struct Walk<'a> {
     decode_allowance: usize,
     /// Most pixels one image may declare, from [`image_pixel_budget`].
     image_pixels: u64,
+    /// The page's area in square points, which a tiling pattern's copies
+    /// are counted across.
+    fill_area: f64,
     next_id: u32,
 }
 
@@ -776,6 +819,18 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
+    /// Refuses a tiling pattern that needs more than [`MAX_TILING_COPIES`]
+    /// copies of its cell to cover the page.
+    fn check_tiling_copies(&self, pattern: &Dict<'_>) -> Result<()> {
+        let copies = tiling_copies(pattern, self.fill_area);
+        if copies.is_nan() || copies > MAX_TILING_COPIES {
+            return Err(refused(
+                "a tiling pattern needs more copies of its cell than this render may draw",
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuses tiling cell renderers, held at once along one path, that
     /// together have more than [`image_pixel_budget`] pixels.
     fn check_cell_pixels(&self, pixels: u64) -> Result<()> {
@@ -903,7 +958,10 @@ impl<'a> Walk<'a> {
         // A tiling cell renders into a renderer of its own, held while the
         // cell's content runs, beneath every cell it is nested in.
         let cells = match route {
-            Route::Pattern => frame.cells.saturating_add(cell_pixels(stream.dict())),
+            Route::Pattern => {
+                self.check_tiling_copies(stream.dict())?;
+                frame.cells.saturating_add(cell_pixels(stream.dict()))
+            }
             Route::Form | Route::SoftMask => frame.cells,
         };
         self.check_cell_pixels(cells)?;
@@ -1075,6 +1133,7 @@ impl<'a> Walk<'a> {
             for name in &scan.patterns {
                 let pattern = find(&chain, b"Pattern", name).ok_or_else(outside)?;
                 if let Some(cell) = pattern.into_stream() {
+                    self.check_tiling_copies(cell.dict())?;
                     self.check_cell_pixels(cell_pixels(cell.dict()))?;
                     let own = vec![own_resources(cell.dict())];
                     targets.push((cell, own, PATTERN_COST));
@@ -1365,6 +1424,8 @@ fn decode_is_fixed(stream: &Stream<'_>) -> bool {
 /// glyph procedure could enter another content stream, or when checking
 /// would take more contexts or decoded bytes than its bounds allow.
 pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize, image_pixels: u64) -> Result<()> {
+    let (width, height) = page.render_dimensions();
+    let fill_area = f64::from(width) * f64::from(height);
     let mut walk = Walk {
         scans: HashMap::new(),
         fonts: HashMap::new(),
@@ -1376,6 +1437,11 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize, image_pixels: u
         decoded: 0,
         decode_allowance,
         image_pixels,
+        fill_area: if fill_area.is_finite() {
+            fill_area.abs()
+        } else {
+            f64::MAX
+        },
         next_id: 1,
     };
 
