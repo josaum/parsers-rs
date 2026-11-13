@@ -713,8 +713,7 @@ enum XrefEntry {
     },
 }
 
-/// One cross-reference section's entries by object number, plus the
-/// section's trailer entries.
+/// Every object's current entry by object number, plus the newest trailer.
 type ParsedSection = (HashMap<u32, XrefEntry>, HashMap<String, String>);
 
 /// Most cross-reference sections one source may chain through `/Prev`.
@@ -744,6 +743,70 @@ const DECODE_FLOOR_BYTES: usize = 64 * 1024;
 ///
 /// Eight bytes hold any 64-bit offset; a wider field can only be malformed.
 const MAX_XREF_FIELD_BYTES: usize = 8;
+
+/// Source bytes per cross-reference entry the entry cap allows.
+///
+/// 120 local PDFs re-saved with object streams (pikepdf,
+/// `ObjectStreamMode.generate`) held at most one entry per 51 bytes (median
+/// one per 600); their originals at most one per 79. One entry per 8 bytes
+/// is more than six times the densest file seen, and keeps a source's
+/// entries (some tens of bytes of memory each) within a few times its length.
+const SOURCE_BYTES_PER_ENTRY: usize = 8;
+
+/// Entries allowed on top of [`SOURCE_BYTES_PER_ENTRY`], whatever the length.
+///
+/// Lets a source of a few hundred bytes hold its handful of objects.
+const ENTRY_FLOOR: usize = 4096;
+
+/// Cross-reference entries read so far, newest section first, under one cap
+/// set by the source's length.
+#[derive(Debug)]
+struct Entries {
+    map: HashMap<u32, XrefEntry>,
+    limit: usize,
+}
+
+impl Entries {
+    /// Returns an empty set for a source of `length` bytes.
+    fn for_source(length: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            limit: (length / SOURCE_BYTES_PER_ENTRY).saturating_add(ENTRY_FLOOR),
+        }
+    }
+
+    /// Fails unless `count` more entries could still be stored.
+    fn ensure_room(&self, count: u64) -> Result<()> {
+        let room = self.limit.saturating_sub(self.map.len());
+        if usize::try_from(count).map_or(true, |count| count > room) {
+            return Err(self.full());
+        }
+        Ok(())
+    }
+
+    fn full(&self) -> anyhow::Error {
+        anyhow!(
+            "the cross-reference names more than {} entries, more than a file \
+             of this length holds",
+            self.limit
+        )
+    }
+
+    /// Stores `entry` for `object` unless a newer section gave one, and
+    /// returns whether it was stored. A free entry is stored too: it hides
+    /// the object from older sections.
+    fn offer(&mut self, object: u32, entry: XrefEntry) -> Result<bool> {
+        let full = self.map.len() >= self.limit;
+        match self.map.entry(object) {
+            std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+            std::collections::hash_map::Entry::Vacant(_) if full => Err(self.full()),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+                Ok(true)
+            }
+        }
+    }
+}
 
 /// What may still be decoded from one source.
 #[derive(Debug)]
@@ -798,7 +861,7 @@ fn read_xref_sections(data: &[u8], start: u64, budget: &mut DecodeBudget) -> Res
     // Sections are read newest first, so the first entry seen for an object
     // is the current one. That includes a free entry: an object deleted by a
     // later revision must not come back from an earlier one.
-    let mut merged: HashMap<u32, XrefEntry> = HashMap::new();
+    let mut merged = Entries::for_source(data.len());
     let mut latest_trailer = None;
     let mut seen = std::collections::HashSet::new();
     let mut next = Some(start);
@@ -819,10 +882,10 @@ fn read_xref_sections(data: &[u8], start: u64, budget: &mut DecodeBudget) -> Res
             .and_then(|at| data.get(at..))
             .filter(|slice| !slice.is_empty())
             .ok_or_else(|| anyhow!("xref offset {} is outside the file", current))?;
-        let (section, trailer) = if looks_like_compressed_xref(slice) {
-            read_xref_stream(data, current, budget)?
+        let trailer = if looks_like_compressed_xref(slice) {
+            read_xref_stream(data, current, budget, &mut merged, &Default::default())?
         } else {
-            let (mut section, trailer) = parse_xref_section(data, current)?;
+            let (trailer, table_free) = parse_xref_section(data, current, &mut merged)?;
             if let Some(hidden) = trailer.get("/XRefStm") {
                 let hidden = hidden
                     .parse::<u64>()
@@ -832,23 +895,14 @@ fn read_xref_sections(data: &[u8], start: u64, budget: &mut DecodeBudget) -> Res
                 }
                 // The stream places what the table could not describe: the
                 // objects in object streams, which the table leaves out or
-                // marks free so that older readers skip them.
-                let (stream_entries, _) = read_xref_stream(data, hidden, budget)?;
-                for (object, entry) in stream_entries {
-                    let placed = matches!(
-                        section.get(&object),
-                        Some(XrefEntry::InUse { .. } | XrefEntry::Compressed { .. })
-                    );
-                    if !placed {
-                        section.insert(object, entry);
-                    }
-                }
+                // marks free so that older readers skip them. A stream that
+                // cannot be read fails the source: read from the table alone,
+                // an older revision's copy of such an object would come back
+                // as silently stale content.
+                read_xref_stream(data, hidden, budget, &mut merged, &table_free)?;
             }
-            (section, trailer)
+            trailer
         };
-        for (object, entry) in section {
-            merged.entry(object).or_insert(entry);
-        }
         let previous = trailer
             .get("/Prev")
             .map(|value| {
@@ -867,7 +921,7 @@ fn read_xref_sections(data: &[u8], start: u64, budget: &mut DecodeBudget) -> Res
             next = Some(previous);
         }
     }
-    Ok((merged, latest_trailer.unwrap_or_default()))
+    Ok((merged.map, latest_trailer.unwrap_or_default()))
 }
 
 /// Parses the cross-reference sections of a file whose objects all stand at
@@ -886,13 +940,20 @@ fn parse_xref(data: &[u8], start: u64) -> Result<(Xref, HashMap<String, String>)
     Ok((Xref::new(data, in_use), trailer))
 }
 
-fn parse_xref_section(data: &[u8], start: u64) -> Result<ParsedSection> {
+/// Reads the classic table at `start` into `entries`; returns its trailer
+/// entries and the objects it newly marked free, which the table's
+/// `/XRefStm` stream may still place.
+fn parse_xref_section(
+    data: &[u8],
+    start: u64,
+    entries: &mut Entries,
+) -> Result<(HashMap<String, String>, std::collections::HashSet<u32>)> {
     let slice = usize::try_from(start)
         .ok()
         .and_then(|start| data.get(start..))
         .filter(|slice| !slice.is_empty())
         .ok_or_else(|| anyhow!("xref offset {} is outside the file", start))?;
-    let mut xref: HashMap<u32, XrefEntry> = HashMap::new();
+    let mut table_free = std::collections::HashSet::new();
 
     // The section is read line by line up to its `trailer` keyword and no
     // further: in a file saved more than once, later revisions follow this
@@ -949,7 +1010,9 @@ fn parse_xref_section(data: &[u8], start: u64) -> Result<ParsedSection> {
                     } else {
                         XrefEntry::Free
                     };
-                    xref.insert(object, entry);
+                    if entries.offer(object, entry)? && entry == XrefEntry::Free {
+                        table_free.insert(object);
+                    }
                     current_obj = object.checked_add(1);
                 }
             }
@@ -985,7 +1048,7 @@ fn parse_xref_section(data: &[u8], start: u64) -> Result<ParsedSection> {
     // A trailer's /ID strings are arbitrary bytes, so the text is lossy; the
     // values read from it are names, numbers and references.
     let dict = String::from_utf8_lossy(&after_keyword[..dict_end]);
-    Ok((xref, trailer_entries(&dict)))
+    Ok((trailer_entries(&dict), table_free))
 }
 
 /// Returns the trailer entries this crate uses from a trailer dictionary or
@@ -1005,8 +1068,17 @@ fn trailer_entries(dict: &str) -> HashMap<String, String> {
 
 /// Reads the cross-reference stream at `offset`: its entries, and the
 /// trailer entries of its dictionary.
-fn read_xref_stream(data: &[u8], offset: u64, budget: &mut DecodeBudget) -> Result<ParsedSection> {
-    read_xref_stream_at(data, offset, budget)
+/// Reads the cross-reference stream at `offset` into `entries`, and returns
+/// the trailer entries of its dictionary. It may replace the entries named
+/// in `overridable`: free entries its own section's table gave.
+fn read_xref_stream(
+    data: &[u8],
+    offset: u64,
+    budget: &mut DecodeBudget,
+    entries: &mut Entries,
+    overridable: &std::collections::HashSet<u32>,
+) -> Result<HashMap<String, String>> {
+    read_xref_stream_at(data, offset, budget, entries, overridable)
         .with_context(|| format!("cross-reference stream at byte {offset}"))
 }
 
@@ -1014,7 +1086,9 @@ fn read_xref_stream_at(
     data: &[u8],
     offset: u64,
     budget: &mut DecodeBudget,
-) -> Result<ParsedSection> {
+    entries: &mut Entries,
+    overridable: &std::collections::HashSet<u32>,
+) -> Result<HashMap<String, String>> {
     let slice = usize::try_from(offset)
         .ok()
         .and_then(|offset| data.get(offset..))
@@ -1069,7 +1143,8 @@ fn read_xref_stream_at(
             "/Index names {claimed} entries but the stream holds {rows} rows"
         ));
     }
-    let mut entries = HashMap::new();
+    // Refused before any row is stored, not after memory is spent.
+    entries.ensure_room(claimed)?;
     let mut row_bytes = decoded.chunks_exact(row_width);
     for (first, count) in subsections {
         for step in 0..count {
@@ -1081,10 +1156,14 @@ fn read_xref_stream_at(
                 .and_then(|object| u32::try_from(object).ok())
                 .ok_or_else(|| anyhow!("/Index numbers an object past 4294967295"))?;
             let entry = xref_row(row, widths)?;
-            entries.entry(object).or_insert(entry);
+            if overridable.contains(&object) {
+                entries.map.insert(object, entry);
+            } else {
+                entries.offer(object, entry)?;
+            }
         }
     }
-    Ok((entries, trailer_entries(&object_text(dictionary))))
+    Ok(trailer_entries(&object_text(dictionary)))
 }
 
 /// Reads `/W`: the widths of a cross-reference stream row's three fields.
@@ -1346,7 +1425,10 @@ fn unpack_object_streams(
         let xref = Xref::new(&data, in_use);
         return Ok((data, xref));
     }
-    let containers = Xref::new(source, in_use.clone());
+    // Containers are read through the objects at file offsets only; what is
+    // unpacked joins the table after every stream is read.
+    let mut xref = Xref::new(source, in_use);
+    let mut unpacked: Vec<(u32, u64)> = Vec::new();
     let compressed: std::collections::HashSet<u32> = packed
         .values()
         .flatten()
@@ -1358,19 +1440,24 @@ fn unpack_object_streams(
                 "object stream {stream} is itself in an object stream"
             ));
         }
-        let objects = read_object_stream(source, &containers, stream, &members, budget)
+        let objects = read_object_stream(source, &xref, stream, &members, budget)
             .with_context(|| format!("object stream {stream}"))?;
         for (object, body) in objects {
             data.push(b'\n');
             let offset = u64::try_from(data.len())
                 .map_err(|_| anyhow!("the unpacked objects pass 2^64 bytes"))?;
-            data.extend_from_slice(format!("{object} 0 obj\n").as_bytes());
+            writeln!(data, "{object} 0 obj")?;
             data.extend_from_slice(&body);
             data.extend_from_slice(b"\nendobj\n");
-            in_use.insert(object, (offset, 0));
+            unpacked.push((object, offset));
         }
     }
-    let xref = Xref::new(&data, in_use);
+    // Every unpacked object starts past the source, after the one before it,
+    // with the header written just above.
+    for (object, offset) in unpacked {
+        xref.entries.insert(object, (offset, 0));
+        xref.starts.push(offset);
+    }
     Ok((data, xref))
 }
 
@@ -3148,5 +3235,61 @@ mod tests {
         let output = PdfWriter::extract_pages_from_bytes(&pdf, &[1, 50]).expect("extracts");
         assert_eq!(common::page_texts(&output), ["Page 1", "Page 50"]);
         assert_eq!(work::take(&work::OBJECT_STREAM_DECODES), 1);
+    }
+
+    /// Returns a cross-reference stream object of `rows` free rows, one byte
+    /// each (`/W [1 0 0]`), numbered from `first`.
+    fn free_rows(number: u32, first: usize, rows: usize, prev: Option<usize>) -> Vec<u8> {
+        let prev = prev.map_or(String::new(), |at| format!(" /Prev {at}"));
+        let body = common::stream(
+            &format!("/Type /XRef /W [1 0 0] /Index [{first} {rows}] /Size 1 /Root 2 0 R /Filter /FlateDecode{prev}"),
+            &common::deflate(&vec![0u8; rows]),
+        );
+        let mut object = format!("{number} 0 obj\n").into_bytes();
+        object.extend_from_slice(&body);
+        object.extend_from_slice(b"\nendobj\n");
+        object
+    }
+
+    /// WHY: a row of `/W [1 0 0]` is one decoded byte, so the decode budget
+    /// alone let a 1 MB file store sixteen million entries (2 GB). Rows past
+    /// the entry cap the file's length sets are refused before any is stored.
+    #[test]
+    fn rows_past_the_entry_cap_are_refused_before_they_are_stored() {
+        let mut pdf = b"%PDF-1.5\n%".to_vec();
+        pdf.resize(200_000, b'x');
+        pdf.push(b'\n');
+        let at = pdf.len();
+        let rows = 15 * at;
+        pdf.extend_from_slice(&free_rows(1, 0, rows, None));
+        pdf.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+        let error = format!("{:#}", Pdf::parse(&pdf).err().expect("refused"));
+        assert!(error.contains("entries"), "{error}");
+    }
+
+    /// WHY: 1,024 chained streams, each under its share of the decode
+    /// budget, stored 1.4 GB of entries for a 1.2 MB file. The cap counts
+    /// every section.
+    #[test]
+    fn chained_sections_share_one_entry_cap() {
+        let mut pdf = b"%PDF-1.5\n%".to_vec();
+        pdf.resize(100_000, b'x');
+        pdf.push(b'\n');
+        let per = (16 * 120_000) / 1024;
+        let mut prev = None;
+        for section in 0..1024 {
+            let at = pdf.len();
+            pdf.extend_from_slice(&free_rows(
+                1_000_000 + section as u32,
+                section * per,
+                per,
+                prev,
+            ));
+            prev = Some(at);
+        }
+        let at = prev.expect("sections");
+        pdf.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+        let error = format!("{:#}", Pdf::parse(&pdf).err().expect("refused"));
+        assert!(error.contains("entries"), "{error}");
     }
 }
