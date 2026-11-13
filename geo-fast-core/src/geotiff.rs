@@ -765,10 +765,12 @@ fn chunk_to_f32(decoded: DecodingResult) -> Vec<f32> {
 ///
 /// # Errors
 ///
-/// Returns [`GeoError::InvalidFormat`] for a strip or tile size of zero and
-/// for a chunk with fewer samples than its place in the raster needs, and
-/// [`GeoError::Tiff`] when a chunk is missing or cannot be decoded or the
-/// raster is larger than `decoding_budget`.
+/// Returns [`GeoError::InvalidFormat`] for a chunk with fewer samples than
+/// its place in the raster needs, and [`GeoError::Tiff`] when a chunk is
+/// missing or cannot be decoded or the raster is larger than
+/// `decoding_budget`. A strip or tile size of zero is an error too, in
+/// practice [`GeoError::Tiff`]: the decoder refuses it before the check
+/// here is reached.
 fn read_planar_bands<R: Read + Seek>(
     decoder: &mut Decoder<R>,
     (width, height): (u32, u32),
@@ -816,6 +818,10 @@ fn read_planar_bands<R: Read + Seek>(
                 .min(height),
         ),
     };
+    // Not reached from any file tried: the `tiff` decoder refuses a
+    // RowsPerStrip, TileWidth or TileLength of zero when it reads the tags.
+    // The check stays so that the divisions below cannot divide by zero
+    // should a later version of the decoder let one through.
     if chunk_width == 0 || chunk_height == 0 {
         return Err(GeoError::InvalidFormat(format!(
             "GeoTIFF declares strips or tiles of {chunk_width}x{chunk_height} pixels"
