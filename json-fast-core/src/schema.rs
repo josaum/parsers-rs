@@ -303,6 +303,8 @@ struct Ctx<'a, 'v> {
     /// References that resolved to nothing, each reported once more at the
     /// end so that neither `not` nor a passing alternative can hide them.
     unresolved: Vec<Finding>,
+    /// The (schema object, `$dynamicRef`?) sites already in `unresolved`.
+    unresolved_sites: HashSet<(usize, bool)>,
     /// Compiled patterns, keyed by pattern text, so rows never recompile.
     patterns: HashMap<String, Result<regex::Regex, String>>,
     /// Bytes of pattern text compiled so far.
@@ -765,6 +767,7 @@ fn run_on_this_stack<'a>(
         scope: Vec::new(),
         scope_ids: HashMap::new(),
         unresolved: Vec::new(),
+        unresolved_sites: HashSet::new(),
         patterns: HashMap::new(),
         pattern_bytes: 0,
         depth: 0,
@@ -785,9 +788,15 @@ fn run_on_this_stack<'a>(
     } else {
         // An unresolvable reference fails the validation even where `not`
         // or another alternative discarded its finding.
-        for unresolved in ctx.unresolved {
-            if !findings.iter().any(|f| f.message == unresolved.message) {
-                findings.push(unresolved);
+        if !ctx.unresolved.is_empty() {
+            let mut reported: HashSet<(String, String)> = findings
+                .iter()
+                .map(|f| (f.path.clone(), f.message.clone()))
+                .collect();
+            for unresolved in ctx.unresolved {
+                if reported.insert((unresolved.path.clone(), unresolved.message.clone())) {
+                    findings.push(unresolved);
+                }
             }
         }
     }
@@ -808,6 +817,7 @@ impl<'a> Ctx<'a, '_> {
             scope: std::mem::take(&mut self.scope),
             scope_ids: std::mem::take(&mut self.scope_ids),
             unresolved: std::mem::take(&mut self.unresolved),
+            unresolved_sites: std::mem::take(&mut self.unresolved_sites),
             patterns: std::mem::take(&mut self.patterns),
             pattern_bytes: self.pattern_bytes,
             depth: self.depth,
@@ -825,6 +835,7 @@ impl<'a> Ctx<'a, '_> {
         self.scope = inner.scope;
         self.scope_ids = inner.scope_ids;
         self.unresolved = inner.unresolved;
+        self.unresolved_sites = inner.unresolved_sites;
         self.patterns = inner.patterns;
         self.pattern_bytes = inner.pattern_bytes;
         self.steps = inner.steps;
@@ -901,14 +912,15 @@ impl<'a> Ctx<'a, '_> {
     }
 
     /// Records a `$ref`/`$dynamicRef` that resolves to nothing: an error
-    /// here, and once more at the end of the validation.
+    /// here, and once per reference site at the end of the validation.
     fn unresolvable(
         &mut self,
-        keyword: &str,
+        site: (usize, bool),
         reference: &str,
         path: &str,
         findings: &mut Vec<Finding>,
     ) {
+        let keyword = if site.1 { "$dynamicRef" } else { "$ref" };
         let finding = Finding::error(
             path,
             format!(
@@ -917,11 +929,7 @@ impl<'a> Ctx<'a, '_> {
                  followed, so the value is not accepted"
             ),
         );
-        if !self
-            .unresolved
-            .iter()
-            .any(|known| known.message == finding.message)
-        {
+        if self.unresolved_sites.insert(site) {
             self.unresolved.push(finding.clone());
         }
         findings.push(finding);
@@ -1294,8 +1302,9 @@ fn apply_object<'v>(
             continue;
         };
         let registry = ctx.registry;
-        let Some(Some(target)) = registry.references.get(&(schema_address, dynamic)) else {
-            ctx.unresolvable(keyword, reference, path, findings);
+        let site = (schema_address, dynamic);
+        let Some(Some(target)) = registry.references.get(&site) else {
+            ctx.unresolvable(site, reference, path, findings);
             continue;
         };
         // A `$dynamicRef` to a `$dynamicAnchor` leads to the outermost
