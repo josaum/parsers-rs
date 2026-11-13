@@ -431,34 +431,94 @@ fn a_reference_in_symbol_font_text_is_mapped_like_the_text_around_it() {
     assert_eq!(first_paragraph(&doc.blocks), "αβχ & <");
 }
 
-/// Document properties written one element per line, as producers other
-/// than Word do.
-fn indented_properties() -> DocxDocument {
-    let core = "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n  <dc:title>R&amp;D &lt;plan&gt;</dc:title>\n  <dc:creator>Ada</dc:creator>\n</cp:coreProperties>";
-    let custom = "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\" xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">\n  <property fmtid=\"x\" pid=\"2\" name=\"Client\">\n    <vt:lpwstr>A &amp; B</vt:lpwstr>\n  </property>\n</Properties>";
+const CORE_NS: &str = r#"xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/""#;
+const APP_NS: &str = r#"xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes""#;
+const CUSTOM_NS: &str = r#"xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes""#;
+
+/// The three property parts, with `gap` between every two elements: empty
+/// as Word writes them, a line break and indentation as other producers do.
+fn properties(gap: &str) -> DocxDocument {
+    let lines = |parts: &[&str]| parts.join(gap).into_bytes();
+    let core = lines(&[
+        &format!("<cp:coreProperties {CORE_NS}>"),
+        "<dc:title>R&amp;D &lt;plan&gt;</dc:title>",
+        "<dc:creator>Ada</dc:creator>",
+        "<dc:subject> </dc:subject>",
+        "<cp:keywords/>",
+        "</cp:coreProperties>",
+    ]);
+    let app = lines(&[
+        &format!("<Properties {APP_NS}>"),
+        "<Company>Acme &amp; Co</Company>",
+        "<Pages>3</Pages>",
+        "<HeadingPairs>",
+        "<vt:vector size=\"0\" baseType=\"variant\">",
+        "</vt:vector>",
+        "</HeadingPairs>",
+        "<TitlesOfParts>",
+        "<vt:vector size=\"1\" baseType=\"lpstr\">",
+        "<vt:lpstr>Title</vt:lpstr>",
+        "</vt:vector>",
+        "</TitlesOfParts>",
+        "</Properties>",
+    ]);
+    let custom = lines(&[
+        &format!("<Properties {CUSTOM_NS}>"),
+        r#"<property fmtid="x" pid="2" name="Client">"#,
+        "<vt:lpwstr>A &amp; B</vt:lpwstr>",
+        "</property>",
+        r#"<property fmtid="x" pid="3" name="Reviewed">"#,
+        "<vt:bool>true</vt:bool>",
+        "</property>",
+        "</Properties>",
+    ]);
     let bytes = package(&[
         (
             "word/document.xml",
             w_part("document", "<w:body><w:p/></w:body>"),
         ),
-        ("docProps/core.xml", core.as_bytes().to_vec()),
-        ("docProps/custom.xml", custom.as_bytes().to_vec()),
+        ("docProps/core.xml", core),
+        ("docProps/app.xml", app),
+        ("docProps/custom.xml", custom),
     ]);
     parse_docx_bytes(bytes, ParseOptions::default()).expect("document parses")
 }
 
-// Known defect, pinned as found: the whitespace between elements counts as
-// a value, so the root element shows up as a property and an indented custom
-// property reads as its indentation.
+fn sorted(map: &std::collections::HashMap<String, String>) -> Vec<(&str, &str)> {
+    let mut pairs: Vec<_> = map
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    pairs
+}
+
 #[test]
-fn indented_properties_read_as_before() {
-    let doc = indented_properties();
-    let core = &doc.metadata.core;
-    assert_eq!(core.get("title").map(String::as_str), Some("R&D <plan>"));
-    assert_eq!(core.get("creator").map(String::as_str), Some("Ada"));
-    assert_eq!(core.get("coreProperties").map(String::as_str), Some("\n  "));
-    assert_eq!(core.len(), 3);
-    let custom = &doc.metadata.custom;
-    assert_eq!(custom.get("Client").map(String::as_str), Some("\n    "));
-    assert_eq!(custom.len(), 1);
+fn whitespace_between_property_elements_is_not_a_value() {
+    for gap in ["", "\n  ", "\r\n\t"] {
+        let doc = properties(gap);
+        // The root element is not a property, and neither is an element
+        // that holds only other elements or only a line break. A value that
+        // is itself a space is still a value.
+        assert_eq!(
+            sorted(&doc.metadata.core),
+            [
+                ("creator", "Ada"),
+                ("subject", " "),
+                ("title", "R&D <plan>")
+            ],
+            "core with gap {gap:?}"
+        );
+        assert_eq!(
+            sorted(&doc.metadata.app),
+            [("Company", "Acme & Co"), ("Pages", "3"), ("lpstr", "Title")],
+            "app with gap {gap:?}"
+        );
+        assert_eq!(
+            sorted(&doc.metadata.custom),
+            [("Client", "A & B"), ("Reviewed", "true")],
+            "custom with gap {gap:?}"
+        );
+        assert_eq!(doc.page_count, Some(3));
+    }
 }

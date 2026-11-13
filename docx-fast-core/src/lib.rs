@@ -1119,22 +1119,42 @@ fn parse_settings(archive: &DocxArchive, max_inflate: usize) -> Result<HashMap<S
 /// section), so it is collected until something other than character data
 /// ends it. The first run of character data after the key is the value;
 /// taking the key stops later runs from replacing it.
-fn store_property(out: &mut HashMap<String, String>, key: &mut Option<String>, value: &mut String) {
-    if value.is_empty() {
-        return;
-    }
-    if let Some(key) = key.take() {
-        out.insert(key, normalize_datetime(value));
+///
+/// A run of nothing but whitespace is the layout of the file, not a value,
+/// in two cases: when another element opens right after it
+/// (`before_element`), which is the indentation between two elements and
+/// leaves the key open for the value element that follows; and when it
+/// holds a line break, which is the indentation inside an element that has
+/// no content. Spaces that fill an element up to its end tag are a value.
+fn store_property(
+    out: &mut HashMap<String, String>,
+    key: &mut Option<String>,
+    value: &mut String,
+    before_element: bool,
+) {
+    let is_whitespace = value
+        .chars()
+        .all(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'));
+    let is_layout = is_whitespace && (before_element || value.contains(['\r', '\n']));
+    if !value.is_empty() && !is_layout {
+        if let Some(key) = key.take() {
+            out.insert(key, normalize_datetime(value));
+        }
     }
     value.clear();
 }
 
+/// Reads `docProps/core.xml` or `docProps/app.xml`.
+///
+/// Every element below the root that holds text is a property, named by its
+/// local name. The root element itself is not one.
 fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
     let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
     let mut out = HashMap::new();
     let mut current_key: Option<String> = None;
     let mut value = String::new();
+    let mut depth = 0usize;
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
@@ -1143,14 +1163,21 @@ fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                 }
             }
             Ok(event) => {
-                store_property(&mut out, &mut current_key, &mut value);
+                let before_element = matches!(event, Event::Start(_) | Event::Empty(_));
+                store_property(&mut out, &mut current_key, &mut value, before_element);
                 match event {
                     Event::Start(e) => {
-                        let raw = e.name().as_ref().to_vec();
-                        let key = local_name(&raw);
-                        current_key = Some(String::from_utf8_lossy(key).to_string());
+                        if depth > 0 {
+                            let raw = e.name().as_ref().to_vec();
+                            let key = local_name(&raw);
+                            current_key = Some(String::from_utf8_lossy(key).to_string());
+                        }
+                        depth += 1;
                     }
-                    Event::End(_) => current_key = None,
+                    Event::End(_) => {
+                        current_key = None;
+                        depth = depth.saturating_sub(1);
+                    }
                     Event::Eof => break,
                     _ => {}
                 }
@@ -1162,6 +1189,10 @@ fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
     Ok(out)
 }
 
+/// Reads `docProps/custom.xml`.
+///
+/// A property is a `property` element; its name is the `name` attribute and
+/// its value the text of the value element inside it.
 fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
     let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
@@ -1176,7 +1207,8 @@ fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                 }
             }
             Ok(event) => {
-                store_property(&mut out, &mut current_name, &mut value);
+                let before_element = matches!(event, Event::Start(_) | Event::Empty(_));
+                store_property(&mut out, &mut current_name, &mut value, before_element);
                 match event {
                     Event::Start(e) => {
                         let raw = e.name().as_ref().to_vec();
