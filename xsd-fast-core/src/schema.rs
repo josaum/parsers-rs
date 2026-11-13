@@ -257,6 +257,18 @@ pub enum ContentModel {
     Empty,
 }
 
+/// How a complex type derives from its complex base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Derivation {
+    /// `xs:extension`: the base's particles and attributes, then the type's
+    /// own.
+    #[default]
+    Extension,
+    /// `xs:restriction`: the particles the type states itself, and the
+    /// base's attributes except those it prohibits.
+    Restriction,
+}
+
 /// A complex type: attributes + content model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComplexType {
@@ -276,16 +288,32 @@ pub struct ComplexType {
     /// After [`SchemaModel::resolve_inheritance`] runs, inherited attributes are
     /// prepended ahead of locally declared ones (for inheriting types only).
     pub attributes: Vec<AttributeDecl>,
-    /// Base type for `complexContent`/`extension` against a *complex* base.
+    /// Base type of a `complexContent` extension or restriction against a
+    /// *complex* base.
     ///
     /// `None` for types that do not derive from a complex base (the common
-    /// case). When set, [`SchemaModel::resolve_inheritance`] uses it to fold the
-    /// base's particles and attributes into [`content`] and [`attributes`].
+    /// case). When set, [`SchemaModel::resolve_inheritance`] uses it to fold
+    /// the base into [`content`] and [`attributes`]: particles and attributes
+    /// for an extension, attributes only for a restriction, as
+    /// [`derivation`] says.
     ///
     /// [`content`]: ComplexType::content
     /// [`attributes`]: ComplexType::attributes
+    /// [`derivation`]: ComplexType::derivation
     #[serde(default)]
     pub base: Option<QName>,
+    /// How the type derives from [`base`](ComplexType::base); means nothing
+    /// without one.
+    #[serde(default)]
+    pub derivation: Derivation,
+    /// Names of the attributes a restriction declares with
+    /// `use="prohibited"`.
+    ///
+    /// They are not attributes of the type, so they are not in
+    /// [`attributes`](ComplexType::attributes); the names are kept so the
+    /// base's attributes of those names are left out when it is folded in.
+    #[serde(default)]
+    pub prohibited_attributes: Vec<String>,
     /// Occurrence bounds of the model group that is the type's content: the
     /// `minOccurs` / `maxOccurs` written on its `xs:sequence`, `xs:all` or
     /// `xs:choice`. With a minimum of zero the whole content may be left out,
@@ -314,7 +342,8 @@ impl ComplexType {
         &self.attributes
     }
 
-    /// Whether this type derives from a complex base via `complexContent`/`extension`.
+    /// Whether this type derives from a complex base, by extension or by
+    /// restriction.
     pub fn inherits(&self) -> bool {
         self.base.is_some()
     }
@@ -404,11 +433,13 @@ impl SchemaModel {
         self.global_elements.get(local)
     }
 
-    /// Fold `complexContent`/`extension` base types into derived types.
+    /// Fold `complexContent` base types into derived types.
     ///
     /// For every complex type whose [`base`](ComplexType::base) is set, this
     /// prepends the (transitively) resolved base's particles and attributes
-    /// ahead of the type's own. Inline complex types nested in particles, and
+    /// ahead of the type's own. A restriction keeps the particles it states
+    /// and takes only the base's attributes: those it prohibits are left
+    /// out, and one it declares again keeps the base's type. Inline complex types nested in particles, and
     /// the inline types of global elements, are resolved too, so inheritance
     /// works regardless of where it appears. A chain of bases is followed to
     /// its end, however long. Types that do not inherit are left
@@ -649,6 +680,9 @@ impl CopyCost {
         for name in complex.name.iter().chain(complex.base.iter()) {
             self.add_qname(name);
         }
+        for name in &complex.prohibited_attributes {
+            self.add_text(name);
+        }
         self.add_attributes(&complex.attributes);
         self.add_content(&complex.content);
     }
@@ -723,20 +757,31 @@ fn resolve_complex_type<'a>(
         if let Some((mut base_particles, mut base_attrs)) =
             collect_base(&base.local, owner, originals, folding, budget)?
         {
-            match &mut ct.content {
-                // The type's own particles move behind the inherited ones.
-                ContentModel::Sequence(own) => {
-                    base_particles.append(own);
-                    *own = base_particles;
+            if ct.derivation == Derivation::Restriction {
+                // A restriction states its particles itself; only the
+                // attributes come from the base.
+                restrict_attributes(
+                    &mut base_attrs,
+                    std::mem::take(&mut ct.attributes),
+                    &ct.prohibited_attributes,
+                );
+            } else {
+                match &mut ct.content {
+                    // The type's own particles move behind the inherited ones.
+                    ContentModel::Sequence(own) => {
+                        base_particles.append(own);
+                        *own = base_particles;
+                    }
+                    // Pure extension that only adds attributes: keep the base's
+                    // particles verbatim.
+                    ContentModel::Empty => ct.content = ContentModel::Sequence(base_particles),
+                    ContentModel::All(_)
+                    | ContentModel::Choice(_)
+                    | ContentModel::SimpleContent(_) => {}
                 }
-                // Pure extension that only adds attributes: keep the base's
-                // particles verbatim.
-                ContentModel::Empty => ct.content = ContentModel::Sequence(base_particles),
-                ContentModel::All(_) | ContentModel::Choice(_) | ContentModel::SimpleContent(_) => {
-                }
+                // Inherited attributes come first, then locally declared ones.
+                base_attrs.append(&mut ct.attributes);
             }
-            // Inherited attributes come first, then locally declared ones.
-            base_attrs.append(&mut ct.attributes);
             ct.attributes = base_attrs;
         }
     }
@@ -848,14 +893,70 @@ fn collect_base<'a>(
     let mut particles: Vec<Particle> = Vec::new();
     let mut attrs: Vec<AttributeDecl> = Vec::new();
     for base in chain.into_iter().rev() {
+        let restricts = base.base.is_some() && base.derivation == Derivation::Restriction;
+        if restricts {
+            // A restriction on the chain replaces the particles of
+            // everything before it with the ones it states.
+            particles.clear();
+        }
         if let ContentModel::Sequence(p) = &base.content {
             budget.charge(CopyCost::of_particles(p))?;
             particles.extend(p.iter().cloned());
         }
         budget.charge(CopyCost::of_attributes(&base.attributes))?;
-        attrs.extend(base.attributes.iter().cloned());
+        if restricts {
+            restrict_attributes(
+                &mut attrs,
+                base.attributes.clone(),
+                &base.prohibited_attributes,
+            );
+        } else {
+            attrs.extend(base.attributes.iter().cloned());
+        }
     }
     Ok(Some((particles, attrs)))
+}
+
+/// Applies a restriction's attribute declarations to the attributes it
+/// inherits.
+///
+/// An inherited attribute named in `prohibited` is removed. One the
+/// restriction declares again stays where it is and keeps the type the base
+/// gave it, with the restriction's `use` and whichever default and fixed
+/// value the restriction states. An attribute the base does not have is
+/// appended.
+fn restrict_attributes(
+    inherited: &mut Vec<AttributeDecl>,
+    own: Vec<AttributeDecl>,
+    prohibited: &[String],
+) {
+    if !prohibited.is_empty() {
+        let prohibited: std::collections::HashSet<&str> =
+            prohibited.iter().map(String::as_str).collect();
+        inherited.retain(|attribute| !prohibited.contains(attribute.name.as_str()));
+    }
+    let positions: std::collections::HashMap<String, usize> = inherited
+        .iter()
+        .enumerate()
+        .map(|(position, attribute)| (attribute.name.clone(), position))
+        .collect();
+    for attribute in own {
+        match positions
+            .get(&attribute.name)
+            .and_then(|position| inherited.get_mut(*position))
+        {
+            Some(existing) => {
+                existing.required = attribute.required;
+                if attribute.default.is_some() {
+                    existing.default = attribute.default;
+                }
+                if attribute.fixed.is_some() {
+                    existing.fixed = attribute.fixed;
+                }
+            }
+            None => inherited.push(attribute),
+        }
+    }
 }
 
 /// Mutable access to a content model's particles, for the variants that carry them.

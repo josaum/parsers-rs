@@ -57,7 +57,7 @@ pub mod arrow;
 
 pub use parser::{ParseOptions, SchemaSet};
 pub use schema::{
-    ComplexType, ContentModel, ElementDecl, EnumValue, OccurrenceConstraint, SchemaType,
-    SimpleTypeKind, XsdType,
+    ComplexType, ContentModel, Derivation, ElementDecl, EnumValue, OccurrenceConstraint,
+    SchemaType, SimpleTypeKind, XsdType,
 };
 pub use validator::{ValidateOptions, ValidationError, ValidationSeverity};
