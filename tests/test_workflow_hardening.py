@@ -1100,6 +1100,36 @@ def test_the_required_checks_keep_their_names():
     assert_ci_jobs(read(CI))
 
 
+FUZZ_LOCKFILE_CHECK = (
+    "      - name: Every fuzz lockfile matches its manifest\n"
+    "        run: |\n"
+    "          for manifest in */fuzz/Cargo.toml; do\n"
+    '            cargo metadata --locked --format-version 1 --manifest-path "$manifest" > /dev/null\n'
+    "          done\n"
+)
+
+
+def assert_fuzz_lockfiles_checked(ci: str) -> None:
+    """The `rust` job resolves every fuzz package against its own lockfile.
+
+    A fuzz package's Cargo.lock is outside the workspace, so `--locked` on
+    the workspace build says nothing about it.
+    """
+    assert FUZZ_LOCKFILE_CHECK in jobs(ci)["rust"], (
+        "the rust job must resolve every */fuzz/Cargo.toml with --locked"
+    )
+
+
+def test_every_fuzz_lockfile_is_checked():
+    assert_fuzz_lockfiles_checked(read(CI))
+    # The glob covers every fuzz package there is, so the check is not
+    # vacuous: each of them has a manifest and a lockfile at that depth.
+    packages = sorted(path.parent for path in ROOT.glob("*/fuzz/Cargo.toml"))
+    assert len(packages) >= 9
+    assert all((package / "Cargo.lock").is_file() for package in packages)
+    assert not [p for p in ROOT.glob("*/*/fuzz/Cargo.toml")], "a deeper fuzz package escapes the glob"
+
+
 def test_feature_gated_code_is_linted_and_tested():
     assert_gated_features_are_built_and_tested(read(CI))
 
@@ -1379,6 +1409,9 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         # A required check renamed, removed or given a display name; an undeclared job; a silent doc build.
         (assert_ci_jobs, CI, "\n  lean-formal:\n", "\n  lean:\n"),
         (assert_ci_jobs, CI, "\n  rust:\n", "\n  rust:\n    name: Rust\n"),
+        (assert_fuzz_lockfiles_checked, CI, FUZZ_LOCKFILE_CHECK, ""),
+        (assert_fuzz_lockfiles_checked, CI, "cargo metadata --locked --format-version 1", "cargo metadata --format-version 1"),
+        (assert_fuzz_lockfiles_checked, CI, "for manifest in */fuzz/Cargo.toml", "for manifest in xsd-fast-core/fuzz/Cargo.toml"),
         (assert_gated_features_are_built_and_tested, CI, "      - run: cargo test -p geo-fast-core --locked --features http\n", ""),
         (assert_gated_features_are_built_and_tested, CI, "      - run: cargo clippy -p geo-fast-core --all-targets --locked --features http\n", ""),
         (assert_gated_features_are_built_and_tested, CI, "      - run: cargo clippy -p json-fast-core --all-targets --locked --features mmap\n", ""),
