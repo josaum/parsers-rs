@@ -533,21 +533,9 @@ fn parse_header_footer_refs<R: BufRead>(reader: R) -> Result<Vec<HeaderFooterRef
                         let key_raw = attr.key.as_ref();
                         let key = local_name(key_raw);
                         if key_raw == b"r:id" || key == b"id" {
-                            rel_id = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            rel_id = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"type" {
-                            ref_type = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            ref_type = Some(attribute_string(&attr, reader.decoder()));
                         }
                     }
                     if let Some(rel_id) = rel_id {
@@ -1085,9 +1073,7 @@ fn parse_settings(archive: &DocxArchive, max_inflate: usize) -> Result<HashMap<S
                 let mut attrs = Vec::new();
                 for attr in e.attributes().with_checks(false).flatten() {
                     let key = local_name(attr.key.as_ref());
-                    let val = attr
-                        .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())?
-                        .to_string();
+                    let val = attribute_string(&attr, reader.decoder());
                     if key == b"val" {
                         value = Some(val.clone());
                     }
@@ -1215,13 +1201,7 @@ fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                         if local_name(&raw) == b"property" {
                             for attr in e.attributes().with_checks(false).flatten() {
                                 if local_name(attr.key.as_ref()) == b"name" {
-                                    current_name = Some(
-                                        attr.decoded_and_normalized_value(
-                                            XmlVersion::Implicit1_0,
-                                            reader.decoder(),
-                                        )?
-                                        .to_string(),
-                                    );
+                                    current_name = Some(attribute_string(&attr, reader.decoder()));
                                 }
                             }
                         }
@@ -1275,27 +1255,11 @@ fn parse_styles(xml: &[u8]) -> Result<Vec<Style>> {
                     for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"styleId" {
-                            style.id = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string();
+                            style.id = attribute_string(&attr, reader.decoder());
                         } else if key == b"type" {
-                            style.style_type = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            style.style_type = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"default" {
-                            let val = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string();
+                            let val = attribute_string(&attr, reader.decoder());
                             style.is_default = val == "1" || val.eq_ignore_ascii_case("true");
                         }
                     }
@@ -1717,43 +1681,17 @@ fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Res
                     for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"id" {
-                            comment.id = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                            comment.id = attribute_string(&attr, reader.decoder())
                                 .parse::<i32>()
                                 .unwrap_or(0);
                         } else if key == b"author" {
-                            comment.author = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            comment.author = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"initials" {
-                            comment.initials = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            comment.initials = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"date" {
-                            comment.date = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            comment.date = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"parentId" {
-                            comment.parent_id = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                            comment.parent_id = attribute_string(&attr, reader.decoder())
                                 .parse::<i32>()
                                 .ok();
                         }
@@ -1821,19 +1759,11 @@ fn apply_extended_comments(comments: &mut [Comment], xml: &[u8]) -> Result<()> {
                     for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"id" {
-                            current_id = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                            current_id = attribute_string(&attr, reader.decoder())
                                 .parse::<i32>()
                                 .ok();
                         } else if key == b"parentId" {
-                            parent_id = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                            parent_id = attribute_string(&attr, reader.decoder())
                                 .parse::<i32>()
                                 .ok();
                         }
@@ -1981,21 +1911,9 @@ fn parse_content_types(
                     for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"Extension" {
-                            ext = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            ext = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"ContentType" {
-                            ct = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            ct = Some(attribute_string(&attr, reader.decoder()));
                         }
                     }
                     if let (Some(ext), Some(ct)) = (ext, ct) {
@@ -2007,21 +1925,9 @@ fn parse_content_types(
                     for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"PartName" {
-                            part_name = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            part_name = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"ContentType" {
-                            ct = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            ct = Some(attribute_string(&attr, reader.decoder()));
                         }
                     }
                     if let (Some(part_name), Some(ct)) = (part_name, ct) {
@@ -2068,6 +1974,79 @@ fn guess_content_type(path: &str) -> Option<String> {
     }
 }
 
+/// Reads one attribute value, never failing on what it holds.
+///
+/// A well-formed value is read as an XML processor reports it: references
+/// resolved and literal white space normalized. A value that is not
+/// well-formed (an unknown entity, a character reference to no character, a
+/// bare `&`, a byte that is not UTF-8) is read by
+/// [`lenient_attribute_value`], so one bad character in an attribute costs
+/// that character, as it does in text, and not the whole document.
+fn attribute_string(
+    attr: &quick_xml::events::attributes::Attribute<'_>,
+    decoder: quick_xml::encoding::Decoder,
+) -> String {
+    match attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder) {
+        Ok(value) => value.into_owned(),
+        Err(_) => lenient_attribute_value(&attr.value),
+    }
+}
+
+/// Reads an attribute value that is not well-formed.
+///
+/// Every reference that can be resolved is resolved and literal white space
+/// is normalized, as for a well-formed value. A reference that cannot be
+/// resolved, and a bare `&`, are kept as written; a byte that is not UTF-8
+/// becomes U+FFFD.
+fn lenient_attribute_value(raw: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(raw);
+    let mut out = String::with_capacity(raw.len());
+    let mut rest: &str = &raw;
+    while let Some(ch) = rest.chars().next() {
+        let mut consumed = ch.len_utf8();
+        match ch {
+            '\t' | '\n' => out.push(' '),
+            '\r' => {
+                out.push(' ');
+                if rest[consumed..].starts_with('\n') {
+                    consumed += 1;
+                }
+            }
+            '&' => {
+                let resolved = rest[1..].find(';').and_then(|end| {
+                    let name = &rest[1..=end];
+                    resolve_reference_name(name).map(|text| (text, end + 2))
+                });
+                match resolved {
+                    Some((text, length)) => {
+                        out.push_str(&text);
+                        consumed = length;
+                    }
+                    None => out.push('&'),
+                }
+            }
+            other => out.push(other),
+        }
+        rest = &rest[consumed..];
+    }
+    out
+}
+
+/// The text a reference named `name` (what stands between `&` and `;`)
+/// resolves to, `None` when it names nothing.
+fn resolve_reference_name(name: &str) -> Option<String> {
+    if let Some(number) = name.strip_prefix('#') {
+        let code = match number.strip_prefix('x') {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => number.parse::<u32>().ok()?,
+        };
+        return char::from_u32(code)
+            .filter(|ch| *ch != '\0')
+            .map(String::from);
+    }
+    quick_xml::escape::resolve_xml_entity(name).map(str::to_owned)
+}
+
 fn attr_value<R: BufRead>(
     reader: &Reader<R>,
     e: &quick_xml::events::BytesStart<'_>,
@@ -2075,10 +2054,7 @@ fn attr_value<R: BufRead>(
 ) -> Result<Option<String>> {
     for attr in e.attributes().with_checks(false).flatten() {
         if local_name(attr.key.as_ref()) == key {
-            return Ok(Some(
-                attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())?
-                    .to_string(),
-            ));
+            return Ok(Some(attribute_string(&attr, reader.decoder())));
         }
     }
     Ok(None)
@@ -2481,13 +2457,7 @@ impl<'a> DocxBodyParser<'a> {
                 let mut paragraph = ParagraphBuilder::default();
                 for attr in e.attributes().with_checks(false).flatten() {
                     if local_name(attr.key.as_ref()) == b"paraId" {
-                        paragraph.id = Some(
-                            attr.decoded_and_normalized_value(
-                                XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string(),
-                        );
+                        paragraph.id = Some(attribute_string(&attr, reader.decoder()));
                     }
                 }
                 self.current_paragraph = Some(paragraph);
@@ -2654,28 +2624,11 @@ impl<'a> DocxBodyParser<'a> {
                 for attr in e.attributes().with_checks(false).flatten() {
                     let key = local_name(attr.key.as_ref());
                     if key == b"id" {
-                        info.id = attr
-                            .decoded_and_normalized_value(
-                                XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string();
+                        info.id = attribute_string(&attr, reader.decoder());
                     } else if key == b"author" {
-                        info.author = Some(
-                            attr.decoded_and_normalized_value(
-                                XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string(),
-                        );
+                        info.author = Some(attribute_string(&attr, reader.decoder()));
                     } else if key == b"date" {
-                        info.date = Some(
-                            attr.decoded_and_normalized_value(
-                                XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string(),
-                        );
+                        info.date = Some(attribute_string(&attr, reader.decoder()));
                     }
                 }
                 if !info.id.is_empty() && self.revision_ids.insert(info.id.clone()) {
