@@ -85,15 +85,12 @@ allow = ["MPL-2.0"]
 #   core-foundation 0.9.4, 0.10.1  foldhash 0.1.5, 0.2.0
 #   getrandom 0.2.17, 0.3.4, 0.4.3 hashbrown 0.15.5, 0.17.1
 #   miniz_oxide 0.8.9, 0.9.1       moxcms 0.7.11, 0.8.1
-#   phf 0.13.1, 0.14.0             phf_codegen 0.13.1, 0.14.0
-#   phf_generator 0.13.1, 0.14.0   phf_macros 0.13.1, 0.14.0
-#   phf_shared 0.13.1, 0.14.0      png 0.17.16, 0.18.1
-#   r-efi 5.3.0, 6.0.0             rand_core 0.6.4, 0.9.5, 0.10.1
-#   string_cache 0.9.0, 0.11.0     string_cache_codegen 0.6.1, 0.11.2
-#   syn 2.0.119, 3.0.10            web_atoms 0.2.6, 0.3.0
+#   phf 0.13.1, 0.14.0             phf_generator 0.13.1, 0.14.0
+#   phf_macros 0.13.1, 0.14.0      phf_shared 0.13.1, 0.14.0
+#   png 0.17.16, 0.18.1            r-efi 5.3.0, 6.0.0
+#   rand_core 0.6.4, 0.9.5, 0.10.1 syn 2.0.119, 3.0.10
 # (The phf crates: the HTML stack under scraper is on 0.14, hayro's font
-# crates are still on 0.13. string_cache and web_atoms: email-fast-core still
-# names web_atoms 0.2 for its entity table.)
+# crates are still on 0.13.)
 # Raise this to "deny" (with a `skip` entry per unavoidable crate) once the
 # list is short enough to keep by hand.
 multiple-versions = "warn"
