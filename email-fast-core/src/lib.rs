@@ -925,6 +925,8 @@ fn unique_file_name(name: String, used: &mut std::collections::HashSet<String>) 
 /// stack per level: a 256 KiB stack overflows near 105 levels. Thirty-two
 /// levels keep the whole parse within a third of such a stack, and mail that
 /// nests past ten levels is not something a mail client produces.
+/// `mailparse` 0.18 refuses a part nested past 100 levels on
+/// its own, but only while it recurses; this limit is checked first.
 const MAX_MIME_DEPTH: usize = 32;
 
 /// Reports whether `raw` nests multipart containers more than `limit` deep.
@@ -951,11 +953,22 @@ fn mime_nesting_exceeds(raw: &[u8], limit: usize) -> bool {
 ///
 /// The depth is that of the deepest part: how many containers enclose it. A
 /// message that is a single part has depth 0. The walk splits parts exactly
-/// as `mailparse::parse_mail` (version 0.15) does, with the same header
+/// as `mailparse::parse_mail` (version 0.18) does, with the same header
 /// parser and the same boundary search, but keeps its work list on the heap,
 /// so it can measure a tree that would overflow the stack if `mailparse`
 /// were handed it. It must agree with `mailparse` on every input;
 /// `mime_depth_walk_agrees_with_mailparse` checks that.
+///
+/// As in `mailparse`, a part whose type begins with `multipart` and that
+/// declares a boundary is a container (the rule [`is_container`] follows),
+/// a delimiter may end the data it is searched in, and the line break
+/// before a delimiter belongs to the delimiter, so it is cut from the part
+/// above it. That cut moves where a nested part ends, and with it
+/// whether that part's own closing delimiter is found.
+///
+/// `mailparse` refuses a part nested more than 100 levels deep; with a
+/// `limit` of 100 this walk refuses exactly the messages it refuses for
+/// that reason, before it recurses.
 fn mime_nesting_depth(raw: &[u8], limit: usize) -> Option<usize> {
     let mut deepest = 0;
     let mut pending: Vec<(&[u8], usize)> = vec![(raw, 0)];
@@ -975,7 +988,7 @@ fn mime_nesting_depth(raw: &[u8], limit: usize) -> Option<usize> {
         let Some(boundary) = content_type.params.get("boundary") else {
             continue;
         };
-        if !content_type.mimetype.starts_with("multipart/") || part.len() <= body_start {
+        if !content_type.mimetype.starts_with("multipart") || part.len() <= body_start {
             continue;
         }
         let delimiter = format!("--{boundary}");
@@ -990,9 +1003,12 @@ fn mime_nesting_depth(raw: &[u8], limit: usize) -> Option<usize> {
                 return None;
             }
             deepest = deepest.max(child_depth);
-            let part_end = find_line_prefix(part, part_start, delimiter).unwrap_or(part.len());
+            let next_delimiter = find_line_prefix(part, part_start, delimiter);
+            let part_end = next_delimiter.map_or(part.len(), |at| {
+                without_line_break_before(part, part_start, at)
+            });
             pending.push((&part[part_start..part_end], child_depth));
-            delimiter_end = part_end + delimiter.len();
+            delimiter_end = next_delimiter.map_or(part.len(), |at| at + delimiter.len());
             if delimiter_end + 2 > part.len() || part[delimiter_end..].starts_with(b"--") {
                 break;
             }
@@ -1011,6 +1027,13 @@ fn mime_nesting_depth(raw: &[u8], limit: usize) -> Option<usize> {
 /// (this crate has a header read up to four times), and some fifty times
 /// that in an unoptimized build. Mail is nowhere near it: an unfolded line
 /// of 2,000 properly encoded recipients (68 KB) costs 1.4e8.
+///
+/// Re-measured on `mailparse` 0.18 the same way, with 0.15 alongside on one
+/// machine: the encoded-word search is unchanged, so the replay gives the
+/// same costs (2.34e9 and 1.36e8), and the 1,000-word line decodes in
+/// 0.081 s on both versions there. That machine did not reproduce the
+/// 0.68 s above, but the two versions decode at the same speed, so the
+/// bound keeps its meaning and its value.
 const MAX_HEADER_DECODE_COST: u64 = 3_000_000_000;
 
 /// Longest multipart boundary accepted, in bytes.
@@ -1021,7 +1044,7 @@ const MAX_HEADER_DECODE_COST: u64 = 3_000_000_000;
 /// allows 70 characters; this leaves room for writers that go over.
 const MAX_BOUNDARY_LEN: usize = 200;
 
-/// Returns the work `mailparse` 0.15 does to decode the headers of `raw`.
+/// Returns the work `mailparse` does to decode the headers of `raw`.
 ///
 /// `mailparse` looks for encoded-words (`=?charset?B?text?=`) one physical
 /// line of a header value at a time. For every `=?`, and for every `?=` it
@@ -1162,8 +1185,7 @@ impl HeaderScan {
         };
         let content_type = mailparse::parse_content_type(&parsed.get_value());
         if let Some(boundary) = content_type.params.get("boundary") {
-            if content_type.mimetype.starts_with("multipart/") && boundary.len() > MAX_BOUNDARY_LEN
-            {
+            if content_type.mimetype.starts_with("multipart") && boundary.len() > MAX_BOUNDARY_LEN {
                 return Err(anyhow!(
                     "multipart boundary longer than {MAX_BOUNDARY_LEN} bytes"
                 ));
@@ -1269,19 +1291,32 @@ fn header_line_decode_cost(line: &str, limit: u64) -> u64 {
 
 /// Finds `key` in `data` at or after `start`, as `mailparse` does.
 ///
-/// This reproduces one quirk of the `mailparse` search on purpose: a match
-/// that ends exactly at the end of `data` is not reported. The depth walk has
-/// to split parts where `mailparse` splits them, quirks included.
+/// A match may end exactly at the end of `data`. `mailparse` 0.15 left that
+/// last position out, and the depth walk followed it; 0.18 searches it, and
+/// the walk has to split parts where `mailparse` splits them.
 fn find_bytes(data: &[u8], start: usize, key: &[u8]) -> Option<usize> {
-    // Candidate positions are `start..last`; the final one is left out.
-    let last = data.len().checked_sub(key.len())?;
-    if key.is_empty() || start >= last {
+    if key.is_empty() {
         return None;
     }
-    data[start..data.len() - 1]
+    data.get(start..)?
         .windows(key.len())
         .position(|window| window == key)
         .map(|at| start + at)
+}
+
+/// Returns `end` moved back over a `\n` or `\r\n` that ends `data[start..end]`.
+///
+/// RFC 2046 makes the line break before a delimiter part of the delimiter,
+/// and `mailparse` 0.18 cuts it from the part above.
+fn without_line_break_before(data: &[u8], start: usize, end: usize) -> usize {
+    let mut end = end;
+    if end > start && data[end - 1] == b'\n' {
+        end -= 1;
+        if end > start && data[end - 1] == b'\r' {
+            end -= 1;
+        }
+    }
+    end
 }
 
 /// Finds `key` at `start` or at the start of a later line, as `mailparse` does.
@@ -1532,6 +1567,19 @@ fn parse_date(s: &str) -> Result<DateTime<Utc>> {
     Err(anyhow!("Cannot parse date: {}", s))
 }
 
+/// Reports whether `part` is a multipart container rather than a leaf.
+///
+/// The rule is the one `mailparse` splits by: a type that begins with
+/// `multipart` and declares a `boundary`. A part it split always qualifies,
+/// so a part that has children is never read as a leaf. A part whose type
+/// says multipart but that declares no boundary is not split, and its
+/// content is kept as a leaf's. `mime_nesting_depth` counts containers by
+/// the same rule. `content_type` is the part's type, lowercased.
+fn is_container(part: &mailparse::ParsedMail<'_>, content_type: &str) -> bool {
+    !part.subparts.is_empty()
+        || (content_type.starts_with("multipart") && part.ctype.params.contains_key("boundary"))
+}
+
 fn parse_mime_part(
     part: &mailparse::ParsedMail<'_>,
     body: &mut EmailBody,
@@ -1540,11 +1588,10 @@ fn parse_mime_part(
     total_attachment_bytes: &mut usize,
 ) -> Result<()> {
     let content_type = part.ctype.mimetype.to_lowercase();
-    let is_multipart = content_type.starts_with("multipart/");
 
-    // A multipart/* part is only a container; never treat it as a leaf.
-    // Just classify its children.
-    if is_multipart {
+    // A container is never treated as a leaf; only its children are
+    // classified. Any other part, whatever its type says, is a leaf.
+    if is_container(part, &content_type) {
         for subpart in &part.subparts {
             parse_mime_part(subpart, body, attachments, options, total_attachment_bytes)?;
         }
@@ -3016,10 +3063,12 @@ mod malformed_input_unit_tests {
             1 => format!("b{}", *next_id % 3),
             _ => format!("part{next_id:03}"),
         };
-        let header = match rng.below(4) {
+        let header = match rng.below(5) {
             0 => format!("content-type: MULTIPART/Mixed; BOUNDARY=\"{boundary}\""),
             1 => format!("Content-Type: multipart/alternative;\r\n boundary={boundary}"),
             2 => format!("Content-Type: multipart/digest; boundary=\"{boundary}\"; x=y"),
+            // A type that only begins with `multipart` is a container too.
+            3 => format!("Content-Type: multipart; boundary={boundary}"),
             _ => format!("Content-Type: multipart/mixed; boundary={boundary}"),
         };
         let newline: &[u8] = if rng.below(4) == 0 { b"\n" } else { b"\r\n" };
@@ -3110,21 +3159,83 @@ mod malformed_input_unit_tests {
             .contains("-----Original Message-----"));
     }
 
+    /// A message whose one leaf is nested `depth` multipart levels deep.
+    fn nested(depth: usize) -> Vec<u8> {
+        let mut out = b"Subject: deep\r\n".to_vec();
+        for level in 0..depth {
+            out.extend_from_slice(
+                format!(
+                    "Content-Type: multipart/mixed; boundary=b{level:04}\r\n\r\n--b{level:04}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        out.extend_from_slice(b"Content-Type: text/plain\r\n\r\nleaf\r\n");
+        out
+    }
+
+    /// `mailparse` refuses a part nested more than 100 levels deep. Given
+    /// that limit, the walk refuses the same messages without recursing, and
+    /// the crate's own limit refuses them long before `mailparse` would.
+    #[test]
+    fn the_walk_refuses_what_mailparse_refuses_for_depth() {
+        const MAILPARSE_RECURSION_LIMIT: usize = 100;
+        for depth in MAILPARSE_RECURSION_LIMIT - 1..=MAILPARSE_RECURSION_LIMIT + 2 {
+            let message = nested(depth);
+            let refused = mailparse::parse_mail(&message).is_err();
+            assert_eq!(refused, depth > MAILPARSE_RECURSION_LIMIT, "{depth}");
+            assert_eq!(
+                mime_nesting_depth(&message, MAILPARSE_RECURSION_LIMIT).is_none(),
+                refused,
+                "{depth}"
+            );
+            assert!(mime_nesting_exceeds(&message, MAX_MIME_DEPTH), "{depth}");
+        }
+    }
+
+    /// A part whose type begins with `multipart` but that declares no
+    /// boundary is not split by `mailparse`, so it is a leaf: its content is
+    /// kept, at the top of the message and inside a container.
+    #[test]
+    fn a_multipart_type_without_a_boundary_is_kept_as_a_leaf() {
+        use base64::Engine as _;
+        let options = ParseOptions {
+            extract_attachment_content: true,
+            ..ParseOptions::default()
+        };
+        let mut lost = Vec::new();
+        for content_type in ["multipart/mixed", "multipart"] {
+            let leaf = format!("Content-Type: {content_type}\r\n\r\nkept content\r\n");
+            let messages = [
+                ("top", format!("Subject: s\r\n{leaf}")),
+                (
+                    "nested",
+                    format!(
+                        "Subject: s\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
+                         --outer\r\n{leaf}--outer--\r\n"
+                    ),
+                ),
+            ];
+            for (place, message) in messages {
+                let email = parse_eml_bytes(message.as_bytes(), options)
+                    .expect("a boundaryless multipart parses");
+                let kept = email.attachments.iter().any(|attachment| {
+                    let content = base64::engine::general_purpose::STANDARD
+                        .decode(attachment.content.as_deref().unwrap_or_default())
+                        .unwrap_or_default();
+                    attachment.content_type == content_type
+                        && String::from_utf8_lossy(&content).contains("kept content")
+                });
+                if !kept || email.attachments.len() != 1 {
+                    lost.push(format!("{content_type} ({place})"));
+                }
+            }
+        }
+        assert!(lost.is_empty(), "not kept as a leaf: {lost:?}");
+    }
+
     #[test]
     fn nesting_at_the_limit_parses_and_one_past_it_does_not() {
-        let nested = |depth: usize| {
-            let mut out = b"Subject: deep\r\n".to_vec();
-            for level in 0..depth {
-                out.extend_from_slice(
-                    format!(
-                        "Content-Type: multipart/mixed; boundary=b{level:04}\r\n\r\n--b{level:04}\r\n"
-                    )
-                    .as_bytes(),
-                );
-            }
-            out.extend_from_slice(b"Content-Type: text/plain\r\n\r\nleaf\r\n");
-            out
-        };
         let at_limit = parse_eml_bytes(&nested(MAX_MIME_DEPTH), ParseOptions::default())
             .expect("nesting at the limit");
         assert_eq!(at_limit.body.text.as_deref().map(str::trim), Some("leaf"));

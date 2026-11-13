@@ -4,6 +4,52 @@ Changes a consumer of the wheels, Node packages, crates or Flight servers
 can observe. Each release also has generated notes listing every pull
 request.
 
+## Unreleased
+
+### Changed output
+
+- **email:** mailparse moves from 0.15 to 0.18, which splits a message
+  differently:
+  - The line break before a boundary delimiter belongs to the delimiter
+    (RFC 2046, section 5.1.1), so it is no longer left at the end of the
+    part above it. A text or HTML body loses the CRLF (or LF) it used to end
+    with, and an attachment loses those bytes from `content` and `size`.
+  - A delimiter that ends the message, or ends a part, is found. 0.15 missed
+    it and read it as text.
+  - Every type that begins with `multipart` and declares a `boundary` is
+    split into its parts, so is `multipart` with no subtype. 0.15 read such
+    a part as one leaf.
+  - A part is a container exactly when mailparse splits it. A part whose
+    type begins with `multipart` but that declares no `boundary` is a leaf,
+    and its content is kept as an attachment. Before, such a part was
+    dropped when its type had a slash (`multipart/mixed`).
+  - `Content-Type` and `Content-Disposition` parameters are split only at
+    semicolons outside quotes, so a quoted value holding `;` is read whole.
+    A backslash in a quoted value now escapes the next character, and RFC
+    2231 continuations are decoded after joining, so a character split
+    across two segments survives. These two can change a `filename`; neither
+    occurs in the files measured below.
+  - Address lists read comments in more places, and a `:` after an address
+    that has an `@` no longer opens a group (`to`, `cc`, `from`).
+  - mailparse refuses nesting past 100 levels. The crate's own limit of 32
+    is checked first, so no message changes because of it.
+
+  Measured against 0.15:
+  - 26 real .eml files: 16 parse to different JSON, all because of the
+    line break (`body` in 16, `attachments` in 2). Every changed body only
+    lost the line break before a delimiter.
+  - 11,925 distinct messages that email-fast-core's tests parse: 1,752
+    differ. One of them is a mutated message whose nested part lost its
+    `boundary` parameter and declares base64: it used to be dropped, it is
+    now read as a leaf, and its body is not base64, so the message fails as
+    any message with such an attachment does. The other 1,751 differ in
+    `body` (1,515), `attachments` (1,513), `to` (15), `cc` (6) and `from`
+    (2). Counted by field, 2,930 differences come from the line break
+    alone, 48 from a boundaryless `multipart` part now kept (one more
+    attachment each), 23 from address parsing (the ones inspected are
+    mutated, malformed address lines), 4 from quoted semicolons, 1 from a
+    delimiter at the end, and 45 from two or more of these together.
+
 ## v2026.11.13.2
 
 v2026.11.13.1 was tagged but never released: its Linux x86_64 wheels did

@@ -33,7 +33,7 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 
 # Email parsing
-mailparse = "0.15"
+mailparse = "0.18"
 charset = "0.1"
 quoted_printable = "0.5"
 base64 = { version = "0.23", default-features = false, features = ["std"] }
