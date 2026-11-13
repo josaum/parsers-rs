@@ -159,7 +159,9 @@ fn every_utf16_part_reads_like_its_utf8_form() {
     };
     assert_eq!(
         paragraph.text,
-        "caf\u{e9} & \u{65E5}\u{672C} \u{1F600} \u{3B1}"
+        // The paragraph's style puts it in the Symbol font, so "caf" reads
+        // as the Greek letters on those keys.
+        "\u{3C7}\u{3B1}\u{3C6}\u{e9} & \u{65E5}\u{672C} \u{1F600} \u{3B1}"
     );
     assert_eq!(paragraph.style_name.as_deref(), Some("Gr\u{e9}\u{e9}k"));
     assert_eq!(expected.footnotes.len(), 1);

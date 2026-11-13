@@ -335,8 +335,10 @@ impl Derivation<'_> {
             XsdType::Complex(ct) => self.fields_from_complex(ct, depth, &prefix, fields),
             XsdType::Ref(qn) => {
                 if let Some(ct) = model.complex_types.get(&qn.local) {
-                    // Avoid infinite recursion on self-referential types.
-                    if depth < self.max_depth {
+                    // Avoid infinite recursion on self-referential types. A
+                    // type that declares nothing has nowhere to recurse, and
+                    // keeps its marker column at the flattening limit too.
+                    if depth < self.max_depth || declares_nothing(ct) {
                         self.fields_from_complex(ct, depth, &prefix, fields)?;
                     }
                     Ok(())
@@ -370,6 +372,13 @@ impl Derivation<'_> {
         prefix: &str,
         fields: &mut Vec<Field>,
     ) -> Result<()> {
+        // A type that declares nothing makes its element a marker: all the
+        // element says is that it is there. It keeps a text column, as an
+        // element of an unknown type does, so the marker is not dropped and
+        // a parent holding it keeps its shape.
+        if declares_nothing(ct) {
+            return self.emit_leaf(prefix.to_string(), None, fields);
+        }
         // Attributes first.
         if self.opts.include_attributes {
             self.emit_attributes(ct, prefix, fields)?;
@@ -555,6 +564,19 @@ impl Derivation<'_> {
         force_nullable(&mut fields[start..]);
         Ok(())
     }
+}
+
+/// Whether a complex type is empty as written, and has stayed so.
+///
+/// True for `<xs:complexType/>` and for the open-and-closed form with
+/// nothing inside but annotations. Having no particles and no attributes is
+/// not enough: the parser leaves out the constructs it does not model, so a
+/// type built only from those has neither, and derives no column.
+fn declares_nothing(ct: &ComplexType) -> bool {
+    ct.empty_in_source
+        && ct.base.is_none()
+        && ct.attributes.is_empty()
+        && matches!(ct.content, ContentModel::Empty)
 }
 
 /// Marks every field nullable: a choice selects at most one branch, so none

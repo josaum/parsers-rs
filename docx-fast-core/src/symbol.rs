@@ -262,11 +262,12 @@ impl SymbolFont {
         }
     }
 
-    /// Whether text typed in the font is stored as plain 8-bit characters
-    /// that have to be mapped too.
+    /// Whether the font's codes above 0x7F are mapped when they are stored
+    /// as the plain characters U+0080..=U+00FF.
     ///
-    /// True for the Webdings and Wingdings fonts. For the Symbol font only
-    /// the Private Use Area form is mapped, as it always was.
+    /// True for the Webdings and Wingdings fonts. For the Symbol font that
+    /// range is mapped only in its Private Use Area form; its ASCII range is
+    /// mapped in both forms, like the dingbat fonts'.
     fn is_dingbat(self) -> bool {
         !matches!(self, Self::Symbol)
     }
@@ -327,10 +328,14 @@ impl SymbolFonts {
         let code = u32::from(ch);
         let font = match code {
             SYMBOL_PUA_BASE..=SYMBOL_PUA_LAST => self.private_use(),
-            // Typing in a dingbat font stores the key's own character. The
-            // Symbol font is left as it was: only its Private Use Area form
-            // is mapped.
-            0x00..=0x7F => self.ascii.filter(|font| font.is_dingbat()),
+            // Text in a symbol font can be stored as the key's own
+            // character: a plain "a" whose ASCII font is Symbol is shown as
+            // alpha. A code the font's table has no entry for (a tab, a
+            // line break) is kept.
+            0x00..=0x7F => self.ascii,
+            // Above ASCII only the dingbat fonts are mapped from the plain
+            // character; the Symbol font is, there, only in its Private Use
+            // Area form.
             0x80..=0xFF => self.high_ansi.filter(|font| font.is_dingbat()),
             _ => None,
         };
@@ -541,13 +546,18 @@ mod tests {
     }
 
     #[test]
-    fn run_text_mapping_touches_only_the_symbol_window() {
+    fn run_text_mapping_touches_only_what_the_symbol_font_covers() {
         let symbol = SymbolFonts {
             ascii: Some(SymbolFont::Symbol),
             high_ansi: Some(SymbolFont::Symbol),
             complex_script: None,
         };
-        assert_eq!(symbol.map_run_text("a\u{F061}\u{F062} é"), "aαβ é");
+        assert_eq!(symbol.map_run_text("a\u{F061}\u{F062} é\t"), "ααβ é\t");
+        let high_only = SymbolFonts {
+            ascii: None,
+            ..symbol
+        };
+        assert_eq!(high_only.map_run_text("a\u{F061} é"), "aα é");
         assert_eq!(
             SymbolFonts::default().map_run_text("a\u{F061}"),
             "a\u{F061}"

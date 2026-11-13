@@ -571,15 +571,9 @@ fn header_footer_ref<R: BufRead>(
         let key_raw = attr.key.as_ref();
         let key = local_name(key_raw);
         if key_raw == b"r:id" || key == b"id" {
-            rel_id = Some(
-                attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())?
-                    .to_string(),
-            );
+            rel_id = Some(attribute_string(&attr, reader.decoder()));
         } else if key == b"type" {
-            ref_type = Some(
-                attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())?
-                    .to_string(),
-            );
+            ref_type = Some(attribute_string(&attr, reader.decoder()));
         }
     }
     let kind = if name == b"headerReference" {
@@ -1193,9 +1187,7 @@ fn parse_settings(archive: &DocxArchive, max_inflate: usize) -> Result<HashMap<S
                 let mut attrs = Vec::new();
                 for attr in e.attributes().with_checks(false).flatten() {
                     let key = local_name(attr.key.as_ref());
-                    let val = attr
-                        .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())?
-                        .to_string();
+                    let val = attribute_string(&attr, reader.decoder());
                     if key == b"val" {
                         value = Some(val.clone());
                     }
@@ -1254,13 +1246,41 @@ fn store_property(
 
 /// Reads `docProps/core.xml` or `docProps/app.xml`.
 ///
-/// Every element below the root that holds text is a property, named by its
-/// local name. The root element itself is not one.
+/// Every child of the root that holds text is a property, named by its
+/// local name (`Company`, `title`). The root element itself is not one.
+///
+/// A property whose value is nested, as the vectors of `docProps/app.xml`
+/// are (`TitlesOfParts`, `HeadingPairs`), keeps the name of the property:
+/// the elements inside it (`vt:vector`, `vt:variant`, `vt:lpstr`, `vt:i4`)
+/// say how the value is typed and are not properties. Its value is the text
+/// of every item, in document order, one per line. So `TitlesOfParts` with
+/// two `vt:lpstr` items reads `"First\nSecond"`, where it used to appear
+/// under the key `lpstr` holding the last item only.
+///
+/// An item is an element inside the property that holds no other element
+/// and is not one of the containers `vt:vector`, `vt:array` and
+/// `vt:variant`. Every item is one line, an empty one included, so the
+/// number of lines is the number of items and the pairs of `HeadingPairs`
+/// can be matched with `TitlesOfParts` again: three items of which only the
+/// second has text read `"\nScope\n"`. A property with one empty item reads
+/// `""`; a property with no item is not stored. A line break inside an item
+/// (`\r\n`, `\n` or `\r`) reads as one space, so that a line is never part
+/// of an item; the break itself is not recoverable.
+///
+/// A property that is not nested is not touched by any of this: its text is
+/// stored as it is, line breaks included, and not at all when it is empty.
 fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
     let mut reader = xml_reader(Cursor::new(utf8_xml(xml)));
     let mut buf = Vec::new();
-    let mut out = HashMap::new();
+    let mut out: HashMap<String, String> = HashMap::new();
     let mut current_key: Option<String> = None;
+    // The child of the root being read, and whether the text now collected
+    // stands in an element nested inside it.
+    let mut property: Option<String> = None;
+    let mut nested = false;
+    // Whether the element now open is a nested item: inside a property, not
+    // a container, and with no element met inside it so far.
+    let mut item_open = false;
     let mut value = String::new();
     let mut depth = 0usize;
     loop {
@@ -1271,20 +1291,56 @@ fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                 }
             }
             Ok(event) => {
+                if item_open && matches!(event, Event::End(_)) {
+                    // The end of an item: its text is a line whatever it is.
+                    if let Some(key) = current_key.take() {
+                        push_nested_item(&mut out, key, &nested_item_line(&value));
+                    }
+                    value.clear();
+                }
                 let before_element = matches!(event, Event::Start(_) | Event::Empty(_));
-                store_property(&mut out, &mut current_key, &mut value, before_element);
+                let mut stored = HashMap::new();
+                store_property(&mut stored, &mut current_key, &mut value, before_element);
+                for (key, text) in stored {
+                    if nested {
+                        // Text beside the items, inside a container.
+                        push_nested_item(&mut out, key, &single_line(&text));
+                    } else {
+                        out.insert(key, text);
+                    }
+                }
                 match event {
                     Event::Start(e) => {
-                        if depth > 0 {
-                            let raw = e.name().as_ref().to_vec();
-                            let key = local_name(&raw);
-                            current_key = Some(String::from_utf8_lossy(key).to_string());
+                        let raw = e.name().as_ref().to_vec();
+                        let name = local_name(&raw);
+                        if depth == 1 {
+                            property = Some(String::from_utf8_lossy(name).to_string());
                         }
+                        if depth > 0 {
+                            current_key.clone_from(&property);
+                            nested = depth > 1;
+                        }
+                        item_open = depth > 1 && !is_property_container(name);
                         depth += 1;
                     }
+                    Event::Empty(e) => {
+                        // A self-closing element inside a property is an
+                        // item with no text.
+                        let raw = e.name().as_ref().to_vec();
+                        if depth > 1 && !is_property_container(local_name(&raw)) {
+                            if let Some(key) = property.clone() {
+                                push_nested_item(&mut out, key, "");
+                            }
+                        }
+                        item_open = false;
+                    }
                     Event::End(_) => {
+                        item_open = false;
                         current_key = None;
                         depth = depth.saturating_sub(1);
+                        if depth <= 1 {
+                            property = None;
+                        }
                     }
                     Event::Eof => break,
                     _ => {}
@@ -1295,6 +1351,46 @@ fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
         buf.clear();
     }
     Ok(out)
+}
+
+/// Whether an element inside a property groups items instead of being one.
+fn is_property_container(local: &[u8]) -> bool {
+    matches!(local, b"vector" | b"array" | b"variant")
+}
+
+/// Adds one item of a nested property as a line of its own.
+fn push_nested_item(out: &mut HashMap<String, String>, key: String, text: &str) {
+    match out.get_mut(&key) {
+        Some(items) => {
+            items.push('\n');
+            items.push_str(text);
+        }
+        None => {
+            out.insert(key, text.to_string());
+        }
+    }
+}
+
+/// The line that stands for one nested item.
+///
+/// Nothing but whitespace with a line break in it is the layout of an
+/// element with no content, and reads as empty. Any other line break in the
+/// item reads as one space: lines separate items, so an item cannot hold
+/// one.
+fn nested_item_line(value: &str) -> String {
+    let is_layout = value.contains(['\r', '\n'])
+        && value
+            .chars()
+            .all(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'));
+    if is_layout {
+        return String::new();
+    }
+    normalize_datetime(&single_line(value))
+}
+
+/// `value` with every line break (`\r\n`, `\n` or `\r`) read as one space.
+fn single_line(value: &str) -> String {
+    value.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
 /// Reads `docProps/custom.xml`.
@@ -1323,13 +1419,7 @@ fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                         if local_name(&raw) == b"property" {
                             for attr in e.attributes().with_checks(false).flatten() {
                                 if local_name(attr.key.as_ref()) == b"name" {
-                                    current_name = Some(
-                                        attr.decoded_and_normalized_value(
-                                            XmlVersion::Implicit1_0,
-                                            reader.decoder(),
-                                        )?
-                                        .to_string(),
-                                    );
+                                    current_name = Some(attribute_string(&attr, reader.decoder()));
                                 }
                             }
                         }
@@ -1383,27 +1473,11 @@ fn parse_styles(xml: &[u8]) -> Result<Vec<Style>> {
                     for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"styleId" {
-                            style.id = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string();
+                            style.id = attribute_string(&attr, reader.decoder());
                         } else if key == b"type" {
-                            style.style_type = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            style.style_type = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"default" {
-                            let val = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string();
+                            let val = attribute_string(&attr, reader.decoder());
                             style.is_default = val == "1" || val.eq_ignore_ascii_case("true");
                         }
                     }
@@ -1466,12 +1540,18 @@ struct StyleFonts {
     /// The fonts of the default paragraph style, which a paragraph without a
     /// `w:pStyle` uses.
     default_paragraph: symbol::FontChoice,
+    /// The fonts of the default table style, which a table without a
+    /// `w:tblStyle` uses.
+    default_table: symbol::FontChoice,
+    /// The fonts of `w:docDefaults` (`w:rPrDefault`), behind every style.
+    defaults: symbol::FontChoice,
 }
 
 impl StyleFonts {
-    /// Whether no style names a font, so only a run's own font matters.
+    /// Whether neither a style nor the document defaults name a font, so
+    /// only a run's own font matters.
     fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.by_id.is_empty() && self.defaults.is_inherit()
     }
 
     fn of(&self, style_id: &str) -> symbol::FontChoice {
@@ -1479,19 +1559,30 @@ impl StyleFonts {
     }
 
     /// The fonts in effect for a run, nearest formatting first: the run's
-    /// own, its character style, then the paragraph's style.
+    /// own, its character style, the paragraph's style, the style of the
+    /// table the run is in, then the document defaults (ECMA-376 part 1,
+    /// 17.7.2).
+    ///
+    /// `table_style` is `None` outside a table, and inside one the table's
+    /// `w:tblStyle`, itself `None` for a table that names no style.
     fn effective(
         &self,
         run: symbol::FontChoice,
         run_style: Option<&str>,
         paragraph_style: Option<&str>,
+        table_style: Option<Option<&str>>,
     ) -> symbol::FontChoice {
         let character = run_style.map(|id| self.of(id)).unwrap_or_default();
         let paragraph = match paragraph_style {
             Some(id) => self.of(id),
             None => self.default_paragraph,
         };
-        run.or(character).or(paragraph)
+        let table = match table_style {
+            Some(Some(id)) => self.of(id),
+            Some(None) => self.default_table,
+            None => symbol::FontChoice::default(),
+        };
+        run.or(character).or(paragraph).or(table).or(self.defaults)
     }
 }
 
@@ -1531,6 +1622,9 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
     let mut buf = Vec::new();
     let mut declared: HashMap<String, Declared> = HashMap::new();
     let mut default_paragraph: Option<String> = None;
+    let mut default_table: Option<String> = None;
+    let mut defaults = symbol::FontChoice::default();
+    let mut in_doc_defaults = false;
     let mut current: Option<(String, Declared)> = None;
     let mut in_rpr = false;
     // Inside `w:tblStylePr`: formatting for part of a table, not the style's.
@@ -1546,10 +1640,14 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
                         let id = attr_value(&reader, e, b"styleId")?.unwrap_or_default();
                         let is_default = attr_value(&reader, e, b"default")?
                             .is_some_and(|val| val == "1" || val.eq_ignore_ascii_case("true"));
-                        let is_paragraph = attr_value(&reader, e, b"type")?
-                            .is_some_and(|kind| kind == "paragraph");
+                        let kind = attr_value(&reader, e, b"type")?;
+                        let is_paragraph = kind.as_deref() == Some("paragraph");
                         if is_default && is_paragraph && default_paragraph.is_none() {
                             default_paragraph = Some(id.clone());
+                        }
+                        if is_default && kind.as_deref() == Some("table") && default_table.is_none()
+                        {
+                            default_table = Some(id.clone());
                         }
                         let style = Declared {
                             based_on: None,
@@ -1570,9 +1668,12 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
                     }
                     b"rPr" if is_start => in_rpr = true,
                     b"tblStylePr" if is_start => in_table_part = true,
+                    b"docDefaults" if is_start => in_doc_defaults = true,
                     b"rFonts" if in_rpr && !in_table_part => {
                         if let Some((_, style)) = current.as_mut() {
                             style.fonts = font_choice(&reader, e)?;
+                        } else if in_doc_defaults {
+                            defaults = font_choice(&reader, e)?;
                         }
                     }
                     _ => {}
@@ -1588,6 +1689,7 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
                     }
                     b"rPr" => in_rpr = false,
                     b"tblStylePr" => in_table_part = false,
+                    b"docDefaults" => in_doc_defaults = false,
                     _ => {}
                 }
             }
@@ -1621,9 +1723,15 @@ fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
         .as_deref()
         .map(|id| by_id.get(id).copied().unwrap_or_default())
         .unwrap_or_default();
+    let default_table = default_table
+        .as_deref()
+        .map(|id| by_id.get(id).copied().unwrap_or_default())
+        .unwrap_or_default();
     Ok(StyleFonts {
         by_id,
         default_paragraph,
+        default_table,
+        defaults,
     })
 }
 
@@ -1825,43 +1933,17 @@ fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Res
                     for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"id" {
-                            comment.id = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                            comment.id = attribute_string(&attr, reader.decoder())
                                 .parse::<i32>()
                                 .unwrap_or(0);
                         } else if key == b"author" {
-                            comment.author = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            comment.author = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"initials" {
-                            comment.initials = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            comment.initials = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"date" {
-                            comment.date = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            comment.date = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"parentId" {
-                            comment.parent_id = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                            comment.parent_id = attribute_string(&attr, reader.decoder())
                                 .parse::<i32>()
                                 .ok();
                         }
@@ -1929,19 +2011,11 @@ fn apply_extended_comments(comments: &mut [Comment], xml: &[u8]) -> Result<()> {
                     for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"id" {
-                            current_id = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                            current_id = attribute_string(&attr, reader.decoder())
                                 .parse::<i32>()
                                 .ok();
                         } else if key == b"parentId" {
-                            parent_id = attr
-                                .decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
+                            parent_id = attribute_string(&attr, reader.decoder())
                                 .parse::<i32>()
                                 .ok();
                         }
@@ -2167,21 +2241,9 @@ fn parse_content_types(
                     for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"Extension" {
-                            ext = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            ext = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"ContentType" {
-                            ct = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            ct = Some(attribute_string(&attr, reader.decoder()));
                         }
                     }
                     if let (Some(ext), Some(ct)) = (ext, ct) {
@@ -2193,21 +2255,9 @@ fn parse_content_types(
                     for attr in e.attributes().with_checks(false).flatten() {
                         let key = local_name(attr.key.as_ref());
                         if key == b"PartName" {
-                            part_name = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            part_name = Some(attribute_string(&attr, reader.decoder()));
                         } else if key == b"ContentType" {
-                            ct = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
+                            ct = Some(attribute_string(&attr, reader.decoder()));
                         }
                     }
                     if let (Some(part_name), Some(ct)) = (part_name, ct) {
@@ -2254,6 +2304,79 @@ fn guess_content_type(path: &str) -> Option<String> {
     }
 }
 
+/// Reads one attribute value, never failing on what it holds.
+///
+/// A well-formed value is read as an XML processor reports it: references
+/// resolved and literal white space normalized. A value that is not
+/// well-formed (an unknown entity, a character reference to no character, a
+/// bare `&`, a byte that is not UTF-8) is read by
+/// [`lenient_attribute_value`], so one bad character in an attribute costs
+/// that character, as it does in text, and not the whole document.
+fn attribute_string(
+    attr: &quick_xml::events::attributes::Attribute<'_>,
+    decoder: quick_xml::encoding::Decoder,
+) -> String {
+    match attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder) {
+        Ok(value) => value.into_owned(),
+        Err(_) => lenient_attribute_value(&attr.value),
+    }
+}
+
+/// Reads an attribute value that is not well-formed.
+///
+/// Every reference that can be resolved is resolved and literal white space
+/// is normalized, as for a well-formed value. A reference that cannot be
+/// resolved, and a bare `&`, are kept as written; a byte that is not UTF-8
+/// becomes U+FFFD.
+fn lenient_attribute_value(raw: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(raw);
+    let mut out = String::with_capacity(raw.len());
+    let mut rest: &str = &raw;
+    while let Some(ch) = rest.chars().next() {
+        let mut consumed = ch.len_utf8();
+        match ch {
+            '\t' | '\n' => out.push(' '),
+            '\r' => {
+                out.push(' ');
+                if rest[consumed..].starts_with('\n') {
+                    consumed += 1;
+                }
+            }
+            '&' => {
+                let resolved = rest[1..].find(';').and_then(|end| {
+                    let name = &rest[1..=end];
+                    resolve_reference_name(name).map(|text| (text, end + 2))
+                });
+                match resolved {
+                    Some((text, length)) => {
+                        out.push_str(&text);
+                        consumed = length;
+                    }
+                    None => out.push('&'),
+                }
+            }
+            other => out.push(other),
+        }
+        rest = &rest[consumed..];
+    }
+    out
+}
+
+/// The text a reference named `name` (what stands between `&` and `;`)
+/// resolves to, `None` when it names nothing.
+fn resolve_reference_name(name: &str) -> Option<String> {
+    if let Some(number) = name.strip_prefix('#') {
+        let code = match number.strip_prefix('x') {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => number.parse::<u32>().ok()?,
+        };
+        return char::from_u32(code)
+            .filter(|ch| *ch != '\0')
+            .map(String::from);
+    }
+    quick_xml::escape::resolve_xml_entity(name).map(str::to_owned)
+}
+
 fn attr_value<R: BufRead>(
     reader: &Reader<R>,
     e: &quick_xml::events::BytesStart<'_>,
@@ -2261,10 +2384,7 @@ fn attr_value<R: BufRead>(
 ) -> Result<Option<String>> {
     for attr in e.attributes().with_checks(false).flatten() {
         if local_name(attr.key.as_ref()) == key {
-            return Ok(Some(
-                attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())?
-                    .to_string(),
-            ));
+            return Ok(Some(attribute_string(&attr, reader.decoder())));
         }
     }
     Ok(None)
@@ -2467,6 +2587,9 @@ struct DocxBodyParser<'a> {
     /// Table containers currently on `containers`, kept under
     /// [`MAX_TABLE_DEPTH`].
     open_tables: usize,
+    /// The `w:tblStyle` of each open table, innermost last; `None` for a
+    /// table that names no style.
+    table_styles: Vec<Option<String>>,
     in_ppr: bool,
     in_rpr: bool,
     in_numpr: bool,
@@ -2585,6 +2708,7 @@ impl<'a> DocxBodyParser<'a> {
             pending_comment_refs: Vec::new(),
             current_revision_stack: Vec::new(),
             open_tables: 0,
+            table_styles: Vec::new(),
             in_ppr: false,
             in_rpr: false,
             in_numpr: false,
@@ -2603,6 +2727,7 @@ impl<'a> DocxBodyParser<'a> {
         self.pending_comment_refs.clear();
         self.current_revision_stack.clear();
         self.open_tables = 0;
+        self.table_styles.clear();
         self.in_ppr = false;
         self.in_rpr = false;
         self.in_numpr = false;
@@ -2693,7 +2818,7 @@ impl<'a> DocxBodyParser<'a> {
         e: &quick_xml::events::BytesStart<'_>,
         name: &[u8],
     ) -> Result<()> {
-        if matches!(name, b"rPrChange" | b"pPrChange") {
+        if matches!(name, b"rPrChange" | b"pPrChange" | b"tblPrChange") {
             self.old_properties_depth += 1;
             return Ok(());
         }
@@ -2710,13 +2835,7 @@ impl<'a> DocxBodyParser<'a> {
                 let mut paragraph = ParagraphBuilder::default();
                 for attr in e.attributes().with_checks(false).flatten() {
                     if local_name(attr.key.as_ref()) == b"paraId" {
-                        paragraph.id = Some(
-                            attr.decoded_and_normalized_value(
-                                XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string(),
-                        );
+                        paragraph.id = Some(attribute_string(&attr, reader.decoder()));
                     }
                 }
                 self.current_paragraph = Some(paragraph);
@@ -2883,28 +3002,11 @@ impl<'a> DocxBodyParser<'a> {
                 for attr in e.attributes().with_checks(false).flatten() {
                     let key = local_name(attr.key.as_ref());
                     if key == b"id" {
-                        info.id = attr
-                            .decoded_and_normalized_value(
-                                XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string();
+                        info.id = attribute_string(&attr, reader.decoder());
                     } else if key == b"author" {
-                        info.author = Some(
-                            attr.decoded_and_normalized_value(
-                                XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string(),
-                        );
+                        info.author = Some(attribute_string(&attr, reader.decoder()));
                     } else if key == b"date" {
-                        info.date = Some(
-                            attr.decoded_and_normalized_value(
-                                XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )?
-                            .to_string(),
-                        );
+                        info.date = Some(attribute_string(&attr, reader.decoder()));
                     }
                 }
                 if !info.id.is_empty() && self.revision_ids.insert(info.id.clone()) {
@@ -2955,8 +3057,14 @@ impl<'a> DocxBodyParser<'a> {
                     ));
                 }
                 self.open_tables += 1;
+                self.table_styles.push(None);
                 self.containers
                     .push(Container::Table(TableBuilder::default()));
+            }
+            b"tblStyle" => {
+                if let Some(style) = self.table_styles.last_mut() {
+                    *style = attr_value(reader, e, b"val")?;
+                }
             }
             b"tr" => {
                 self.containers
@@ -3027,8 +3135,14 @@ impl<'a> DocxBodyParser<'a> {
                 .current_paragraph
                 .as_ref()
                 .and_then(|paragraph| paragraph.style_id.as_deref());
+            let table_style = self.table_styles.last().map(Option::as_deref);
             self.style_fonts
-                .effective(run.fonts, run.style_id.as_deref(), paragraph_style)
+                .effective(
+                    run.fonts,
+                    run.style_id.as_deref(),
+                    paragraph_style,
+                    table_style,
+                )
                 .symbol_fonts()
         };
         run.symbol_fonts = Some(fonts);
@@ -3036,7 +3150,7 @@ impl<'a> DocxBodyParser<'a> {
     }
 
     fn handle_end(&mut self, name: &[u8]) -> Result<()> {
-        if matches!(name, b"rPrChange" | b"pPrChange") {
+        if matches!(name, b"rPrChange" | b"pPrChange" | b"tblPrChange") {
             self.old_properties_depth = self.old_properties_depth.saturating_sub(1);
             return Ok(());
         }
@@ -3092,6 +3206,7 @@ impl<'a> DocxBodyParser<'a> {
                 }
             }
             b"tbl" => {
+                self.table_styles.pop();
                 if let Some(Container::Table(table)) = self.pop_container() {
                     let block = Block::Table(Table { rows: table.rows });
                     self.push_block(block);

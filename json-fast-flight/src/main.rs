@@ -25,8 +25,9 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::SchemaRef;
 use flight_ipc_config::{
-    capability_json, FlightIpcDirection, FlightIpcObservationGuard, FlightRequestAuthVerifier,
-    FlightRpcAction, ParserRoute, CAPABILITY_ACTION,
+    capability_json, do_put_unsupported, resolve_path, root_relative_error_text,
+    FlightIpcDirection, FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction,
+    ParserRoute, CAPABILITY_ACTION,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -205,24 +206,6 @@ fn collect_json_paths(root: &Path, limit: usize) -> Result<Vec<PathBuf>, Status>
     Ok(out)
 }
 
-fn resolve_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let canon = joined
-        .canonicalize()
-        .map_err(|_| Status::not_found("file not found"))?;
-    let root_canon = root
-        .canonicalize()
-        .map_err(|_| Status::internal("failed to resolve root"))?;
-    if !canon.starts_with(&root_canon) {
-        return Err(Status::permission_denied("path escapes root"));
-    }
-    Ok(canon)
-}
-
 fn path_to_ticket(root: &Path, path: &Path) -> String {
     if let Ok(root_canon) = root.canonicalize() {
         if let Ok(rel) = path.strip_prefix(&root_canon) {
@@ -285,9 +268,17 @@ fn ticket_to_request(root: &Path, ticket: &Ticket) -> Result<(PathBuf, FlightQue
     resolve_path(root, Path::new(path_str)).map(|path| (path, query))
 }
 
-fn file_schema(path: &Path, options: &ArrowOptions) -> Result<SchemaRef, Status> {
-    let text = fs::read_to_string(path)
-        .map_err(|err| Status::internal(format!("read {}: {err}", path.display())))?;
+/// The answer for a file that could not be read. It names the file by its
+/// path below the root, never by where the root is on the server.
+fn read_error(root: &Path, path: &Path, err: &std::io::Error) -> Status {
+    Status::internal(root_relative_error_text(
+        &format!("read {}: {err}", path.display()),
+        root,
+    ))
+}
+
+fn file_schema(root: &Path, path: &Path, options: &ArrowOptions) -> Result<SchemaRef, Status> {
+    let text = fs::read_to_string(path).map_err(|err| read_error(root, path, &err))?;
     arrow::jsonl_schema(&text, options).map_err(|err| Status::internal(err.to_string()))
 }
 
@@ -345,7 +336,7 @@ impl FlightService for JsonFlightService {
                 let descriptor = FlightDescriptor::new_path(components);
                 let endpoint = FlightEndpoint::new().with_ticket(ticket);
 
-                let schema = match file_schema(&path, &options) {
+                let schema = match file_schema(&root_canon, &path, &options) {
                     Ok(schema) => schema,
                     Err(err) => {
                         let _ = tx.blocking_send(Err(err));
@@ -385,7 +376,7 @@ impl FlightService for JsonFlightService {
 
         let mut options = self.arrow_options.clone();
         apply_query_overrides(&query, &mut options);
-        let schema = file_schema(&path, &options)?;
+        let schema = file_schema(&self.root, &path, &options)?;
 
         let ticket = Ticket::new(path_to_ticket(&self.root, &path));
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
@@ -403,8 +394,9 @@ impl FlightService for JsonFlightService {
 
     async fn poll_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
+        self.authorize(&request)?;
         Err(Status::unimplemented("poll_flight_info"))
     }
 
@@ -419,7 +411,7 @@ impl FlightService for JsonFlightService {
 
         let mut options = self.arrow_options.clone();
         apply_query_overrides(&query, &mut options);
-        let schema = file_schema(&path, &options)?;
+        let schema = file_schema(&self.root, &path, &options)?;
 
         let options = IpcWriteOptions::default();
         let schema_ipc = arrow_flight::SchemaAsIpc::new(schema.as_ref(), &options);
@@ -444,8 +436,7 @@ impl FlightService for JsonFlightService {
         let mut options = self.arrow_options.clone();
         apply_query_overrides(&query, &mut options);
 
-        let text = fs::read_to_string(&path)
-            .map_err(|err| Status::internal(format!("read {}: {err}", path.display())))?;
+        let text = fs::read_to_string(&path).map_err(|err| read_error(&self.root, &path, &err))?;
         let schema = arrow::jsonl_schema(&text, &options).map_err(to_status)?;
 
         let (tx, rx) =
@@ -480,17 +471,19 @@ impl FlightService for JsonFlightService {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented(
-            "json-fast-flight is reader-only (use json-fast-zerobus for writes)",
-        ))
+        // The bearer is checked first: an unauthenticated caller learns
+        // nothing about the server, not even that it is read-only.
+        self.authorize(&request)?;
+        Err(do_put_unsupported())
     }
 
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        self.authorize(&request)?;
         Err(Status::unimplemented("do_exchange"))
     }
 
@@ -525,5 +518,167 @@ impl FlightService for JsonFlightService {
         .await
         .map_err(|_| Status::internal("capability listing failed"))?;
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "../../flight-ipc-config/test-support/mod.rs"]
+mod flight_auth_test_support;
+
+#[cfg(all(test, unix))]
+#[path = "../../flight-ipc-config/test-support/wire.rs"]
+mod flight_wire_test_support;
+
+#[cfg(all(test, unix))]
+mod wire_parity_tests {
+    //! What a Flight client sees from this server, pinned as text in
+    //! `tests/wire_transcript.txt`.
+    //!
+    //! The transcript was captured from the server while it still carried its
+    //! own copy of the Flight skeleton and of the path and ticket handling, so
+    //! a change to any answer in it is a change in behaviour, not in
+    //! structure. Unix only: the probes include a symbolic link and a
+    //! backslash in a file name.
+    use super::*;
+    use crate::flight_auth_test_support::required_auth_verifier;
+    use crate::flight_wire_test_support::Wire;
+
+    const EXPECTED: &str = include_str!("../tests/wire_transcript.txt");
+
+    const FIXTURE: &str = "{\"id\":1,\"name\":\"ada\",\"tags\":[\"a\"]}\n\
+{\"id\":2,\"name\":\"bob\",\"score\":1.5}\n\
+{\"id\":3,\"name\":null}\n";
+
+    fn service(root: &Path) -> JsonFlightService {
+        JsonFlightService {
+            root: root.to_path_buf(),
+            arrow_options: ArrowOptions {
+                batch_size: 64,
+                schema: None,
+            },
+            write_options: IpcWriteOptions::default(),
+            capability_body: b"{}".to_vec(),
+            auth_verifier: required_auth_verifier(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_root_is_answered_like_a_missing_one() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).expect("directories");
+        let mut wire = Wire::start(service(&root), base.path()).await;
+        wire.assert_outside_paths_look_missing(base.path(), "jsonl")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn every_rpc_answers_as_it_did_before_the_shared_server() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("directories");
+        std::fs::write(root.join("data.jsonl"), FIXTURE).expect("fixture");
+        std::fs::write(root.join("Upper.JSON"), FIXTURE).expect("upper-case extension");
+        std::fs::write(root.join("sub").join("nested.json"), "{\"only\":true}\n").expect("nested");
+        std::fs::write(root.join("notes.txt"), b"not json").expect("other file");
+        std::fs::write(base.path().join("outside.jsonl"), FIXTURE).expect("outside");
+        std::os::unix::fs::symlink(base.path().join("outside.jsonl"), root.join("link.jsonl"))
+            .expect("symlink");
+        let outside = base.path().join("outside.jsonl");
+        let outside = outside.to_string_lossy();
+
+        let mut wire = Wire::start(service(&root), base.path()).await;
+
+        wire.handshake(false).await;
+        wire.handshake(true).await;
+        wire.list_flights(false).await;
+        wire.list_flights(true).await;
+
+        wire.get_flight_info("data.jsonl", false).await;
+        for path in [
+            "data.jsonl",
+            "data.jsonl?batch_size=1",
+            "data.jsonl?batch=1",
+            "data.jsonl?table=x",
+            "data.jsonl?batch_size",
+            "data.jsonl?batch_size=x",
+            "data.jsonl?batch_size=0",
+            "data.jsonl?batch_size=%31",
+            "data.jsonl?",
+            "Upper.JSON",
+            "sub/nested.json",
+            "sub\\nested.json",
+            "notes.txt",
+            "sub",
+            "missing.jsonl",
+            "missing.jsonl?batch=1",
+            "../outside.jsonl",
+            "link.jsonl",
+            outside.as_ref(),
+        ] {
+            wire.get_flight_info(path, true).await;
+        }
+        wire.get_flight_info_parts(&["sub", "nested.json?batch_size=2"], true)
+            .await;
+        wire.get_flight_info_parts(&["sub", "..", "data.jsonl"], true)
+            .await;
+        wire.get_flight_info_cmd(b"data.jsonl?batch_size=2", true)
+            .await;
+        wire.get_flight_info_cmd(b"data.jsonl?batch=2", true).await;
+        wire.get_flight_info_cmd(b"\xff", true).await;
+        wire.get_flight_info_cmd(b"", true).await;
+
+        wire.poll_flight_info("data.jsonl", false).await;
+        wire.poll_flight_info("data.jsonl", true).await;
+
+        wire.get_schema("data.jsonl", false).await;
+        wire.get_schema("data.jsonl", true).await;
+        wire.get_schema("sub/nested.json", true).await;
+        wire.get_schema("missing.jsonl", true).await;
+        wire.get_schema("notes.txt", true).await;
+
+        wire.do_get(b"data.jsonl", false).await;
+        for ticket in [
+            "data.jsonl",
+            "data.jsonl?batch_size=1",
+            "data.jsonl?batch=1",
+            "data.jsonl?batch_size=x",
+            "data.jsonl?",
+            "Upper.JSON",
+            "sub/nested.json",
+            "sub\\nested.json",
+            "notes.txt",
+            "sub",
+            "missing.jsonl",
+            "../outside.jsonl",
+            "sub/../data.jsonl",
+            "link.jsonl",
+            outside.as_ref(),
+            "",
+        ] {
+            wire.do_get(ticket.as_bytes(), true).await;
+        }
+        wire.do_get(b"\xff", true).await;
+
+        wire.do_put(false).await;
+        wire.do_put(true).await;
+
+        wire.do_exchange_path("data.jsonl", false).await;
+        wire.do_exchange_path("data.jsonl", true).await;
+        wire.do_exchange("no message", Vec::new(), true).await;
+
+        wire.do_action(CAPABILITY_ACTION, "", true, false).await;
+        wire.do_action(CAPABILITY_ACTION, "", true, true).await;
+        wire.do_action("unknown", "", true, true).await;
+        wire.list_actions(false).await;
+        wire.list_actions(true).await;
+        wire.path_probes(&root, base.path(), "jsonl").await;
+
+        assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
     }
 }
