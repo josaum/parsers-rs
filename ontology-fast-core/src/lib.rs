@@ -1182,8 +1182,18 @@ struct Abbreviator<'a> {
     /// the prefix that sorts first, as in [`abbreviate`].
     namespaces: Vec<(&'a str, &'a str)>,
     /// `parents[i]` is the index of the longest other namespace that starts
-    /// namespace `i`, when there is one.
+    /// namespace `i`, when there is one. Following parents from a namespace
+    /// visits every namespace that starts it, longest first.
     parents: Vec<Option<usize>>,
+    /// `jumps[i]` is a namespace further along the parents of `i`, when `i`
+    /// has a parent: the parent itself, or the namespace two equal jumps
+    /// beyond it. One link per namespace, laid out (Myers, "An applicative
+    /// random-access stack", 1983) so that any number of parents can be
+    /// crossed in a number of links logarithmic in that number.
+    jumps: Vec<Option<usize>>,
+    /// String comparisons and link steps made by lookups so far.
+    #[cfg(test)]
+    steps: std::cell::Cell<usize>,
 }
 
 impl<'a> Abbreviator<'a> {
@@ -1200,7 +1210,10 @@ impl<'a> Abbreviator<'a> {
         // it, so one pass with a stack of the still-open ones finds each
         // parent: whatever does not start the current entry starts no later
         // entry either.
-        let mut parents = Vec::with_capacity(namespaces.len());
+        let mut parents: Vec<Option<usize>> = Vec::with_capacity(namespaces.len());
+        let mut jumps: Vec<Option<usize>> = Vec::with_capacity(namespaces.len());
+        // How many parents each namespace has; needed only to lay out jumps.
+        let mut depths: Vec<usize> = Vec::with_capacity(namespaces.len());
         let mut open: Vec<usize> = Vec::new();
         for (index, (namespace, _)) in namespaces.iter().enumerate() {
             while let Some(top) = open.last().copied() {
@@ -1212,16 +1225,50 @@ impl<'a> Abbreviator<'a> {
                 }
                 open.pop();
             }
-            parents.push(open.last().copied());
+            let parent = open.last().copied();
+            // A parent sorts before its children, so its own entries exist.
+            let depth_of = |at: usize| depths.get(at).copied().unwrap_or(0);
+            let jump_of = |at: usize| jumps.get(at).copied().flatten();
+            let jump = parent.map(|parent| {
+                let near = jump_of(parent);
+                match near.zip(near.and_then(jump_of)) {
+                    // The parent's jump and the jump after it are equally
+                    // long: this namespace jumps over both.
+                    Some((near, far))
+                        if depth_of(parent) - depth_of(near) == depth_of(near) - depth_of(far) =>
+                    {
+                        far
+                    }
+                    _ => parent,
+                }
+            });
+            let depth = parent.map_or(0, |parent| depth_of(parent) + 1);
+            parents.push(parent);
+            jumps.push(jump);
+            depths.push(depth);
             open.push(index);
         }
         Self {
             namespaces,
             parents,
+            jumps,
+            #[cfg(test)]
+            steps: std::cell::Cell::new(0),
         }
     }
 
+    /// Count one string comparison or one link followed; tests only.
+    #[inline]
+    fn step(&self) {
+        #[cfg(test)]
+        self.steps.set(self.steps.get() + 1);
+    }
+
     /// The longest declared namespace that starts `iri`, with its prefix.
+    ///
+    /// Logarithmic in the number of namespaces whatever their shape: one
+    /// binary search, then a climb that crosses `k` parents in `O(log k)`
+    /// links.
     fn longest_namespace(&self, iri: &str) -> Option<(&'a str, &'a str)> {
         // Every namespace that starts `iri` sorts at or before it, and so does
         // `nearest`, the greatest namespace at or before `iri`. `nearest` sits
@@ -1229,9 +1276,10 @@ impl<'a> Abbreviator<'a> {
         // answer is `nearest` itself or one of its parents, and a parent
         // starts `iri` exactly when it is no longer than what `nearest` and
         // `iri` share. One search, then lengths only.
-        let after = self
-            .namespaces
-            .partition_point(|(namespace, _)| *namespace <= iri);
+        let after = self.namespaces.partition_point(|(namespace, _)| {
+            self.step();
+            *namespace <= iri
+        });
         let mut at = after.checked_sub(1)?;
         let (nearest, _) = *self.namespaces.get(at)?;
         let shared = nearest
@@ -1239,13 +1287,23 @@ impl<'a> Abbreviator<'a> {
             .zip(iri.bytes())
             .take_while(|(left, right)| left == right)
             .count();
-        loop {
-            let (namespace, prefix) = *self.namespaces.get(at)?;
-            if namespace.len() <= shared {
-                return Some((namespace, prefix));
-            }
-            at = (*self.parents.get(at)?)?;
+        // Parents get strictly shorter, so "too long to start `iri`" holds
+        // for a run of them and then never again: the answer is the first
+        // namespace past that run. A jump is taken when it lands inside the
+        // run, and the single parent link when it would leave it.
+        let too_long = |at: usize| {
+            self.namespaces
+                .get(at)
+                .is_some_and(|(namespace, _)| namespace.len() > shared)
+        };
+        while too_long(at) {
+            self.step();
+            at = match self.jumps.get(at).copied().flatten() {
+                Some(jump) if too_long(jump) => jump,
+                _ => (*self.parents.get(at)?)?,
+            };
         }
+        self.namespaces.get(at).copied()
     }
 
     /// As [`abbreviate`], for this table.
@@ -1680,6 +1738,60 @@ mod tests {
                 bytes: std::rc::Rc::clone(&self.0),
             }
         }
+    }
+
+    /// Steps per lookup, and the answers, for `iris` under a prefix table.
+    fn lookup_steps(prefixes: &BTreeMap<String, String>, iris: &[String]) -> (usize, Vec<String>) {
+        let abbreviator = Abbreviator::new(prefixes);
+        let answers = iris.iter().map(|iri| abbreviator.abbreviate(iri)).collect();
+        (abbreviator.steps.get(), answers)
+    }
+
+    #[test]
+    fn a_namespace_lookup_is_logarithmic_in_the_prefixes_for_every_shape() {
+        // Steps are string comparisons of the search plus links followed
+        // afterwards. Three thousand namespaces, each starting the next: the
+        // deepest chain a lookup can be asked to climb.
+        let count = 3_000_usize;
+        let iris = 2_000_usize;
+        let chain: BTreeMap<String, String> = (1..=count)
+            .map(|k| (format!("p{k}"), format!("http://e/{}", "a".repeat(k))))
+            .collect();
+        let log2 = (count.ilog2() + 1) as usize;
+        let bound = 4 * iris * log2;
+        // Only the shortest namespace starts the IRI, yet every namespace
+        // sorts before it: the answer is the far end of the chain.
+        let shortest: Vec<String> = (0..iris).map(|n| format!("http://e/ab{n}")).collect();
+        let (steps, answers) = lookup_steps(&chain, &shortest);
+        assert_eq!(answers[7], "p1:b7");
+        assert!(steps <= bound, "shortest: {steps} steps, bound {bound}");
+        // The nearest namespace is the answer: no climb at all.
+        let deep = "a".repeat(count);
+        let nearest: Vec<String> = (0..iris).map(|n| format!("http://e/{deep}b{n}")).collect();
+        let (steps, answers) = lookup_steps(&chain, &nearest);
+        assert_eq!(answers[7], format!("p{count}:b7"));
+        assert!(steps <= bound, "nearest: {steps} steps, bound {bound}");
+        // Every stopping point in between.
+        let between: Vec<String> = (0..iris)
+            .map(|n| format!("http://e/{}b", "a".repeat(1 + n * 7 % count)))
+            .collect();
+        let (steps, answers) = lookup_steps(&chain, &between);
+        assert_eq!(answers[7], "p50:b");
+        for (iri, answer) in between.iter().zip(&answers) {
+            assert_eq!(answer, &abbreviate(iri, &chain), "{iri}");
+        }
+        assert!(steps <= bound, "between: {steps} steps, bound {bound}");
+        // No namespace starts another, and none starts the IRI, though each
+        // shares one byte more with it than the one before.
+        let near_misses: BTreeMap<String, String> = (0..count)
+            .map(|k| (format!("p{k}"), format!("a:{}a", "b".repeat(k))))
+            .collect();
+        let missed: Vec<String> = (0..iris)
+            .map(|n| format!("a:{}/x{n}", "b".repeat(count + 1)))
+            .collect();
+        let (steps, answers) = lookup_steps(&near_misses, &missed);
+        assert_eq!(answers[7], format!("<a:{}/x7>", "b".repeat(count + 1)));
+        assert!(steps <= bound, "near misses: {steps} steps, bound {bound}");
     }
 
     #[test]

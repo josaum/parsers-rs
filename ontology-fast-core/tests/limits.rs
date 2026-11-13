@@ -143,7 +143,10 @@ fn max_statements_does_not_apply_to_the_prefix_table() {
 fn rendering_does_not_test_every_prefix_against_every_term() {
     // Forty thousand prefixes and one hundred and twenty thousand distinct
     // terms: testing each term against each prefix is billions of string
-    // comparisons, where a sorted lookup is a few million.
+    // comparisons, where a sorted lookup is a few million. What is asserted
+    // here is the answer; the cost is asserted as a count of comparisons and
+    // links, not on a clock, by the unit test
+    // `a_namespace_lookup_is_logarithmic_in_the_prefixes_for_every_shape`.
     let count = 40_000;
     let mut text = String::new();
     for n in 0..count {
@@ -152,15 +155,9 @@ fn rendering_does_not_test_every_prefix_against_every_term() {
     for n in 0..count {
         text.push_str(&format!("p{n}:s <urn:n:{n}/p> <urn:q:{n}> .\n"));
     }
-    let started = std::time::Instant::now();
     let ontology = parse_turtle(text.as_bytes(), OntologyLimits::default()).expect("parses");
-    let elapsed = started.elapsed();
     assert_eq!(ontology.triples().len(), count);
     assert_eq!(ontology.triples()[7].to_line(), "p7:s\tp7:p\t<urn:q:7>");
-    assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "rendering took {elapsed:?}"
-    );
 }
 
 #[test]
@@ -168,7 +165,8 @@ fn rendering_does_not_search_once_per_namespace_that_nearly_matches() {
     // A thousand namespaces that each share one byte more with every IRI than
     // the one before, and none of which starts any IRI. A lookup that drops
     // one candidate per search makes a thousand searches per term; one search
-    // and a comparison of lengths is enough.
+    // and a comparison of lengths is enough. The answer is asserted here and
+    // the cost, as a count, by the unit test named above.
     let prefixes = 1_000;
     let rows = 5_000;
     let mut text = String::new();
@@ -179,18 +177,30 @@ fn rendering_does_not_search_once_per_namespace_that_nearly_matches() {
     for n in 0..rows {
         text.push_str(&format!("<x{n}> <p> <o> .\n"));
     }
-    let started = std::time::Instant::now();
     let ontology = parse_turtle(text.as_bytes(), OntologyLimits::default()).expect("parses");
-    let elapsed = started.elapsed();
     assert_eq!(ontology.triples().len(), rows);
     assert_eq!(
         ontology.triples()[7].subject,
         format!("<a:{}/x7>", "b".repeat(prefixes + 1))
     );
-    assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "rendering took {elapsed:?}"
-    );
+}
+
+#[test]
+fn a_chain_of_nested_namespaces_renders_through_the_longest_that_fits() {
+    // Each namespace starts the next. An IRI is rendered through the longest
+    // one that starts it, wherever along the chain that is.
+    let prefixes = 300;
+    let mut text = String::new();
+    for k in 1..=prefixes {
+        text.push_str(&format!("@prefix p{k}: <http://e/{}> .\n", "a".repeat(k)));
+    }
+    let deep = "a".repeat(prefixes);
+    text.push_str(&format!(
+        "<http://e/ab> <http://e/{deep}b> <http://e/{}c> .\n",
+        "a".repeat(17)
+    ));
+    let ontology = parse_turtle(text.as_bytes(), OntologyLimits::default()).expect("parses");
+    assert_eq!(ontology.triples()[0].to_line(), "p1:b\tp300:b\tp17:c");
 }
 
 #[test]
