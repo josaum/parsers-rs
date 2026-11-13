@@ -84,3 +84,33 @@ fn a_wildcard_is_no_column() {
     let names: Vec<_> = arrow.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(names, ["w1"]);
 }
+
+const OPTIONAL: &[u8] = br###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+    xmlns:t="urn:t" targetNamespace="urn:t">
+  <xs:element name="a"><xs:complexType><xs:choice><xs:any minOccurs="0"/></xs:choice></xs:complexType></xs:element>
+  <xs:element name="b"><xs:complexType><xs:sequence>
+    <xs:sequence minOccurs="0"><xs:element name="req" type="xs:string"/><xs:any minOccurs="0"/></xs:sequence>
+    <xs:any minOccurs="0"/>
+  </xs:sequence></xs:complexType></xs:element>
+</xs:schema>"###;
+
+fn optional_messages(xml: &str) -> Vec<String> {
+    SchemaSet::load_bytes(OPTIONAL, ParseOptions::default())
+        .expect("schema loads")
+        .validate(xml.as_bytes(), ValidateOptions::default())
+        .expect("validation runs")
+        .into_iter()
+        .map(|finding| format!("{} {}", finding.path, finding.message))
+        .collect()
+}
+
+#[test]
+fn a_choice_whose_wildcard_may_be_left_out_may_be_empty() {
+    assert!(optional_messages(r##"<a xmlns="urn:t"/>"##).is_empty());
+}
+
+#[test]
+fn an_unclaimed_child_does_not_select_an_optional_sequence() {
+    // The child may be the outer wildcard's; nothing requires `req`.
+    assert!(optional_messages(r##"<b xmlns="urn:t"><x/></b>"##).is_empty());
+}

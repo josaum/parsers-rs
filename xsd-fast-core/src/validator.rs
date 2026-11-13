@@ -953,7 +953,11 @@ impl<'m> ValidationContext<'m> {
                     // missing; any other group reports its own required
                     // children below.
                     let is_choice_group = matches!(**group, ContentModel::Choice(_));
-                    if is_choice_group && particle.occurrence.min >= 1 && selected == 0 {
+                    if is_choice_group
+                        && particle.occurrence.min >= 1
+                        && selected == 0
+                        && !self.choice_may_be_empty(group)
+                    {
                         self.push_error(
                             ValidationSeverity::Error,
                             "required choice group has no selected branch".to_string(),
@@ -993,8 +997,13 @@ impl<'m> ValidationContext<'m> {
             branch_total = self.wildcard_matches(&index, particles);
         }
 
-        // For a required top-level choice, at least one branch must appear.
-        if is_choice && branch_total == 0 && !particles.is_empty() {
+        // For a required top-level choice, at least one branch must appear,
+        // unless a wildcard branch may itself be left out.
+        if is_choice
+            && branch_total == 0
+            && !particles.is_empty()
+            && !optional_wildcard(&index, particles)
+        {
             self.push_error(
                 ValidationSeverity::Error,
                 "choice requires exactly one branch, none present".to_string(),
@@ -1027,7 +1036,21 @@ impl<'m> ValidationContext<'m> {
                 total = total.saturating_add(self.group_branch_count(inner, child_counts));
             }
         }
-        total.saturating_add(self.wildcard_matches(&index, particles))
+        // Only a choice is selected by what its wildcards take: in a
+        // sequence the child may belong to another wildcard of the type.
+        if matches!(content, ContentModel::Choice(_)) {
+            total = total.saturating_add(self.wildcard_matches(&index, particles));
+        }
+        total
+    }
+
+    /// Whether a choice has a wildcard branch that may be left out.
+    fn choice_may_be_empty(&mut self, content: &'m ContentModel) -> bool {
+        let ContentModel::Choice(particles) = content else {
+            return false;
+        };
+        let index = self.content_index(content);
+        optional_wildcard(&index, particles)
     }
 
     /// Children that the wildcards among `particles` take: those no named
@@ -1106,6 +1129,15 @@ impl<'m> ValidationContext<'m> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Whether one of the wildcards among `particles` may occur zero times.
+fn optional_wildcard(index: &ContentIndex<'_>, particles: &[Particle]) -> bool {
+    index
+        .wildcards
+        .iter()
+        .filter_map(|at| particles.get(*at))
+        .any(|particle| particle.occurrence.min == 0)
+}
 
 /// Whether a start tag carries `xsi:nil` with a true value.
 ///
