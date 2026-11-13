@@ -262,16 +262,9 @@ impl PdfScanner {
         epsilon: f32,
         dpi: f32,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let doc = Arc::clone(&self.doc);
         // Convert on the calling thread so we never move Python objects across detach.
         let ocr = ocr_input_from_py(ocr_runs)?;
-        let bytes = py.detach(move || {
-            let batch =
-                page_table_layout_batch_from_ocr_input(&doc, page_index, epsilon, dpi, &ocr)
-                    .map_err(to_py_err)?;
-            record_batch_to_ipc_bytes(&batch)
-        })?;
-        Ok(PyBytes::new(py, &bytes))
+        self.table_layout_ipc_from_ocr(py, page_index, ocr, epsilon, dpi)
     }
 
     #[pyo3(signature = (page_index, ocr_runs, epsilon=2.0, dpi=300.0))]
@@ -370,14 +363,8 @@ impl PdfScanner {
         epsilon: f32,
         dpi: f32,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let doc = Arc::clone(&self.doc);
         let ocr = ocr_input_from_py(ocr_runs)?;
-        let bytes = py.detach(move || {
-            let batch = page_table_batch_from_ocr_input(&doc, page_index, epsilon, dpi, &ocr)
-                .map_err(to_py_err)?;
-            record_batch_to_ipc_bytes(&batch)
-        })?;
-        Ok(PyBytes::new(py, &bytes))
+        self.table_ipc_from_ocr(py, page_index, ocr, epsilon, dpi)
     }
 
     #[pyo3(signature = (page_index, ocr_runs, epsilon=2.0, dpi=300.0))]
@@ -1199,7 +1186,96 @@ fn record_batch_to_arrow_c_array_capsules<'py>(
     Ok((schema_capsule, array_capsule))
 }
 
+/// Columns an OCR Arrow batch must carry, with the types the table routing
+/// can read from each.
+const OCR_BATCH_COLUMNS: [(&str, &str); 4] = [
+    ("text", "Utf8 or LargeUtf8"),
+    ("px_x", "Float32 or Float64"),
+    ("px_y", "Float32 or Float64"),
+    ("px_height", "Float32 or Float64"),
+];
+
+/// Refuses an OCR Arrow batch whose schema lacks a required column or gives
+/// one a type the table routing cannot read, naming the column.
+///
+/// The core reads these columns only when the page has a table and only row
+/// by row, so without this a wrong batch fails late, or not at all.
+fn validate_ocr_batch_schema(batch: &RecordBatch) -> PyResult<()> {
+    use arrow::datatypes::DataType;
+    let schema = batch.schema();
+    for (name, expected) in OCR_BATCH_COLUMNS {
+        let field = schema.field_with_name(name).map_err(|_| {
+            PyValueError::new_err(format!(
+                "ocr_runs Arrow batch is missing required column '{name}' \
+                 (expected text, px_x, px_y, px_height)"
+            ))
+        })?;
+        let readable = match name {
+            "text" => matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8),
+            _ => matches!(field.data_type(), DataType::Float32 | DataType::Float64),
+        };
+        if !readable {
+            return Err(PyValueError::new_err(format!(
+                "ocr_runs column '{name}' must be {expected}, got {:?}",
+                field.data_type()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Converts OCR runs from Python and, for an Arrow batch, checks its schema
+/// before any other work.
 fn ocr_input_from_py(value: &Bound<'_, PyAny>) -> PyResult<OcrInput> {
+    let input = ocr_input_from_py_unchecked(value)?;
+    if let OcrInput::Batch(batch) = &input {
+        validate_ocr_batch_schema(batch)?;
+    }
+    Ok(input)
+}
+
+impl PdfScanner {
+    /// Table layout of one page, routed with already converted OCR runs, as
+    /// Arrow IPC bytes.
+    fn table_layout_ipc_from_ocr<'py>(
+        &self,
+        py: Python<'py>,
+        page_index: usize,
+        ocr: OcrInput,
+        epsilon: f32,
+        dpi: f32,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let doc = Arc::clone(&self.doc);
+        let bytes = py.detach(move || {
+            let batch =
+                page_table_layout_batch_from_ocr_input(&doc, page_index, epsilon, dpi, &ocr)
+                    .map_err(to_py_err)?;
+            record_batch_to_ipc_bytes(&batch)
+        })?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Tables of one page, routed with already converted OCR runs, as Arrow
+    /// IPC bytes.
+    fn table_ipc_from_ocr<'py>(
+        &self,
+        py: Python<'py>,
+        page_index: usize,
+        ocr: OcrInput,
+        epsilon: f32,
+        dpi: f32,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let doc = Arc::clone(&self.doc);
+        let bytes = py.detach(move || {
+            let batch = page_table_batch_from_ocr_input(&doc, page_index, epsilon, dpi, &ocr)
+                .map_err(to_py_err)?;
+            record_batch_to_ipc_bytes(&batch)
+        })?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+}
+
+fn ocr_input_from_py_unchecked(value: &Bound<'_, PyAny>) -> PyResult<OcrInput> {
     if value.is_instance_of::<PyString>() {
         let text: String = value.extract()?;
         return Ok(OcrInput::Runs(parse_ocr_runs_json(&text)?));
@@ -1621,10 +1697,12 @@ fn scan_pdf_page_table_layout_from_ocr_arrow_ipc_py<'py>(
     epsilon: Option<f32>,
     dpi: Option<f32>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    PdfScanner::new(path.to_string())?.page_table_layout_from_ocr_arrow_ipc(
+    // The batch is checked before the document is opened.
+    let ocr = ocr_input_from_py(ocr_runs)?;
+    PdfScanner::new(path.to_string())?.table_layout_ipc_from_ocr(
         py,
         page_index,
-        ocr_runs,
+        ocr,
         epsilon.unwrap_or(2.0),
         dpi.unwrap_or(300.0),
     )
@@ -1681,10 +1759,12 @@ fn scan_pdf_page_table_from_ocr_arrow_ipc_py<'py>(
     epsilon: Option<f32>,
     dpi: Option<f32>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    PdfScanner::new(path.to_string())?.page_table_from_ocr_arrow_ipc(
+    // The batch is checked before the document is opened.
+    let ocr = ocr_input_from_py(ocr_runs)?;
+    PdfScanner::new(path.to_string())?.table_ipc_from_ocr(
         py,
         page_index,
-        ocr_runs,
+        ocr,
         epsilon.unwrap_or(2.0),
         dpi.unwrap_or(300.0),
     )
