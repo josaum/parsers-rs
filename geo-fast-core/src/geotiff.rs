@@ -262,6 +262,10 @@ pub fn parse_geotiff_geokey_params_reader<R: Read + Seek>(
 
     let mut params = GeoKeyParams::default();
     for [key_id, location, count, offset] in entries {
+        // A key of no values has no value to give.
+        if count == 0 {
+            continue;
+        }
         let range = usize::from(offset)..usize::from(offset) + usize::from(count);
         match location {
             TAG_GEO_DOUBLE_PARAMS => {
@@ -275,8 +279,11 @@ pub fn parse_geotiff_geokey_params_reader<R: Read + Seek>(
                     .and_then(|all| all.get(range))
                     .and_then(|bytes| std::str::from_utf8(bytes).ok());
                 if let Some(text) = text {
-                    // `|` ends a string in the tag, standing in for NUL.
-                    let text = text.trim_end_matches(['|', '\0']);
+                    // One `|` ends a string in the tag, standing in for the
+                    // NUL that ends the tag itself; any `|` before it is
+                    // part of the string.
+                    let text = text.strip_suffix('\0').unwrap_or(text);
+                    let text = text.strip_suffix('|').unwrap_or(text);
                     params.strings.insert(key_id, text.to_string());
                 }
             }
@@ -293,7 +300,13 @@ pub fn parse_geotiff_geokey_params_reader<R: Read + Seek>(
 /// other kind of value.
 fn tag_bytes(value: Value) -> Option<Vec<u8>> {
     match value {
-        Value::Ascii(text) => Some(text.into_bytes()),
+        Value::Ascii(text) => {
+            // The decoder drops the NUL that ends the tag; a key's count may
+            // include it, so it is put back.
+            let mut bytes = text.into_bytes();
+            bytes.push(0);
+            Some(bytes)
+        }
         other => other
             .into_u64_vec()
             .ok()?
@@ -896,7 +909,8 @@ fn read_doubles_tag<R: Read + Seek>(
 ///
 /// The value is the entry's `ValueOffset`: the value itself for a key stored
 /// in the directory, and the position of the value in its parameter tag for
-/// any other key.
+/// any other key. `GTRasterTypeGeoKey` is in the map only when it is stored
+/// in the directory.
 ///
 /// # Errors
 ///
@@ -906,6 +920,13 @@ fn read_geokey_directory<R: Read + Seek>(
 ) -> Result<HashMap<u16, u32>, GeoError> {
     Ok(read_geokey_entries(decoder)?
         .into_iter()
+        // The raster type is a SHORT stored in the directory. An entry that
+        // puts it in a parameter tag is malformed, and its `ValueOffset` is a
+        // position there, not a raster type: `pixel_is_point` must not read
+        // it as one, so the key is left out.
+        .filter(|&[key_id, tiff_tag_location, ..]| {
+            key_id != GEOKEY_RASTER_TYPE || tiff_tag_location == 0
+        })
         .map(|[key_id, _tiff_tag_location, _count, value_offset]| (key_id, u32::from(value_offset)))
         .collect())
 }
@@ -1866,5 +1887,54 @@ mod tests {
             !matches!(raised, Err(GeoError::UnsupportedFormat(_))),
             "{raised:?}"
         );
+    }
+
+    #[test]
+    fn geokey_parameter_edge_cases() {
+        let keys: [u16; 32] = [
+            1, 1, 0, 7, //
+            1024, 0, 1, 2, //
+            1026, 34737, 4, 0, // "A||" and its terminator: the value is "A|"
+            2049, 34737, 0, 4, // no values
+            3073, 34737, 8, 4, // "WGS 84|" and the NUL that ends the tag
+            2057, 34736, 0, 0, // no values
+            2058, 34736, 2, 0, // two values
+            2059, 34736, 1, 2, // one past the end
+        ];
+        let bytes = geotiff_with_params(&keys, Some(&[1.0, 2.0]), Some("A|||WGS 84|"));
+        let params = parse_geotiff_geokey_params_reader(Cursor::new(bytes)).expect("params");
+        // Exactly one `|` is the terminator.
+        assert_eq!(params.citation(), Some("A||"));
+        // A count of zero is no value, not an empty one.
+        assert_eq!(params.geographic_citation(), None);
+        assert_eq!(params.semi_major_axis(), None);
+        // A count that takes in the tag's own NUL still resolves.
+        assert_eq!(params.projected_citation(), Some("WGS 84"));
+        assert_eq!(params.doubles.get(&2058), Some(&vec![1.0, 2.0]));
+        assert_eq!(params.inverse_flattening(), None);
+    }
+
+    /// A raster type that claims to live in the double parameters is not a
+    /// raster type: its `ValueOffset` of 2 is a position, and must not turn
+    /// the raster into `PixelIsPoint`.
+    #[test]
+    fn raster_type_outside_the_directory_is_not_trusted() {
+        let keys: [u16; 16] = [
+            1, 1, 0, 3, 1024, 0, 1, 2, 1025, 34736, 1, 2, 2048, 0, 1, 4326,
+        ];
+        let parsed = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                geokeys: Some(&keys),
+                ..GeoTags::default()
+            },
+        ));
+        assert!(!parsed.pixel_is_point());
+        assert_eq!(parsed.upper_left(), Some((-48.0, -15.0)));
+        assert_bbox(&parsed.bbox.expect("bbox"), -48.0, -15.5, -47.0, -15.0);
+        assert_eq!(parsed.epsg_code, Some(4326));
     }
 }
