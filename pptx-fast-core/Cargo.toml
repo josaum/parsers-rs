@@ -8,6 +8,9 @@ license.workspace = true
 keywords = ["pptx", "powerpoint", "ooxml", "parser", "office", "presentation"]
 categories = ["parser-implementations", "encoding"]
 rust-version.workspace = true
+# Benchmarks and the one-shot bench drivers are for this repository, not for
+# users of the crate: they stay out of the published package.
+exclude = ["benches/", "examples/"]
 
 [lib]
 name = "pptx_fast_core"
@@ -32,5 +35,10 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3.10"
 zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[[bench]]
+name = "parse"
+harness = false

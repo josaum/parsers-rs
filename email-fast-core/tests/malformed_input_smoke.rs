@@ -875,3 +875,24 @@ fn msg_substg_name_with_non_ascii_characters_is_not_a_panic() {
     let email = parse_msg_bytes(&bytes, ParseOptions::default()).expect("unknown names skipped");
     assert_eq!(email.subject.as_deref(), Some("Subject"));
 }
+
+/// The seeds above are also the starting corpus of the fuzz targets in
+/// `fuzz/`; `WRITE_FUZZ_SEEDS=1` writes them out again after a seed changes.
+#[test]
+fn the_fuzz_corpus_holds_these_seeds() {
+    smoke::fuzz_seeds(
+        env!("CARGO_MANIFEST_DIR"),
+        &[
+            ("eml", "multipart.eml", eml_seed()),
+            ("eml", "html.eml", html_eml_seed()),
+            ("mbox", "two-messages.mbox", mbox_seed()),
+            ("msg", "full.msg", msg_seed()),
+            ("msg", "no-mini-stream.msg", msg_seed_without_mini_stream()),
+            (
+                "msg",
+                "written-fixture.msg",
+                write_msg_cfb_fixture("Subject", "a@example.com", "b@example.com", "Body"),
+            ),
+        ],
+    );
+}
