@@ -129,7 +129,9 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Ema
     let from_name = first_string(&streams, TAG_SENDER_NAME);
     let to_raw = first_string(&streams, TAG_DISPLAY_TO);
     let cc_raw = first_string(&streams, TAG_DISPLAY_CC);
-    let mut body_text = first_string_with(&streams, TAG_BODY, body_encoding);
+    // The plain body is a string property like the others, so it follows
+    // the message code page; the HTML body follows the internet one.
+    let mut body_text = first_string(&streams, TAG_BODY);
     let body_html = first_string_with(&streams, TAG_BODY_HTML, body_encoding).or_else(|| {
         first_binary(&streams, TAG_BODY_HTML)
             .map(|b| {
@@ -1038,10 +1040,15 @@ fn encoding_for_codepage(codepage: u32) -> Option<&'static Encoding> {
 
 /// Decodes a non-Unicode (PtypString8 or binary body) value.
 ///
-/// The code page the message declares decides. Bytes in a multi-byte code
-/// page are often valid UTF-8 as well (`D0 BB D0 BB` is two Chinese
-/// characters in code page 936 and two Cyrillic letters in UTF-8), so the
-/// bytes cannot be asked which they are.
+/// A declared multi-byte code page decides. Bytes in such a code page are
+/// often valid UTF-8 as well (`D0 BB D0 BB` is two Chinese characters in
+/// code page 936 and two Cyrillic letters in UTF-8), so the bytes cannot be
+/// asked which they are.
+///
+/// Under a declared single-byte code page, bytes that are valid UTF-8 with
+/// at least one multi-byte sequence are taken as UTF-8: writers do store
+/// UTF-8 there, and text in a single-byte code page is almost never valid
+/// multi-byte UTF-8 by accident. Anything else decodes with the code page.
 ///
 /// Without a declared code page (none written, or one this reader has no
 /// decoder for), and with code page 65001, valid UTF-8 is taken as UTF-8 and
@@ -1049,6 +1056,13 @@ fn encoding_for_codepage(codepage: u32) -> Option<&'static Encoding> {
 /// to U+FFFD the way a UTF-8 lossy read does.
 fn decode_ansi(bytes: &[u8], declared: Option<&'static Encoding>) -> String {
     match declared {
+        Some(encoding)
+            if encoding.is_single_byte()
+                && !bytes.is_ascii()
+                && std::str::from_utf8(bytes).is_ok() =>
+        {
+            String::from_utf8_lossy(bytes).into_owned()
+        }
         Some(encoding) if encoding != encoding_rs::UTF_8 => {
             encoding.decode_without_bom_handling(bytes).0.into_owned()
         }
@@ -1586,17 +1600,46 @@ mod cfb_hardening_tests {
         ]);
         assert_eq!(email.subject.as_deref(), Some("\u{8c22}\u{8c22}"));
         assert_eq!(email.body.text.as_deref(), Some("\u{8c22}\u{8c22}"));
+    }
 
-        // The same holds for a single-byte code page: UTF-8 bytes under a
-        // declared windows-1252 are read as windows-1252.
+    /// Writers do put UTF-8 in an ANSI string under a single-byte code
+    /// page. Text in such a code page is almost never valid multi-byte
+    /// UTF-8 by accident, so there UTF-8 is believed.
+    #[test]
+    fn utf8_in_an_ansi_string_wins_over_a_single_byte_code_page() {
+        for codepage in [1252, 1251, 28592, 874] {
+            let email = parse_fixture(&[
+                (
+                    "__properties_version1.0",
+                    property_stream(&[(PROP_MESSAGE_CODEPAGE, codepage)]),
+                ),
+                (
+                    "__substg1.0_0037001E",
+                    "Ol\u{e1} \u{20ac}".as_bytes().to_vec(),
+                ),
+            ]);
+            assert_eq!(
+                email.subject.as_deref(),
+                Some("Ol\u{e1} \u{20ac}"),
+                "{codepage}"
+            );
+        }
+    }
+
+    /// The ANSI body is a string like the subject: it follows the message
+    /// code page even when the internet code page says something else.
+    #[test]
+    fn the_ansi_body_follows_the_message_code_page() {
         let email = parse_fixture(&[
             (
                 "__properties_version1.0",
-                property_stream(&[(PROP_MESSAGE_CODEPAGE, 1252)]),
+                property_stream(&[(PROP_MESSAGE_CODEPAGE, 936), (PROP_INTERNET_CODEPAGE, 1252)]),
             ),
-            ("__substg1.0_0037001E", "Ol\u{e1}".as_bytes().to_vec()),
+            ("__substg1.0_0037001E", GBK_THANKS.to_vec()),
+            ("__substg1.0_1000001E", GBK_THANKS.to_vec()),
         ]);
-        assert_eq!(email.subject.as_deref(), Some("Ol\u{c3}\u{a1}"));
+        assert_eq!(email.subject.as_deref(), Some("\u{8c22}\u{8c22}"));
+        assert_eq!(email.body.text.as_deref(), Some("\u{8c22}\u{8c22}"));
     }
 
     #[test]
