@@ -1007,6 +1007,30 @@ fn a_sampled_function_with_a_huge_overflowing_or_empty_size_is_refused() {
     );
 }
 
+#[test]
+fn a_million_saved_graphics_states_are_refused() {
+    let content = format!("{}0 0 10 10 re f", "q\n".repeat(1_000_000));
+    assert_refused("a million q", &one_page("", &content, Vec::new()));
+    let nested = format!("{}0 0 10 10 re f{}", "q ".repeat(100), " Q".repeat(100));
+    assert_renders("a hundred nested q", &one_page("", &nested, Vec::new()));
+}
+
+#[test]
+fn saved_graphics_states_add_up_across_nested_forms() {
+    // Each stream alone is under the bound; the form is drawn inside the
+    // page's 3,000 saved states and adds 3,000 of its own.
+    let page = format!("{}/F1 Do", "q ".repeat(3_000));
+    let inner = format!("{}0 0 10 10 re f", "q ".repeat(3_000));
+    assert_refused(
+        "3,000 q on the page, 3,000 in its form",
+        &one_page(
+            PAGE_DRAWS_F1,
+            &page,
+            vec![(10, form("/Resources << >>", &inner))],
+        ),
+    );
+}
+
 /// Runs the interpreter with no guard, on a thread with a chosen stack.
 ///
 /// Not a test: it exists to confirm that a fixture aborts the process and to

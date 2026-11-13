@@ -71,9 +71,11 @@
 //!   one it is drawn in, and every tiling cell one sized by its `/XStep`
 //!   and `/YStep` at the cell's scale, which is not the page's: up to
 //!   65,535 pixels a side, so a single small pattern can ask for gigabytes.
-//!   The interpreter's saved-state stack is unbounded.
+//!   Each saved graphics state copies the clip paths in force, and the
+//!   number of those is not bounded.
 //!
-//! Bounded beyond recursion: a sampled function's table, by
+//! Bounded beyond recursion: the interpreter's saved-state stack, by
+//! [`MAX_SAVED_STATES`]; a sampled function's table, by
 //! [`MAX_SAMPLED_FUNCTION_ENTRIES`], and its cost per evaluation, which
 //! doubles with each input, by [`MAX_SAMPLED_FUNCTION_INPUTS`]. Every font a
 //! stream selects, and every object it reaches, is held to
@@ -197,6 +199,18 @@ const MAX_CONTENT_NESTING: usize = 4_096;
 /// optimized: under 1 MiB unoptimized at this depth.
 const MAX_PROGRAM_NESTING: usize = 256;
 
+/// Most graphics states the interpreter may hold saved at once along one
+/// path of nested content streams.
+///
+/// Every `q` clones the whole current state onto a stack that has no limit:
+/// a page of a million `q` reached a peak of 616 MB in a release build
+/// against 6 MB for a blank page, about 610 bytes a state, more when clip
+/// paths are in force, since each saved state copies the list of them. Real
+/// content nests `q` a few levels deep, rarely past a few dozen. This many
+/// cost about 2.5 MB without clips. Glyph procedures are bounded per stream
+/// only, so a glyph shown at the deepest point can hold as many again.
+const MAX_SAVED_STATES: usize = 4_096;
+
 /// Most samples a sampled (Type 0) function may hold: the product of its
 /// `/Size` entries times its outputs, and the samples its stream holds.
 ///
@@ -267,11 +281,15 @@ struct Scan {
     ext_g_states: Vec<Vec<u8>>,
     /// Font operands of `Tf`.
     fonts: Vec<Vec<u8>>,
+    /// Most graphics states this stream holds saved at once: the deepest
+    /// `q` nesting, with a `Q` past the first ignored.
+    saves: usize,
 }
 
 impl Scan {
     fn of(content: &[u8]) -> Self {
         let mut scan = Self::default();
+        let mut depth = 0usize;
         for instruction in TypedIter::new(content) {
             match instruction {
                 TypedInstruction::XObject(op) => {
@@ -293,6 +311,11 @@ impl Scan {
                 TypedInstruction::TextFont(op) => {
                     remember(&mut scan.seen, 3, &mut scan.fonts, &op.0);
                 }
+                TypedInstruction::SaveState(_) => {
+                    depth += 1;
+                    scan.saves = scan.saves.max(depth);
+                }
+                TypedInstruction::RestoreState(_) => depth = depth.saturating_sub(1),
                 _ => {}
             }
         }
@@ -390,6 +413,9 @@ struct Frame<'a> {
     /// Stack the deepest glyph procedure of a Type 3 font selected here
     /// needs, when one is selected.
     glyphs: Option<u32>,
+    /// Graphics states the interpreter may hold saved inside this stream:
+    /// its own deepest nesting on top of every stream's above it.
+    saves: usize,
 }
 
 impl Frame<'_> {
@@ -476,7 +502,9 @@ impl<'a> Walk<'a> {
     fn scan_content(&mut self, content: &[u8]) -> Result<Scan> {
         self.spend(content.len())?;
         check_nesting(content, MAX_CONTENT_NESTING)?;
-        Ok(Scan::of(content))
+        let scan = Scan::of(content);
+        check_saves(scan.saves)?;
+        Ok(scan)
     }
 
     /// Bounds the depth of every object the interpreter may build from one
@@ -667,7 +695,13 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
-    fn push(&mut self, child: Child<'a>, resources: Resources<'a>, floor: u32) -> Result<()> {
+    fn push(
+        &mut self,
+        child: Child<'a>,
+        resources: Resources<'a>,
+        floor: u32,
+        saves_above: usize,
+    ) -> Result<()> {
         if floor > STACK_BUDGET {
             return Err(refused(
                 "content streams nest deeper than the interpreter's stack allows",
@@ -689,7 +723,9 @@ impl<'a> Walk<'a> {
             through_forms: 0,
             target: None,
             glyphs: None,
+            saves: saves_above.saturating_add(child.scan.saves),
         };
+        check_saves(frame.saves)?;
         self.vet_resource_objects(&frame.resources)?;
         self.expand(&mut frame, &child.scan)?;
         self.stack.push(frame);
@@ -750,6 +786,8 @@ impl<'a> Walk<'a> {
         let Some(scan) = self.scan(stream)? else {
             return Ok(());
         };
+        // Its saved states sit on top of those of every stream above it.
+        check_saves(frame.saves.saturating_add(scan.saves))?;
         if scan.is_empty() {
             // This walk never enters it, so its own resources are checked
             // here: the interpreter still builds whatever they hold if the
@@ -969,16 +1007,17 @@ impl<'a> Walk<'a> {
     /// Vets `root` and everything beneath it; `floor` is the stack already in
     /// use when `root` starts. Returns the stack needed beneath `root`.
     fn run(&mut self, root: Child<'a>, resources: Resources<'a>, floor: u32) -> Result<u32> {
-        self.push(root, resources, floor)?;
+        self.push(root, resources, floor, 0)?;
         loop {
             let Some(frame) = self.stack.last_mut() else {
                 return Ok(0);
             };
             if let Some(child) = frame.children.pop() {
                 let floor = frame.floor.saturating_add(child.route.cost());
+                let saves = frame.saves;
                 let resources = Resources::from_parent(child.own.clone(), frame.resources.clone());
                 self.count()?;
-                self.push(child, resources, floor)?;
+                self.push(child, resources, floor, saves)?;
                 continue;
             }
             let Some(done) = self.stack.pop() else {
@@ -1150,6 +1189,16 @@ fn check_cmap_comments(text: &[u8]) -> Result<()> {
             }
             _ => run = 0,
         }
+    }
+    Ok(())
+}
+
+/// Refuses more saved graphics states than [`MAX_SAVED_STATES`].
+fn check_saves(saves: usize) -> Result<()> {
+    if saves > MAX_SAVED_STATES {
+        return Err(refused(
+            "the page saves more graphics states at once than the interpreter may hold",
+        ));
     }
     Ok(())
 }
