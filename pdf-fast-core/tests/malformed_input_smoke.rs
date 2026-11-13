@@ -927,7 +927,11 @@ fn a_run_of_saved_states_does_not_grow_the_table_extractor() {
     let mut payloads = Payloads::seed();
     payloads.table_content = b"q ".repeat(36_000_000);
     let document = document(&payloads);
-    exercise_tables(&document, ParseOptions::default());
+    // On the harness's small stack, so the test behaves the same on every
+    // platform whatever stack its test threads get.
+    smoke::run_on_small_stack(move || {
+        exercise_tables(&document, ParseOptions::default());
+    });
 }
 
 // ── Seed sanity ─────────────────────────────────────────────────────────────
