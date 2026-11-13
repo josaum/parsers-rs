@@ -284,15 +284,25 @@ const MAX_CELL_CHARS: usize = 32_767;
 const MAX_FORMULA_CHARS: usize = 8_192;
 /// Most characters (UTF-16 code units) a sheet name may hold.
 const MAX_SHEET_NAME_CHARS: usize = 31;
+/// Characters a uniqueness suffix ` (N)` takes besides its digits.
+const SUFFIX_FRAME_CHARS: usize = 3;
+/// First serial number a date cell may hold: 1900-03-01. Earlier serials are
+/// ambiguous because Excel counts a 29 February 1900 that never happened.
+const MIN_DATE_SERIAL: f64 = 61.0;
+/// First serial number past the dates Excel can show: the day after
+/// 9999-12-31.
+const END_DATE_SERIAL: f64 = 2_958_466.0;
 /// Widest column Excel accepts, in character units.
 const MAX_COLUMN_WIDTH: f64 = 255.0;
 
 /// A workbook.
 pub struct Workbook {
     sheets: Vec<Sheet>,
-    /// Lower-cased sheet names in use, each with the next numeric suffix to
-    /// try when the same name is asked for again.
-    taken_names: HashMap<String, u32>,
+    /// Lower-cased sheet names in use.
+    taken_names: std::collections::HashSet<String>,
+    /// For each lower-cased stem a suffix has been added to, the next number
+    /// to try. Kept apart from `taken_names`: a stem is not a name in use.
+    next_suffix: HashMap<String, u64>,
 }
 
 /// Cuts `name` to at most `limit` UTF-16 code units without splitting a
@@ -317,6 +327,11 @@ fn valid_sheet_name(name: &str, position: usize) -> String {
         .chars()
         .map(|ch| match ch {
             '[' | ']' | ':' | '*' | '?' | '/' | '\\' => '_',
+            // The name is written as an XML attribute, which cannot carry
+            // these at all. Replacing them here, before the name is checked
+            // for uniqueness, keeps the stored name equal to the written one.
+            // A carriage return is written as a character reference instead.
+            other if other != '\r' && needs_xstring_escape(other) => char::REPLACEMENT_CHARACTER,
             other => other,
         })
         .collect();
@@ -340,7 +355,8 @@ impl Workbook {
     pub fn new() -> Self {
         Self {
             sheets: Vec::new(),
-            taken_names: HashMap::new(),
+            taken_names: std::collections::HashSet::new(),
+            next_suffix: HashMap::new(),
         }
     }
     /// Append a worksheet and return a mutable handle to it.
@@ -348,7 +364,9 @@ impl Workbook {
     /// Excel refuses a workbook with a sheet name it does not accept, so the
     /// name is made valid here and [`Sheet::name`] returns the name actually
     /// used: it is cut to 31 characters; each of `[ ] : * ? / \` and an
-    /// apostrophe at either end becomes `_`; an empty name becomes `SheetN`;
+    /// apostrophe at either end becomes `_`; a character XML cannot carry (a
+    /// control character other than tab, line feed and carriage return,
+    /// U+FFFE or U+FFFF) becomes U+FFFD; an empty name becomes `SheetN`;
     /// the reserved name `History` gets a trailing `_`; and a name already in
     /// use (ignoring case) gets a suffix such as ` (2)`.
     pub fn add_sheet(&mut self, name: impl Into<String>) -> &mut Sheet {
@@ -369,21 +387,30 @@ impl Workbook {
     /// Returns a valid sheet name no other sheet uses, and records it.
     fn unique_sheet_name(&mut self, requested: &str) -> String {
         let base = valid_sheet_name(requested, self.sheets.len() + 1);
-        let mut name = base.clone();
+        if self.taken_names.insert(base.to_lowercase()) {
+            return base;
+        }
+        // A suffix ` (N)` is added to the name cut to leave room for it. The
+        // counter is kept per stem as printed, not per requested name: long
+        // names sharing a prefix are cut to the same stem, and a counter per
+        // name would make each of them retry every suffix already taken.
+        let mut digits = 1;
         loop {
-            if let std::collections::hash_map::Entry::Vacant(slot) =
-                self.taken_names.entry(name.to_lowercase())
-            {
-                slot.insert(2);
+            let room = MAX_SHEET_NAME_CHARS.saturating_sub(SUFFIX_FRAME_CHARS + digits);
+            let stem = truncate_utf16(&base, room);
+            let counter = self.next_suffix.entry(stem.to_lowercase()).or_insert(2);
+            let needed = counter.to_string().len();
+            if needed > digits {
+                // The numbers that fit this stem are used up; a longer
+                // number needs a shorter stem, which has its own counter.
+                digits = needed;
+                continue;
+            }
+            let name = format!("{stem} ({counter})");
+            *counter = counter.saturating_add(1);
+            if self.taken_names.insert(name.to_lowercase()) {
                 return name;
             }
-            // The counter is kept per requested name, so asking for the same
-            // name many times does not retry every earlier suffix.
-            let counter = self.taken_names.entry(base.to_lowercase()).or_insert(2);
-            let suffix = format!(" ({counter})");
-            *counter = counter.saturating_add(1);
-            let room = MAX_SHEET_NAME_CHARS.saturating_sub(suffix.len());
-            name = format!("{}{suffix}", truncate_utf16(&base, room));
         }
     }
 
@@ -664,8 +691,10 @@ pub struct SheetSpec {
 ///
 /// `t` is the cell type: `"s"` (string), `"n"` (number), `"b"` (bool),
 /// `"d"` (date: an ISO `YYYY-MM-DD[THH:MM[:SS]]` string or an Excel serial
-/// number) or `"f"` (formula). A value that does not fit the declared type is
-/// written as what it is: text stays text, `null` leaves the cell empty.
+/// number from 61 up to, not including, 2958466, which is 1900-03-01 to
+/// 9999-12-31) or `"f"` (formula). A value that does not fit the declared
+/// type is written as what it is: text stays text, a serial number outside
+/// that range stays a plain number, `null` leaves the cell empty.
 ///
 /// Only `"f"` creates a formula. Text under any other type is written as
 /// text even when it starts with `=`, `+`, `-` or `@`.
@@ -715,7 +744,12 @@ impl Workbook {
                             continue;
                         }
                         ("d", Value::Number(serial)) => {
-                            if let Some(serial) = serial.as_f64() {
+                            // Only a serial `write_date` could have produced
+                            // gets the date style; any other number (NaN
+                            // fails the comparison too) stays a number.
+                            let in_range =
+                                |serial: &f64| (MIN_DATE_SERIAL..END_DATE_SERIAL).contains(serial);
+                            if let Some(serial) = serial.as_f64().filter(in_range) {
                                 sheet.write_date_serial(row_idx, col_idx, serial);
                                 continue;
                             }

@@ -417,3 +417,105 @@ fn a_mixed_workbook_passes_unzip_and_reads_back_identically() {
         }
     }
 }
+
+/// WHY: a sheet name is an XML attribute, which cannot carry control
+/// characters. Names that differ only in such characters used to be written
+/// as one and the same name, and `Sheet::name` reported a name that was not
+/// the one in the file.
+#[test]
+fn sheet_names_stay_unique_after_unwritable_characters_are_replaced() {
+    let mut workbook = Workbook::new();
+    let mut names = Vec::new();
+    for requested in [
+        "a\u{1}",
+        "a\u{2}",
+        "a\u{fffe}",
+        "a\u{fffd}",
+        "a\u{ffff}",
+        "a\u{b}",
+        "a\tb",
+        "a\nb",
+        "a\rb",
+        "a",
+    ] {
+        names.push(workbook.add_sheet(requested).name().to_string());
+    }
+    let distinct: std::collections::HashSet<String> =
+        names.iter().map(|name| name.to_lowercase()).collect();
+    assert_eq!(distinct.len(), names.len(), "{names:?}");
+    assert_eq!(names[0], "a\u{fffd}");
+    let read_back: Vec<String> = read(bytes_of(&workbook).expect("writes"))
+        .sheets
+        .into_iter()
+        .map(|sheet| sheet.name)
+        .collect();
+    assert_eq!(read_back, names);
+}
+
+/// WHY: a suffix is added to a name cut to make room for it, so long names
+/// that share a prefix compete for the same suffixes. Each used to retry
+/// every suffix already taken, which made a workbook of many such sheets
+/// take minutes.
+#[test]
+fn many_long_names_sharing_a_prefix_are_made_unique_quickly() {
+    const SHEETS: usize = 20_000;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut workbook = Workbook::new();
+        let mut names = std::collections::HashSet::new();
+        for round in 0..2 {
+            for index in 0..SHEETS {
+                let requested = format!("{}{:04x}", "X".repeat(27), index);
+                let name = workbook.add_sheet(requested).name().to_string();
+                assert!(name.encode_utf16().count() <= 31, "{name:?}");
+                assert!(
+                    names.insert(name.to_lowercase()),
+                    "{name:?} in round {round}"
+                );
+            }
+        }
+        // A sheet later named like a cut stem is still free to use.
+        let stem = "X".repeat(27);
+        assert_eq!(workbook.add_sheet(stem.clone()).name(), stem);
+        let _ = sender.send(names.len());
+    });
+    let made = receiver
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("naming the sheets did not finish in time");
+    assert_eq!(made, 2 * SHEETS);
+}
+
+/// WHY: a serial number given as a spec date used to get the date style
+/// whatever it was, so -1 read back as 1899-12-30 and 2958466 as a date in
+/// the year 10000. Outside the range `write_date` accepts it is a number.
+#[test]
+fn a_spec_date_serial_outside_the_date_range_is_a_plain_number() {
+    let spec = r#"{"sheets":[{"name":"S","rows":[[
+        {"t":"d","v":61},{"t":"d","v":2958465.75},{"t":"d","v":-1},{"t":"d","v":60},
+        {"t":"d","v":60.999},{"t":"d","v":2958466},{"t":"d","v":1e300}]]}]}"#;
+    let cells = read(Workbook::write_json_spec_to_bytes(spec).expect("writes"))
+        .sheets
+        .remove(0)
+        .cells;
+    let shown: Vec<String> = cells
+        .iter()
+        .map(|cell| match &cell.value {
+            Read_::Date { serial, .. } => format!("date {serial}"),
+            Read_::Number { v } if *v == 1e300 => "number 1e300".to_string(),
+            Read_::Number { v } => format!("number {v}"),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "date 61",
+            "date 2958465.75",
+            "number -1",
+            "number 60",
+            "number 60.999",
+            "number 2958466",
+            "number 1e300"
+        ]
+    );
+}
