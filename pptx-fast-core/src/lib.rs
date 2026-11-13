@@ -1345,20 +1345,30 @@ fn parse_metadata(archive: &PptxArchive, max_inflate: usize) -> Result<Metadata>
     Ok(metadata)
 }
 
+/// Reads core or extended properties: element name to element text.
+///
+/// A property is an element that holds text and no child element. The root
+/// element is not a property, and neither is the whitespace an indented part
+/// has between its elements.
 fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
     let mut reader = xml_reader(Cursor::new(xml));
     let mut buf = Vec::new();
     let mut out = HashMap::new();
-    // The open element and the character data read since its start tag. A
-    // value arrives in pieces (text, references, CDATA) and ends at the next
-    // tag of any kind.
+    let mut depth = 0usize;
+    // The innermost open element, while it has no child element, and the
+    // character data read since its start tag. A value arrives in pieces
+    // (text, references, CDATA).
     let mut pending: Option<(String, String)> = None;
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                store_prop(&mut out, pending.take());
-                let key = String::from_utf8_lossy(local_name(e.name().as_ref())).into_owned();
-                pending = Some((key, String::new()));
+                depth += 1;
+                // Whatever the parent held so far was not a value.
+                pending = (depth > 1).then(|| {
+                    let name = e.name();
+                    let key = String::from_utf8_lossy(local_name(name.as_ref())).into_owned();
+                    (key, String::new())
+                });
             }
             Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
                 if let (Some((_, value)), Some(piece)) = (pending.as_mut(), character_data(&event))
@@ -1366,7 +1376,11 @@ fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
                     value.push_str(&piece);
                 }
             }
-            Ok(Event::Empty(_) | Event::End(_)) => store_prop(&mut out, pending.take()),
+            Ok(Event::Empty(_)) => pending = None,
+            Ok(Event::End(_)) => {
+                depth = depth.saturating_sub(1);
+                store_prop(&mut out, pending.take());
+            }
             Ok(Event::Eof) => break,
             Err(err) => return Err(anyhow!("parse props: {err}")),
             _ => {}
@@ -1376,45 +1390,51 @@ fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
     Ok(out)
 }
 
+/// Reads custom properties: property name to the text of its value element.
+///
+/// The value element is the first child of `property` (`vt:lpwstr`,
+/// `vt:i4`, ...). Whitespace around it is not the value.
 fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
     let mut reader = xml_reader(Cursor::new(xml));
     let mut buf = Vec::new();
     let mut out = HashMap::new();
-    // The open property's name and the character data read so far. The value
-    // is the first stretch of character data inside the property; it arrives
-    // in pieces (text, references, CDATA) and ends at the next tag.
+    let mut depth = 0usize;
+    // The open property's name and the character data of its value so far.
     let mut pending: Option<(String, String)> = None;
+    // Depth of the open value element, while the reader is inside it.
+    let mut value_depth: Option<usize> = None;
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                if pending.as_ref().is_some_and(|(_, value)| !value.is_empty()) {
-                    store_prop(&mut out, pending.take());
-                }
+                depth += 1;
                 if local_name(e.name().as_ref()) == b"property" {
+                    pending = None;
+                    value_depth = None;
                     for attr in e.attributes().with_checks(false).flatten() {
                         if local_name(attr.key.as_ref()) == b"name" {
                             let name = attr_text(&attr, reader.decoder())?.to_string();
                             pending = Some((name, String::new()));
                         }
                     }
+                } else if pending.is_some() && value_depth.is_none() {
+                    value_depth = Some(depth);
                 }
             }
             Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
-                if let (Some((_, value)), Some(piece)) = (pending.as_mut(), character_data(&event))
-                {
-                    value.push_str(&piece);
-                }
-            }
-            Ok(Event::Empty(_)) => {
-                if pending.as_ref().is_some_and(|(_, value)| !value.is_empty()) {
-                    store_prop(&mut out, pending.take());
+                if value_depth.is_some() {
+                    if let (Some((_, value)), Some(piece)) =
+                        (pending.as_mut(), character_data(&event))
+                    {
+                        value.push_str(&piece);
+                    }
                 }
             }
             Ok(Event::End(e)) => {
-                let closes_property = local_name(e.name().as_ref()) == b"property";
-                if closes_property || pending.as_ref().is_some_and(|(_, value)| !value.is_empty()) {
+                if value_depth == Some(depth) || local_name(e.name().as_ref()) == b"property" {
                     store_prop(&mut out, pending.take());
+                    value_depth = None;
                 }
+                depth = depth.saturating_sub(1);
             }
             Ok(Event::Eof) => break,
             Err(err) => return Err(anyhow!("parse custom props: {err}")),

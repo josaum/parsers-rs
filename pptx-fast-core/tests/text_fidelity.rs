@@ -27,6 +27,8 @@ struct Deck {
     modern_comments: Vec<u8>,
     /// Whole `docProps/core.xml`.
     core: Vec<u8>,
+    /// Whole `docProps/app.xml`.
+    app: Vec<u8>,
     /// Whole `docProps/custom.xml`.
     custom: Vec<u8>,
 }
@@ -114,6 +116,7 @@ impl Deck {
                 .into_bytes(),
             ),
             ("docProps/core.xml", self.core.clone()),
+            ("docProps/app.xml", self.app.clone()),
             ("docProps/custom.xml", self.custom.clone()),
         ];
 
@@ -261,6 +264,7 @@ fn cdata_text_is_kept_literally() {
         comments: br#"<p:cm authorId="0" idx="1"><p:text><![CDATA[1 < 2]]></p:text></p:cm>"#
             .to_vec(),
         modern_comments: Vec::new(),
+        app: Vec::new(),
         core: br#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title><![CDATA[R&D <plan>]]></dc:title></cp:coreProperties>"#.to_vec(),
         custom: br#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="x" pid="2" name="Client"><vt:lpwstr><![CDATA[A&B]]></vt:lpwstr></property></Properties>"#.to_vec(),
     };
@@ -567,4 +571,76 @@ fn modern_comment_text_is_the_body_and_nothing_else() {
     assert_eq!(doc.comments[0].author.as_deref(), Some("Grace & Co"));
     // The leading empty paragraph is a line, as it is in a table cell.
     assert_eq!(doc.comments[0].text.as_deref(), Some("\nbody\nmore"));
+}
+
+#[test]
+fn indented_property_parts_read_like_compact_ones() {
+    // A property's value is the text of its value element. The whitespace an
+    // indented part has between elements is not a value, and the root element
+    // is not a property.
+    let core = [
+        r#"<cp:coreProperties xmlns:cp="c" xmlns:dc="d">"#,
+        "<dc:title>Plan</dc:title>",
+        "<dc:creator> Ada </dc:creator>",
+        "<cp:keywords/>",
+        "</cp:coreProperties>",
+    ];
+    let app = [
+        r#"<Properties xmlns="e" xmlns:vt="v">"#,
+        "<Application>Deck Tool</Application>",
+        "<TitlesOfParts>",
+        r#"<vt:vector size="1" baseType="lpstr">"#,
+        "<vt:lpstr>Intro</vt:lpstr>",
+        "</vt:vector>",
+        "</TitlesOfParts>",
+        "<Slides>3</Slides>",
+        "</Properties>",
+    ];
+    let custom = [
+        r#"<Properties xmlns="u" xmlns:vt="v">"#,
+        r#"<property fmtid="x" pid="2" name="k1">"#,
+        "<vt:lpwstr>v1</vt:lpwstr>",
+        "</property>",
+        r#"<property fmtid="x" pid="3" name="k2">"#,
+        "<vt:i4>42</vt:i4>",
+        "</property>",
+        r#"<property fmtid="x" pid="4" name="empty">"#,
+        "<vt:lpwstr/>",
+        "</property>",
+        "</Properties>",
+    ];
+    let sorted = |map: &std::collections::HashMap<String, String>| {
+        let mut pairs: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pairs.sort();
+        pairs
+    };
+    let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+    for separator in ["", "\n    ", "\r\n\t"] {
+        let deck = Deck {
+            core: core.join(separator).into_bytes(),
+            app: app.join(separator).into_bytes(),
+            custom: custom.join(separator).into_bytes(),
+            ..Deck::default()
+        };
+        let doc = deck.parse();
+        assert_eq!(
+            sorted(&doc.metadata.core),
+            [pair("creator", " Ada "), pair("title", "Plan")],
+            "core, separator {separator:?}"
+        );
+        assert_eq!(
+            sorted(&doc.metadata.app),
+            [
+                pair("Application", "Deck Tool"),
+                pair("Slides", "3"),
+                pair("lpstr", "Intro")
+            ],
+            "app, separator {separator:?}"
+        );
+        assert_eq!(
+            sorted(&doc.metadata.custom),
+            [pair("k1", "v1"), pair("k2", "42")],
+            "custom, separator {separator:?}"
+        );
+    }
 }
