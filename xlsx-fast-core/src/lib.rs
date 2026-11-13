@@ -231,8 +231,8 @@ fn decode_xstring_tail(text: &mut String, from: usize) {
 /// Arrow RecordBatch streaming output (optional feature).
 ///
 /// Exports spreadsheet data as Arrow Record Batch files, suitable for
-/// columnar ETL pipelines and analytics systems. Used by [`xlsx-fast-flight`]
-/// (flight server), [`xlsx-fast-py`] (Python bindings), and integration
+/// columnar ETL pipelines and analytics systems. Used by `xlsx-fast-flight`
+/// (flight server), `xlsx-fast-py` (Python bindings), and integration
 /// tests in sibling parsers.
 #[cfg(feature = "arrow")]
 pub mod arrow;

@@ -25,7 +25,8 @@ pub fn parts(seed: &[u8]) -> Vec<(String, Vec<u8>)> {
             let mut entry = archive.by_index(index).expect("seed entry opens");
             let mut body = Vec::new();
             entry.read_to_end(&mut body).expect("seed entry reads");
-            (entry.name().to_owned(), body)
+            let name = entry.name().expect("seed entry is named in UTF-8");
+            (name.into_owned(), body)
         })
         .collect()
 }

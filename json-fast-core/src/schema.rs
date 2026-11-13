@@ -45,8 +45,8 @@
 //! `items` / `properties` apply to borrowed slices with no intermediate
 //! copies. Pairwise string/byte work rides the `regex` crate's memchr/SIMD
 //! fast paths; the JSON parse itself is sonic-rs (SIMD). The `mmap` crate
-//! feature adds zero-cpu-copy file entry points ([`crate::parse_file`],
-//! [`crate::validate_file`]).
+//! feature adds zero-cpu-copy file entry points (`crate::parse_file`,
+//! `crate::validate_file`).
 //!
 //! `validate` never panics and never allocates outside the findings list and
 //! the evaluation tracker.
