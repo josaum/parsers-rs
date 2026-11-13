@@ -553,6 +553,53 @@ struct HeaderFooterRef {
     ref_type: Option<String>,
 }
 
+/// Reads one `headerReference` or `footerReference` element.
+///
+/// Returns `None` for any other element, and for a reference without a
+/// relationship id.
+fn header_footer_ref<R: BufRead>(
+    reader: &Reader<R>,
+    e: &quick_xml::events::BytesStart<'_>,
+    name: &[u8],
+) -> Result<Option<HeaderFooterRef>> {
+    if name != b"headerReference" && name != b"footerReference" {
+        return Ok(None);
+    }
+    let mut rel_id = None;
+    let mut ref_type = None;
+    for attr in e.attributes().with_checks(false).flatten() {
+        let key_raw = attr.key.as_ref();
+        let key = local_name(key_raw);
+        if key_raw == b"r:id" || key == b"id" {
+            rel_id = Some(
+                attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())?
+                    .to_string(),
+            );
+        } else if key == b"type" {
+            ref_type = Some(
+                attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())?
+                    .to_string(),
+            );
+        }
+    }
+    let kind = if name == b"headerReference" {
+        "header"
+    } else {
+        "footer"
+    };
+    Ok(rel_id.map(|rel_id| HeaderFooterRef {
+        kind: kind.to_string(),
+        rel_id,
+        ref_type,
+    }))
+}
+
+/// Finds the header and footer references of a document part in a pass of
+/// its own.
+///
+/// The usual route collects them while the body is parsed
+/// ([`parse_document_blocks_with_refs`]). This pass is what that route falls
+/// back to, and its error is the one a malformed document reports.
 fn parse_header_footer_refs<R: BufRead>(reader: R) -> Result<Vec<HeaderFooterRef>> {
     let mut reader = xml_reader(utf8_stream(reader)?);
     let mut buf = Vec::new();
@@ -562,42 +609,8 @@ fn parse_header_footer_refs<R: BufRead>(reader: R) -> Result<Vec<HeaderFooterRef
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 let qname = e.name();
                 let name = local_name(qname.as_ref());
-                if name == b"headerReference" || name == b"footerReference" {
-                    let mut rel_id = None;
-                    let mut ref_type = None;
-                    for attr in e.attributes().with_checks(false).flatten() {
-                        let key_raw = attr.key.as_ref();
-                        let key = local_name(key_raw);
-                        if key_raw == b"r:id" || key == b"id" {
-                            rel_id = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
-                        } else if key == b"type" {
-                            ref_type = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )?
-                                .to_string(),
-                            );
-                        }
-                    }
-                    if let Some(rel_id) = rel_id {
-                        let kind = if name == b"headerReference" {
-                            "header"
-                        } else {
-                            "footer"
-                        };
-                        refs.push(HeaderFooterRef {
-                            kind: kind.to_string(),
-                            rel_id,
-                            ref_type,
-                        });
-                    }
+                if let Some(reference) = header_footer_ref(&reader, &e, name)? {
+                    refs.push(reference);
                 }
             }
             Ok(Event::Eof) => break,
@@ -775,8 +788,34 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
     let document_xml = read_part_bytes(&archive, &document_path, options.max_inflate)
         .with_context(|| format!("read document: {document_path}"))?;
     let document_xml = utf8_xml(&document_xml);
+    // The references are needed before the body, because headers and footers
+    // are parsed first and number their fields first. Finding them used to
+    // take a pass of its own over the whole document part. Instead the body
+    // is parsed now, collecting the references on the way, into vectors of
+    // its own, and is moved behind the headers and footers afterwards:
+    //
+    // - if the body does not parse, the original order is followed from the
+    //   start, so the error reported is the one that order meets first;
+    // - a field's number is its place among all fields, so the body's fields
+    //   are renumbered by however many came before them
+    //   ([`shift_field_ids`]).
+    let mut body_ahead = None;
     let header_footer_refs = if options.extract_headers {
-        parse_header_footer_refs(Cursor::new(&*document_xml))?
+        let mut body_fields = Vec::new();
+        let mut body_revisions = Vec::new();
+        match parse_document_blocks_with_refs(
+            Cursor::new(&*document_xml),
+            &styles,
+            &style_fonts,
+            &mut body_fields,
+            &mut body_revisions,
+        ) {
+            Ok((blocks, refs)) => {
+                body_ahead = Some((blocks, body_fields, body_revisions));
+                refs
+            }
+            Err(_) => parse_header_footer_refs(Cursor::new(&*document_xml))?,
+        }
     } else {
         Vec::new()
     };
@@ -808,13 +847,29 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         }
     }
 
-    let blocks = parse_document_blocks(
-        Cursor::new(&*document_xml),
-        &styles,
-        &style_fonts,
-        &mut fields,
-        &mut revisions,
-    )?;
+    let blocks = match body_ahead {
+        Some((mut blocks, mut body_fields, body_revisions)) => {
+            // Field numbers stay within `u32` however many fields there are:
+            // the parser itself numbers them with the same width.
+            let earlier = fields.len() as u32;
+            if earlier > 0 {
+                for field in &mut body_fields {
+                    field.id = field.id.wrapping_add(earlier);
+                }
+                shift_field_ids(&mut blocks, earlier);
+            }
+            fields.append(&mut body_fields);
+            revisions.extend(body_revisions);
+            blocks
+        }
+        None => parse_document_blocks(
+            Cursor::new(&*document_xml),
+            &styles,
+            &style_fonts,
+            &mut fields,
+            &mut revisions,
+        )?,
+    };
 
     let mut toc = Vec::new();
     collect_toc(&blocks, &mut toc);
@@ -1905,6 +1960,47 @@ fn parse_document_blocks<R: BufRead>(
     parser.parse(reader)
 }
 
+/// Adds `by` to the field number of every run in `blocks`, tables included.
+///
+/// A field is numbered by its place among all fields of the document, in the
+/// order the parts are parsed. Blocks parsed ahead of parts that come first
+/// in that order were numbered from one, and are moved into place by this.
+fn shift_field_ids(blocks: &mut [Block], by: u32) {
+    for block in blocks {
+        match block {
+            Block::Paragraph(paragraph) => {
+                for run in &mut paragraph.runs {
+                    if let Some(id) = run.field_id.as_mut() {
+                        *id = id.wrapping_add(by);
+                    }
+                }
+            }
+            Block::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        shift_field_ids(&mut cell.blocks, by);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// [`parse_document_blocks`] for the document part, also returning the header
+/// and footer references met on the way, in document order.
+fn parse_document_blocks_with_refs<R: BufRead>(
+    reader: R,
+    styles: &[Style],
+    style_fonts: &StyleFonts,
+    fields_out: &mut Vec<Field>,
+    revisions_out: &mut Vec<Revision>,
+) -> Result<(Vec<Block>, Vec<HeaderFooterRef>)> {
+    let mut parser = DocxBodyParser::new(styles, style_fonts, fields_out, revisions_out);
+    parser.section_refs = Some(Vec::new());
+    let blocks = parser.parse(reader)?;
+    Ok((blocks, parser.section_refs.take().unwrap_or_default()))
+}
+
 fn collect_toc(blocks: &[Block], out: &mut Vec<TocEntry>) {
     for block in blocks {
         match block {
@@ -2302,6 +2398,8 @@ struct DocxBodyParser<'a> {
     fields_out: &'a mut Vec<Field>,
     revisions_out: &'a mut Vec<Revision>,
     revision_ids: HashSet<String>,
+    /// Header and footer references met so far, when the caller wants them.
+    section_refs: Option<Vec<HeaderFooterRef>>,
     containers: Vec<Container>,
     current_paragraph: Option<ParagraphBuilder>,
     current_run: Option<RunBuilder>,
@@ -2420,6 +2518,7 @@ impl<'a> DocxBodyParser<'a> {
             fields_out,
             revisions_out,
             revision_ids: HashSet::new(),
+            section_refs: None,
             containers: vec![Container::Doc(Vec::new())],
             current_paragraph: None,
             current_run: None,
@@ -2462,11 +2561,13 @@ impl<'a> DocxBodyParser<'a> {
                 Ok(Event::Start(e)) => {
                     let qname = e.name();
                     let name = local_name(qname.as_ref());
+                    self.note_section_ref(&reader, &e, name)?;
                     self.handle_start(&reader, &e, name)?;
                 }
                 Ok(Event::Empty(e)) => {
                     let qname = e.name();
                     let name = local_name(qname.as_ref());
+                    self.note_section_ref(&reader, &e, name)?;
                     self.handle_empty(&reader, &e, name)?;
                 }
                 Ok(Event::Text(e)) => {
@@ -2493,6 +2594,23 @@ impl<'a> DocxBodyParser<'a> {
             buf.clear();
         }
         Ok(self.finish())
+    }
+
+    /// Records `e` if it is a header or footer reference and the caller
+    /// asked for them. It is seen here, before anything is skipped, so the
+    /// list matches what [`parse_header_footer_refs`] finds.
+    fn note_section_ref<R: BufRead>(
+        &mut self,
+        reader: &Reader<R>,
+        e: &quick_xml::events::BytesStart<'_>,
+        name: &[u8],
+    ) -> Result<()> {
+        if let Some(refs) = self.section_refs.as_mut() {
+            if let Some(reference) = header_footer_ref(reader, e, name)? {
+                refs.push(reference);
+            }
+        }
+        Ok(())
     }
 
     fn handle_start<R: BufRead>(
