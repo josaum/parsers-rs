@@ -381,6 +381,30 @@ fn checked_count(
 
 /// Read `n` XY vertices; `n` has already been checked against the record.
 fn read_points(cur: &mut Cursor<&[u8]>, n: usize) -> Result<Vec<Coordinate>, GeoError> {
+    // All `n` vertices at once when the record holds them, without a bounds
+    // check and an error path per coordinate.
+    let data: &[u8] = cur.get_ref();
+    let whole = usize::try_from(cur.position()).ok().and_then(|start| {
+        let end = start.checked_add(n.checked_mul(SHP_POINT_SIZE)?)?;
+        Some((data.get(start..end)?, end))
+    });
+    if let Some((bytes, end)) = whole {
+        let (vertices, _) = bytes.as_chunks::<SHP_POINT_SIZE>();
+        let points = vertices
+            .iter()
+            .map(|vertex| {
+                let (lon, lat) = vertex.split_at(8);
+                let mut x = [0u8; 8];
+                let mut y = [0u8; 8];
+                x.copy_from_slice(lon);
+                y.copy_from_slice(lat);
+                Coordinate::new(f64::from_le_bytes(x), f64::from_le_bytes(y))
+            })
+            .collect();
+        cur.set_position(end as u64);
+        return Ok(points);
+    }
+    // A record too short for its vertices: read up to the error as before.
     let mut points = Vec::with_capacity(n);
     for _ in 0..n {
         let lon = cur.read_f64::<LittleEndian>().map_err(io_err)?;

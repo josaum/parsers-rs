@@ -934,6 +934,199 @@ fn a_run_of_saved_states_does_not_grow_the_table_extractor() {
     });
 }
 
+// ── Cross-reference chain cost ──────────────────────────────────────────────
+
+/// A one-page document with a classic table; returns the bytes and where the
+/// table starts.
+fn one_revision() -> (Vec<u8>, usize) {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (number, body) in [
+        (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"),
+    ] {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let table = out.len();
+    out.extend_from_slice(b"xref\n1 3\n");
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
+    (out, table)
+}
+
+/// The most work the cross-reference chain may report for `bytes`: its own
+/// budget of eight units a byte plus a fixed allowance.
+fn chain_work_bound(bytes: &[u8]) -> usize {
+    bytes.len() * 8 + 4096
+}
+
+/// A few kilobytes whose newest section is a cross-reference stream that
+/// inflates to four million one-byte rows. Building a row per byte once
+/// cost over a hundred times the decoded size in heap, a gigabyte from an
+/// 8 KB file, before any limit was consulted.
+#[test]
+fn a_cross_reference_stream_that_inflates_to_millions_of_rows_is_not_read() {
+    let _serial = serial();
+    let rows = 4_000_000usize;
+    let (mut bytes, first) = one_revision();
+    let stream_at = bytes.len();
+    let data = zlib(&vec![0u8; rows]);
+    bytes.extend_from_slice(
+        format!(
+            "30 0 obj\n<< /Type /XRef /Size {rows} /W [0 0 1] /Index [0 {rows}] /Root 1 0 R \
+             /Prev {first} /Filter /FlateDecode /Length {} >>\nstream\n",
+            data.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&data);
+    bytes.extend_from_slice(
+        format!("\nendstream\nendobj\nstartxref\n{stream_at}\n%%EOF\n").as_bytes(),
+    );
+    for keep_decoded_streams in [true, false] {
+        let options = ParseOptions {
+            keep_decoded_streams,
+            ..ParseOptions::default()
+        };
+        let document = PdfDocument::from_slice(&bytes, options).expect("parses");
+        assert_eq!(document.pages().len(), 1);
+        let work = document.xref_chain_work();
+        assert!(
+            work <= chain_work_bound(&bytes) && work < rows / 100,
+            "{work} units of work for a {} byte file",
+            bytes.len()
+        );
+    }
+}
+
+/// 2,040 tiny sections, each sending `/XRefStm` to an `xref` keyword hidden
+/// in a comment inside one shared run of entries. Entering a table there
+/// re-read the run once per section: five seconds for a 280 KB file.
+#[test]
+fn sections_cannot_re_read_one_run_of_entries_through_a_hidden_keyword() {
+    let _serial = serial();
+    let (mut bytes, first) = one_revision();
+    let points = 2_040usize;
+    let mut entry_points = Vec::new();
+    for _ in 0..points {
+        bytes.push(b'%');
+        entry_points.push(bytes.len());
+        bytes.extend_from_slice(b"xref 0 4294967295\n");
+        for _ in 0..20 {
+            bytes.extend_from_slice(b"0 0n\n");
+        }
+    }
+    bytes.extend_from_slice(b"trailer\n<< >>\n");
+    let section = |point: usize, next: usize| {
+        format!("xref\ntrailer\n<< /Root 1 0 R /XRefStm {point:>10} /Prev {next:>10} >>\n")
+    };
+    let width = section(0, 0).len();
+    let base = bytes.len();
+    for (index, point) in entry_points.iter().enumerate() {
+        let next = if index + 1 == points {
+            first
+        } else {
+            base + (index + 1) * width
+        };
+        bytes.extend_from_slice(section(*point, next).as_bytes());
+    }
+    bytes.extend_from_slice(format!("startxref\n{base}\n%%EOF\n").as_bytes());
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+    assert_eq!(document.pages().len(), 1);
+    let work = document.xref_chain_work();
+    // Every entry in the file read once is 2,040 x 20; re-reading the run
+    // from each entry point was about a thousand times that.
+    assert!(
+        work <= chain_work_bound(&bytes) && work < points * 20 * 8,
+        "{work} units of work for a {} byte file",
+        bytes.len()
+    );
+}
+
+/// Only the work budget stops this one. Six cross-reference streams, each
+/// under the decode cap and each all rows for object numbers the file does
+/// not have, hang off a small newest table by `/Prev`. No single section is
+/// refused; together they are more rows than the budget allows.
+#[test]
+fn many_cross_reference_streams_under_the_decode_cap_spend_the_budget() {
+    let _serial = serial();
+    let rows = 8_192usize;
+    let (mut bytes, first) = one_revision();
+    let data = zlib(&vec![0u8; rows]);
+    let mut previous = first;
+    for number in 30..36 {
+        let at = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "{number} 0 obj\n<< /Type /XRef /Size 9 /W [0 0 1] /Index [1000 {rows}] \
+                 /Prev {previous} /Filter /FlateDecode /Length {} >>\nstream\n",
+                data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        previous = at;
+    }
+    let table = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 9 /Root 1 0 R /Prev {previous} >>\n\
+             startxref\n{table}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    assert!(
+        bytes.len() * 4 + 4096 > rows,
+        "each stream is under the decode cap"
+    );
+    assert!(
+        6 * rows > chain_work_bound(&bytes),
+        "together they exceed the budget"
+    );
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+    assert_eq!(document.pages().len(), 1);
+    let work = document.xref_chain_work();
+    println!("budget test: {work} units for {} bytes", bytes.len());
+    assert!(
+        work <= chain_work_bound(&bytes) + 64,
+        "{work} units of work for a {} byte file",
+        bytes.len()
+    );
+}
+
+/// Only the "numbers the scan produced" rule stops this one. A well-formed
+/// table lists 100,000 in-use objects the file does not contain. Nothing
+/// may be kept for them.
+#[test]
+fn entries_for_objects_the_scan_never_saw_are_not_kept() {
+    let _serial = serial();
+    let (mut bytes, first) = one_revision();
+    let listed = 100_000usize;
+    let table = bytes.len();
+    bytes.extend_from_slice(format!("xref\n1000 {listed}\n").as_bytes());
+    for _ in 0..listed {
+        bytes.extend_from_slice(b"0000000000 00000 n \n");
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 9 /Root 1 0 R /Prev {first} >>\nstartxref\n{table}\n%%EOF\n")
+            .as_bytes(),
+    );
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+    assert_eq!(document.pages().len(), 1);
+    let kept = document.xref_chain_entries();
+    println!(
+        "filter test: {kept} entries kept, {} units for {} bytes",
+        document.xref_chain_work(),
+        bytes.len()
+    );
+    assert!(kept <= 3, "{kept} entries kept for a three-object file");
+}
+
 /// Runs `parse` on a thread with a stack of `stack_bytes`.
 fn run_on_stack<F>(stack_bytes: usize, parse: F)
 where

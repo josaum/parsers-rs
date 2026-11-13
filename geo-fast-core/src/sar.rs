@@ -59,6 +59,25 @@ pub struct GroundControlPoint {
     pub height: f64,
 }
 
+/// The platform and the instrument a SAFE manifest names.
+///
+/// A manifest names the platform (`SENTINEL-1` and its number, `A`) and,
+/// inside it, the instrument it carries (`Synthetic Aperture Radar`, with
+/// the abbreviation `SAR`). [`SarMetadata::sensor`] is the platform name;
+/// this keeps the instrument beside it instead of in its place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SafePlatform {
+    /// Platform family name followed by its number, such as `SENTINEL-1A`:
+    /// the value of [`SarMetadata::sensor`].
+    pub platform: String,
+    /// Name of the instrument, such as `Synthetic Aperture Radar`, when the
+    /// manifest names one.
+    pub instrument: Option<String>,
+    /// Abbreviation of the instrument's name, such as `SAR`, when the
+    /// manifest gives one.
+    pub instrument_abbreviation: Option<String>,
+}
+
 /// Parser for SAR metadata formats (SAFE manifest, CEOS leader, annotation GCPs).
 pub struct SarParser;
 
@@ -67,7 +86,31 @@ impl SarParser {
     ///
     /// The manifest contains `<metadataObject>` elements with platform info,
     /// acquisition dates, footprint coordinates, and product type.
+    ///
+    /// [`SarMetadata::sensor`] is the platform's family name followed by its
+    /// number. The name of the instrument, which a manifest nests inside the
+    /// platform, is not part of it: [`SarParser::parse_safe_platform`]
+    /// returns that.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeoError::Xml`] when the manifest is not well-formed and
+    /// [`GeoError::InvalidFormat`] when it names no platform.
     pub fn parse_safe_manifest(xml_bytes: &[u8]) -> Result<SarMetadata, GeoError> {
+        Self::parse_safe(xml_bytes).map(|(metadata, _)| metadata)
+    }
+
+    /// Reads the platform and instrument names from a SAFE manifest.
+    ///
+    /// # Errors
+    ///
+    /// As [`SarParser::parse_safe_manifest`].
+    pub fn parse_safe_platform(xml_bytes: &[u8]) -> Result<SafePlatform, GeoError> {
+        Self::parse_safe(xml_bytes).map(|(_, platform)| platform)
+    }
+
+    /// Reads a SAFE manifest once for both of its public readers.
+    fn parse_safe(xml_bytes: &[u8]) -> Result<(SarMetadata, SafePlatform), GeoError> {
         use quick_xml::events::Event;
         use quick_xml::Reader;
 
@@ -90,7 +133,10 @@ impl SarParser {
         // Track the current element path for context
         let mut current_tag = String::new();
         let mut in_platform = false;
+        let mut in_instrument = false;
         let mut in_acquisition = false;
+        let mut instrument: Option<String> = None;
+        let mut instrument_abbreviation: Option<String> = None;
 
         loop {
             let event = reader.read_event_into(&mut buf).map_err(|e| {
@@ -125,10 +171,15 @@ impl SarParser {
             if !text.is_empty() {
                 match current_tag.as_str() {
                     // Platform / sensor
+                    // The instrument is nested in the platform and has a
+                    // `familyName` of its own, which is not the platform's.
+                    "safe:familyName" | "familyName" if in_instrument => {
+                        instrument = Some(text);
+                    }
                     "safe:familyName" | "familyName" if in_platform => {
                         sensor = text;
                     }
-                    "safe:number" | "number" if in_platform => {
+                    "safe:number" | "number" if in_platform && !in_instrument => {
                         if !sensor.is_empty() {
                             sensor = format!("{}{}", sensor, text);
                         }
@@ -192,6 +243,23 @@ impl SarParser {
                     let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     match tag_name.as_str() {
                         "safe:platform" | "platform" => in_platform = true,
+                        "safe:instrument" | "instrument" if in_platform => in_instrument = true,
+                        "safe:familyName" | "familyName" if in_instrument => {
+                            let abbreviation = e
+                                .attributes()
+                                .with_checks(false)
+                                .flatten()
+                                .find(|attr| attr.key.local_name().as_ref() == b"abbreviation")
+                                .and_then(|attr| {
+                                    attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                        .ok()
+                                })
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty());
+                            if abbreviation.is_some() {
+                                instrument_abbreviation = abbreviation;
+                            }
+                        }
                         "safe:acquisitionPeriod" | "acquisitionPeriod" => in_acquisition = true,
                         _ => {}
                     }
@@ -200,7 +268,11 @@ impl SarParser {
                 Event::End(e) => {
                     let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     match tag_name.as_str() {
-                        "safe:platform" | "platform" => in_platform = false,
+                        "safe:platform" | "platform" => {
+                            in_platform = false;
+                            in_instrument = false;
+                        }
+                        "safe:instrument" | "instrument" => in_instrument = false,
                         "safe:acquisitionPeriod" | "acquisitionPeriod" => in_acquisition = false,
                         _ => {}
                     }
@@ -240,7 +312,12 @@ impl SarParser {
             BBox::new(min_lon, min_lat, max_lon, max_lat)
         };
 
-        Ok(SarMetadata {
+        let platform = SafePlatform {
+            platform: sensor.clone(),
+            instrument,
+            instrument_abbreviation,
+        };
+        let metadata = SarMetadata {
             sensor,
             acquisition_date,
             polarization,
@@ -251,7 +328,8 @@ impl SarParser {
             orbit_direction,
             incidence_angle_deg,
             product_type,
-        })
+        };
+        Ok((metadata, platform))
     }
 
     /// Parse SAR metadata from a CEOS leader file.
@@ -588,6 +666,42 @@ mod tests {
         assert_eq!(gcps.len(), 2);
         assert!((gcps[0].geo.lat - (-10.5)).abs() < 1e-6);
         assert!((gcps[1].sample - 200.0).abs() < 1e-6);
+    }
+
+    /// A Sentinel-1 manifest names the instrument inside the platform, in a
+    /// `familyName` of its own, which replaced the platform's name as the
+    /// sensor: "Synthetic Aperture Radar" for "SENTINEL-1A".
+    const NESTED_INSTRUMENT: &[u8] = br#"<xfdu:XFDU><safe:platform>
+        <safe:nssdcIdentifier>2014-016A</safe:nssdcIdentifier>
+        <safe:familyName>SENTINEL-1</safe:familyName>
+        <safe:number>A</safe:number>
+        <safe:instrument>
+          <safe:familyName abbreviation="SAR">Synthetic Aperture Radar</safe:familyName>
+          <safe:number>9</safe:number>
+        </safe:instrument>
+      </safe:platform></xfdu:XFDU>"#;
+
+    #[test]
+    fn instrument_name_inside_the_platform_does_not_replace_the_platform_name() {
+        let metadata = SarParser::parse_safe_manifest(NESTED_INSTRUMENT).expect("manifest");
+        assert_eq!(metadata.sensor, "SENTINEL-1A");
+
+        let platform = SarParser::parse_safe_platform(NESTED_INSTRUMENT).expect("platform");
+        assert_eq!(
+            platform,
+            SafePlatform {
+                platform: "SENTINEL-1A".into(),
+                instrument: Some("Synthetic Aperture Radar".into()),
+                instrument_abbreviation: Some("SAR".into()),
+            }
+        );
+        // A manifest that names no instrument has none.
+        let bare = SarParser::parse_safe_platform(&manifest("ERS", "")).expect("platform");
+        assert_eq!(bare.platform, "ERS");
+        assert_eq!(
+            (bare.instrument, bare.instrument_abbreviation),
+            (None, None)
+        );
     }
 
     /// A SAFE manifest whose platform name is `family_name`, with `extra`
