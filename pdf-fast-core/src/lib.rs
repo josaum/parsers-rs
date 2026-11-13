@@ -79,6 +79,8 @@ pub mod bitmap_components;
 #[cfg(feature = "rasterize")]
 mod ccitt;
 #[cfg(feature = "rasterize")]
+mod render_guard;
+#[cfg(feature = "rasterize")]
 pub use bitmap_components::{
     BitmapComponentOptions, BitmapComponentPage, BitmapGlyphCandidate, BitmapTextLine,
 };
@@ -178,6 +180,18 @@ const MAX_FORM_XOBJECT_DEPTH: usize = 8;
 /// Annex C names 28 as the nesting a reader must support; this allows about
 /// ten times that. Saves past the limit are counted rather than stored, so
 /// the `Q` operators that close them still pair up correctly.
+///
+/// A `Q` that closes a counted save has no state of its own to restore.
+/// Leaving the state alone would let a color, matrix or clip set inside the
+/// pair leak out to everything after it, and popping a stored state would
+/// unbalance every pair around it. Instead the state is copied once, at the
+/// first save past the limit, and every `Q` past the limit restores that
+/// copy. This is exact for the outermost pair past the limit and for any
+/// run of saves that change nothing; inside deeper pairs a restore goes back
+/// further than it should, but never to a state from outside the region
+/// past the limit, and nothing set there survives the `Q` that leaves it.
+/// All three content interpreters (text, rasterizer, table primitives)
+/// behave this way.
 const MAX_GRAPHICS_STATE_DEPTH: usize = 256;
 
 /// Most components one color operator can set.
@@ -290,6 +304,12 @@ impl DecodedByteBudget {
             return Err(self.total_limit_error());
         }
         Ok(())
+    }
+
+    /// Bytes the budget could still grant. Reading it spends nothing.
+    #[cfg(feature = "rasterize")]
+    fn available_bytes(&self) -> usize {
+        self.remaining.lock().map_or(0, |remaining| *remaining)
     }
 
     fn charge_resource_bytes(&self, bytes: usize) -> Result<()> {
@@ -857,7 +877,9 @@ impl PdfDocument {
         let (png_bytes, apply_fast_path_rotation) =
             if let Some(png) = fast_path.and_then(|(bytes, _format)| bytes) {
                 (png, true)
-            } else if let Some(png) = self.rasterized_page_image_payload_hayro(page_index, dpi)? {
+            } else if let Some(png) = self
+                .rasterized_page_image_payload_hayro((page.object_number, page.generation), dpi)?
+            {
                 // Hayro applies the page's initial transform, including
                 // `/Rotate`, while rendering.
                 (png, false)
@@ -941,7 +963,11 @@ impl PdfDocument {
         page_index: usize,
         dpi: f32,
     ) -> Result<Option<Vec<u8>>> {
-        self.rasterized_page_image_payload_hayro(page_index, dpi)
+        let pages = self.pages();
+        let Some(page) = pages.iter().find(|page| page.page_index == page_index) else {
+            return Ok(None);
+        };
+        self.rasterized_page_image_payload_hayro((page.object_number, page.generation), dpi)
     }
 
     /// Stub without the `rasterize` feature: the full interpreter is not
@@ -965,30 +991,17 @@ impl PdfDocument {
         Ok(None)
     }
 
+    /// Renders the page that is indirect object `page_object` with the full
+    /// interpreter, after [`render_guard::vet_page`] has accepted it.
     #[cfg(feature = "rasterize")]
     fn rasterized_page_image_payload_hayro(
         &self,
-        page_index: usize,
+        page_object: (u32, u16),
         dpi: f32,
     ) -> Result<Option<Vec<u8>>> {
-        use hayro::hayro_interpret::InterpreterSettings;
-        use hayro::hayro_syntax::Pdf;
-        use hayro::RenderSettings;
-        use std::sync::Arc;
-
         if !dpi.is_finite() || !(1.0..=600.0).contains(&dpi) {
             return Ok(None);
         }
-
-        // Known limit: the full interpreter follows `Do` with no cycle or
-        // depth guard, so a Form XObject that draws itself, directly or
-        // through inherited resources, recurses until the stack overflows.
-        // Walking the page with this crate's own content walker first was
-        // tried and removed: it charged the decode budget on every render,
-        // refused forms nested deeper than the fast path allows, and still
-        // missed forms reached through inherited resources. A caller that
-        // renders untrusted files with this entry point should do so in a
-        // process it can afford to lose.
 
         let replay_bytes = self.streams.iter().try_fold(0usize, |total, stream| {
             let decoded_len = stream.decoded_len.unwrap_or(stream.raw_len);
@@ -1005,13 +1018,154 @@ impl PdfDocument {
         self.decoded_byte_budget
             .charge_resource_bytes(reserved_before_render)?;
 
+        // The interpreter builds its page list by recursing over `/Kids`
+        // as soon as the document is opened, before anything can look at
+        // the tree through its object model. Bound the tree on this crate's
+        // reading of it first.
+        if self.page_tree_depth_exceeds(render_guard::MAX_PAGE_TREE_DEPTH) {
+            return Err(anyhow!(
+                "interpreted render refused: the page tree is nested deeper than {} levels",
+                render_guard::MAX_PAGE_TREE_DEPTH
+            ));
+        }
+
+        // The interpreter recurses, and a stack overflow aborts the process
+        // rather than unwinding. Run it on a thread whose stack size is
+        // known, so the guard's budget does not depend on how much stack the
+        // caller happens to have left. The stack is reserved address space;
+        // the system commits pages only as they are touched. If the thread
+        // cannot be created the render fails: it never falls back to the
+        // caller's stack.
         let pdf_bytes = self.bytes().to_vec();
+        let budget = &self.decoded_byte_budget;
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("pdf-fast-render".to_string())
+                .stack_size(render_guard::RENDER_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    Self::interpret_on_render_stack(budget, pdf_bytes, page_object, dpi)
+                })
+                .map_err(|error| {
+                    anyhow!("interpreted render refused: no render thread ({error})")
+                })?;
+            match worker.join() {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
+    }
+
+    /// Whether any chain of `/Kids` is longer than `limit`, on this crate's
+    /// own reading of the objects. Iterative; a cycle counts as too deep.
+    #[cfg(feature = "rasterize")]
+    fn page_tree_depth_exceeds(&self, limit: usize) -> bool {
+        let kids_of = |id: (u32, u16)| -> Vec<(u32, u16)> {
+            let Some(kids) = self
+                .object_by_id(id.0, id.1)
+                .and_then(|object| object.dictionary.as_ref())
+                .and_then(|dictionary| dictionary.get("Kids"))
+                .and_then(|kids| self.resolve_array(kids))
+            else {
+                return Vec::new();
+            };
+            kids.iter()
+                .filter_map(|kid| match kid {
+                    PdfValue::Reference {
+                        object_number,
+                        generation,
+                    } => Some((*object_number, *generation)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Height of each node once known; a node still on the path has none.
+        let mut heights: HashMap<(u32, u16), usize> = HashMap::new();
+        let mut on_path: HashSet<(u32, u16)> = HashSet::new();
+        for object in &self.objects {
+            let root = (object.object_number, object.generation);
+            if heights.contains_key(&root)
+                || object
+                    .dictionary
+                    .as_ref()
+                    .is_none_or(|dictionary| dictionary.get("Kids").is_none())
+            {
+                continue;
+            }
+            let mut path = vec![(root, kids_of(root), 0usize)];
+            on_path.insert(root);
+            while let Some((id, kids, tallest)) = path.last_mut() {
+                if let Some(kid) = kids.pop() {
+                    if let Some(height) = heights.get(&kid) {
+                        *tallest = (*tallest).max(*height);
+                    } else if on_path.contains(&kid) {
+                        return true;
+                    } else {
+                        on_path.insert(kid);
+                        let next = kids_of(kid);
+                        path.push((kid, next, 0));
+                        if path.len() > limit {
+                            return true;
+                        }
+                    }
+                    continue;
+                }
+                let (id, height) = (*id, *tallest + 1);
+                if height > limit {
+                    return true;
+                }
+                on_path.remove(&id);
+                heights.insert(id, height);
+                path.pop();
+                if let Some((_, _, tallest)) = path.last_mut() {
+                    *tallest = (*tallest).max(height);
+                }
+            }
+        }
+        false
+    }
+
+    /// Opens the document with the full interpreter, vets the page and
+    /// renders it. Must run on a stack of
+    /// [`render_guard::RENDER_STACK_BYTES`].
+    #[cfg(feature = "rasterize")]
+    fn interpret_on_render_stack(
+        budget: &DecodedByteBudget,
+        pdf_bytes: Vec<u8>,
+        page_object: (u32, u16),
+        dpi: f32,
+    ) -> Result<Option<Vec<u8>>> {
+        use hayro::hayro_interpret::InterpreterSettings;
+        use hayro::hayro_syntax::object::ObjectIdentifier;
+        use hayro::hayro_syntax::Pdf;
+        use hayro::RenderSettings;
+        use std::sync::Arc;
+
         let Ok(pdf) = Pdf::new(Arc::new(pdf_bytes)) else {
             return Ok(None);
         };
-        let Some(page) = pdf.pages().get(page_index) else {
+        // A page index counts this crate's pages, which list a page once
+        // however often `/Kids` names it. The interpreter lists it once per
+        // entry, so the same index can be a different page there. Find the
+        // interpreter's copy of the page that was asked for by its object
+        // number; a page it does not have is not rendered at all.
+        let Ok(object_number) = i32::try_from(page_object.0) else {
             return Ok(None);
         };
+        let wanted = ObjectIdentifier::new(object_number, i32::from(page_object.1));
+        let Some(page) = pdf
+            .pages()
+            .iter()
+            .find(|page| page.raw().obj_id() == Some(wanted))
+        else {
+            return Ok(None);
+        };
+        // The interpreter enters nested content streams with no cycle or
+        // depth guard of its own, and a stack overflow there aborts the
+        // process. Vet the exact page object it is about to render, on its
+        // own object model, so there is no second parser to disagree with
+        // it. The check may look at as much decoded data as the budget has
+        // left, and takes none of it.
+        render_guard::vet_page(page, budget.available_bytes())?;
         let (width, height) = page.render_dimensions();
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return Ok(None);
@@ -1025,17 +1179,17 @@ impl PdfDocument {
         }
         let pixel_count = u64::from(px_width)
             .checked_mul(u64::from(px_height))
-            .ok_or_else(|| self.decoded_byte_budget.total_limit_error())?;
+            .ok_or_else(|| budget.total_limit_error())?;
         if pixel_count > 100_000_000 {
             return Ok(None);
         }
         let rgba_bytes = usize::try_from(
             pixel_count
                 .checked_mul(4)
-                .ok_or_else(|| self.decoded_byte_budget.total_limit_error())?,
+                .ok_or_else(|| budget.total_limit_error())?,
         )
-        .map_err(|_| self.decoded_byte_budget.total_limit_error())?;
-        self.decoded_byte_budget.charge_resource_bytes(rgba_bytes)?;
+        .map_err(|_| budget.total_limit_error())?;
+        budget.charge_resource_bytes(rgba_bytes)?;
         let settings = RenderSettings {
             x_scale: scale,
             y_scale: scale,
@@ -1050,9 +1204,7 @@ impl PdfDocument {
         if rgba.len() != rgba_bytes {
             return Err(anyhow!("Hayro raster size changed after bounded preflight"));
         }
-        self.decoded_byte_budget
-            .encode_rgba_png(rgba, width, height)
-            .map(Some)
+        budget.encode_rgba_png(rgba, width, height).map(Some)
     }
 
     /// Extract the largest embedded image from a page (JPEG, JBIG2, etc.).
@@ -4527,6 +4679,9 @@ struct ContentState {
     color_stack: Vec<(PdfColor, PdfColor)>, // (fill_color, stroke_color)
     /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
     unsaved_states: usize,
+    /// The matrix and colors at the first `q` past the limit, restored by
+    /// every `Q` past it.
+    overflow_state: Option<(ContentMatrix, PdfColor, PdfColor)>,
     text_matrix: ContentMatrix,
     line_matrix: ContentMatrix,
     leading: f32,
@@ -4548,6 +4703,7 @@ impl Default for ContentState {
             graphics_stack: Vec::new(),
             color_stack: Vec::new(),
             unsaved_states: 0,
+            overflow_state: None,
             text_matrix: IDENTITY_MATRIX,
             line_matrix: IDENTITY_MATRIX,
             leading: 0.0,
@@ -4851,6 +5007,9 @@ struct PageRasterizer<'a> {
     state_stack: Vec<GraphicsState>,
     /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
     unsaved_states: usize,
+    /// The state at the first `q` past the limit, restored by every `Q` past
+    /// it. It shares its clip mask with the state it was copied from.
+    overflow_state: Option<GraphicsState>,
     path_builder: PathBuilder,
     pending_clip: Option<FillRule>,
     form_stack: Vec<(u32, u16)>,
@@ -4898,6 +5057,11 @@ pub struct PdfImagePlacement {
 struct TablePrimitiveExtractor<'a> {
     doc: &'a PdfDocument,
     state_stack: Vec<PrimitiveState>,
+    /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
+    unsaved_states: usize,
+    /// The state at the first `q` past the limit, restored by every `Q` past
+    /// it.
+    overflow_state: Option<PrimitiveState>,
     path_segments: Vec<LineSegment>,
     current_point: Option<(f32, f32)>,
     subpath_start: Option<(f32, f32)>,
@@ -8191,7 +8355,14 @@ fn extract_semantic_text_runs(
                     }
                     "q" => {
                         if state.graphics_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
-                            state.unsaved_states += 1;
+                            if state.unsaved_states == 0 {
+                                state.overflow_state = Some((
+                                    state.ctm,
+                                    state.fill_color.clone(),
+                                    state.stroke_color.clone(),
+                                ));
+                            }
+                            state.unsaved_states = state.unsaved_states.saturating_add(1);
                         } else {
                             state.graphics_stack.push(state.ctm);
                             state
@@ -8202,6 +8373,14 @@ fn extract_semantic_text_runs(
                     "Q" => {
                         if state.unsaved_states > 0 {
                             state.unsaved_states -= 1;
+                            if let Some((matrix, fill, stroke)) = state.overflow_state.clone() {
+                                state.ctm = matrix;
+                                state.fill_color = fill;
+                                state.stroke_color = stroke;
+                            }
+                            if state.unsaved_states == 0 {
+                                state.overflow_state = None;
+                            }
                         } else {
                             if let Some(matrix) = state.graphics_stack.pop() {
                                 state.ctm = matrix;
@@ -8715,6 +8894,7 @@ impl<'a> PageRasterizer<'a> {
             px_height,
             state_stack: vec![GraphicsState::default()],
             unsaved_states: 0,
+            overflow_state: None,
             path_builder: PathBuilder::new(),
             pending_clip: None,
             form_stack: Vec::new(),
@@ -8772,7 +8952,10 @@ impl<'a> PageRasterizer<'a> {
         match operator {
             "q" => {
                 if self.state_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
-                    self.unsaved_states += 1;
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = self.state_stack.last().cloned();
+                    }
+                    self.unsaved_states = self.unsaved_states.saturating_add(1);
                 } else {
                     let current = self.state_stack.last().cloned().unwrap_or_default();
                     self.state_stack.push(current);
@@ -8781,6 +8964,14 @@ impl<'a> PageRasterizer<'a> {
             "Q" => {
                 if self.unsaved_states > 0 {
                     self.unsaved_states -= 1;
+                    if let (Some(saved), Some(current)) =
+                        (self.overflow_state.as_ref(), self.state_stack.last_mut())
+                    {
+                        *current = saved.clone();
+                    }
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = None;
+                    }
                 } else if self.state_stack.len() > 1 {
                     self.state_stack.pop();
                 }
@@ -9010,6 +9201,8 @@ impl<'a> TablePrimitiveExtractor<'a> {
         Self {
             doc,
             state_stack: vec![PrimitiveState::default()],
+            unsaved_states: 0,
+            overflow_state: None,
             path_segments: Vec::new(),
             current_point: None,
             subpath_start: None,
@@ -9047,11 +9240,30 @@ impl<'a> TablePrimitiveExtractor<'a> {
     ) -> Result<()> {
         match operator {
             "q" => {
+                // One state per `q` with no limit made a stream of nothing
+                // but `q` cost twelve times its own size in saved matrices.
                 let state = self.state_stack.last().copied().unwrap_or_default();
-                self.state_stack.push(state);
+                if self.state_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = Some(state);
+                    }
+                    self.unsaved_states = self.unsaved_states.saturating_add(1);
+                } else {
+                    self.state_stack.push(state);
+                }
             }
             "Q" => {
-                if self.state_stack.len() > 1 {
+                if self.unsaved_states > 0 {
+                    self.unsaved_states -= 1;
+                    if let (Some(saved), Some(current)) =
+                        (self.overflow_state, self.state_stack.last_mut())
+                    {
+                        *current = saved;
+                    }
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = None;
+                    }
+                } else if self.state_stack.len() > 1 {
                     self.state_stack.pop();
                 }
             }
