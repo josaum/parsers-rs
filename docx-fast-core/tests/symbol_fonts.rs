@@ -277,3 +277,54 @@ fn a_font_for_part_of_a_table_style_is_not_the_style_font() {
     );
     assert_eq!(paragraphs(&parse(body, styles)), ["\u{F061}"]);
 }
+
+#[test]
+fn the_old_properties_of_a_tracked_format_change_are_not_the_run_font() {
+    let styles = [
+        style("paragraph", "Greek", "", None, SYMBOL),
+        style("character", "Marks", "", None, WINGDINGS),
+    ]
+    .concat();
+    let change = |old: &str| {
+        format!(r#"<w:rPrChange w:id="1" w:author="a"><w:rPr>{old}</w:rPr></w:rPrChange>"#)
+    };
+    let body = [
+        // Now Arial, formerly Wingdings: ordinary text.
+        format!(
+            r#"<w:p><w:r><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/>{}</w:rPr><w:t>Hello</w:t></w:r></w:p>"#,
+            change(&format!("<w:rFonts {WINGDINGS}/>"))
+        ),
+        // Now Wingdings, formerly Arial: symbols.
+        format!(
+            r#"<w:p><w:r><w:rPr><w:rFonts {WINGDINGS}/>{}</w:rPr><w:t>J</w:t></w:r></w:p>"#,
+            change(r#"<w:rFonts w:ascii="Arial" w:hAnsi="Arial"/>"#)
+        ),
+        // Formerly in a Wingdings character style, now in none.
+        format!(
+            r#"<w:p><w:r><w:rPr>{}</w:rPr><w:t>J</w:t></w:r></w:p>"#,
+            change(r#"<w:rStyle w:val="Marks"/>"#)
+        ),
+        // The paragraph was formerly in a Symbol style, now in none.
+        concat!(
+            r#"<w:p><w:pPr><w:pPrChange w:id="2" w:author="a"><w:pPr><w:pStyle w:val="Greek"/></w:pPr></w:pPrChange></w:pPr><w:r><w:t>"#,
+            "\u{F061}</w:t></w:r></w:p>"
+        )
+        .to_string(),
+        // The paragraph is in the Symbol style now, formerly in none.
+        concat!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Greek"/><w:pPrChange w:id="3" w:author="a"><w:pPr/></w:pPrChange></w:pPr><w:r><w:t>"#,
+            "\u{F061}</w:t></w:r></w:p>"
+        )
+        .to_string(),
+    ]
+    .concat();
+    let doc = parse(&body, &styles);
+    assert_eq!(
+        paragraphs(&doc),
+        ["Hello", "\u{263A}", "J", "\u{F061}", "\u{3B1}"]
+    );
+    let Block::Paragraph(fourth) = &doc.blocks[3] else {
+        panic!("expected a paragraph");
+    };
+    assert_eq!(fourth.style_id, None);
+}

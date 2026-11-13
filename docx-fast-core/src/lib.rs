@@ -2205,6 +2205,10 @@ struct DocxBodyParser<'a> {
     in_ppr: bool,
     in_rpr: bool,
     in_numpr: bool,
+    /// How many `w:rPrChange` / `w:pPrChange` elements are open. They hold
+    /// the properties a run or paragraph had before a tracked formatting
+    /// change, which say nothing about how it is formatted now.
+    old_properties_depth: usize,
     in_text: bool,
     in_instr: bool,
 }
@@ -2317,6 +2321,7 @@ impl<'a> DocxBodyParser<'a> {
             in_ppr: false,
             in_rpr: false,
             in_numpr: false,
+            old_properties_depth: 0,
             in_text: false,
             in_instr: false,
         }
@@ -2334,6 +2339,7 @@ impl<'a> DocxBodyParser<'a> {
         self.in_ppr = false;
         self.in_rpr = false;
         self.in_numpr = false;
+        self.old_properties_depth = 0;
         self.in_text = false;
         self.in_instr = false;
     }
@@ -2385,6 +2391,13 @@ impl<'a> DocxBodyParser<'a> {
         e: &quick_xml::events::BytesStart<'_>,
         name: &[u8],
     ) -> Result<()> {
+        if matches!(name, b"rPrChange" | b"pPrChange") {
+            self.old_properties_depth += 1;
+            return Ok(());
+        }
+        if self.old_properties_depth > 0 {
+            return Ok(());
+        }
         match name {
             b"p" => {
                 let mut paragraph = ParagraphBuilder::default();
@@ -2716,6 +2729,13 @@ impl<'a> DocxBodyParser<'a> {
     }
 
     fn handle_end(&mut self, name: &[u8]) -> Result<()> {
+        if matches!(name, b"rPrChange" | b"pPrChange") {
+            self.old_properties_depth = self.old_properties_depth.saturating_sub(1);
+            return Ok(());
+        }
+        if self.old_properties_depth > 0 {
+            return Ok(());
+        }
         match name {
             b"p" => {
                 self.flush_run();
