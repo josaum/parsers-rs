@@ -84,8 +84,16 @@ struct PdfScanner {
 impl PdfScanner {
     #[new]
     fn new(path: String) -> PyResult<Self> {
-        let doc = open_document(&path)?;
-        let page_dimensions = Arc::new(collect_page_dimensions(&doc));
+        // Opening parses the whole file. Every caller holds the GIL, so it is
+        // released here for the parse and taken back before returning.
+        let (doc, page_dimensions) = Python::attach(|py| {
+            py.detach(|| -> PyResult<_> {
+                let doc = open_document(&path)?;
+                let page_dimensions = collect_page_dimensions(&doc);
+                Ok((doc, page_dimensions))
+            })
+        })?;
+        let page_dimensions = Arc::new(page_dimensions);
         let page_count = page_dimensions.len();
         Ok(Self {
             path,
