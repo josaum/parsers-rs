@@ -517,8 +517,19 @@ fn open(bytes: &[u8]) -> PdfDocument {
     PdfDocument::from_slice(bytes, ParseOptions::default()).expect("parses")
 }
 
+/// Parses and renders page 0 on a thread with a stack of its own.
+///
+/// Several fixtures are hostile to this crate's parser too (100,000 nested
+/// page-tree nodes, over a million nested arrays). Test threads get 2 MiB
+/// and unoptimized frames differ by platform, so the size is fixed here.
 fn interpreted(bytes: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-    open(bytes).page_rasterized_png_interpreted_checked(0, 72.0)
+    let bytes = bytes.to_vec();
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || open(&bytes).page_rasterized_png_interpreted_checked(0, 72.0))
+        .expect("spawns")
+        .join()
+        .expect("the render did not panic")
 }
 
 fn assert_refused(what: &str, bytes: &[u8]) {

@@ -16,44 +16,65 @@
 //! decode, differently on different paths, so the walk follows contexts,
 //! not streams.
 //!
-//! # What is bounded, and by what
+//! # Recursion in the interpreter, and what bounds it
 //!
-//! Recursive functions in hayro 0.5.0 that hostile input can drive:
+//! Every function in `hayro` 0.5.0, `hayro-interpret` 0.5.0, `hayro-syntax`
+//! 0.5.0 and `hayro-font` 0.4.0 that calls itself, found by searching each
+//! function body for a call to its own name, plus the cycles through one
+//! other function known from reading (marked "one hop"). The image decoder
+//! crates (`hayro-jpeg2000`, `hayro-jbig2`, `hayro-ccitt`) were not searched.
 //!
-//! | recursion | bounded by |
+//! Bounded by this module:
+//!
+//! | recursion | bound |
 //! |---|---|
-//! | `interpret` through `draw_form_xobject` (`Do`, annotation `/AP /N`) | [`STACK_BUDGET`]; a stream beneath itself is refused |
-//! | `interpret` through `TilingPattern::interpret` | the same |
-//! | `interpret` through `SoftMask::interpret` | the same |
-//! | `interpret` through `Type3::render_glyph` | a glyph procedure that could enter another content stream is refused |
-//! | `Resources::clone`, `Resources` lookups and drop, one frame per level | the same budget, since the chain is as long as the nesting |
-//! | `page::resolve_pages` over `/Kids` | `MAX_PAGE_TREE_DEPTH`, checked on this crate's own reading of the file before the interpreter opens it |
-//! | `Function::new` through stitching functions | [`MAX_OBJECT_DEPTH`] |
-//! | `ColorSpace::new` through `/Indexed`, `/Separation`, `/DeviceN`, `/ICCBased` | [`MAX_OBJECT_DEPTH`] |
+//! | `interpret` and `draw_form_xobject` (`Do`, annotation `/AP /N`; one hop) | [`STACK_BUDGET`]; a stream beneath itself is refused |
+//! | `interpret` and `TilingPattern::interpret` (one hop) | the same |
+//! | `interpret` and `SoftMask::interpret` (one hop) | the same |
+//! | `interpret` and `Type3::render_glyph` (one hop) | glyph procedures are walked with the font's own resources only, `MAX_GLYPH_FORM_DEPTH` forms deep |
+//! | `Resources` clone, lookup and drop (derived, one frame per level) | the same budget: the chain is as long as the nesting |
+//! | `page::resolve_pages` | `MAX_PAGE_TREE_DEPTH`, on this crate's own reading of the file |
+//! | `Function::new` and stitching functions (one hop) | [`MAX_OBJECT_DEPTH`] |
+//! | `ColorSpace::new` and `/Indexed`, `/Separation`, `/DeviceN`, `/ICCBased` (one hop) | [`MAX_OBJECT_DEPTH`] |
 //! | `function::type4::parse_procedure_inner` | [`MAX_PROGRAM_NESTING`] |
-//! | the content tokenizer's `skip` and `read` of nested arrays and dictionaries | [`MAX_CONTENT_NESTING`] |
+//! | `function::type4::eval_inner` | the same: it recurses once per parsed procedure level |
+//! | array and dictionary `skip`/`read` in a content stream (one hop) | [`MAX_CONTENT_NESTING`] |
 //!
-//! # What is not bounded
+//! Bounded by the interpreter itself:
 //!
-//! * **Nesting in the file's own object syntax.** Reading any object whose
-//!   text holds deeply nested arrays or dictionaries recurses in the
-//!   interpreter's parser, and that happens while it opens the document,
-//!   before this module sees anything. Only the size of the render stack
-//!   stands against it.
+//! | recursion | bound |
+//! |---|---|
+//! | `xref::fallback_xref_map_inner` | a flag allows one level |
+//! | `hayro-font` `cff::_parse_char_string` | subroutine depth 10 |
+//! | `hayro-font` `type1::charstring::_parse_char_string` | subroutine depth 10 |
+//!
+//! Bounded only by the size of the render stack:
+//!
+//! | recursion | what drives it |
+//! |---|---|
+//! | array and dictionary `skip`/`read` on objects in the file itself | nesting in any object's text; it runs while the document is opened, before this module sees anything |
+//! | `font::cmap::CMapLexer::get_obj` | one level per consecutive comment line in a CMap |
+//! | `function::type0::interpolate_inner` | one level per input of a sampled function, and twice the work per input |
+//! | `function::type0::increment_index` | one level per input of a sampled function |
+//!
+//! Matched by the search but not recursion: `hayro` `renderer::draw_image`
+//! (calls a different method of the same name), `hayro-font`
+//! `type1::decrypt::decrypt` (a closure of the same name), and
+//! `hayro-interpret` `color::decode_l` (calls `decode_l_constant`).
+//!
+//! # What else is not bounded
+//!
 //! * **A page tree the two parsers read differently.** The page-tree bound
 //!   uses this crate's parser, not the interpreter's.
-//! * **Objects this module does not follow.** Font dictionaries, CMaps
-//!   (`usecmap` chains), embedded font programs, ICC profiles, image
-//!   decoders (JPEG 2000, JBIG2, CCITT) and optional-content dictionaries
-//!   were not audited for recursion.
-//! * **Memory.** Every nested tiling cell and soft mask gets a renderer the
-//!   size of the page, and the interpreter's saved-state stack is unbounded.
-//!   The stack budget limits their depth, not what they allocate.
+//! * **`usecmap` chains and the image decoders** were not examined.
+//! * **Objects reached only through fonts.** Font dictionaries are not
+//!   followed by the object-depth check.
+//! * **Memory and time.** Every nested tiling cell and soft mask gets a
+//!   renderer the size of the page, the interpreter's saved-state stack is
+//!   unbounded, and a sampled function's cost doubles with each input.
 //!
-//! The table above was drawn from reading the content-stream entry points
-//! and the functions a review found to overflow. It is not the result of an
-//! exhaustive search of `hayro-syntax`, `hayro-interpret`, `hayro` and
-//! `hayro-font` for every self-recursive function.
+//! The search finds a function that names itself. A cycle through two or
+//! more other functions that was not already known would not appear here.
 
 use anyhow::{anyhow, Result};
 use hayro::hayro_syntax::content::ops::TypedInstruction;
