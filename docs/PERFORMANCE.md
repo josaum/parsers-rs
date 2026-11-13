@@ -21,6 +21,10 @@ cargo bench -p xlsx-fast-core -- xlsx_200k_cells/json
 cargo bench -p xlsx-fast-core --no-run --locked
 ```
 
+criterion is a dev-dependency only, with its default features off. It adds 18
+packages to `Cargo.lock` and none to a build of the crates themselves, and
+`benches/` and `examples/` are excluded from the published packages.
+
 Every input is built in memory and is the same on every run. Nothing is read
 from a fixture file or the network. Before timing, each bench checks what it
 parsed (cell, paragraph, slide, note and message counts), so a broken package
@@ -55,7 +59,8 @@ optimizations below were judged by:
 
 Both need a one-shot driver: a process that parses one file, serializes the
 result and exits. Each of `xlsx-fast-core`, `docx-fast-core`,
-`pptx-fast-core` and `email-fast-core` has one in `examples/bench_driver.rs`,
+`pptx-fast-core` and `email-fast-core` has one in `examples/`, named
+`<format>_bench_driver.rs` so that no two examples in the workspace share a name,
 and one script runs them all on the benchmark inputs:
 
 ```bash
@@ -77,47 +82,31 @@ the two binaries are then not comparable.
 
 Apple M1 (8 cores), 16 GB, macOS 26.5.2, rustc 1.98.1, release profile.
 **The machine was under heavy load throughout** (load average between 25 and
-150 from unrelated builds), so the criterion medians below are slower than an
-idle machine would give and carry the noise shown. They are a floor to
-improve on, not a target.
+150 from unrelated builds).
 
-Criterion medians, with the 95% interval criterion reported. Each row is one
-run. The docx rows are this branch (the faster of two runs; the other gave
-37.1 ms and 31.7 ms while a compile was running beside it). The xlsx rows
-were taken with the build before the date change, which wall-clock time
-cannot tell apart from this branch. The pptx, email and archive crates have
-no source change.
-
-| Benchmark | Median | Interval | Throughput | Items per second |
-|---|---|---|---|---|
-| `xlsx_200k_cells/json` | 390 ms | 373-408 ms | 21.8 MiB/s | 0.51 M cells/s |
-| `xlsx_200k_cells/parse_only` | 263 ms | 235-293 ms | 32.3 MiB/s | 0.76 M cells/s |
-| `xlsx_200k_cells/ndjson` | 263 ms | 236-292 ms | 32.3 MiB/s | 0.76 M cells/s |
-| `xlsx_200k_cells/arrow_ipc` | 252 ms | 213-292 ms | 33.7 MiB/s | 0.79 M cells/s |
-| `docx_2000_paragraphs/json` | 22.6 ms | 21.3-24.0 ms | 52.0 MiB/s | 88,000 paragraphs/s |
-| `docx_2000_paragraphs/parse_only` | 15.8 ms | 14.8-17.1 ms | 74.2 MiB/s | 126,000 paragraphs/s |
-| `pptx_200_slides/json` | 14.8 ms | 13.6-16.5 ms | 52.9 MiB/s | 13,500 slides/s |
-| `pptx_200_slides/parse_only` | 12.1 ms | 11.9-12.4 ms | 64.8 MiB/s | 16,500 slides/s |
-| `email_2mb_multipart/json` | 11.6 ms | 11.2-12.1 ms | 165 MiB/s | 86 messages/s |
-| `email_2mb_multipart/json_metadata_only` | 12.6 ms | 11.5-13.6 ms | 152 MiB/s | 79 messages/s |
-| `email_mbox_5000_messages/ndjson` | 60.3 ms | 55.4-65.8 ms | 32.2 MiB/s | 83,000 messages/s |
-| `email_msg_fixture/json` | 23.7 µs | 21.1-26.5 µs | 351 MiB/s | 42,000 messages/s |
-| `archive_2000_entries_stored/open` | 0.84 ms | 0.75-0.93 ms | 9.2 GiB/s | 2.4 M parts/s |
-| `archive_2000_entries_stored/open_and_read_all` | 1.39 ms | 1.20-1.62 ms | 5.5 GiB/s | 1.4 M parts/s |
-| `archive_2000_entries_deflated/open` | 0.56 ms | 0.50-0.63 ms | 13.7 GiB/s | 3.6 M parts/s |
-| `archive_2000_entries_deflated/open_and_read_all` | 78.5 ms | 68.7-88.6 ms | 100 MiB/s | 25,500 parts/s |
-
-The xlsx rows were measured at the highest load: one parse plus JSON of the
-same workbook as a whole process, start-up included, took 0.16 s of wall
-time and 0.14 s of user CPU time when the machine had a quiet moment
-(about 1.4 M cells/s).
-
-One parse plus JSON as a whole process:
+One parse plus JSON of each benchmark input as a whole process, start-up
+included, from `scripts/bench-instructions.sh` (two runs):
 
 | Input | Instructions retired | Peak resident memory |
 |---|---|---|
-| xlsx, 200,000 cells | 1.262e9 | 51.5 MB |
-| docx, 2,000 paragraphs | 122.6 M | 11.8-12.9 MB |
+| xlsx, 200,000 cells | 1.213e9, 1.219e9 | 51.2-51.3 MB |
+| docx, 2,000 paragraphs | 125.6 M, 125.9 M | 11.9-13.9 MB |
+| pptx, 200 slides | 143.0 M, 145.6 M | 9.1 MB |
+| email, 2 MB multipart | 149.5 M, 156.4 M | 12.4-12.5 MB |
+
+These were taken before the archive's part index became an ordered map,
+which every input's part lookups go through. One run after that change gave
+1.214e9, 126.2 M, 147.4 M and 157.1 M: within the spread above for xlsx, docx
+and email, and 1% to 3% above it for pptx, which opens 603 parts. One run
+does not settle whether that is the map or noise.
+
+No criterion medians are recorded here. The ones taken while this file was
+written came from a machine so loaded that two runs of the same binary
+differed by 40% or more, and the code has changed since; a table of them
+would be out of date and was never reproducible. Run `cargo bench` on a quiet
+machine for throughput in MB/s. For scale only: on this machine, in a quiet
+moment, one parse plus JSON of the 200,000-cell workbook took 0.16 s of wall
+time as a whole process (about 1.2 M cells per second).
 
 From reading the code, neither parser holds a decompressed part twice: a
 part is inflated once into one buffer and read from it, and a UTF-16 part is
@@ -162,11 +151,14 @@ its own time:
 | xlsx: write a date cell's ISO text directly instead of through `strftime` | 1.337e9 to 1.262e9 (-5.6%) | 20 parses: 2.80-3.07 s to 2.62-2.91 s (-6%) |
 | docx: find header and footer references while parsing the body, instead of in a pass of their own | 150.5 M to 122.6 M (-18%) | not measured |
 
-The docx criterion rows in the table above were taken before the last
-change.
+The two docx changes are separate steps on the same document: the first took
+it from 201.5 M to about 151 M instructions, the second from there to
+122.6 M, which is 39% below where it started. These figures come from a
+scratch driver, so they sit a little below the committed driver's in the
+baseline table.
 
-Peak memory did not change with either (xlsx 51.5 MB, docx 11.8-13.2 MB
-before and after).
+Peak memory did not change with any of them (xlsx about 51.5 MB, docx 11.8
+to 13.2 MB before and after).
 
 Looked at and left alone, because the gain was within the noise of the
 measure used:
@@ -192,9 +184,11 @@ Known and not yet done:
 - pptx and ooxml-archive: each part is inflated with a fresh decoder. Reusing
   one would save its set-up and zeroing, not the Huffman tables, which are
   built per deflate block; not measured yet.
-- ooxml-archive: the part index is a `HashMap` with SipHash. It only shows
-  for stored archives with thousands of parts, where the whole open takes
-  under a millisecond.
+- ooxml-archive: the part index is an ordered map, so that parts are walked
+  in name order. Lookups in it only show for stored archives with thousands
+  of parts, where the whole open takes about a millisecond; the effect of
+  the ordered map on that benchmark has not been measured, and pptx may pay
+  1% to 3% for it (see the baseline).
 
 ## What an optimization must keep
 
@@ -218,7 +212,8 @@ Speed never buys a change in output.
    `HashMap` may hold data, but nothing is written in its iteration order.
 4. `docx-fast-core/tests/header_footer_pass.rs` passes: the error a
    malformed document reports and the numbering of fields both follow the
-   order header, footer, body.
+   order header, footer, body, and a document that fails is not parsed a
+   second time (the test counts parser runs, not time).
 5. No `unsafe` is added, and nothing that depends on the input may
    `unwrap()` or `expect()`.
 6. A claimed gain is larger than the run-to-run spread of the measure it was
