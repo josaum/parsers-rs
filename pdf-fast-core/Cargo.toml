@@ -63,7 +63,7 @@ optional         = true
 [dev-dependencies]
 flate2      = "1.0"
 tempfile    = "3.10"
-base64      = "0.22"
+base64      = { version = "0.23", default-features = false, features = ["std"] }
 csv         = "1"
 
 [lints]

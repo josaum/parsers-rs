@@ -41,6 +41,20 @@ request.
   `unevaluatedItems` see through `$dynamicRef`. The JSON Schema Test Suite's
   2020-12 core cases go from 1,239 to 1,299 of 1,300. This closes the json
   known gap listed under v2026.11.13.
+- **pdf:** a panic inside the interpreted renderer reached the caller as a
+  panic (Python `PanicException`, a Rust caller's thread unwinding). It is
+  now an error, `interpreted render failed: the interpreter panicked on
+  this page` (Python `RuntimeError`, Node `Error`), and
+  `page_rasterized_png_interpreted` returns `None`. The interpreter's own
+  panic message still goes to stderr through the panic hook.
+
+### New refusals
+
+- **pdf:** the interpreted renderer refuses a tiling pattern that needs
+  more than 10,000,000 copies of its cell to cover the page, or whose step
+  is zero, infinite or NaN, or whose `/Matrix` collapses the cell. On page
+  one of 1,295 real files the most any pattern needed was 98,929; none is
+  refused.
 
 ## v2026.11.13
 
