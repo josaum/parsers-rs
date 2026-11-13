@@ -287,6 +287,31 @@ mod rendering {
     }
 
     #[test]
+    fn a_restore_past_the_saved_state_limit_does_not_leak_what_was_set_inside() {
+        // 300 saves is past the 256 the rasterizer keeps. The red set after
+        // them sits inside a save that was counted, not stored; the `Q` that
+        // closes it used to restore nothing, so the square came out red.
+        let content = format!("{}1 0 0 rg Q 0 0 100 100 re f", "q ".repeat(300));
+        let bytes = pdf(&[
+            (1u32, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>".to_vec(),
+            ),
+            (4, stream("", content.as_bytes())),
+        ]);
+        let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+        let png = document
+            .page_rasterized_png(0, 72.0)
+            .expect("renders")
+            .expect("paints");
+        let image = image::load_from_memory(&png).expect("decodes").to_rgba8();
+        let pixel = image.get_pixel(50, 50).0;
+        assert_eq!(pixel, [0, 0, 0, 255], "the fill kept a color set inside");
+    }
+
+    #[test]
     fn a_new_clip_at_every_level_is_still_bounded_by_the_budget() {
         // Each level changes the clip, so each needs a mask of its own. With
         // a 64 MiB budget and 8.7 MB masks, 200 levels cannot all be held.

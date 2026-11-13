@@ -918,6 +918,18 @@ fn deeply_nested_content_arrays_are_bounded_on_a_small_stack() {
     });
 }
 
+/// A content stream of nothing but `q`. The table extractor kept one saved
+/// matrix per `q` with no limit, 24 bytes for every two bytes of content, so
+/// this 72 MB stream asked for more than the allocator's 1 GiB cap.
+#[test]
+fn a_run_of_saved_states_does_not_grow_the_table_extractor() {
+    let _serial = serial();
+    let mut payloads = Payloads::seed();
+    payloads.table_content = b"q ".repeat(36_000_000);
+    let document = document(&payloads);
+    exercise_tables(&document, ParseOptions::default());
+}
+
 // ── Seed sanity ─────────────────────────────────────────────────────────────
 
 /// The seed has to reach the readers it claims to; a seed whose streams fail

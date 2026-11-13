@@ -180,6 +180,18 @@ const MAX_FORM_XOBJECT_DEPTH: usize = 8;
 /// Annex C names 28 as the nesting a reader must support; this allows about
 /// ten times that. Saves past the limit are counted rather than stored, so
 /// the `Q` operators that close them still pair up correctly.
+///
+/// A `Q` that closes a counted save has no state of its own to restore.
+/// Leaving the state alone would let a color, matrix or clip set inside the
+/// pair leak out to everything after it, and popping a stored state would
+/// unbalance every pair around it. Instead the state is copied once, at the
+/// first save past the limit, and every `Q` past the limit restores that
+/// copy. This is exact for the outermost pair past the limit and for any
+/// run of saves that change nothing; inside deeper pairs a restore goes back
+/// further than it should, but never to a state from outside the region
+/// past the limit, and nothing set there survives the `Q` that leaves it.
+/// All three content interpreters (text, rasterizer, table primitives)
+/// behave this way.
 const MAX_GRAPHICS_STATE_DEPTH: usize = 256;
 
 /// Most components one color operator can set.
@@ -4547,6 +4559,9 @@ struct ContentState {
     color_stack: Vec<(PdfColor, PdfColor)>, // (fill_color, stroke_color)
     /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
     unsaved_states: usize,
+    /// The matrix and colors at the first `q` past the limit, restored by
+    /// every `Q` past it.
+    overflow_state: Option<(ContentMatrix, PdfColor, PdfColor)>,
     text_matrix: ContentMatrix,
     line_matrix: ContentMatrix,
     leading: f32,
@@ -4568,6 +4583,7 @@ impl Default for ContentState {
             graphics_stack: Vec::new(),
             color_stack: Vec::new(),
             unsaved_states: 0,
+            overflow_state: None,
             text_matrix: IDENTITY_MATRIX,
             line_matrix: IDENTITY_MATRIX,
             leading: 0.0,
@@ -4871,6 +4887,9 @@ struct PageRasterizer<'a> {
     state_stack: Vec<GraphicsState>,
     /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
     unsaved_states: usize,
+    /// The state at the first `q` past the limit, restored by every `Q` past
+    /// it. It shares its clip mask with the state it was copied from.
+    overflow_state: Option<GraphicsState>,
     path_builder: PathBuilder,
     pending_clip: Option<FillRule>,
     form_stack: Vec<(u32, u16)>,
@@ -4918,6 +4937,11 @@ pub struct PdfImagePlacement {
 struct TablePrimitiveExtractor<'a> {
     doc: &'a PdfDocument,
     state_stack: Vec<PrimitiveState>,
+    /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
+    unsaved_states: usize,
+    /// The state at the first `q` past the limit, restored by every `Q` past
+    /// it.
+    overflow_state: Option<PrimitiveState>,
     path_segments: Vec<LineSegment>,
     current_point: Option<(f32, f32)>,
     subpath_start: Option<(f32, f32)>,
@@ -8211,7 +8235,14 @@ fn extract_semantic_text_runs(
                     }
                     "q" => {
                         if state.graphics_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
-                            state.unsaved_states += 1;
+                            if state.unsaved_states == 0 {
+                                state.overflow_state = Some((
+                                    state.ctm,
+                                    state.fill_color.clone(),
+                                    state.stroke_color.clone(),
+                                ));
+                            }
+                            state.unsaved_states = state.unsaved_states.saturating_add(1);
                         } else {
                             state.graphics_stack.push(state.ctm);
                             state
@@ -8222,6 +8253,14 @@ fn extract_semantic_text_runs(
                     "Q" => {
                         if state.unsaved_states > 0 {
                             state.unsaved_states -= 1;
+                            if let Some((matrix, fill, stroke)) = state.overflow_state.clone() {
+                                state.ctm = matrix;
+                                state.fill_color = fill;
+                                state.stroke_color = stroke;
+                            }
+                            if state.unsaved_states == 0 {
+                                state.overflow_state = None;
+                            }
                         } else {
                             if let Some(matrix) = state.graphics_stack.pop() {
                                 state.ctm = matrix;
@@ -8735,6 +8774,7 @@ impl<'a> PageRasterizer<'a> {
             px_height,
             state_stack: vec![GraphicsState::default()],
             unsaved_states: 0,
+            overflow_state: None,
             path_builder: PathBuilder::new(),
             pending_clip: None,
             form_stack: Vec::new(),
@@ -8792,7 +8832,10 @@ impl<'a> PageRasterizer<'a> {
         match operator {
             "q" => {
                 if self.state_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
-                    self.unsaved_states += 1;
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = self.state_stack.last().cloned();
+                    }
+                    self.unsaved_states = self.unsaved_states.saturating_add(1);
                 } else {
                     let current = self.state_stack.last().cloned().unwrap_or_default();
                     self.state_stack.push(current);
@@ -8801,6 +8844,14 @@ impl<'a> PageRasterizer<'a> {
             "Q" => {
                 if self.unsaved_states > 0 {
                     self.unsaved_states -= 1;
+                    if let (Some(saved), Some(current)) =
+                        (self.overflow_state.as_ref(), self.state_stack.last_mut())
+                    {
+                        *current = saved.clone();
+                    }
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = None;
+                    }
                 } else if self.state_stack.len() > 1 {
                     self.state_stack.pop();
                 }
@@ -9030,6 +9081,8 @@ impl<'a> TablePrimitiveExtractor<'a> {
         Self {
             doc,
             state_stack: vec![PrimitiveState::default()],
+            unsaved_states: 0,
+            overflow_state: None,
             path_segments: Vec::new(),
             current_point: None,
             subpath_start: None,
@@ -9067,11 +9120,30 @@ impl<'a> TablePrimitiveExtractor<'a> {
     ) -> Result<()> {
         match operator {
             "q" => {
+                // One state per `q` with no limit made a stream of nothing
+                // but `q` cost twelve times its own size in saved matrices.
                 let state = self.state_stack.last().copied().unwrap_or_default();
-                self.state_stack.push(state);
+                if self.state_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = Some(state);
+                    }
+                    self.unsaved_states = self.unsaved_states.saturating_add(1);
+                } else {
+                    self.state_stack.push(state);
+                }
             }
             "Q" => {
-                if self.state_stack.len() > 1 {
+                if self.unsaved_states > 0 {
+                    self.unsaved_states -= 1;
+                    if let (Some(saved), Some(current)) =
+                        (self.overflow_state, self.state_stack.last_mut())
+                    {
+                        *current = saved;
+                    }
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = None;
+                    }
+                } else if self.state_stack.len() > 1 {
                     self.state_stack.pop();
                 }
             }
