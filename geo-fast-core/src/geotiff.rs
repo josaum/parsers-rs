@@ -427,10 +427,53 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
 /// the decoder can read, and [`GeoError::UnsupportedFormat`] for 64-bit
 /// integer samples, for a raster of several bands stored as separate
 /// planes (`PlanarConfiguration` 2), and for a raster whose bands would take
-/// more than 512 MiB as `f32` (134,217,728 samples across all bands).
+/// more `f32` bytes than the default limit: 512 MiB or four times the size
+/// of the file, whichever is larger. Four bytes out per byte in is an
+/// uncompressed 8-bit raster, so no uncompressed file is refused for its
+/// size; a compressed one is held to 512 MiB (134,217,728 samples across
+/// all bands) unless the file itself is larger than 128 MiB.
+/// [`parse_geotiff_bands_with_limit`] takes the limit from the caller.
 pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, GeoError> {
     let file = std::fs::File::open(path.as_ref()).map_err(GeoError::Io)?;
-    read_bands(BufReader::new(file), max_band_bytes())
+    let input_len = file.metadata().map_err(GeoError::Io)?.len();
+    let limit = default_band_limit(input_len, max_band_bytes());
+    read_bands(BufReader::new(file), limit)
+}
+
+/// Parse GeoTIFF bands like [`parse_geotiff_bands`], under a caller's limit.
+///
+/// `max_band_bytes` is the most `f32` band data to return, in bytes: four
+/// per sample, all bands together. It replaces the default limit, and may be
+/// lower or higher. The decoder's own cap on the raster it decodes (256 MiB
+/// of samples as stored) still applies.
+///
+/// # Errors
+///
+/// As [`parse_geotiff_bands`], with [`GeoError::UnsupportedFormat`] for a
+/// raster whose bands would take more than `max_band_bytes`.
+pub fn parse_geotiff_bands_with_limit<P: AsRef<Path>>(
+    path: P,
+    max_band_bytes: usize,
+) -> Result<Vec<Vec<f32>>, GeoError> {
+    let file = std::fs::File::open(path.as_ref()).map_err(GeoError::Io)?;
+    read_bands(BufReader::new(file), max_band_bytes)
+}
+
+/// Bytes of `f32` band data per byte of an uncompressed 8-bit raster.
+const BAND_BYTES_PER_INPUT_BYTE: usize = 4;
+
+/// The default limit on band data for a file of `input_len` bytes.
+///
+/// `floor`, or [`BAND_BYTES_PER_INPUT_BYTE`] times the file if that is more.
+/// The floor alone refused ordinary uncompressed 8-bit imagery (a
+/// 12000×12000 gray or 7000×7000 RGB raster), which claims no more than
+/// four bytes for each byte it is made of. A small file claiming a large
+/// raster gets only the floor.
+fn default_band_limit(input_len: u64, floor: usize) -> usize {
+    usize::try_from(input_len)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(BAND_BYTES_PER_INPUT_BYTE)
+        .max(floor)
 }
 
 /// Bytes of band data returned per byte of raster the decoder may decode.
@@ -445,7 +488,7 @@ pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, Geo
 /// samples.
 const BAND_BYTES_PER_DECODED_BYTE: usize = 2;
 
-/// Most bytes of `f32` band data [`parse_geotiff_bands`] returns.
+/// Floor of the default limit on the `f32` band data returned.
 ///
 /// [`BAND_BYTES_PER_DECODED_BYTE`] times the decoder's own raster cap: 512
 /// MiB, or 134,217,728 samples across all bands.
@@ -1727,5 +1770,101 @@ mod tests {
         assert_eq!(params.citation(), None);
         assert_eq!(params.geographic_citation(), Some("WGS 84"));
         assert!(metadata(bytes).is_geographic);
+    }
+
+    /// A `width`×`height` 8-bit gray TIFF, Deflate-compressed, whose one
+    /// strip is eleven bytes: a small file claiming a large raster.
+    fn small_file_claiming(width: u32, height: u32) -> Vec<u8> {
+        const SHORT: u16 = 3;
+        const LONG: u16 = 4;
+        let strip = [0x78, 0x9c, 0x63, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0, 0];
+        let mut file = Vec::new();
+        file.extend_from_slice(b"II");
+        file.extend_from_slice(&42u16.to_le_bytes());
+        file.extend_from_slice(&20u32.to_le_bytes()); // directory offset
+        file.extend_from_slice(&strip); // at 8
+        file.push(0); // pad to 20
+        let entries: [(u16, u16, u32, u32); 8] = [
+            (256, LONG, 1, width),
+            (257, LONG, 1, height),
+            (258, SHORT, 1, 8),     // BitsPerSample
+            (259, SHORT, 1, 8),     // Compression: Deflate
+            (262, SHORT, 1, 1),     // PhotometricInterpretation: black is zero
+            (273, LONG, 1, 8),      // StripOffsets
+            (278, LONG, 1, height), // RowsPerStrip
+            (279, LONG, 1, 11),     // StripByteCounts
+        ];
+        file.extend_from_slice(&8u16.to_le_bytes());
+        for (tag, field_type, count, value) in entries {
+            file.extend_from_slice(&tag.to_le_bytes());
+            file.extend_from_slice(&field_type.to_le_bytes());
+            file.extend_from_slice(&count.to_le_bytes());
+            file.extend_from_slice(&value.to_le_bytes());
+        }
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file
+    }
+
+    /// The flat 512 MiB limit refused ordinary uncompressed 8-bit imagery
+    /// that had always loaded: 12000×12000 gray is 549 MiB of bands.
+    #[test]
+    fn default_limit_admits_any_uncompressed_8_bit_raster() {
+        let floor = max_band_bytes();
+        // Header and tags aside, an uncompressed 8-bit file is its samples.
+        let gray = default_band_limit(12_000 * 12_000, floor);
+        assert!(check_band_bytes(12_000, 12_000, 1, floor).is_err());
+        assert!(check_band_bytes(12_000, 12_000, 1, gray).is_ok());
+        let rgb = default_band_limit(7_000 * 7_000 * 3, floor);
+        assert!(check_band_bytes(7_000, 7_000, 3, floor).is_err());
+        assert!(check_band_bytes(7_000, 7_000, 3, rgb).is_ok());
+        // A small file gets the floor and no more.
+        assert_eq!(default_band_limit(118, floor), floor);
+        assert_eq!(default_band_limit(u64::MAX, floor), usize::MAX);
+
+        // On a real file, with no floor at all: four bytes per input byte
+        // is enough for an uncompressed 8-bit raster.
+        let rgb = raster::<colortype::RGB8>(4, 4, &[7u8; 48]);
+        let limit = default_band_limit(rgb.len() as u64, 0);
+        assert_eq!(read_bands(Cursor::new(rgb), limit).expect("bands").len(), 3);
+    }
+
+    #[test]
+    fn small_compressed_file_claiming_a_huge_raster_is_refused_by_default() {
+        // 20000×20000 samples from a 120-byte file: 1.5 GiB of bands.
+        let bytes = small_file_claiming(20_000, 20_000);
+        assert!(bytes.len() < 200);
+        let error = bands_of(&bytes).expect_err("over the default limit");
+        assert!(
+            matches!(&error, GeoError::UnsupportedFormat(message)
+                if message.contains("20000x20000")),
+            "{error}"
+        );
+        // The same file with a claim under the limit gets past the check
+        // and as far as the decoder, which finds the strip too short.
+        let small = bands_of(&small_file_claiming(4, 4)).expect_err("short strip");
+        assert!(matches!(small, GeoError::Tiff(_)), "{small}");
+    }
+
+    #[test]
+    fn caller_limit_replaces_the_default_in_both_directions() {
+        let file = tempfile::NamedTempFile::new().expect("temporary file");
+        // 4×4 RGB: 192 bytes of bands. The default admits it.
+        std::fs::write(file.path(), raster::<colortype::RGB8>(4, 4, &[7u8; 48])).expect("write");
+        assert!(parse_geotiff_bands(file.path()).is_ok());
+        assert!(parse_geotiff_bands_with_limit(file.path(), 192).is_ok());
+        let error = parse_geotiff_bands_with_limit(file.path(), 191).expect_err("lowered");
+        assert!(matches!(error, GeoError::UnsupportedFormat(_)), "{error}");
+
+        // 16384×8193 is one row over the default. A higher limit lets the
+        // header check pass; the eleven-byte strip then fails to fill it,
+        // or the decoder's own cap refuses it, but not the band limit.
+        std::fs::write(file.path(), small_file_claiming(16_384, 8_193)).expect("write");
+        let error = parse_geotiff_bands(file.path()).expect_err("default");
+        assert!(matches!(error, GeoError::UnsupportedFormat(_)), "{error}");
+        let raised = parse_geotiff_bands_with_limit(file.path(), usize::MAX);
+        assert!(
+            !matches!(raised, Err(GeoError::UnsupportedFormat(_))),
+            "{raised:?}"
+        );
     }
 }
