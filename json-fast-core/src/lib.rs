@@ -54,6 +54,15 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 /// Default maximum JSON array/object nesting depth.
 pub const DEFAULT_MAX_NESTING_DEPTH: usize = 64;
+/// Deepest nesting any caller-supplied [`JsonLimits`] can allow.
+///
+/// The parse recurses once per array/object level and cannot be given a
+/// depth limit of its own, so a caller who raised `max_nesting_depth` far
+/// enough got a stack overflow instead of an error (100 nested arrays
+/// already overflow a 2 MiB stack in an unoptimized build). A limit above
+/// this ceiling is treated as this ceiling. 512 levels need about 1 MiB of
+/// stack in an optimized build, going by the 128 KiB measured for 64.
+pub const MAX_SUPPORTED_NESTING_DEPTH: usize = 512;
 /// Default maximum lexical JSON tokens.
 pub const DEFAULT_MAX_TOKENS: usize = 1_000_000;
 /// Default maximum physical lines in one JSONL input.
@@ -70,7 +79,8 @@ pub const DEFAULT_MAX_IPC_BYTES: usize = 64 * 1024 * 1024;
 pub struct JsonLimits {
     /// Maximum UTF-8 bytes in one input.
     pub max_input_bytes: usize,
-    /// Maximum object/array nesting depth.
+    /// Maximum object/array nesting depth; values above
+    /// [`MAX_SUPPORTED_NESTING_DEPTH`] are treated as that ceiling.
     pub max_nesting_depth: usize,
     /// Maximum lexical tokens across one JSON document or JSONL batch.
     pub max_tokens: usize,
@@ -136,7 +146,11 @@ pub(crate) fn scan_json(input: &str, limits: &JsonLimits) -> Result<JsonUsage> {
             }
             b'[' | b'{' => {
                 depth = depth.saturating_add(1);
-                check_limit(JsonResource::NestingDepth, depth, limits.max_nesting_depth)?;
+                check_limit(
+                    JsonResource::NestingDepth,
+                    depth,
+                    limits.max_nesting_depth.min(MAX_SUPPORTED_NESTING_DEPTH),
+                )?;
                 tokens = tokens.saturating_add(1);
                 check_limit(JsonResource::Tokens, tokens, limits.max_tokens)?;
                 index += 1;

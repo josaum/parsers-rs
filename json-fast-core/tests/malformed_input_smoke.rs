@@ -150,6 +150,97 @@ fn a_million_nested_containers_are_refused_on_a_small_stack() {
     }
 }
 
+/// A caller may raise `max_nesting_depth`, but not past what the recursive
+/// parse can survive: a million levels is an error, not a stack overflow.
+#[test]
+fn a_raised_nesting_limit_still_refuses_a_million_levels() {
+    let raised = JsonLimits {
+        max_nesting_depth: usize::MAX,
+        max_tokens: usize::MAX,
+        max_retained_bytes: usize::MAX,
+        ..JsonLimits::default()
+    };
+    for (open, body, close) in [("[", "1", "]"), ("{\"a\":", "1", "}"), ("[", "", "")] {
+        let document = smoke::nested(
+            open.as_bytes(),
+            body.as_bytes(),
+            close.as_bytes(),
+            1_000_000,
+        );
+        smoke::run_on_small_stack(move || {
+            let text = std::str::from_utf8(&document).expect("ascii");
+            let error = json_fast_core::parse_value_with_limits(text, &raised)
+                .expect_err("a million levels");
+            assert_eq!(error.code(), "resource_limit");
+            assert!(jsonl::parse_many_with_limits::<Value>(text, &raised).is_err());
+        });
+    }
+    // A modest raise still works.
+    let modest = JsonLimits {
+        max_nesting_depth: 80,
+        ..JsonLimits::default()
+    };
+    let text = "[".repeat(80) + &"]".repeat(80);
+    std::thread::Builder::new()
+        .stack_size(MAIN_THREAD_STACK_BYTES * 4)
+        .spawn(move || {
+            assert!(json_fast_core::parse_value(&text).is_err());
+            assert!(json_fast_core::parse_value_with_limits(&text, &modest).is_ok());
+        })
+        .expect("spawn")
+        .join()
+        .expect("parse panicked");
+}
+
+/// The memory-mapped entry points read a file from outside: malformed
+/// content, a missing path, a directory, an empty file and bytes that are
+/// not UTF-8 must all be errors or findings, never a panic.
+#[cfg(feature = "mmap")]
+#[test]
+fn mutated_json_files_never_panic() {
+    let directory = std::env::temp_dir().join(format!("json-fast-smoke-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("temp dir");
+    let path = directory.join("input.json");
+    let small = JsonLimits {
+        max_input_bytes: 512,
+        max_nesting_depth: 4,
+        max_tokens: 64,
+        ..JsonLimits::default()
+    };
+    smoke::assert_no_panics("json-fast-core files", &seeds(), 1_000, |bytes| {
+        std::fs::write(&path, bytes).expect("write input");
+        let parsed = json_fast_core::parse_file(&path);
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            assert_eq!(parsed.is_ok(), json_fast_core::parse_value(text).is_ok());
+        } else {
+            assert!(parsed.is_err());
+        }
+        let _ = json_fast_core::parse_file_with_limits(&path, &small);
+        let _ = json_fast_core::validate_file(&path, SCHEMA);
+        let _ = json_fast_core::validate_file(&path, &String::from_utf8_lossy(bytes));
+    });
+    for (content, expect_ok) in [
+        (&b""[..], false),
+        (b"\xff\xfe{}", false),
+        (DOCUMENT.as_bytes(), true),
+    ] {
+        std::fs::write(&path, content).expect("write input");
+        assert_eq!(json_fast_core::parse_file(&path).is_ok(), expect_ok);
+        assert_eq!(
+            json_fast_core::validate_file(&path, SCHEMA).is_ok(),
+            expect_ok
+        );
+    }
+    std::fs::write(&path, smoke::nested(b"[", b"1", b"]", 1_000_000)).expect("write deep");
+    assert!(json_fast_core::parse_file(&path).is_err());
+    assert!(json_fast_core::validate_file(&path, SCHEMA).is_err());
+    for missing in [directory.join("absent.json"), directory.clone()] {
+        assert!(json_fast_core::parse_file(&missing).is_err());
+        assert!(json_fast_core::validate_file(&missing, SCHEMA).is_err());
+    }
+    std::fs::remove_dir_all(&directory).expect("remove temp dir");
+}
+
 /// A schema fragment to nest, and the document shape that matches it:
 /// schema opener, schema closer, containers one fragment opens, document
 /// opener, document closer.
