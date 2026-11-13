@@ -85,20 +85,50 @@ fn sym_elements_in_the_dingbat_fonts_read_as_unicode() {
 }
 
 #[test]
-fn a_dingbat_code_without_a_unicode_character_reads_as_the_replacement_character() {
-    // Wingdings 0xFF is the Windows logo, which Unicode does not encode.
-    // The letter "ÿ" or a private-use code point would both be wrong text.
+fn a_dingbat_code_without_a_unicode_character_keeps_what_is_stored() {
+    // Wingdings 0xFF is the Windows logo, which Unicode does not encode, and
+    // 0x26 has no settled mapping. The stored code is kept, so a consumer
+    // that knows the font can still recover the glyph.
+    let wingdings = r#"w:ascii="Wingdings" w:hAnsi="Wingdings""#;
     let body = [
         sym("Wingdings", "F0FF"),
-        run(
-            r#"w:ascii="Wingdings" w:hAnsi="Wingdings""#,
-            "a\u{F0FF}\u{FF}b",
-        ),
+        sym("Wingdings", "0026"),
+        run(wingdings, "a\u{F0FF}\u{FF}b"),
+        run(wingdings, "a&amp;\u{F026}b"),
     ]
     .concat();
     assert_eq!(
         paragraphs(&parse(&body, "")),
-        ["\u{FFFD}", "\u{264B}\u{FFFD}\u{FFFD}\u{264C}"]
+        [
+            "\u{F0FF}",
+            "&",
+            "\u{264B}\u{F0FF}\u{FF}\u{264C}",
+            "\u{264B}&\u{F026}\u{264C}"
+        ]
+    );
+}
+
+#[test]
+fn dingbats_whose_name_was_reworded_before_publication_are_mapped() {
+    let body = [
+        sym("Webdings", "F0EC"),
+        sym("Webdings", "F078"),
+        sym("Wingdings", "F08A"),
+        sym("Wingdings 2", "F073"),
+        sym("Wingdings 3", "F04B"),
+        run(r#"w:ascii="Webdings" w:hAnsi="Webdings""#, "B\u{FF}"),
+    ]
+    .concat();
+    assert_eq!(
+        paragraphs(&parse(&body, "")),
+        [
+            "\u{1F393}",
+            "\u{29B8}",
+            "\u{2789}",
+            "\u{2469}",
+            "\u{2B87}",
+            "\u{1F3D8}\u{1F54A}"
+        ]
     );
 }
 

@@ -8,18 +8,26 @@
 //! decimal), and its section 6 gives the character name.
 //!
 //! That document is a proposal, written before the characters were
-//! published in Unicode 7.0, so an entry is kept only when the proposal
-//! proves itself against the published standard: sections 6 and 7 agree on
-//! the code point, and the name the document gives is the name the Unicode
-//! Character Database (checked against versions 15.0.0 and 17.0.0) has for
-//! that code point. 845 of the 867 glyphs pass. The rest have no entry here
-//! and read as U+FFFD: 21 whose name was reworded before publication, and
-//! the Windows logo at Wingdings 0xFF, which was never proposed. So do the
-//! 25 codes the document does not list because the fonts have no glyph
-//! there (0x7F in each font, Wingdings 2 from 0xFA, Wingdings 3 from 0xF1).
+//! published in Unicode 7.0, so every entry is checked against the published
+//! standard (the Unicode Character Database, versions 15.0.0 and 17.0.0):
+//!
+//! - 845 entries: sections 6 and 7 agree on the code point, and the name the
+//!   document gives is exactly the published name of that code point.
+//! - 20 entries, marked "name reworded": sections 6 and 7 agree on the code
+//!   point, and the published name of that code point is a rewording of the
+//!   document's name ("HOUSES BUILDINGS" became HOUSE BUILDINGS, "DOVE"
+//!   became DOVE OF PEACE, "CIRCLED DIGIT TEN" is CIRCLED NUMBER TEN). The
+//!   comment gives the published name.
+//!
+//! Two of the 867 glyphs have no entry, and a character in them is left at
+//! the code the document stores: Wingdings 0x26, where the document
+//! contradicts itself (U+1F56E in one table, the name of U+1F4D6 in
+//! another), and the Windows logo at Wingdings 0xFF, which was never
+//! proposed. Neither do the 25 codes the fonts have no glyph for (0x7F in
+//! each font, Wingdings 2 from 0xFA, Wingdings 3 from 0xF1).
 
 /// Webdings code to Unicode, sorted by code.
-pub(super) const WEBDINGS: [(u8, char); 209] = [
+pub(super) const WEBDINGS: [(u8, char); 222] = [
     (0x21, '\u{1F577}'), // SPIDER
     (0x22, '\u{1F578}'), // SPIDER WEB
     (0x23, '\u{1F572}'), // NO PIRACY
@@ -53,6 +61,7 @@ pub(super) const WEBDINGS: [(u8, char); 209] = [
     (0x3F, '\u{1F5F3}'), // BALLOT BOX WITH BALLOT
     (0x40, '\u{1F6E0}'), // HAMMER AND WRENCH
     (0x41, '\u{1F3D7}'), // BUILDING CONSTRUCTION
+    (0x42, '\u{1F3D8}'), // HOUSE BUILDINGS (name reworded)
     (0x43, '\u{1F3D9}'), // CITYSCAPE
     (0x44, '\u{1F3DA}'), // DERELICT HOUSE BUILDING
     (0x45, '\u{1F3DC}'), // DESERT
@@ -68,6 +77,7 @@ pub(super) const WEBDINGS: [(u8, char); 209] = [
     (0x4F, '\u{1F442}'), // EAR
     (0x50, '\u{1F3DE}'), // NATIONAL PARK
     (0x51, '\u{1F3D5}'), // CAMPING
+    (0x52, '\u{1F6E4}'), // RAILWAY TRACK (name reworded)
     (0x53, '\u{1F3DF}'), // STADIUM
     (0x54, '\u{1F6F3}'), // PASSENGER SHIP
     (0x55, '\u{1F56C}'), // BULLHORN WITH SOUND WAVES
@@ -96,13 +106,16 @@ pub(super) const WEBDINGS: [(u8, char); 209] = [
     (0x6C, '\u{1F7C8}'), // REVERSE LIGHT FOUR POINTED PINWHEEL STAR
     (0x6D, '\u{1F574}'), // MAN IN BUSINESS SUIT LEVITATING
     (0x6E, '\u{2B24}'),  // BLACK LARGE CIRCLE
+    (0x6F, '\u{1F6E5}'), // MOTOR BOAT (name reworded)
     (0x70, '\u{1F694}'), // ONCOMING POLICE CAR
     (0x71, '\u{1F5D8}'), // CLOCKWISE RIGHT AND LEFT SEMICIRCLE ARROWS
+    (0x72, '\u{1F5D9}'), // CANCELLATION X (name reworded)
     (0x73, '\u{2753}'),  // BLACK QUESTION MARK ORNAMENT
     (0x74, '\u{1F6F2}'), // DIESEL LOCOMOTIVE
     (0x75, '\u{1F687}'), // METRO
     (0x76, '\u{1F68D}'), // ONCOMING BUS
     (0x77, '\u{26F3}'),  // FLAG IN HOLE
+    (0x78, '\u{29B8}'),  // CIRCLED REVERSE SOLIDUS (name reworded)
     (0x79, '\u{2296}'),  // CIRCLED MINUS
     (0x7A, '\u{1F6AD}'), // NO SMOKING SYMBOL
     (0x7B, '\u{1F5EE}'), // LEFT ANGER BUBBLE
@@ -111,6 +124,8 @@ pub(super) const WEBDINGS: [(u8, char); 209] = [
     (0x7E, '\u{1F5F2}'), // LIGHTNING MOOD
     (0x80, '\u{1F6B9}'), // MENS SYMBOL
     (0x81, '\u{1F6BA}'), // WOMENS SYMBOL
+    (0x82, '\u{1F6C9}'), // BOYS SYMBOL (name reworded)
+    (0x83, '\u{1F6CA}'), // GIRLS SYMBOL (name reworded)
     (0x84, '\u{1F6BC}'), // BABY SYMBOL
     (0x85, '\u{1F47D}'), // EXTRATERRESTRIAL ALIEN
     (0x86, '\u{1F3CB}'), // WEIGHT LIFTER
@@ -130,6 +145,7 @@ pub(super) const WEBDINGS: [(u8, char); 209] = [
     (0x94, '\u{1F46A}'), // FAMILY
     (0x95, '\u{1F5E1}'), // DAGGER KNIFE
     (0x96, '\u{1F5E2}'), // LIPS
+    (0x97, '\u{1F5E3}'), // SPEAKING HEAD IN SILHOUETTE (name reworded)
     (0x98, '\u{272F}'),  // PINWHEEL STAR
     (0x99, '\u{1F584}'), // ENVELOPE WITH LIGHTNING
     (0x9A, '\u{1F585}'), // FLYING ENVELOPE
@@ -151,6 +167,7 @@ pub(super) const WEBDINGS: [(u8, char); 209] = [
     (0xAA, '\u{1F5DF}'), // PAGE WITH CIRCLED TEXT
     (0xAB, '\u{1F5C3}'), // CARD FILE BOX
     (0xAC, '\u{1F5C2}'), // CARD INDEX DIVIDERS
+    (0xAD, '\u{1F5BC}'), // FRAME WITH PICTURE (name reworded)
     (0xAE, '\u{1F3AD}'), // PERFORMING ARTS
     (0xAF, '\u{1F39C}'), // BEAMED ASCENDING MUSICAL NOTES
     (0xB0, '\u{1F398}'), // MUSICAL KEYBOARD WITH JACKS
@@ -193,6 +210,7 @@ pub(super) const WEBDINGS: [(u8, char); 209] = [
     (0xD5, '\u{1F323}'), // WHITE SUN
     (0xD6, '\u{1F324}'), // WHITE SUN WITH SMALL CLOUD
     (0xD7, '\u{1F325}'), // WHITE SUN BEHIND CLOUD
+    (0xD8, '\u{1F326}'), // WHITE SUN BEHIND CLOUD WITH RAIN (name reworded)
     (0xD9, '\u{2601}'),  // CLOUD
     (0xDA, '\u{1F328}'), // CLOUD WITH SNOW
     (0xDB, '\u{1F327}'), // CLOUD WITH RAIN
@@ -208,9 +226,11 @@ pub(super) const WEBDINGS: [(u8, char); 209] = [
     (0xE5, '\u{1F378}'), // COCKTAIL GLASS
     (0xE6, '\u{1F6CE}'), // BELLHOP BELL
     (0xE7, '\u{1F6CD}'), // SHOPPING BAGS
+    (0xE8, '\u{24C5}'),  // CIRCLED LATIN CAPITAL LETTER P (name reworded)
     (0xE9, '\u{267F}'),  // WHEELCHAIR SYMBOL
     (0xEA, '\u{1F6C6}'), // TRIANGLE WITH ROUNDED CORNERS
     (0xEB, '\u{1F588}'), // BLACK PUSHPIN
+    (0xEC, '\u{1F393}'), // GRADUATION CAP (name reworded)
     (0xED, '\u{1F5E4}'), // THREE RAYS ABOVE
     (0xEE, '\u{1F5E5}'), // THREE RAYS BELOW
     (0xEF, '\u{1F5E6}'), // THREE RAYS LEFT
@@ -229,10 +249,11 @@ pub(super) const WEBDINGS: [(u8, char); 209] = [
     (0xFC, '\u{1F30D}'), // EARTH GLOBE EUROPE-AFRICA
     (0xFD, '\u{1F30F}'), // EARTH GLOBE ASIA-AUSTRALIA
     (0xFE, '\u{1F30E}'), // EARTH GLOBE AMERICAS
+    (0xFF, '\u{1F54A}'), // DOVE OF PEACE (name reworded)
 ];
 
 /// Wingdings code to Unicode, sorted by code.
-pub(super) const WINGDINGS: [(u8, char); 217] = [
+pub(super) const WINGDINGS: [(u8, char); 220] = [
     (0x21, '\u{1F589}'), // LOWER LEFT PENCIL
     (0x22, '\u{2702}'),  // BLACK SCISSORS
     (0x23, '\u{2701}'),  // UPPER BLADE SCISSORS
@@ -336,6 +357,8 @@ pub(super) const WINGDINGS: [(u8, char); 217] = [
     (0x87, '\u{2786}'),  // DINGBAT CIRCLED SANS-SERIF DIGIT SEVEN
     (0x88, '\u{2787}'),  // DINGBAT CIRCLED SANS-SERIF DIGIT EIGHT
     (0x89, '\u{2788}'),  // DINGBAT CIRCLED SANS-SERIF DIGIT NINE
+    (0x8A, '\u{2789}'),  // DINGBAT CIRCLED SANS-SERIF NUMBER TEN (name reworded)
+    (0x8B, '\u{1F10C}'), // DINGBAT NEGATIVE CIRCLED SANS-SERIF DIGIT ZERO (name reworded)
     (0x8C, '\u{278A}'),  // DINGBAT NEGATIVE CIRCLED SANS-SERIF DIGIT ONE
     (0x8D, '\u{278B}'),  // DINGBAT NEGATIVE CIRCLED SANS-SERIF DIGIT TWO
     (0x8E, '\u{278C}'),  // DINGBAT NEGATIVE CIRCLED SANS-SERIF DIGIT THREE
@@ -345,6 +368,7 @@ pub(super) const WINGDINGS: [(u8, char); 217] = [
     (0x92, '\u{2790}'),  // DINGBAT NEGATIVE CIRCLED SANS-SERIF DIGIT SEVEN
     (0x93, '\u{2791}'),  // DINGBAT NEGATIVE CIRCLED SANS-SERIF DIGIT EIGHT
     (0x94, '\u{2792}'),  // DINGBAT NEGATIVE CIRCLED SANS-SERIF DIGIT NINE
+    (0x95, '\u{2793}'),  // DINGBAT NEGATIVE CIRCLED SANS-SERIF NUMBER TEN (name reworded)
     (0x96, '\u{1F662}'), // NORTH EAST POINTING BUD
     (0x97, '\u{1F660}'), // NORTH WEST POINTING BUD
     (0x98, '\u{1F661}'), // SOUTH WEST POINTING BUD
@@ -453,7 +477,7 @@ pub(super) const WINGDINGS: [(u8, char); 217] = [
 ];
 
 /// Wingdings 2 code to Unicode, sorted by code.
-pub(super) const WINGDINGS_2: [(u8, char); 214] = [
+pub(super) const WINGDINGS_2: [(u8, char); 216] = [
     (0x21, '\u{1F58A}'), // LOWER LEFT BALLPOINT PEN
     (0x22, '\u{1F58B}'), // LOWER LEFT FOUNTAIN PEN
     (0x23, '\u{1F58C}'), // LOWER LEFT PAINTBRUSH
@@ -536,6 +560,7 @@ pub(super) const WINGDINGS_2: [(u8, char); 214] = [
     (0x70, '\u{2466}'),  // CIRCLED DIGIT SEVEN
     (0x71, '\u{2467}'),  // CIRCLED DIGIT EIGHT
     (0x72, '\u{2468}'),  // CIRCLED DIGIT NINE
+    (0x73, '\u{2469}'),  // CIRCLED NUMBER TEN (name reworded)
     (0x74, '\u{24FF}'),  // NEGATIVE CIRCLED DIGIT ZERO
     (0x75, '\u{2776}'),  // DINGBAT NEGATIVE CIRCLED DIGIT ONE
     (0x76, '\u{2777}'),  // DINGBAT NEGATIVE CIRCLED DIGIT TWO
@@ -546,6 +571,7 @@ pub(super) const WINGDINGS_2: [(u8, char); 214] = [
     (0x7B, '\u{277C}'),  // DINGBAT NEGATIVE CIRCLED DIGIT SEVEN
     (0x7C, '\u{277D}'),  // DINGBAT NEGATIVE CIRCLED DIGIT EIGHT
     (0x7D, '\u{277E}'),  // DINGBAT NEGATIVE CIRCLED DIGIT NINE
+    (0x7E, '\u{277F}'),  // DINGBAT NEGATIVE CIRCLED NUMBER TEN (name reworded)
     (0x80, '\u{2609}'),  // SUN
     (0x81, '\u{1F315}'), // FULL MOON SYMBOL
     (0x82, '\u{263D}'),  // FIRST QUARTER MOON
@@ -671,7 +697,7 @@ pub(super) const WINGDINGS_2: [(u8, char); 214] = [
 ];
 
 /// Wingdings 3 code to Unicode, sorted by code.
-pub(super) const WINGDINGS_3: [(u8, char); 205] = [
+pub(super) const WINGDINGS_3: [(u8, char); 207] = [
     (0x21, '\u{2B60}'),  // LEFTWARDS TRIANGLE-HEADED ARROW
     (0x22, '\u{2B62}'),  // RIGHTWARDS TRIANGLE-HEADED ARROW
     (0x23, '\u{2B61}'),  // UPWARDS TRIANGLE-HEADED ARROW
@@ -714,6 +740,7 @@ pub(super) const WINGDINGS_3: [(u8, char); 205] = [
     (0x48, '\u{2B84}'), // LEFTWARDS TRIANGLE-HEADED PAIRED ARROWS
     (0x49, '\u{2B86}'), // RIGHTWARDS TRIANGLE-HEADED PAIRED ARROWS
     (0x4A, '\u{2B85}'), // UPWARDS TRIANGLE-HEADED PAIRED ARROWS
+    (0x4B, '\u{2B87}'), // DOWNWARDS TRIANGLE-HEADED PAIRED ARROWS (name reworded)
     (0x4C, '\u{2B8F}'), // ANTICLOCKWISE TRIANGLE-HEADED TOP U-SHAPED ARROW
     (0x4D, '\u{2B8D}'), // ANTICLOCKWISE TRIANGLE-HEADED BOTTOM U-SHAPED ARROW
     (0x4E, '\u{2B8E}'), // ANTICLOCKWISE TRIANGLE-HEADED LEFT U-SHAPED ARROW
@@ -727,6 +754,7 @@ pub(super) const WINGDINGS_3: [(u8, char); 205] = [
     (0x56, '\u{2423}'), // OPEN BOX
     (0x57, '\u{237D}'), // SHOULDERED OPEN BOX
     (0x58, '\u{21EA}'), // UPWARDS WHITE ARROW FROM BAR
+    (0x59, '\u{2BB8}'), // UPWARDS WHITE ARROW FROM BAR WITH HORIZONTAL BAR (name reworded)
     (0x5A, '\u{1F8A0}'), // LEFTWARDS BOTTOM-SHADED WHITE ARROW
     (0x5B, '\u{1F8A1}'), // RIGHTWARDS BOTTOM SHADED WHITE ARROW
     (0x5C, '\u{1F8A2}'), // LEFTWARDS TOP SHADED WHITE ARROW

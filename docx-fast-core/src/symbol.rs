@@ -8,8 +8,9 @@
 //!
 //! Five fonts are mapped: Symbol, from Adobe's table below, and Webdings,
 //! Wingdings, Wingdings 2 and Wingdings 3, from the tables in [`dingbats`].
-//! A character of any other font is kept at the code point the document
-//! stores; it is never dropped.
+//! A character of any other font, or one these tables have no entry for, is
+//! kept at the code point the document stores; it is never dropped and
+//! never replaced.
 
 mod dingbats;
 
@@ -261,12 +262,11 @@ impl SymbolFont {
         }
     }
 
-    /// Whether every printable 8-bit code of the font is a pictograph.
+    /// Whether text typed in the font is stored as plain 8-bit characters
+    /// that have to be mapped too.
     ///
-    /// True for the Webdings and Wingdings fonts: a code without an entry in
-    /// their table still displays a pictograph, never the letter with that
-    /// code, so it reads as U+FFFD. The Symbol table is complete instead: a
-    /// code without an entry is not in the font, and is left alone.
+    /// True for the Webdings and Wingdings fonts. For the Symbol font only
+    /// the Private Use Area form is mapped, as it always was.
     fn is_dingbat(self) -> bool {
         !matches!(self, Self::Symbol)
     }
@@ -290,18 +290,9 @@ impl SymbolFont {
             SYMBOL_PUA_BASE..=SYMBOL_PUA_LAST => code - SYMBOL_PUA_BASE,
             _ => code,
         };
-        let code = u8::try_from(code).ok()?;
-        match self.lookup(code) {
-            Some(mapped) => Some(mapped),
-            // Control codes and the space are not pictographs.
-            None if self.is_dingbat() && code > FONT_SPACE => Some(char::REPLACEMENT_CHARACTER),
-            None => None,
-        }
+        self.lookup(u8::try_from(code).ok()?)
     }
 }
-
-/// The space, the last 8-bit code that is not a glyph in a dingbat font.
-const FONT_SPACE: u8 = 0x20;
 
 /// The symbol fonts in effect for the three kinds of character a run holds.
 ///
@@ -471,7 +462,7 @@ mod tests {
     fn dingbat_tables_hold_no_ascii_or_private_use_characters() {
         for font in ALL_FONTS.into_iter().filter(|font| font.is_dingbat()) {
             for (code, mapped) in font.table() {
-                assert!(*code > FONT_SPACE, "{font:?} {code:#04X}");
+                assert!(*code > b' ', "{font:?} {code:#04X}");
                 assert!(!mapped.is_ascii(), "{font:?} {code:#04X}");
                 assert!(
                     !(0xE000..=0xF8FF).contains(&u32::from(*mapped)),
@@ -505,12 +496,13 @@ mod tests {
     }
 
     #[test]
-    fn dingbat_codes_without_an_entry_are_the_replacement_character() {
+    fn dingbat_codes_without_an_entry_are_not_mapped() {
         let wingdings = SymbolFont::Wingdings;
         assert_eq!(wingdings.to_unicode(0xF04A), Some('\u{263A}'));
         assert_eq!(wingdings.to_unicode(0x4A), Some('\u{263A}'));
-        assert_eq!(wingdings.to_unicode(0xFF), Some('\u{FFFD}'));
-        assert_eq!(wingdings.to_unicode(0x7F), Some('\u{FFFD}'));
+        assert_eq!(wingdings.to_unicode(0xFF), None);
+        assert_eq!(wingdings.to_unicode(0xF026), None);
+        assert_eq!(wingdings.to_unicode(0x7F), None);
         assert_eq!(wingdings.to_unicode(0x20), None);
         assert_eq!(wingdings.to_unicode(0x09), None);
         assert_eq!(wingdings.to_unicode(0x2014), None);
