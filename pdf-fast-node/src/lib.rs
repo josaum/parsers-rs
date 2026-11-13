@@ -386,20 +386,20 @@ impl PdfScanner {
         Self { path }
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn scan_json(&self) -> Result<String> {
         let doc = open_document(&self.path)?;
         serde_json::to_string(&doc).map_err(to_err)
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn semantic_runs_json(&self) -> Result<String> {
         let doc = open_document(&self.path)?;
         serde_json::to_string(&doc.semantic_text_runs()).map_err(to_err)
     }
 
     /// Page-by-page paragraphs via `pdf_fast_core::paragraph::merge_paragraphs`.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn paragraphs_json(&self) -> Result<String> {
         let doc = open_document(&self.path)?;
         let runs = doc.semantic_text_runs();
@@ -408,7 +408,7 @@ impl PdfScanner {
     }
 
     /// Whole-document semantic text runs as Arrow IPC bytes.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn semantic_runs_arrow_ipc(&self) -> Result<Buffer> {
         let doc = open_document(&self.path)?;
         let batch = doc
@@ -418,7 +418,7 @@ impl PdfScanner {
     }
 
     /// Whole-document page multimodal batch as Arrow IPC bytes.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn page_multimodal_arrow_ipc(&self) -> Result<Buffer> {
         let doc = open_document(&self.path)?;
         let batch = doc
@@ -429,7 +429,7 @@ impl PdfScanner {
 
     /// Single-page multimodal batch as Arrow IPC bytes.
     /// Node replacement for Python's `page_multimodal_c_data`.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn page_multimodal_ipc(&self, page_index: u32) -> Result<Buffer> {
         let doc = open_document(&self.path)?;
         let batch = doc
@@ -438,7 +438,7 @@ impl PdfScanner {
         Ok(record_batch_to_ipc_bytes(&batch)?.into())
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn page_bitmap_components_json(&self, page_index: u32) -> Result<String> {
         let doc = open_document(&self.path)?;
         let components = doc
@@ -451,7 +451,7 @@ impl PdfScanner {
     }
 
     /// Page table layout batch as Arrow IPC bytes. `epsilon` defaults to 2.0.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn page_table_layout_arrow_ipc(
         &self,
         page_index: u32,
@@ -466,7 +466,7 @@ impl PdfScanner {
 
     /// Page table layout (from OCR runs) as Arrow IPC bytes.
     /// `epsilon` defaults to 2.0, `dpi` to 300.0.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn page_table_layout_from_ocr_arrow_ipc(
         &self,
         page_index: u32,
@@ -488,7 +488,7 @@ impl PdfScanner {
     }
 
     /// Page table batch as Arrow IPC bytes. `epsilon` defaults to 2.0.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn page_table_arrow_ipc(&self, page_index: u32, epsilon: Option<f64>) -> Result<Buffer> {
         let doc = open_document(&self.path)?;
         let batch = doc
@@ -499,7 +499,7 @@ impl PdfScanner {
 
     /// Page table (from OCR runs) as Arrow IPC bytes.
     /// `epsilon` defaults to 2.0, `dpi` to 300.0.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn page_table_from_ocr_arrow_ipc(
         &self,
         page_index: u32,
@@ -520,14 +520,14 @@ impl PdfScanner {
         Ok(record_batch_to_ipc_bytes(&batch)?.into())
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn page_count(&self) -> Result<u32> {
         let doc = open_document(&self.path)?;
         Ok(doc.pages().len() as u32)
     }
 
     /// Per-page effective geometry (CropBox preferred, else MediaBox) as JSON.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn page_dimensions_json(&self) -> Result<String> {
         let doc = open_document(&self.path)?;
         let mut out: Vec<serde_json::Value> = Vec::new();
@@ -553,7 +553,7 @@ impl PdfScanner {
     }
 
     /// Rasterize a page to PNG bytes. `dpi` defaults to 180.0. Returns null if unavailable.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn page_rasterized_png(&self, page_index: u32, dpi: Option<f64>) -> Result<Option<Buffer>> {
         let doc = open_document(&self.path)?;
         let png_opt = doc
@@ -563,7 +563,7 @@ impl PdfScanner {
     }
 
     /// Debug helper: human-readable reading-order block dump for a page.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn debug_reading_order_blocks(&self, page_index: u32) -> Result<String> {
         let doc = open_document(&self.path)?;
         let page = doc
@@ -610,7 +610,7 @@ impl PdfScanner {
         Ok(out)
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn reading_order_blocks_json(&self, page_index: u32) -> Result<String> {
         let doc = open_document(&self.path)?;
         let page = doc
@@ -637,7 +637,7 @@ impl PdfScanner {
     }
 
     /// Assemble the full document text. `readingOrder` defaults to false.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn full_text(&self, reading_order: Option<bool>) -> Result<FullTextResult> {
         let doc = open_document(&self.path)?;
         let (text, diagnostics) = compute_full_text(&doc, reading_order.unwrap_or(false));
@@ -649,42 +649,42 @@ impl PdfScanner {
 // Standalone convenience functions mirroring the PdfScanner methods.
 // ---------------------------------------------------------------------------
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_json(path: String) -> Result<String> {
     PdfScanner::new(path).scan_json()
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_semantic_runs_json(path: String) -> Result<String> {
     PdfScanner::new(path).semantic_runs_json()
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_paragraphs_json(path: String) -> Result<String> {
     PdfScanner::new(path).paragraphs_json()
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_semantic_runs_arrow_ipc(path: String) -> Result<Buffer> {
     PdfScanner::new(path).semantic_runs_arrow_ipc()
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_page_multimodal_arrow_ipc(path: String) -> Result<Buffer> {
     PdfScanner::new(path).page_multimodal_arrow_ipc()
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_page_multimodal_ipc(path: String, page_index: u32) -> Result<Buffer> {
     PdfScanner::new(path).page_multimodal_ipc(page_index)
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_page_bitmap_components_json(path: String, page_index: u32) -> Result<String> {
     PdfScanner::new(path).page_bitmap_components_json(page_index)
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_page_table_layout_arrow_ipc(
     path: String,
     page_index: u32,
@@ -693,7 +693,7 @@ pub fn scan_pdf_page_table_layout_arrow_ipc(
     PdfScanner::new(path).page_table_layout_arrow_ipc(page_index, epsilon)
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_page_table_layout_from_ocr_arrow_ipc(
     path: String,
     page_index: u32,
@@ -709,7 +709,7 @@ pub fn scan_pdf_page_table_layout_from_ocr_arrow_ipc(
     )
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_page_table_arrow_ipc(
     path: String,
     page_index: u32,
@@ -718,7 +718,7 @@ pub fn scan_pdf_page_table_arrow_ipc(
     PdfScanner::new(path).page_table_arrow_ipc(page_index, epsilon)
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_page_table_from_ocr_arrow_ipc(
     path: String,
     page_index: u32,
@@ -729,17 +729,17 @@ pub fn scan_pdf_page_table_from_ocr_arrow_ipc(
     PdfScanner::new(path).page_table_from_ocr_arrow_ipc(page_index, ocr_runs_json, epsilon, dpi)
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_page_count(path: String) -> Result<u32> {
     PdfScanner::new(path).page_count()
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_page_dimensions_json(path: String) -> Result<String> {
     PdfScanner::new(path).page_dimensions_json()
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_page_rasterized_png(
     path: String,
     page_index: u32,
@@ -748,7 +748,7 @@ pub fn scan_pdf_page_rasterized_png(
     PdfScanner::new(path).page_rasterized_png(page_index, dpi)
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn scan_pdf_full_text(path: String, reading_order: Option<bool>) -> Result<FullTextResult> {
     PdfScanner::new(path).full_text(reading_order)
 }

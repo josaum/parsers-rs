@@ -3,7 +3,7 @@
 // as a STORE-only OOXML zip or a plain EML, so the check needs no committed
 // binary and survives a fresh checkout. Exits non-zero on the first failure.
 //
-// Usage: node scripts/smoke-node.mjs [docx|xlsx|pptx|email|geo|xsd|json ...]
+// Usage: node scripts/smoke-node.mjs [docx|xlsx|pptx|email|geo|xsd|pdf|pdf-write|xlsx-write|json ...]
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync } from 'node:fs';
@@ -51,6 +51,28 @@ const officeRelNs = 'http://schemas.openxmlformats.org/officeDocument/2006/relat
 const rels = (entries) => `<?xml version="1.0" encoding="UTF-8"?>\n<Relationships xmlns="${relsNs}">${
   entries.map(([id, type, target]) => `<Relationship Id="${id}" Type="${officeRelNs}/${type}" Target="${target}"/>`).join('')
 }</Relationships>`;
+
+function pdfFixture() {
+  const content = (text) => {
+    const body = `BT /F1 24 Tf 20 100 Td (${text}) Tj ET`;
+    return `<< /Length ${body.length} >>\nstream\n${body}\nendstream`;
+  };
+  const page = (contents) => `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents ${contents} 0 R /Resources << /Font << /F1 7 0 R >> >> >>`;
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>',
+    page(4), content('Hello PDF'), page(6), content('Second page'),
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ];
+  let out = '%PDF-1.4\n';
+  const offsets = [];
+  objects.forEach((body, i) => { offsets.push(out.length); out += `${i + 1} 0 obj\n${body}\nendobj\n`; });
+  const xref = out.length;
+  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) out += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(out, 'latin1');
+}
 
 const fixtures = {
   docx: () => zipStore([
@@ -116,6 +138,12 @@ const fixtures = {
     return buf;
   },
   xsd: () => Buffer.from(`<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="record"><xs:complexType><xs:sequence><xs:element name="name" type="xs:string"/></xs:sequence></xs:complexType></xs:element></xs:schema>`),
+  // Two pages of Helvetica text with a classic cross-reference table.
+  pdf: () => pdfFixture(),
+  'pdf-write': () => pdfFixture(),
+  'xlsx-write': () => Buffer.from(JSON.stringify({
+    sheets: [{ name: 'Summary', rows: [[{ t: 's', v: 'Hello XLSX write' }, { t: 'n', v: 42 }]] }],
+  })),
   json: () => Buffer.from('{"hello":"Hello JSON","nested":{"a":1}}\n{"hello":"JSONL","nested":{"a":2}}\n'),
 };
 
@@ -191,6 +219,47 @@ const checks = {
     mustThrow(() => m.allArrowSchemasJson(file + '.missing'), 'missing schema');
     return `${Object.keys(all).length} element(s)`;
   },
+  pdf(m, file, dir) {
+    if (m.scanPdfPageCount(file) !== 2) throw new Error('page count');
+    const full = m.scanPdfFullText(file);
+    if (!full.text.includes('Hello PDF') || !full.text.includes('Second page')) throw new Error(`text: ${full.text}`);
+    if (full.diagnostics.pages !== 2) throw new Error('diagnostics pages');
+    if (!m.scanPdfSemanticRunsJson(file).includes('Hello PDF')) throw new Error('semantic runs missing');
+    if (JSON.parse(m.scanPdfPageDimensionsJson(file)).length !== 2) throw new Error('page dimensions');
+    if (m.scanPdfSemanticRunsArrowIpc(file).length === 0) throw new Error('empty arrow ipc');
+    const scanner = new m.PdfScanner(file);
+    if (scanner.pageCount() !== 2) throw new Error('scanner page count');
+    mustThrow(() => m.scanPdfJson(file + '.missing'), 'missing pdf');
+    const bad = path.join(dir, 'bad.pdf'); writeFileSync(bad, 'not a pdf');
+    // The parser is lenient: bytes that are not a PDF read as an empty document.
+    if (m.scanPdfPageCount(bad) !== 0 || m.scanPdfFullText(bad).text !== '') throw new Error('malformed pdf is not empty');
+    mustThrow(() => m.scanPdfPageTableArrowIpc(file, 99), 'page out of range');
+    mustThrow(() => new m.PdfScanner(file).pageMultimodalIpc(99), 'page out of range through the class');
+    return `${full.diagnostics.pages} pages, ${full.text.length} chars`;
+  },
+  'pdf-write'(m, file, dir) {
+    const one = m.extractPagesToBytes(file, [2]);
+    if (one.subarray(0, 5).toString('latin1') !== '%PDF-') throw new Error('not a pdf');
+    if (!one.includes('Second page') || one.includes('Hello PDF')) throw new Error('wrong page kept');
+    const out = path.join(dir, 'subset.pdf'); m.extractPages(file, [1], out);
+    if (!readFileSync(out).includes('Hello PDF')) throw new Error('subset file missing its page');
+    if (m.extractPagesFromBytes(readFileSync(file), [1, 2]).length === 0) throw new Error('empty subset');
+    mustThrow(() => m.extractPagesToBytes(file, [99]), 'page out of range');
+    mustThrow(() => m.extractPagesFromBytes(Buffer.from('not a pdf'), [1]), 'malformed pdf');
+    return `${one.length} bytes for one page`;
+  },
+  'xlsx-write'(m, file, dir) {
+    const spec = JSON.parse(readFileSync(file, 'utf8'));
+    const bytes = m.writeXlsxBytes(spec);
+    if (bytes.subarray(0, 2).toString('latin1') !== 'PK') throw new Error('not a zip archive');
+    const out = path.join(dir, 'out.xlsx'); m.writeXlsx(JSON.stringify(spec), out);
+    if (statSync(out).size === 0) throw new Error('empty workbook');
+    const back = require(path.join(root, 'xlsx-fast-node')).parseXlsx(out);
+    if (!JSON.stringify(back.sheets[0].cells).includes('Hello XLSX write')) throw new Error('written cell not read back');
+    mustThrow(() => m.writeXlsxBytes('{not json'), 'malformed spec');
+    mustThrow(() => m.writeXlsx(spec, path.join(dir, 'no-such-dir', 'out.xlsx')), 'unwritable path');
+    return `${bytes.length} bytes`;
+  },
   json(m, file, dir) {
     const text = readFileSync(file, 'utf8');
     const firstLine = text.split('\n')[0];
@@ -204,11 +273,13 @@ const checks = {
   },
 };
 
-const ext = { docx: 'docx', xlsx: 'xlsx', pptx: 'pptx', email: 'eml', geo: 'tif', xsd: 'xsd', json: 'json' };
+const ext = { docx: 'docx', xlsx: 'xlsx', pptx: 'pptx', email: 'eml', geo: 'tif', xsd: 'xsd', pdf: 'pdf', 'pdf-write': 'pdf', 'xlsx-write': 'json', json: 'json' };
+// The writer crates are named `<format>-fast-write-node`.
+const crateOf = (name) => (name.endsWith('-write') ? `${name.slice(0, -6)}-fast-write-node` : `${name}-fast-node`);
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(checks);
 let failures = 0;
 for (const name of wanted) {
-  const crate = `${name}-fast-node`;
+  const crate = crateOf(name);
   const dir = mkdtempSync(path.join(tmpdir(), `smoke-${name}-`));
   try {
     const mod = require(path.join(root, crate));
