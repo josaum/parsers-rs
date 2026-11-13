@@ -891,6 +891,16 @@ fn applying_shared<'v>(
     Applied { passed, evaluated }
 }
 
+/// Reads a keyword whose value is a count. The specification allows any
+/// number with an integral value, so `1.0` is 1.
+fn count_keyword(obj: &Map<String, Value>, key: &str) -> Option<u64> {
+    let value = obj.get(key)?;
+    value.as_u64().or_else(|| {
+        let float = value.as_f64()?;
+        (float >= 0.0 && float.fract() == 0.0 && float < 1.8e19).then_some(float as u64)
+    })
+}
+
 /// Concat `<path>/<n>` into the buffer without allocating.
 fn push_index(path: &mut String, index: usize) {
     let mut digits = [0u8; 20];
@@ -1143,7 +1153,7 @@ fn check_string(
     findings: &mut Vec<Finding>,
 ) {
     let len = s.chars().count() as u64;
-    if let Some(min) = obj.get("minLength").and_then(|m| m.as_u64()) {
+    if let Some(min) = count_keyword(obj, "minLength") {
         if len < min {
             findings.push(Finding::error(
                 path,
@@ -1151,7 +1161,7 @@ fn check_string(
             ));
         }
     }
-    if let Some(max) = obj.get("maxLength").and_then(|m| m.as_u64()) {
+    if let Some(max) = count_keyword(obj, "maxLength") {
         if len > max {
             findings.push(Finding::error(
                 path,
@@ -1220,10 +1230,11 @@ fn check_item<'v>(
     push_index(path, index);
     let applied = applying(item, subschema, path, ctx, findings);
     path.truncate(saved);
-    if applied.passed {
-        evaluated.items.insert(index);
-        evaluated.merge(&applied.evaluated);
-    }
+    // The index is covered by this keyword whether or not the item is valid
+    // (an invalid item fails the array on its own); what the item evaluated
+    // inside itself belongs to the item, not to this array.
+    let _ = applied;
+    evaluated.items.insert(index);
 }
 
 fn check_array<'v>(
@@ -1236,7 +1247,7 @@ fn check_array<'v>(
     let mut evaluated = Evaluated::default();
     let len = arr.len() as u64;
 
-    if let Some(min) = obj.get("minItems").and_then(|m| m.as_u64()) {
+    if let Some(min) = count_keyword(obj, "minItems") {
         if len < min {
             findings.push(Finding::error(
                 path,
@@ -1244,7 +1255,7 @@ fn check_array<'v>(
             ));
         }
     }
-    if let Some(max) = obj.get("maxItems").and_then(|m| m.as_u64()) {
+    if let Some(max) = count_keyword(obj, "maxItems") {
         if len > max {
             findings.push(Finding::error(
                 path,
@@ -1414,13 +1425,12 @@ fn check_contains<'v>(
         path.truncate(saved);
         if applied.passed {
             matched.push(i);
-            evaluated.merge(&applied.evaluated);
             evaluated.items.insert(i);
         }
     }
 
-    let min_contains = obj.get("minContains").and_then(|m| m.as_u64()).unwrap_or(1);
-    let max_contains = obj.get("maxContains").and_then(|m| m.as_u64());
+    let min_contains = count_keyword(obj, "minContains").unwrap_or(1);
+    let max_contains = count_keyword(obj, "maxContains");
 
     // minContains: 0 makes `contains` itself always pass.
     let enough = min_contains == 0 || matched.len() as u64 >= min_contains;
@@ -1462,10 +1472,11 @@ fn check_prop<'v>(
     path.push_str(key);
     let applied = applying(value, subschema, path, ctx, findings);
     path.truncate(saved);
-    if applied.passed {
-        evaluated.props.insert(key);
-        evaluated.merge(&applied.evaluated);
-    }
+    // The name is covered by this keyword whether or not its value is valid
+    // (an invalid value fails the object on its own); what the value
+    // evaluated inside itself belongs to the value, not to this object.
+    let _ = applied;
+    evaluated.props.insert(key);
 }
 
 fn check_object<'v>(
@@ -1479,7 +1490,7 @@ fn check_object<'v>(
     let mut evaluated = Evaluated::default();
     let size = map.len() as u64;
 
-    if let Some(min) = obj.get("minProperties").and_then(|m| m.as_u64()) {
+    if let Some(min) = count_keyword(obj, "minProperties") {
         if size < min {
             findings.push(Finding::error(
                 path,
@@ -1487,7 +1498,7 @@ fn check_object<'v>(
             ));
         }
     }
-    if let Some(max) = obj.get("maxProperties").and_then(|m| m.as_u64()) {
+    if let Some(max) = count_keyword(obj, "maxProperties") {
         if size > max {
             findings.push(Finding::error(
                 path,
@@ -1553,10 +1564,13 @@ fn check_object<'v>(
         }
     }
 
+    let declared = obj.get("properties").and_then(|p| p.as_object());
     let unmatched = || -> Vec<&String> {
         map.keys()
             .filter(|key| {
-                !evaluated.props.contains(key.as_str())
+                // A declared property is matched whether or not its value
+                // is valid; only undeclared names are "additional".
+                !declared.is_some_and(|names| names.contains_key(key.as_str()))
                     && !patterns.iter().any(|(re, _)| re.is_match(key))
             })
             .collect()
@@ -1715,8 +1729,10 @@ fn check_combinators<'v>(
             if applied.passed {
                 passes += 1;
             }
-            // anyOf collects annotations from every branch, passing or not.
-            branch_evaluated.merge(&applied.evaluated);
+            // anyOf collects annotations from every branch that passed.
+            if applied.passed {
+                branch_evaluated.merge(&applied.evaluated);
+            }
         }
         if passes == 0 {
             findings.push(Finding::error(
@@ -2716,6 +2732,56 @@ mod tests {
         assert_eq!(deep.findings, []);
         // Three applications per list node, less one: linear, and not doubled.
         assert_eq!((shallow.steps, deep.steps), (32, 182));
+    }
+
+    #[test]
+    fn annotations_come_only_from_passing_schemas_at_the_same_level() {
+        // A failed `anyOf` branch evaluates nothing.
+        let schema = json!({"anyOf": [{"properties": {"a": true}, "required": ["zzz"]}, {"properties": {"b": true}}],
+            "unevaluatedProperties": false});
+        assert!(fails(r#"{"a":1,"b":2}"#, &schema));
+        assert!(passes(r#"{"b":2}"#, &schema));
+        // What a child evaluates inside itself says nothing about its parent.
+        let schema = json!({"properties": {"foo": {"properties": {"bar": true}}}, "unevaluatedProperties": false});
+        assert!(fails(r#"{"foo":{"bar":1},"bar":2}"#, &schema));
+        assert!(passes(r#"{"foo":{"bar":1}}"#, &schema));
+        let schema =
+            json!({"prefixItems": [{"prefixItems": [true, true]}], "unevaluatedItems": false});
+        assert!(fails("[[1,2],3]", &schema));
+        assert!(passes("[[1,2]]", &schema));
+    }
+
+    #[test]
+    fn a_failing_declared_property_is_reported_once() {
+        let leaf = json!({"type": "object", "properties": {"v": {"type": "integer"}}, "additionalProperties": false});
+        let schema = (0..25).fold(leaf, |inner, _| {
+            json!({"type": "object", "properties": {"c": inner}, "additionalProperties": false, "unevaluatedProperties": false})
+        });
+        let document = (0..25).fold(json!({"v": "x"}), |inner, _| json!({ "c": inner }));
+        let findings = validate(&document, &schema);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].path.ends_with("/c/v"));
+    }
+
+    #[test]
+    fn count_keywords_accept_integral_floats() {
+        assert!(fails("[1,2]", &json!({"maxItems": 1.0})));
+        assert!(fails("[]", &json!({"minItems": 1.0})));
+        assert!(fails(r#""ab""#, &json!({"maxLength": 1.0})));
+        assert!(fails(r#""""#, &json!({"minLength": 1.0})));
+        assert!(fails(r#"{"a":1,"b":2}"#, &json!({"maxProperties": 1.0})));
+        assert!(fails("{}", &json!({"minProperties": 1.0})));
+        assert!(fails(
+            "[1,1]",
+            &json!({"contains": {"const": 1}, "maxContains": 1.0})
+        ));
+        assert!(fails(
+            "[1]",
+            &json!({"contains": {"const": 1}, "minContains": 2.0})
+        ));
+        assert!(passes("[1,2]", &json!({"maxItems": 2.0, "minItems": 2.0})));
+        // Not a count: ignored, as before.
+        assert!(passes("[1,2]", &json!({"maxItems": 1.5})));
     }
 
     #[test]
