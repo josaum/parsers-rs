@@ -620,6 +620,8 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
     let mut slides = Vec::new();
     let mut comments = Vec::new();
     // Read once, on the first slide that has modern comments.
+    // Read once per deck: every read is charged to the inflate budget.
+    let mut legacy_authors: Option<HashMap<u32, String>> = None;
     // `Some(None)` is an author list that could not be read.
     let mut modern_authors: Option<Option<HashMap<String, String>>> = None;
     for (id, rid) in slide_ids {
@@ -655,8 +657,12 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
                     if let Some(xml) =
                         read_optional_part_bytes(&archive, &comments_path, options.max_inflate)?
                     {
-                        let authors = parse_comment_authors(&archive, options.max_inflate)?;
-                        let mut slide_comments = parse_comments(&xml, &authors)?;
+                        let authors = match legacy_authors.as_ref() {
+                            Some(authors) => authors,
+                            None => legacy_authors
+                                .insert(parse_comment_authors(&archive, options.max_inflate)?),
+                        };
+                        let mut slide_comments = parse_comments(&xml, authors)?;
                         for comment in slide_comments.iter_mut() {
                             comment.slide_id = id;
                         }
