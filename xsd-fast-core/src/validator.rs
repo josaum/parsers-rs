@@ -16,7 +16,15 @@ use quick_xml::{Reader, XmlVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::parser::SchemaSet;
-use crate::schema::{ComplexType, ContentModel, ElementRef, SchemaModel, SimpleTypeDef, XsdType};
+use crate::schema::{
+    ComplexType, ContentModel, ElementRef, Particle, SchemaModel, SimpleTypeDef, XsdType,
+};
+
+/// Deepest nesting of list item types checked.
+///
+/// XML Schema allows no list of lists, so one level is all a valid schema
+/// has; the bound only keeps a model built by hand from recursing far.
+const MAX_LIST_NESTING: usize = 8;
 
 /// Most bytes of allowed values quoted in one enumeration finding.
 ///
@@ -111,6 +119,7 @@ impl SchemaSet {
             roots: 0,
             outside_text_reported: false,
             namespaces: Vec::new(),
+            unclaimed: Vec::new(),
         };
         ctx.validate_document(xml)?;
         Ok(ctx.errors)
@@ -136,6 +145,8 @@ struct TypeFrame<'m> {
     xsd_type: Option<ResolvedType<'m>>,
     /// Counts of child element occurrences.
     child_counts: HashMap<String, usize>,
+    /// Counts of child element occurrences by local name and namespace.
+    child_namespaces: HashMap<(String, Option<String>), usize>,
     /// Whether the element is nillable and carries `xsi:nil="true"`: it then
     /// has no content to check.
     nil: bool,
@@ -162,14 +173,19 @@ struct ValidationContext<'m> {
     outside_text_reported: bool,
     /// Prefix declarations of the open elements, innermost last.
     namespaces: Vec<PrefixBinding>,
+    /// Children of the element being checked that no named particle of its
+    /// type claims, by namespace, for its wildcards.
+    unclaimed: Vec<(Option<String>, usize)>,
 }
 
 /// One `xmlns:prefix` declaration in scope.
 struct PrefixBinding {
     /// Length of the element path when the declaring element was opened.
     depth: usize,
-    /// The declared prefix.
+    /// The declared prefix; empty for the default namespace.
     prefix: Vec<u8>,
+    /// The namespace the prefix is bound to; empty for none.
+    uri: Vec<u8>,
     /// Whether it is bound to the XML Schema instance namespace.
     is_instance: bool,
 }
@@ -195,6 +211,10 @@ struct ContentIndex<'m> {
     /// Positions checked for every element whatever children it has: nested
     /// groups, and outside a choice the particles that are required.
     always: Vec<usize>,
+    /// Every child name declared here or in a nested group, typed or not.
+    declared: HashSet<&'m str>,
+    /// Positions of the direct particles that are wildcards.
+    wildcards: Vec<usize>,
 }
 
 impl<'m> ValidationContext<'m> {
@@ -229,8 +249,13 @@ impl<'m> ValidationContext<'m> {
 
                     let xsd_type = self.resolve_child_type(&local);
                     let nil = says_nil(e, &self.namespaces) && self.child_is_nillable(&local);
+                    let namespace = self.element_namespace(e.name().as_ref());
 
                     if let Some(parent) = self.type_stack.last_mut() {
+                        *parent
+                            .child_namespaces
+                            .entry((local.clone(), namespace))
+                            .or_insert(0) += 1;
                         *parent.child_counts.entry(local).or_insert(0) += 1;
                     }
 
@@ -238,6 +263,7 @@ impl<'m> ValidationContext<'m> {
                         text: String::new(),
                         xsd_type,
                         child_counts: HashMap::new(),
+                        child_namespaces: HashMap::new(),
                         nil,
                     });
                 }
@@ -255,9 +281,14 @@ impl<'m> ValidationContext<'m> {
 
                     let xsd_type = self.resolve_child_type(&local);
                     let nil = says_nil(e, &self.namespaces) && self.child_is_nillable(&local);
+                    let namespace = self.element_namespace(e.name().as_ref());
                     self.close_namespaces();
 
                     if let Some(parent) = self.type_stack.last_mut() {
+                        *parent
+                            .child_namespaces
+                            .entry((local.clone(), namespace))
+                            .or_insert(0) += 1;
                         *parent.child_counts.entry(local).or_insert(0) += 1;
                     }
 
@@ -268,6 +299,7 @@ impl<'m> ValidationContext<'m> {
                             self.check_text_for_type_val(t, "");
                         }
                         if self.opts.check_cardinality {
+                            self.unclaimed.clear();
                             self.check_cardinality_for_type(t, &HashMap::new());
                         }
                     }
@@ -319,6 +351,7 @@ impl<'m> ValidationContext<'m> {
                                 self.check_text_for_type_val(t, frame.text.trim());
                             }
                             if self.opts.check_cardinality {
+                                self.collect_unclaimed(t, &frame.child_namespaces);
                                 self.check_cardinality_for_type(t, &frame.child_counts);
                             }
                         }
@@ -362,10 +395,35 @@ impl<'m> ValidationContext<'m> {
                 self.namespaces.push(PrefixBinding {
                     depth,
                     prefix: prefix.to_vec(),
+                    uri: attribute.value.to_vec(),
                     is_instance: attribute.value.as_ref() == XSI_NAMESPACE,
+                });
+            } else if attribute.key.as_ref() == b"xmlns" {
+                // The default namespace, which unprefixed element names
+                // take; never the instance namespace's prefix.
+                self.namespaces.push(PrefixBinding {
+                    depth,
+                    prefix: Vec::new(),
+                    uri: attribute.value.to_vec(),
+                    is_instance: false,
                 });
             }
         }
+    }
+
+    /// The namespace of an element named `raw` in the scope of the open
+    /// elements; `None` for no namespace.
+    fn element_namespace(&self, raw: &[u8]) -> Option<String> {
+        let prefix = match raw.iter().position(|byte| *byte == b':') {
+            Some(at) => raw.get(..at).unwrap_or_default(),
+            None => &[],
+        };
+        let binding = self
+            .namespaces
+            .iter()
+            .rev()
+            .find(|binding| binding.prefix == prefix)?;
+        (!binding.uri.is_empty()).then(|| String::from_utf8_lossy(&binding.uri).into_owned())
     }
 
     /// Forgets the prefixes declared by the element being closed.
@@ -646,6 +704,8 @@ impl<'m> ValidationContext<'m> {
             by_name: HashMap::new(),
             groups: Vec::new(),
             always: Vec::new(),
+            declared: HashSet::new(),
+            wildcards: Vec::new(),
         };
         let (particles, is_choice): (&'m [_], bool) = match content {
             ContentModel::Sequence(p) | ContentModel::All(p) => (p, false),
@@ -689,11 +749,17 @@ impl<'m> ValidationContext<'m> {
                         }
                     }
                     index.nillable.extend(inner.nillable.iter().copied());
+                    index.declared.extend(inner.declared.iter().copied());
                     index.groups.push(position);
                     index.always.push(position);
                     continue;
                 }
+                ElementRef::Any(_) => {
+                    index.wildcards.push(position);
+                    continue;
+                }
             };
+            index.declared.insert(name);
             index.by_name.entry(name).or_default().push(position);
             if !is_choice && occurrence.min >= 1 {
                 index.always.push(position);
@@ -730,8 +796,26 @@ impl<'m> ValidationContext<'m> {
                 }
             }
         };
+        self.check_simple_value(st, text, 0);
+    }
+
+    /// Checks one value against a simple type's facets.
+    ///
+    /// The value of a list is checked as a whole against the list's own
+    /// facets, its length counted in items, and then item by item against
+    /// the item type. `depth` is the nesting of lists, which the parser bounds.
+    fn check_simple_value(&mut self, st: &'m SimpleTypeDef, text: &str, depth: usize) {
         let facets = &st.facets;
         let kind = &st.kind;
+        // A list's white space collapses: items are separated by single
+        // spaces, with none at either end, before any facet is checked.
+        let collapsed;
+        let text = if st.list_item.is_some() {
+            collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            collapsed.as_str()
+        } else {
+            text
+        };
 
         if !facets.enumerations.is_empty() && !facets.enumerations.iter().any(|e| e.value == text) {
             let allowed = enumeration_listing(facets.enumerations.iter().map(|e| e.value.as_str()));
@@ -741,7 +825,11 @@ impl<'m> ValidationContext<'m> {
             );
         }
 
-        let char_len = text.chars().count() as u32;
+        // A list's length is its number of items.
+        let char_len = match st.list_item {
+            Some(_) => text.split_whitespace().count(),
+            None => text.chars().count(),
+        } as u32;
         if let Some(min) = facets.min_length {
             if char_len < min {
                 self.push_error(
@@ -786,6 +874,14 @@ impl<'m> ValidationContext<'m> {
                     ValidationSeverity::Warning,
                     format!("expected numeric value for {:?}, got {:?}", kind, text),
                 );
+            }
+        }
+
+        if let Some(item) = st.list_item.as_deref() {
+            if depth < MAX_LIST_NESTING {
+                for value in text.split_whitespace() {
+                    self.check_simple_value(item, value, depth + 1);
+                }
             }
         }
     }
@@ -857,6 +953,8 @@ impl<'m> ValidationContext<'m> {
             let (child_name, occ) = match &particle.element {
                 ElementRef::Inline(decl) => (decl.name.local.as_str(), decl.occurrence),
                 ElementRef::Ref(qn) => (qn.local.as_str(), particle.occurrence),
+                // Wildcards are not among the positions visited.
+                ElementRef::Any(_) => continue,
                 ElementRef::Group(group) => {
                     let selected = self.group_branch_count(group, child_counts);
                     branch_total += selected;
@@ -864,7 +962,11 @@ impl<'m> ValidationContext<'m> {
                     // missing; any other group reports its own required
                     // children below.
                     let is_choice_group = matches!(**group, ContentModel::Choice(_));
-                    if is_choice_group && particle.occurrence.min >= 1 && selected == 0 {
+                    if is_choice_group
+                        && particle.occurrence.min >= 1
+                        && selected == 0
+                        && !self.choice_may_be_empty(group)
+                    {
                         self.push_error(
                             ValidationSeverity::Error,
                             "required choice group has no selected branch".to_string(),
@@ -899,8 +1001,18 @@ impl<'m> ValidationContext<'m> {
             }
         }
 
-        // For a required top-level choice, at least one branch must appear.
-        if is_choice && branch_total == 0 && !particles.is_empty() {
+        // A wildcard branch is taken by a child no named particle claims.
+        if is_choice && branch_total == 0 {
+            branch_total = self.wildcard_matches(&index, particles);
+        }
+
+        // For a required top-level choice, at least one branch must appear,
+        // unless a wildcard branch may itself be left out.
+        if is_choice
+            && branch_total == 0
+            && !particles.is_empty()
+            && !optional_wildcard(&index, particles)
+        {
             self.push_error(
                 ValidationSeverity::Error,
                 "choice requires exactly one branch, none present".to_string(),
@@ -933,7 +1045,60 @@ impl<'m> ValidationContext<'m> {
                 total = total.saturating_add(self.group_branch_count(inner, child_counts));
             }
         }
+        // Only a choice is selected by what its wildcards take: in a
+        // sequence the child may belong to another wildcard of the type.
+        if matches!(content, ContentModel::Choice(_)) {
+            total = total.saturating_add(self.wildcard_matches(&index, particles));
+        }
         total
+    }
+
+    /// Whether a choice has a wildcard branch that may be left out.
+    fn choice_may_be_empty(&mut self, content: &'m ContentModel) -> bool {
+        let ContentModel::Choice(particles) = content else {
+            return false;
+        };
+        let index = self.content_index(content);
+        optional_wildcard(&index, particles)
+    }
+
+    /// Children that the wildcards among `particles` take: those no named
+    /// particle of the element's type claims, in a namespace a wildcard
+    /// admits, counted once per wildcard admitting them.
+    fn wildcard_matches(&self, index: &ContentIndex<'m>, particles: &'m [Particle]) -> usize {
+        let mut total = 0usize;
+        for particle in index.wildcards.iter().filter_map(|at| particles.get(*at)) {
+            if let ElementRef::Any(wildcard) = &particle.element {
+                for (namespace, count) in &self.unclaimed {
+                    if wildcard.admits(namespace.as_deref()) {
+                        total = total.saturating_add(*count);
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// Records the children of an element that no named particle of its
+    /// type claims, by namespace, for [`Self::wildcard_matches`].
+    fn collect_unclaimed(
+        &mut self,
+        xsd: ResolvedType<'m>,
+        child_namespaces: &HashMap<(String, Option<String>), usize>,
+    ) {
+        self.unclaimed.clear();
+        let ResolvedType::Complex(ct) = xsd else {
+            return;
+        };
+        let index = self.content_index(&ct.content);
+        if index.wildcards.is_empty() && index.groups.is_empty() {
+            return;
+        }
+        for ((local, namespace), count) in child_namespaces {
+            if !index.declared.contains(local.as_str()) {
+                self.unclaimed.push((namespace.clone(), *count));
+            }
+        }
     }
 
     /// Records a finding unless [`ValidateOptions::max_errors`] is reached.
@@ -973,6 +1138,15 @@ impl<'m> ValidationContext<'m> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Whether one of the wildcards among `particles` may occur zero times.
+fn optional_wildcard(index: &ContentIndex<'_>, particles: &[Particle]) -> bool {
+    index
+        .wildcards
+        .iter()
+        .filter_map(|at| particles.get(*at))
+        .any(|particle| particle.occurrence.min == 0)
+}
 
 /// Whether a start tag carries `xsi:nil` with a true value.
 ///

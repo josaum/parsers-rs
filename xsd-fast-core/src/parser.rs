@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
@@ -20,7 +21,7 @@ use quick_xml::{Reader, XmlVersion};
 use crate::schema::{
     AttributeDecl, ComplexType, ContentModel, Derivation, ElementDecl, ElementRef, EnumValue,
     OccurrenceConstraint, Particle, QName, SchemaModel, SimpleFacets, SimpleTypeDef,
-    SimpleTypeKind, XsdType,
+    SimpleTypeKind, Wildcard, XsdType,
 };
 
 // ── XS namespace URIs accepted as the XML Schema namespace ──────────────────
@@ -161,6 +162,11 @@ struct Loader {
     max_schema_location_bytes: usize,
     /// Files currently being parsed, the root included.
     include_nesting: usize,
+    /// The named attribute groups, by local name, as written: references
+    /// to other groups are still placeholders.
+    attribute_groups: HashMap<String, Vec<AttributeDecl>>,
+    /// The global attribute declarations, by local name.
+    global_attributes: HashMap<String, AttributeDecl>,
 }
 
 impl Loader {
@@ -176,6 +182,8 @@ impl Loader {
             schema_bytes: 0,
             max_schema_location_bytes: options.max_schema_location_bytes,
             include_nesting: 0,
+            attribute_groups: HashMap::new(),
+            global_attributes: HashMap::new(),
         }
     }
 
@@ -373,6 +381,10 @@ impl Loader {
                 let attrs = collect_attrs(e);
                 if let Some(tns) = attrs.get("targetNamespace") {
                     self.model.target_namespace = Some(tns.clone());
+                    // Kept with the prefixes, which every parser of this
+                    // document's declarations is handed, for wildcards.
+                    file.ns_map
+                        .insert(TARGET_NAMESPACE_KEY.to_owned(), tns.clone());
                 }
                 file.in_schema = true;
             }
@@ -403,6 +415,21 @@ impl Loader {
                     self.model.simple_types.insert(n.clone(), st);
                 }
             }
+            "attribute" if file.in_schema => {
+                let attrs = collect_attrs(e);
+                let inline_type = parse_attribute_children(reader, &file.ns_map)?;
+                if let Some(attribute) = parse_attribute_decl(&attrs, inline_type, &file.ns_map) {
+                    self.global_attributes
+                        .insert(attribute.name.clone(), attribute);
+                }
+            }
+            "attributeGroup" if file.in_schema => {
+                let attrs = collect_attrs(e);
+                let attributes = parse_attribute_group(reader, &file.ns_map)?;
+                if let Some(name) = attrs.get("name") {
+                    self.attribute_groups.insert(name.clone(), attributes);
+                }
+            }
             "include" | "import" => return self.include_target(e),
             _ => {}
         }
@@ -425,6 +452,18 @@ impl Loader {
             "complexType" if file.in_schema => {
                 if let Some(name) = collect_attrs(e).remove("name") {
                     self.model.complex_types.insert(name, empty_complex_type());
+                }
+            }
+            "attributeGroup" if file.in_schema => {
+                if let Some(name) = collect_attrs(e).remove("name") {
+                    self.attribute_groups.insert(name, Vec::new());
+                }
+            }
+            "attribute" if file.in_schema => {
+                if let Some(attribute) = parse_attribute_decl(&collect_attrs(e), None, &file.ns_map)
+                {
+                    self.global_attributes
+                        .insert(attribute.name.clone(), attribute);
                 }
             }
             "simpleType" if file.in_schema => {
@@ -464,6 +503,14 @@ impl Loader {
 
     /// The loaded model, with every type reference settled.
     fn finish(mut self) -> SchemaModel {
+        let mut expansion = Expansion {
+            attribute_groups: &self.attribute_groups,
+            global_attributes: &self.global_attributes,
+            remaining: MAX_EXPANDED_NODES,
+            text_remaining: MAX_EXPANDED_TEXT_BYTES,
+            walks: 0,
+        };
+        expansion.expand_model(&mut self.model);
         settle_unprefixed_builtin_names(&mut self.model);
         self.model
     }
@@ -716,6 +763,11 @@ fn parse_complex_type_into(
                         skip_element(reader, "annotation")?;
                         depth -= 1;
                     }
+                    "attributeGroup" => {
+                        push_attribute_group_ref(&attrs, &mut complex_type.attributes);
+                        skip_element(reader, "attributeGroup")?;
+                        depth -= 1;
+                    }
                     _ => {}
                 }
             }
@@ -725,6 +777,8 @@ fn parse_complex_type_into(
                 }
                 if local == "attribute" {
                     push_attribute_decl(&attrs, None, ns_map, &mut complex_type.attributes);
+                } else if local == "attributeGroup" {
+                    push_attribute_group_ref(&attrs, &mut complex_type.attributes);
                 }
             }
             Tag::End { .. } => {
@@ -761,7 +815,7 @@ fn parse_particles(
                             Some(declared) => declared,
                             None => parse_inline_type(reader, ns_map, depth + 1)?,
                         };
-                        push_inline_particle(&attrs, type_def, &mut particles);
+                        push_inline_particle(&attrs, *type_def, &mut particles);
                     }
                 }
                 "sequence" => {
@@ -775,16 +829,22 @@ fn parse_particles(
                     let inner = parse_particles(reader, ns_map, "choice", depth + 1)?;
                     push_choice_group(&attrs, inner, &mut particles);
                 }
+                "any" => {
+                    push_wildcard(&attrs, ns_map, &mut particles);
+                    skip_element(reader, "any")?;
+                }
                 other => skip_element(reader, other)?,
             },
             Tag::Empty { local, attrs } => {
-                if local == "element" {
+                if local == "any" {
+                    push_wildcard(&attrs, ns_map, &mut particles);
+                } else if local == "element" {
                     if let Some(particle) = reference_particle(&attrs) {
                         particles.push(particle);
                     } else if attrs.contains_key("name") {
                         let type_def =
                             declared_type(&attrs, ns_map).unwrap_or_else(unbounded_string_type);
-                        push_inline_particle(&attrs, type_def, &mut particles);
+                        push_inline_particle(&attrs, *type_def, &mut particles);
                     }
                 }
             }
@@ -797,6 +857,32 @@ fn parse_particles(
         }
     }
     Ok(particles)
+}
+
+/// Key under which a schema document's target namespace is kept in its
+/// prefix map. It starts with a NUL, so no prefix read from XML is equal.
+const TARGET_NAMESPACE_KEY: &str = "\0targetNamespace";
+
+/// Appends the particle for an `<xs:any>` wildcard.
+fn push_wildcard(
+    attrs: &HashMap<String, String>,
+    ns_map: &HashMap<String, String>,
+    particles: &mut Vec<Particle>,
+) {
+    particles.push(Particle {
+        occurrence: parse_occurrence(attrs),
+        element: ElementRef::Any(Wildcard {
+            namespace: attrs
+                .get("namespace")
+                .cloned()
+                .unwrap_or_else(|| "##any".to_owned()),
+            process_contents: attrs
+                .get("processContents")
+                .cloned()
+                .unwrap_or_else(|| "strict".to_owned()),
+            target_namespace: ns_map.get(TARGET_NAMESPACE_KEY).cloned(),
+        }),
+    });
 }
 
 /// The particle for `<xs:element ref="...">`, or `None` without a `ref`.
@@ -860,59 +946,344 @@ fn is_unprefixed_builtin_name(type_ref: &str, ns_map: &HashMap<String, String>) 
 fn named_simple_kind(type_ref: &str, ns_map: &HashMap<String, String>) -> SimpleTypeKind {
     let local = split_prefix(type_ref).1;
     if is_unprefixed_builtin_name(type_ref, ns_map) {
-        SimpleTypeKind::Other(format!("{UNPREFIXED_BUILTIN_NAME}{local}"))
-    } else {
-        SimpleTypeKind::from_local(local)
+        return SimpleTypeKind::Other(format!("{UNPREFIXED_BUILTIN_NAME}{local}"));
+    }
+    match SimpleTypeKind::from_local(local) {
+        // A name outside the XML Schema namespace that is no built-in kind
+        // may be the schema set's own simple type, known once every file is
+        // loaded. `xs:ID` and the like are built-ins and stay as they are.
+        SimpleTypeKind::Other(_) if !names_xs_namespace(type_ref, ns_map) => {
+            SimpleTypeKind::Other(format!("{OWN_SIMPLE_TYPE_NAME}{local}"))
+        }
+        kind => kind,
     }
 }
 
-/// The schema set's own types that are named like built-ins.
-struct OwnTypes {
-    /// Names of the simple and complex types.
-    names: HashSet<String>,
-    /// The simple types as parsed, before any of them is settled.
-    simple: HashMap<String, SimpleTypeDef>,
+/// Whether `type_ref` is in the XML Schema namespace by its prefix, or by
+/// the default namespace when it has none.
+fn names_xs_namespace(type_ref: &str, ns_map: &HashMap<String, String>) -> bool {
+    let prefix = split_prefix(type_ref).0.unwrap_or("");
+    ns_map
+        .get(prefix)
+        .is_some_and(|uri| XS_URIS.contains(&uri.as_str()))
 }
 
-/// Longest chain of own types, each restricting the next, that is followed.
+/// Marks a simple type kind, while files are loading, as naming a simple type
+/// the schema set may declare itself.
 ///
-/// Real chains are one or two long. The bound, with the check for a name met
-/// twice, keeps a cyclic schema from being followed for ever.
-const MAX_OWN_TYPE_CHAIN: usize = 8;
+/// Like [`UNPREFIXED_BUILTIN_NAME`] it starts with a NUL, which no name read
+/// from XML can hold, and no kind keeps it once
+/// [`settle_unprefixed_builtin_names`] has run: it becomes the kind of the
+/// named type, or the name itself, as it was before simple types were
+/// followed, when the schema set declares no simple type of that name.
+const OWN_SIMPLE_TYPE_NAME: &str = "\0own-simple-type:";
 
-/// Decides a simple type whose kind is a marked built-in name.
+/// The simple type a marked kind names, and the kind it means when the schema
+/// set declares no simple type of that name; `None` for an unmarked kind.
+fn marked_reference(kind: &SimpleTypeKind) -> Option<(&str, SimpleTypeKind)> {
+    let SimpleTypeKind::Other(marked) = kind else {
+        return None;
+    };
+    if let Some(name) = marked.strip_prefix(UNPREFIXED_BUILTIN_NAME) {
+        return Some((name, SimpleTypeKind::from_local(name)));
+    }
+    marked
+        .strip_prefix(OWN_SIMPLE_TYPE_NAME)
+        .map(|name| (name, SimpleTypeKind::Other(name.to_owned())))
+}
+
+/// The schema set's own types, as the settling pass needs them.
+struct OwnTypes {
+    /// Names of the simple and complex types that are named like built-ins.
+    names: HashSet<String>,
+    /// Every simple type as parsed, before any of them is settled.
+    simple: HashMap<String, SimpleTypeDef>,
+    /// Names of every complex type.
+    complex: HashSet<String>,
+}
+
+/// Longest chain of own simple types, each restricting the next, that is
+/// followed, and deepest nesting of list items and union members settled.
 ///
-/// Where the schema set declares a simple type of that name, the type takes
-/// its kind and every facet it does not state itself, following a chain of
-/// such types. Where it does not, or the name leads back to `own_name` (the
-/// type being settled), the name is the built-in. Other types are left alone.
-fn settle_simple_type(simple: &mut SimpleTypeDef, own_name: Option<&str>, own: &OwnTypes) {
-    let SimpleTypeKind::Other(marked) = &simple.kind else {
-        return;
-    };
-    let Some(first) = marked.strip_prefix(UNPREFIXED_BUILTIN_NAME) else {
-        return;
-    };
-    let mut name = first.to_owned();
-    let mut seen: Vec<String> = own_name.map(str::to_owned).into_iter().collect();
-    for _ in 0..MAX_OWN_TYPE_CHAIN {
-        let Some(base) = own.simple.get(&name).filter(|_| !seen.contains(&name)) else {
-            break;
-        };
-        inherit_facets(&mut simple.facets, &base.facets);
-        seen.push(name);
-        match &base.kind {
-            SimpleTypeKind::Other(next) if next.starts_with(UNPREFIXED_BUILTIN_NAME) => {
-                name = next[UNPREFIXED_BUILTIN_NAME.len()..].to_owned();
+/// Real chains are a few links long. The bound, with the check for a name met
+/// twice, keeps a cyclic or hostile schema from being followed for ever, and
+/// bounds the recursion of [`SimpleKinds::named`]. What lies beyond it keeps
+/// the name it was written with, as every name did before chains were
+/// followed.
+const MAX_OWN_TYPE_CHAIN: usize = 64;
+
+/// Union members as written, and settled.
+type SettledMembers = (Arc<Vec<SimpleTypeDef>>, Arc<Vec<SimpleTypeDef>>);
+
+/// The kind each own simple type settles to, worked out once per name, and
+/// each own simple type settled, for the types that name it to share.
+struct SimpleKinds<'a> {
+    own: &'a OwnTypes,
+    /// Each named simple type settled so far: `None` while it is being
+    /// settled, so a name met again is a cycle and is not followed.
+    settled: HashMap<String, Option<Arc<SimpleTypeDef>>>,
+    /// Units [`MAX_SETTLE_COPY_UNITS`] still allows.
+    remaining: usize,
+    /// Each list item type settled so far, by the address of the item as
+    /// written, which the entry keeps alive so no other item can take it.
+    settled_items: HashMap<usize, (Arc<SimpleTypeDef>, Arc<SimpleTypeDef>)>,
+    /// Each set of union members settled so far, keyed as `settled_items`.
+    settled_members: HashMap<usize, SettledMembers>,
+    /// The settled kind of each name met so far: `None` inside the outer
+    /// option while it is being worked out, so a name met again is a cycle;
+    /// `None` inside the inner one when the name settles to no kind of its
+    /// own (see [`SimpleKinds::named`]).
+    kinds: HashMap<String, Option<Option<SimpleTypeKind>>>,
+}
+
+impl SimpleKinds<'_> {
+    /// The settled form of the own simple type `name`; `None` when there is
+    /// no such type, it is being settled (a cycle), or the chain of types
+    /// leading here is longer than [`MAX_OWN_TYPE_CHAIN`].
+    fn settled_named(&mut self, name: &str, chain: usize) -> Option<Arc<SimpleTypeDef>> {
+        if chain >= MAX_OWN_TYPE_CHAIN {
+            return None;
+        }
+        if let Some(known) = self.settled.get(name) {
+            return known.clone();
+        }
+        let own = self.own;
+        let (name, written) = own.simple.get_key_value(name)?;
+        let mut simple = written.clone();
+        self.settled.insert(name.clone(), None);
+        settle_simple_type_at(&mut simple, Some(name), self, chain, 0);
+        let simple = Arc::new(simple);
+        self.settled.insert(name.clone(), Some(Arc::clone(&simple)));
+        Some(simple)
+    }
+
+    /// Spends `units`; `false`, with nothing spent, when they are not left.
+    fn charge(&mut self, units: usize) -> bool {
+        match self.remaining.checked_sub(units) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                true
             }
-            kind => {
-                simple.kind = kind.clone();
-                return;
+            None => false,
+        }
+    }
+
+    /// The kind of a simple type as parsed: a union's shared member kind, a
+    /// string for a list, the settled kind of the type a marked kind names.
+    ///
+    /// `None` when the type names an own type that settles to no kind.
+    fn of(&mut self, simple: &SimpleTypeDef, depth: usize) -> Option<SimpleTypeKind> {
+        if !simple.union_members.is_empty() {
+            return Some(self.shared(&simple.union_members, depth));
+        }
+        if simple.list_item.is_some() {
+            return Some(SimpleTypeKind::String);
+        }
+        let Some((name, fallback)) = marked_reference(&simple.kind) else {
+            return Some(simple.kind.clone());
+        };
+        let builtin = matches!(&simple.kind, SimpleTypeKind::Other(marked)
+            if marked.starts_with(UNPREFIXED_BUILTIN_NAME));
+        match self.named(name, depth) {
+            Some(kind) => Some(kind),
+            // A built-in name the chain cannot follow is the built-in.
+            None if builtin => Some(fallback),
+            None => None,
+        }
+    }
+
+    /// The settled kind of the own simple type `name`.
+    ///
+    /// `None` when there is no such type, it leads back to itself, the chain
+    /// is longer than [`MAX_OWN_TYPE_CHAIN`], or it ends at a name that is
+    /// none of these: the type that names it then keeps the name it was
+    /// written with.
+    fn named(&mut self, name: &str, depth: usize) -> Option<SimpleTypeKind> {
+        if depth >= MAX_OWN_TYPE_CHAIN {
+            return None;
+        }
+        if let Some(known) = self.kinds.get(name) {
+            return known.clone().flatten();
+        }
+        let own = self.own;
+        let simple = own.simple.get(name)?;
+        self.kinds.insert(name.to_owned(), None);
+        let kind = self.of(simple, depth + 1);
+        self.kinds.insert(name.to_owned(), Some(kind.clone()));
+        kind
+    }
+
+    /// The kind every member has, or a string when they differ or one of
+    /// them settles to no kind.
+    fn shared(&mut self, members: &[SimpleTypeDef], depth: usize) -> SimpleTypeKind {
+        let mut shared: Option<SimpleTypeKind> = None;
+        for member in members {
+            let Some(kind) = self.of(member, depth + 1) else {
+                return SimpleTypeKind::String;
+            };
+            match &shared {
+                Some(seen) if *seen != kind => return SimpleTypeKind::String,
+                Some(_) => {}
+                None => shared = Some(kind),
+            }
+        }
+        shared.unwrap_or(SimpleTypeKind::String)
+    }
+}
+
+/// Decides a simple type whose kind names another simple type, and the
+/// items or members it is built from.
+///
+/// Where the schema set declares a simple type of the name, the type takes
+/// its kind and every facet it does not state itself, following the chain
+/// of such types; a restriction of a list or a union takes the items or the
+/// members too. Where it does not, or the name leads back to `own_name` (the
+/// type being settled), a built-in name is the built-in and any other name
+/// stays as written. A union takes the kind its members share. Other types
+/// are left alone.
+fn settle_simple_type(
+    simple: &mut SimpleTypeDef,
+    own_name: Option<&str>,
+    kinds: &mut SimpleKinds<'_>,
+) {
+    settle_simple_type_at(simple, own_name, kinds, 0, 0);
+}
+
+/// [`settle_simple_type`] for a type nested `depth` lists or unions deep.
+///
+/// Below the top level, items and members are not taken from a base: their
+/// kind is settled, and what they are built from is not copied again.
+fn settle_simple_type_at(
+    simple: &mut SimpleTypeDef,
+    own_name: Option<&str>,
+    kinds: &mut SimpleKinds<'_>,
+    chain: usize,
+    depth: usize,
+) {
+    let fallback = marked_reference(&simple.kind).map(|(_, fallback)| fallback);
+    let kind = match own_name {
+        Some(name) if fallback.is_some() => kinds.named(name, 0).or(fallback),
+        _ if fallback.is_some() || !simple.union_members.is_empty() => {
+            kinds.of(simple, 0).or(fallback)
+        }
+        _ => None,
+    };
+    let mut own_items = true;
+    let mut own_members = true;
+    let base_name = marked_reference(&simple.kind).map(|(name, _)| name.to_owned());
+    if let Some(base_name) = base_name.filter(|base| own_name != Some(base.as_str())) {
+        if let Some(base) = kinds.settled_named(&base_name, chain + 1) {
+            // The base is settled already: what it holds is shared, and
+            // copied only where the type adds facets of its own.
+            if facets_unset(&simple.facets) {
+                simple.facets = Arc::clone(&base.facets);
+            } else if !facets_unset(&base.facets)
+                && kinds.charge(inherit_cost(&simple.facets, &base.facets))
+            {
+                inherit_facets(Arc::make_mut(&mut simple.facets), &base.facets);
+            }
+            if simple.list_item.is_none() && base.list_item.is_some() {
+                simple.list_item.clone_from(&base.list_item);
+                own_items = false;
+            }
+            if simple.union_members.is_empty() && !base.union_members.is_empty() {
+                simple.union_members = Arc::clone(&base.union_members);
+                own_members = false;
             }
         }
     }
-    simple.kind = SimpleTypeKind::from_local(&name);
+    if let Some(kind) = kind {
+        simple.kind = kind;
+    }
+    if depth < MAX_SIMPLE_TYPE_NESTING {
+        if let Some(item) = simple.list_item.as_mut().filter(|_| own_items) {
+            // Copies of one attribute share one item type: it is settled
+            // once, and the copies share the result.
+            let key = Arc::as_ptr(item) as usize;
+            if let Some((_, settled)) = kinds.settled_items.get(&key) {
+                *item = Arc::clone(settled);
+            } else {
+                let written = Arc::clone(item);
+                settle_simple_type_at(Arc::make_mut(item), None, kinds, chain, depth + 1);
+                kinds.settled_items.insert(key, (written, Arc::clone(item)));
+            }
+        }
+        if own_members && !simple.union_members.is_empty() {
+            let key = Arc::as_ptr(&simple.union_members) as usize;
+            if let Some((_, settled)) = kinds.settled_members.get(&key) {
+                simple.union_members = Arc::clone(settled);
+            } else {
+                let written = Arc::clone(&simple.union_members);
+                for member in Arc::make_mut(&mut simple.union_members) {
+                    settle_simple_type_at(member, None, kinds, chain, depth + 1);
+                }
+                kinds
+                    .settled_members
+                    .insert(key, (written, Arc::clone(&simple.union_members)));
+            }
+        }
+    }
 }
+
+/// Whether no facet is stated.
+fn facets_unset(facets: &SimpleFacets) -> bool {
+    facets.is_empty()
+        && facets.min_exclusive.is_none()
+        && facets.max_exclusive.is_none()
+        && facets.total_digits.is_none()
+        && facets.fraction_digits.is_none()
+}
+
+/// Budget units [`inherit_facets`] spends copying from `base` what `facets`
+/// does not state: one per enumeration value, and one per
+/// [`COPY_TEXT_BYTES_PER_UNIT`] bytes of copied text.
+fn inherit_cost(facets: &SimpleFacets, base: &SimpleFacets) -> usize {
+    let mut values = 0usize;
+    let mut bytes = 0usize;
+    if facets.enumerations.is_empty() {
+        values = base.enumerations.len();
+        for value in &base.enumerations {
+            bytes = bytes.saturating_add(value.value.len());
+            bytes = bytes.saturating_add(value.documentation.as_ref().map_or(0, String::len));
+        }
+    }
+    for (own, base) in [
+        (&facets.pattern, &base.pattern),
+        (&facets.min_inclusive, &base.min_inclusive),
+        (&facets.max_inclusive, &base.max_inclusive),
+        (&facets.min_exclusive, &base.min_exclusive),
+        (&facets.max_exclusive, &base.max_exclusive),
+    ] {
+        if own.is_none() {
+            bytes = bytes.saturating_add(base.as_ref().map_or(0, String::len));
+        }
+    }
+    values
+        .saturating_add(1)
+        .saturating_add(bytes / COPY_TEXT_BYTES_PER_UNIT)
+}
+
+/// Bytes of copied text charged as one unit of [`MAX_SETTLE_COPY_UNITS`]
+/// and [`MAX_EXPANDED_NODES`], as inheritance folding charges text.
+const COPY_TEXT_BYTES_PER_UNIT: usize = 256;
+
+/// Most that copying facets into types that add facets of their own may
+/// spend in one schema set, in units of one enumeration value or
+/// [`COPY_TEXT_BYTES_PER_UNIT`] bytes.
+///
+/// A type that adds no facet of its own shares its base's and copies
+/// nothing. One that adds some gets a copy holding both, and a schema can
+/// ask for a copy of a large enumeration per such type. Past this bound the
+/// type keeps only the facets it states, as every type did before chains of
+/// named types were followed. The size is that of the inheritance budgets.
+const MAX_SETTLE_COPY_UNITS: usize = 1 << 18;
+
+/// Deepest nesting of list items and union members read and settled.
+///
+/// A list of a union of a list is already more than XML Schema allows; the
+/// bound keeps a hostile schema from recursing without end. A list or union
+/// nested deeper is read as a string, as every list and union was before.
+const MAX_SIMPLE_TYPE_NESTING: usize = 8;
 
 /// Fills each facet `facets` does not state from `base`.
 fn inherit_facets(facets: &mut SimpleFacets, base: &SimpleFacets) {
@@ -936,20 +1307,33 @@ fn inherit_facets(facets: &mut SimpleFacets, base: &SimpleFacets) {
 }
 
 /// Settles a complex type: its attributes and everything in its content.
-fn settle_complex_type(complex_type: &mut ComplexType, own: &OwnTypes) {
-    for attribute in &mut complex_type.attributes {
-        settle_simple_type(&mut attribute.type_def, None, own);
+fn settle_complex_type(complex_type: &mut ComplexType, kinds: &mut SimpleKinds<'_>) {
+    // `simpleContent` extending the schema set's own simple type was read as
+    // extending a complex type, which no complex type of that name can fold
+    // in; the text takes the simple type instead.
+    if let (Some(base), Derivation::Extension, ContentModel::Sequence(particles)) = (
+        &complex_type.base,
+        complex_type.derivation,
+        &complex_type.content,
+    ) {
+        if particles.is_empty()
+            && !kinds.own.complex.contains(&base.local)
+            && kinds.own.simple.contains_key(&base.local)
+        {
+            let text = SimpleTypeKind::Other(format!("{OWN_SIMPLE_TYPE_NAME}{}", base.local));
+            complex_type.content =
+                ContentModel::SimpleContent(Box::new(SimpleTypeDef::of_kind(text)));
+        }
     }
-    settle_content(&mut complex_type.content, own);
+    for attribute in &mut complex_type.attributes {
+        settle_simple_type(&mut attribute.type_def, None, kinds);
+    }
+    settle_content(&mut complex_type.content, kinds);
 }
 
 /// The built-in simple type called `local`, with no facets.
 fn builtin_type(local: &str) -> XsdType {
-    XsdType::Simple(SimpleTypeDef {
-        name: None,
-        kind: SimpleTypeKind::from_local(local),
-        facets: SimpleFacets::default(),
-    })
+    XsdType::Simple(SimpleTypeDef::of_kind(SimpleTypeKind::from_local(local)))
 }
 
 /// Marks a reference, while files are loading, as an unprefixed built-in name.
@@ -979,36 +1363,51 @@ fn settle_unprefixed_builtin_names(model: &mut SchemaModel) {
     let simple = model
         .simple_types
         .iter()
-        .filter(|(name, _)| names.contains(*name))
         .map(|(name, simple)| (name.clone(), simple.clone()))
         .collect();
-    let own = OwnTypes { names, simple };
+    let complex = model.complex_types.keys().cloned().collect();
+    let own = OwnTypes {
+        names,
+        simple,
+        complex,
+    };
+    let mut kinds = SimpleKinds {
+        own: &own,
+        settled: HashMap::new(),
+        remaining: MAX_SETTLE_COPY_UNITS,
+        settled_items: HashMap::new(),
+        settled_members: HashMap::new(),
+        kinds: HashMap::new(),
+    };
     for (name, simple) in &mut model.simple_types {
-        settle_simple_type(simple, Some(name), &own);
+        match kinds.settled_named(name, 0) {
+            Some(settled) => *simple = SimpleTypeDef::clone(&settled),
+            None => settle_simple_type(simple, Some(name), &mut kinds),
+        }
     }
     for element in model.global_elements.values_mut() {
-        settle_type(&mut element.type_def, &own);
+        settle_type(&mut element.type_def, &mut kinds);
     }
     for complex_type in model.complex_types.values_mut() {
-        settle_complex_type(complex_type, &own);
+        settle_complex_type(complex_type, &mut kinds);
     }
 }
 
 /// Settles one declared type, and the types declared inside it.
 ///
 /// The recursion follows the nesting of the model, which the parser bounds.
-fn settle_type(declared: &mut XsdType, own: &OwnTypes) {
+fn settle_type(declared: &mut XsdType, kinds: &mut SimpleKinds<'_>) {
     let builtin = match declared {
         XsdType::Ref(name) if name.namespace.as_deref() == Some(UNPREFIXED_BUILTIN_NAME) => {
             name.namespace = None;
-            (!own.names.contains(&name.local)).then(|| builtin_type(&name.local))
+            (!kinds.own.names.contains(&name.local)).then(|| builtin_type(&name.local))
         }
         XsdType::Complex(complex_type) => {
-            settle_complex_type(complex_type, own);
+            settle_complex_type(complex_type, kinds);
             None
         }
         XsdType::Simple(simple) => {
-            settle_simple_type(simple, None, own);
+            settle_simple_type(simple, None, kinds);
             None
         }
         XsdType::Ref(_) => None,
@@ -1019,9 +1418,9 @@ fn settle_type(declared: &mut XsdType, own: &OwnTypes) {
 }
 
 /// Settles the types of the elements declared in one content model.
-fn settle_content(content: &mut ContentModel, own: &OwnTypes) {
+fn settle_content(content: &mut ContentModel, kinds: &mut SimpleKinds<'_>) {
     if let ContentModel::SimpleContent(simple) = content {
-        settle_simple_type(simple, None, own);
+        settle_simple_type(simple, None, kinds);
         return;
     }
     let (ContentModel::Sequence(particles)
@@ -1032,9 +1431,9 @@ fn settle_content(content: &mut ContentModel, own: &OwnTypes) {
     };
     for particle in particles {
         match &mut particle.element {
-            ElementRef::Inline(element) => settle_type(&mut element.type_def, own),
-            ElementRef::Group(group) => settle_content(group, own),
-            ElementRef::Ref(_) => {}
+            ElementRef::Inline(element) => settle_type(&mut element.type_def, kinds),
+            ElementRef::Group(group) => settle_content(group, kinds),
+            ElementRef::Ref(_) | ElementRef::Any(_) => {}
         }
     }
 }
@@ -1042,7 +1441,7 @@ fn settle_content(content: &mut ContentModel, own: &OwnTypes) {
 /// Appends the particle for a named `<xs:element>` whose type is `type_def`.
 fn push_inline_particle(
     attrs: &HashMap<String, String>,
-    type_def: Box<XsdType>,
+    type_def: XsdType,
     particles: &mut Vec<Particle>,
 ) {
     let Some(name) = attrs.get("name") else {
@@ -1053,7 +1452,7 @@ fn push_inline_particle(
         occurrence,
         element: ElementRef::Inline(Box::new(ElementDecl {
             name: QName::local(name.as_str()),
-            type_def: *type_def,
+            type_def,
             occurrence,
             nillable: attrs.get("nillable").is_some_and(|v| v == "true"),
             documentation: None,
@@ -1107,6 +1506,17 @@ fn push_attribute_decl(
 ) {
     if let Some(attr_decl) = parse_attribute_decl(attrs, inline_type, ns_map) {
         attributes.push(attr_decl);
+    } else if let Some(reference) = attrs.get("ref") {
+        // The global declaration is known once every file is loaded; the
+        // reference keeps what it states itself: `use`, `default`, `fixed`.
+        attributes.push(AttributeDecl {
+            name: format!("{ATTRIBUTE_REF}{}", split_prefix(reference).1),
+            type_def: SimpleTypeDef::string_unbounded(),
+            required: attrs.get("use").is_some_and(|u| u == "required"),
+            default: attrs.get("default").cloned(),
+            fixed: attrs.get("fixed").cloned(),
+            referenced: true,
+        });
     }
 }
 
@@ -1292,11 +1702,17 @@ fn parse_derivation_children(
                         push_attribute_decl(&attrs, inline_type, ns_map, attributes);
                     }
                 }
+                "attributeGroup" => {
+                    push_attribute_group_ref(&attrs, attributes);
+                    skip_element(reader, "attributeGroup")?;
+                }
                 other => skip_element(reader, other)?,
             },
             Tag::Empty { local, attrs } => {
                 if local == "attribute" && !push_prohibited(&attrs, prohibited.as_deref_mut()) {
                     push_attribute_decl(&attrs, None, ns_map, attributes);
+                } else if local == "attributeGroup" {
+                    push_attribute_group_ref(&attrs, attributes);
                 }
             }
             // Every nested element is read to its end above, so the first
@@ -1325,6 +1741,8 @@ fn push_prohibited(attrs: &HashMap<String, String>, prohibited: Option<&mut Vec<
     }
     if let Some(name) = attrs.get("name") {
         prohibited.push(name.clone());
+    } else if let Some(reference) = attrs.get("ref") {
+        prohibited.push(split_prefix(reference).1.to_owned());
     }
     true
 }
@@ -1365,11 +1783,9 @@ fn simple_extension_content(
     if !is_xs_primitive(base, ns_map) {
         return None;
     }
-    Some(ContentModel::SimpleContent(Box::new(SimpleTypeDef {
-        name: None,
-        kind: named_simple_kind(base, ns_map),
-        facets: SimpleFacets::default(),
-    })))
+    Some(ContentModel::SimpleContent(Box::new(
+        SimpleTypeDef::of_kind(named_simple_kind(base, ns_map)),
+    )))
 }
 
 // ── Simple type parser ───────────────────────────────────────────────────────
@@ -1378,6 +1794,21 @@ fn parse_simple_type(
     reader: &mut Reader<&[u8]>,
     ns_map: &HashMap<String, String>,
 ) -> Result<SimpleTypeDef> {
+    parse_simple_type_at(reader, ns_map, 0)
+}
+
+/// Parses the children of an `<xs:simpleType>` nested `depth` lists or
+/// unions deep, up to and including its end tag.
+///
+/// A restriction gives the kind and the facets. A list gives the type of its
+/// items and a union its members, named by `itemType` / `memberTypes` or
+/// written inline; past [`MAX_SIMPLE_TYPE_NESTING`] an inline one is skipped.
+fn parse_simple_type_at(
+    reader: &mut Reader<&[u8]>,
+    ns_map: &HashMap<String, String>,
+    depth: usize,
+) -> Result<SimpleTypeDef> {
+    let mut simple = SimpleTypeDef::string_unbounded();
     let mut kind = SimpleTypeKind::String;
     let mut facets = SimpleFacets::default();
     let mut buf = Vec::with_capacity(256);
@@ -1399,7 +1830,10 @@ fn parse_simple_type(
                         parse_facets(reader, &mut facets)?;
                     }
                     "list" | "union" => {
-                        skip_element(reader, local)?;
+                        let local = local.to_owned();
+                        let named = named_parts(&attrs, &local, ns_map);
+                        let inline = parse_simple_type_parts(reader, ns_map, &local, depth)?;
+                        set_parts(&mut simple, &local, named.into_iter().chain(inline));
                     }
                     "annotation" => {
                         skip_element(reader, "annotation")?;
@@ -1421,6 +1855,9 @@ fn parse_simple_type(
                     if let Some(base) = attrs.get("base") {
                         kind = named_simple_kind(base, ns_map);
                     }
+                } else if local == "list" || local == "union" {
+                    let named = named_parts(&collect_attrs(e), local, ns_map);
+                    set_parts(&mut simple, local, named);
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -1440,11 +1877,83 @@ fn parse_simple_type(
         buf.clear();
     }
 
-    Ok(SimpleTypeDef {
-        name: None,
-        kind,
-        facets,
-    })
+    simple.kind = kind;
+    simple.facets = Arc::new(facets);
+    Ok(simple)
+}
+
+/// The item type `itemType` names on a list, or the member types
+/// `memberTypes` names on a union.
+fn named_parts(
+    attrs: &HashMap<String, String>,
+    local: &str,
+    ns_map: &HashMap<String, String>,
+) -> Vec<SimpleTypeDef> {
+    let attribute = if local == "list" {
+        "itemType"
+    } else {
+        "memberTypes"
+    };
+    attrs
+        .get(attribute)
+        .map(|names| {
+            names
+                .split_whitespace()
+                .map(|name| SimpleTypeDef::of_kind(named_simple_kind(name, ns_map)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reads the inline simple types of an `<xs:list>` or `<xs:union>` up to and
+/// including its end tag.
+fn parse_simple_type_parts(
+    reader: &mut Reader<&[u8]>,
+    ns_map: &HashMap<String, String>,
+    end_tag: &str,
+    depth: usize,
+) -> Result<Vec<SimpleTypeDef>> {
+    let mut parts = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        match next_tag(reader, &mut buf, "simpleType")? {
+            Tag::Start { local, .. }
+                if local == "simpleType" && depth < MAX_SIMPLE_TYPE_NESTING =>
+            {
+                parts.push(parse_simple_type_at(reader, ns_map, depth + 1)?);
+            }
+            Tag::Start { local, .. } => skip_element(reader, &local)?,
+            Tag::Empty { local, .. } => {
+                if local == "simpleType" {
+                    parts.push(SimpleTypeDef::string_unbounded());
+                }
+            }
+            Tag::End { local } => {
+                if local == end_tag {
+                    break;
+                }
+            }
+            Tag::Eof => break,
+        }
+    }
+    Ok(parts)
+}
+
+/// Makes `simple` the list or union `local` names, built from `parts`.
+///
+/// A list takes its first part as the item type; a union takes every part,
+/// in order. A list or union with no parts stays a string.
+fn set_parts(
+    simple: &mut SimpleTypeDef,
+    local: &str,
+    parts: impl IntoIterator<Item = SimpleTypeDef>,
+) {
+    let mut parts = parts.into_iter();
+    if local == "list" {
+        simple.list_item = parts.next().map(Arc::new);
+    } else {
+        simple.union_members = Arc::new(parts.collect());
+    }
 }
 
 fn parse_facets(reader: &mut Reader<&[u8]>, facets: &mut SimpleFacets) -> Result<()> {
@@ -1499,6 +2008,327 @@ fn parse_facets(reader: &mut Reader<&[u8]>, facets: &mut SimpleFacets) -> Result
 
 // ── Attribute declaration parser ─────────────────────────────────────────────
 
+/// Marks an attribute, while files are loading, as a reference to the named
+/// attribute group that follows it.
+///
+/// It starts with a NUL, which no attribute name read from XML can hold, and
+/// no attribute keeps it once [`Expansion::expand_model`] has run: it is
+/// replaced by the group's attributes, or removed.
+const ATTRIBUTE_GROUP_REF: &str = "\0attribute-group:";
+
+/// Appends a placeholder for `<xs:attributeGroup ref="...">`, if it has a `ref`.
+fn push_attribute_group_ref(attrs: &HashMap<String, String>, attributes: &mut Vec<AttributeDecl>) {
+    let Some(reference) = attrs.get("ref") else {
+        return;
+    };
+    attributes.push(AttributeDecl {
+        name: format!("{ATTRIBUTE_GROUP_REF}{}", split_prefix(reference).1),
+        type_def: SimpleTypeDef::string_unbounded(),
+        required: false,
+        default: None,
+        fixed: None,
+        referenced: true,
+    });
+}
+
+/// The attribute group an attribute placeholder names, if it is one.
+fn attribute_group_ref(attribute: &AttributeDecl) -> Option<&str> {
+    attribute.name.strip_prefix(ATTRIBUTE_GROUP_REF)
+}
+
+/// Marks an attribute, while files are loading, as a reference to the global
+/// attribute that follows it; settled like [`ATTRIBUTE_GROUP_REF`].
+const ATTRIBUTE_REF: &str = "\0attribute-ref:";
+
+/// The global attribute an attribute placeholder names, if it is one.
+fn attribute_ref(attribute: &AttributeDecl) -> Option<&str> {
+    attribute.name.strip_prefix(ATTRIBUTE_REF)
+}
+
+/// Whether an attribute is a placeholder for a reference of either kind.
+fn is_attribute_placeholder(attribute: &AttributeDecl) -> bool {
+    attribute_group_ref(attribute).is_some() || attribute_ref(attribute).is_some()
+}
+
+/// Reads the children of a named `<xs:attributeGroup>` up to and including
+/// its end tag: its attributes, and placeholders for the groups it names.
+///
+/// Wildcards and annotations are skipped.
+fn parse_attribute_group(
+    reader: &mut Reader<&[u8]>,
+    ns_map: &HashMap<String, String>,
+) -> Result<Vec<AttributeDecl>> {
+    let mut attributes = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        match next_tag(reader, &mut buf, "attributeGroup")? {
+            Tag::Start { local, attrs } => match local.as_str() {
+                "attribute" => {
+                    let inline_type = parse_attribute_children(reader, ns_map)?;
+                    push_attribute_decl(&attrs, inline_type, ns_map, &mut attributes);
+                }
+                "attributeGroup" => {
+                    push_attribute_group_ref(&attrs, &mut attributes);
+                    skip_element(reader, "attributeGroup")?;
+                }
+                other => skip_element(reader, other)?,
+            },
+            Tag::Empty { local, attrs } => {
+                if local == "attribute" {
+                    push_attribute_decl(&attrs, None, ns_map, &mut attributes);
+                } else if local == "attributeGroup" {
+                    push_attribute_group_ref(&attrs, &mut attributes);
+                }
+            }
+            // Every nested element is read to its end above, so the first
+            // end tag met here closes the group itself.
+            Tag::End { .. } | Tag::Eof => break,
+        }
+    }
+    Ok(attributes)
+}
+
+/// Most attributes and particles that expanding group references may copy
+/// in one schema set.
+///
+/// Every reference receives its own copy of the group, and a group can
+/// name other groups, so a small schema can ask for many copies. The bound
+/// is the size of each of the inheritance budgets
+/// ([`crate::schema::SchemaModel::resolve_inheritance`]), so a fully used
+/// expansion holds about as much as one of them. Past it, the references
+/// not yet expanded add nothing, without an error: the type keeps what it
+/// declares itself, as every type did before groups were expanded.
+const MAX_EXPANDED_NODES: usize = 1 << 18;
+
+/// Deepest chain of attribute groups, each naming the next, that is
+/// followed. A group met again on the chain adds nothing more.
+const MAX_ATTRIBUTE_GROUP_NESTING: usize = 32;
+
+/// The state of expanding the attribute group references of one type.
+struct GroupWalk<'a, 'w> {
+    /// The groups being walked, outermost first.
+    chain: &'w mut Vec<&'a str>,
+    /// The groups walked so far for this type.
+    visited: &'w mut HashSet<&'a str>,
+    /// The attribute names the type has so far.
+    seen: &'w mut HashSet<String>,
+}
+
+/// What copying one attribute costs [`Expansion`]: a unit, and a unit per
+/// [`COPY_TEXT_BYTES_PER_UNIT`] bytes of the text it owns; and those bytes.
+/// Its facets are shared with the original, not copied.
+fn attribute_copy_cost(attribute: &AttributeDecl) -> (usize, usize) {
+    let mut bytes = attribute.name.len();
+    for text in [&attribute.default, &attribute.fixed] {
+        bytes = bytes.saturating_add(text.as_ref().map_or(0, String::len));
+    }
+    (
+        1usize.saturating_add(bytes / COPY_TEXT_BYTES_PER_UNIT),
+        bytes,
+    )
+}
+
+/// Most bytes of attribute names, defaults and fixed values that expanding
+/// attribute references and attribute groups may copy in one schema set.
+///
+/// Every reference copies its attribute's text, so a long default or fixed
+/// value referenced by many types is copied once per type. Real attributes
+/// hold a few dozen bytes; 16 MiB is several hundred thousand of them. Past
+/// it, an attribute whose text does not fit is left out, without an error.
+const MAX_EXPANDED_TEXT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Replaces group references with what the groups hold.
+struct Expansion<'a> {
+    /// Named attribute groups, as written.
+    attribute_groups: &'a HashMap<String, Vec<AttributeDecl>>,
+    /// Global attribute declarations.
+    global_attributes: &'a HashMap<String, AttributeDecl>,
+    /// Attributes and particles that may still be copied.
+    remaining: usize,
+    /// Bytes of attribute text that may still be copied; see
+    /// [`MAX_EXPANDED_TEXT_BYTES`].
+    text_remaining: usize,
+    /// Attribute groups walked so far, for tests to bound the work.
+    walks: usize,
+}
+
+impl<'a> Expansion<'a> {
+    /// Expands every group reference in the model.
+    fn expand_model(&mut self, model: &mut SchemaModel) {
+        for complex_type in model.complex_types.values_mut() {
+            self.expand_complex_type(complex_type);
+        }
+        for element in model.global_elements.values_mut() {
+            if let XsdType::Complex(complex_type) = &mut element.type_def {
+                self.expand_complex_type(complex_type);
+            }
+        }
+    }
+
+    /// Expands the references in one complex type and in the inline types
+    /// it holds. The recursion follows the nesting of the model, which the
+    /// parser bounds.
+    fn expand_complex_type(&mut self, complex_type: &mut ComplexType) {
+        if complex_type.attributes.iter().any(is_attribute_placeholder) {
+            let attributes = std::mem::take(&mut complex_type.attributes);
+            complex_type.attributes = self.expand_attributes(attributes);
+        }
+        self.expand_content(&mut complex_type.content);
+    }
+
+    /// Expands the inline types of the elements in one content model.
+    fn expand_content(&mut self, content: &mut ContentModel) {
+        let (ContentModel::Sequence(particles)
+        | ContentModel::All(particles)
+        | ContentModel::Choice(particles)) = content
+        else {
+            return;
+        };
+        for particle in particles {
+            match &mut particle.element {
+                ElementRef::Inline(element) => {
+                    if let XsdType::Complex(complex_type) = &mut element.type_def {
+                        self.expand_complex_type(complex_type);
+                    }
+                }
+                ElementRef::Group(group) => self.expand_content(group),
+                ElementRef::Ref(_) | ElementRef::Any(_) => {}
+            }
+        }
+    }
+
+    /// Charges copying `attribute`; `false`, with nothing charged, when the
+    /// budget cannot pay for it. Running out of units ends the expansion;
+    /// an attribute whose text does not fit is left out alone.
+    fn charge_copy(&mut self, attribute: &AttributeDecl) -> bool {
+        let (units, bytes) = attribute_copy_cost(attribute);
+        let Some(text_remaining) = self.text_remaining.checked_sub(bytes) else {
+            return false;
+        };
+        let Some(remaining) = self.remaining.checked_sub(units) else {
+            self.remaining = 0;
+            return false;
+        };
+        self.remaining = remaining;
+        self.text_remaining = text_remaining;
+        true
+    }
+
+    /// Appends the global attribute a reference names, with the `use`,
+    /// `default` and `fixed` the reference states, unless `seen` holds its
+    /// name, the attribute is not declared, or the budget is spent.
+    fn append_referenced(
+        &mut self,
+        reference: &AttributeDecl,
+        seen: &mut HashSet<String>,
+        expanded: &mut Vec<AttributeDecl>,
+    ) {
+        let Some(name) = attribute_ref(reference) else {
+            return;
+        };
+        let Some(global) = self.global_attributes.get(name) else {
+            return;
+        };
+        if seen.contains(&global.name) {
+            return;
+        }
+        if !self.charge_copy(global) {
+            return;
+        }
+        seen.insert(global.name.clone());
+        let mut attribute = global.clone();
+        attribute.referenced = true;
+        attribute.required = reference.required;
+        if reference.default.is_some() {
+            attribute.default.clone_from(&reference.default);
+        }
+        if reference.fixed.is_some() {
+            attribute.fixed.clone_from(&reference.fixed);
+        }
+        expanded.push(attribute);
+    }
+
+    /// `attributes` with each group reference replaced by the group's
+    /// attributes, nested groups included.
+    ///
+    /// An attribute whose name the list already has, written in the type
+    /// itself or brought in by an earlier group, is not added again.
+    fn expand_attributes(&mut self, attributes: Vec<AttributeDecl>) -> Vec<AttributeDecl> {
+        let mut seen: HashSet<String> = attributes
+            .iter()
+            .filter(|attribute| !is_attribute_placeholder(attribute))
+            .map(|attribute| attribute.name.clone())
+            .collect();
+        let mut expanded = Vec::with_capacity(attributes.len());
+        let mut chain = Vec::new();
+        let mut visited = HashSet::new();
+        for attribute in attributes {
+            if let Some(group) = attribute_group_ref(&attribute) {
+                let mut walk = GroupWalk {
+                    chain: &mut chain,
+                    visited: &mut visited,
+                    seen: &mut seen,
+                };
+                self.append_attribute_group(group, &mut walk, &mut expanded);
+            } else if attribute_ref(&attribute).is_some() {
+                self.append_referenced(&attribute, &mut seen, &mut expanded);
+            } else {
+                expanded.push(attribute);
+            }
+        }
+        expanded
+    }
+
+    /// Appends the attributes of the group `name` that `walk.seen` does not
+    /// hold.
+    ///
+    /// Each group is walked at most once per type: a group met again, on
+    /// its own chain or through another group, has nothing left to add.
+    /// Every walk is charged one unit and every attribute copied its
+    /// [`attribute_copy_cost`], so the work is bounded by the budget.
+    fn append_attribute_group(
+        &mut self,
+        name: &str,
+        walk: &mut GroupWalk<'a, '_>,
+        expanded: &mut Vec<AttributeDecl>,
+    ) {
+        if walk.chain.len() >= MAX_ATTRIBUTE_GROUP_NESTING || self.remaining == 0 {
+            return;
+        }
+        let groups = self.attribute_groups;
+        let Some((name, attributes)) = groups.get_key_value(name) else {
+            return;
+        };
+        if !walk.visited.insert(name.as_str()) {
+            return;
+        }
+        self.remaining -= 1;
+        self.walks += 1;
+        walk.chain.push(name.as_str());
+        for attribute in attributes {
+            match attribute_group_ref(attribute) {
+                Some(inner) => self.append_attribute_group(inner, walk, expanded),
+                None if attribute_ref(attribute).is_some() => {
+                    self.append_referenced(attribute, walk.seen, expanded);
+                }
+                None => {
+                    if walk.seen.contains(&attribute.name) {
+                        continue;
+                    }
+                    if !self.charge_copy(attribute) {
+                        continue;
+                    }
+                    walk.seen.insert(attribute.name.clone());
+                    let mut attribute = attribute.clone();
+                    attribute.referenced = true;
+                    expanded.push(attribute);
+                }
+            }
+        }
+        walk.chain.pop();
+    }
+}
+
 /// The declaration an `<xs:attribute>` makes, or `None` without a `name`.
 ///
 /// A `type` attribute decides the type; without one the inline simple type
@@ -1513,11 +2343,7 @@ fn parse_attribute_decl(
     let default = attrs.get("default").cloned();
     let fixed = attrs.get("fixed").cloned();
     let type_def = if let Some(type_attr) = attrs.get("type") {
-        SimpleTypeDef {
-            name: None,
-            kind: named_simple_kind(type_attr, ns_map),
-            facets: SimpleFacets::default(),
-        }
+        SimpleTypeDef::of_kind(named_simple_kind(type_attr, ns_map))
     } else {
         inline_type.unwrap_or_else(SimpleTypeDef::string_unbounded)
     };
@@ -1527,6 +2353,7 @@ fn parse_attribute_decl(
         required,
         default,
         fixed,
+        referenced: false,
     })
 }
 
@@ -1667,4 +2494,56 @@ fn skip_element(reader: &mut Reader<&[u8]>, tag: &str) -> Result<()> {
         buf.clear();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Attribute groups walked to expand a chain of `depth` groups, each
+    /// naming the next `fan_out` times, referenced from one type.
+    fn walks_for_fan_out(depth: usize, fan_out: usize) -> usize {
+        let mut schema = String::from(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:t="urn:t" targetNamespace="urn:t">"#,
+        );
+        for level in 0..depth {
+            schema.push_str(&format!(r#"<xs:attributeGroup name="g{level}">"#));
+            for _ in 0..fan_out {
+                schema.push_str(&format!(r#"<xs:attributeGroup ref="t:g{}"/>"#, level + 1));
+            }
+            schema.push_str(&format!(
+                r#"<xs:attribute name="a{level}"/></xs:attributeGroup>"#
+            ));
+        }
+        schema.push_str(&format!(r#"<xs:attributeGroup name="g{depth}"/>"#));
+        schema.push_str(
+            r#"<xs:complexType name="T"><xs:attributeGroup ref="t:g0"/></xs:complexType></xs:schema>"#,
+        );
+        let options = ParseOptions::default();
+        let mut loader = Loader::new(None, &options);
+        loader
+            .parse_bytes(schema.as_bytes())
+            .expect("schema parses");
+        let mut expansion = Expansion {
+            attribute_groups: &loader.attribute_groups,
+            global_attributes: &loader.global_attributes,
+            remaining: MAX_EXPANDED_NODES,
+            text_remaining: MAX_EXPANDED_TEXT_BYTES,
+            walks: 0,
+        };
+        let mut model = std::mem::take(&mut loader.model);
+        expansion.expand_model(&mut model);
+        // Only the first 32 groups of the chain are followed.
+        let expected = depth.min(MAX_ATTRIBUTE_GROUP_NESTING);
+        assert_eq!(model.complex_types["T"].attributes.len(), expected);
+        expansion.walks
+    }
+
+    #[test]
+    fn each_attribute_group_is_walked_once_per_type() {
+        for fan_out in [2, 3] {
+            let walks = walks_for_fan_out(31, fan_out);
+            assert!(walks <= 32, "fan-out {fan_out}: {walks} walks");
+        }
+    }
 }

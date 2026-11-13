@@ -3,6 +3,8 @@
 //! This module defines the in-memory representation of a parsed XSD schema.
 //! Only the subset needed for Arrow derivation and simple-type validation is modelled.
 
+use std::sync::Arc;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -222,23 +224,64 @@ pub enum XsdType {
 }
 
 /// A named simple type with its primitive kind and facets.
+///
+/// Non-exhaustive: later versions may add fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SimpleTypeDef {
     /// Optional qualified name for named simple types.
     pub name: Option<QName>,
     /// Primitive base kind (after chasing the restriction chain).
+    ///
+    /// [`SimpleTypeKind::String`] for a list. For a union, the kind every
+    /// member has, or [`SimpleTypeKind::String`] when the members differ.
     pub kind: SimpleTypeKind,
     /// Supported restriction facets.
-    pub facets: SimpleFacets,
+    ///
+    /// On a list, `min_length` and `max_length` count items, as XML Schema
+    /// measures the length of a list.
+    ///
+    /// Shared, not copied, between a named type and the types that restrict
+    /// it without adding facets of their own. Serialized as the facets
+    /// themselves.
+    pub facets: Arc<SimpleFacets>,
+    /// The type of each item when this is an `xs:list`, or a restriction of
+    /// one.
+    ///
+    /// `None` for every other type, and for a model serialized before the
+    /// field existed. Left out of the serialized form when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_item: Option<Arc<SimpleTypeDef>>,
+    /// The member types when this is an `xs:union`, or a restriction of one,
+    /// in the order they are written: `memberTypes` first, then the inline
+    /// members.
+    ///
+    /// Empty for every other type, and for a model serialized before the
+    /// field existed. Left out of the serialized form when empty.
+    #[serde(default, skip_serializing_if = "no_members")]
+    pub union_members: Arc<Vec<SimpleTypeDef>>,
+}
+
+/// Whether a union has no members; decides when
+/// [`SimpleTypeDef::union_members`] is left out of the serialized form.
+fn no_members(members: &Arc<Vec<SimpleTypeDef>>) -> bool {
+    members.is_empty()
 }
 
 impl SimpleTypeDef {
-    pub(crate) fn string_unbounded() -> Self {
+    /// A simple type of `kind` with no name, facets, items or members.
+    pub(crate) fn of_kind(kind: SimpleTypeKind) -> Self {
         Self {
             name: None,
-            kind: SimpleTypeKind::String,
-            facets: SimpleFacets::default(),
+            kind,
+            facets: Arc::default(),
+            list_item: None,
+            union_members: Arc::default(),
         }
+    }
+
+    pub(crate) fn string_unbounded() -> Self {
+        Self::of_kind(SimpleTypeKind::String)
     }
 }
 
@@ -318,10 +361,10 @@ pub struct ComplexType {
     /// `<xs:complexType/>`, or the open-and-closed form of that.
     ///
     /// This is not the same as having no particles and no attributes. The
-    /// parser leaves out what it does not model (attribute references,
-    /// attribute groups, group references, wildcards, a derivation from a
-    /// base it cannot find), so a type built only from those has neither
-    /// and is not empty. `false` for a model that was deserialized without
+    /// parser leaves out what it does not model (references to named model
+    /// groups, an attribute reference or attribute group that names nothing
+    /// declared, an attribute wildcard, a derivation from a base it cannot
+    /// find), so a type built only from those has neither and is not empty. `false` for a model that was deserialized without
     /// this field or built by a caller that does not set it.
     #[serde(default)]
     pub empty_in_source: bool,
@@ -370,7 +413,11 @@ pub struct Particle {
 }
 
 /// A reference or inline declaration of an element inside a content model.
+///
+/// Non-exhaustive: match it with a wildcard arm, as later versions may add
+/// kinds of particle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ElementRef {
     /// Inline element declaration nested inside a complex type.
     Inline(Box<ElementDecl>),
@@ -382,6 +429,45 @@ pub enum ElementRef {
     /// flattening its branches into the parent sequence. The particle's own
     /// [`OccurrenceConstraint`] applies to the whole group.
     Group(Box<ContentModel>),
+    /// An `xs:any` wildcard: any element of a namespace it admits.
+    ///
+    /// It derives no Arrow column. Validation takes it as satisfied by a
+    /// child that no named particle of the type claims.
+    Any(Wildcard),
+}
+
+/// An `xs:any` element wildcard.
+///
+/// Non-exhaustive: later versions may add fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Wildcard {
+    /// The `namespace` attribute as written: `##any` (the default),
+    /// `##other`, or a list of URIs, `##targetNamespace` and `##local`.
+    pub namespace: String,
+    /// The `processContents` attribute as written; `strict` by default.
+    pub process_contents: String,
+    /// Target namespace of the schema document the wildcard is written in,
+    /// which `##targetNamespace` and `##other` refer to.
+    pub target_namespace: Option<String>,
+}
+
+impl Wildcard {
+    /// Whether the wildcard admits an element in namespace `namespace`;
+    /// `None` is no namespace.
+    pub fn admits(&self, namespace: Option<&str>) -> bool {
+        let target = self.target_namespace.as_deref();
+        match self.namespace.trim() {
+            "##any" => true,
+            // Any namespace but the target one, and not no namespace.
+            "##other" => namespace.is_some() && namespace != target,
+            listed => listed.split_whitespace().any(|token| match token {
+                "##targetNamespace" => namespace == target,
+                "##local" => namespace.is_none(),
+                uri => namespace == Some(uri),
+            }),
+        }
+    }
 }
 
 /// A top-level or nested element declaration.
@@ -400,7 +486,10 @@ pub struct ElementDecl {
 }
 
 /// An attribute declaration inside a complex type.
+///
+/// Non-exhaustive: later versions may add fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AttributeDecl {
     /// Attribute local name.
     pub name: String,
@@ -412,6 +501,26 @@ pub struct AttributeDecl {
     pub default: Option<String>,
     /// Optional fixed lexical value.
     pub fixed: Option<String>,
+    /// Whether the attribute reached its type through `xs:attribute ref` or
+    /// `xs:attributeGroup ref`, which earlier versions did not resolve.
+    ///
+    /// Arrow derivation leaves such an attribute out of a child element
+    /// whose other content derives exactly one column, so that element keeps
+    /// the shape it had before references were resolved. `false` for a
+    /// model serialized before the field existed, and left out of the
+    /// serialized form when `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub referenced: bool,
+}
+
+/// Whether `value` is `false`; decides when [`AttributeDecl::referenced`]
+/// is left out of the serialized form.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The resolved schema: named types + global elements.
@@ -503,7 +612,24 @@ impl SchemaModel {
         // chasing reads from this immutable view, which makes the pass
         // order-independent and prevents double-folding when a base type is
         // itself resolved later in the same pass.
-        let originals = self.complex_types.clone();
+        //
+        // Only a type some type names as its base is ever looked up there,
+        // so only those are copied.
+        let mut bases = std::collections::HashSet::new();
+        for ct in self.complex_types.values() {
+            collect_base_names(ct, &mut bases);
+        }
+        for element in self.global_elements.values() {
+            if let XsdType::Complex(ct) = &element.type_def {
+                collect_base_names(ct, &mut bases);
+            }
+        }
+        let originals: IndexMap<String, ComplexType> = self
+            .complex_types
+            .iter()
+            .filter(|(name, _)| bases.contains(name.as_str()))
+            .map(|(name, ct)| (name.clone(), ct.clone()))
+            .collect();
         let mut budget = FoldBudget {
             required: InheritanceBudget {
                 remaining: MAX_INHERITED_NODES,
@@ -538,6 +664,40 @@ impl SchemaModel {
             }
         }
         Ok(())
+    }
+}
+
+/// Adds the name of every base that `ct` or an inline type inside it names.
+///
+/// The recursion follows the nesting of the model, which the parser bounds.
+fn collect_base_names<'m>(ct: &'m ComplexType, bases: &mut std::collections::HashSet<&'m str>) {
+    if let Some(base) = &ct.base {
+        bases.insert(base.local.as_str());
+    }
+    collect_content_base_names(&ct.content, bases);
+}
+
+/// [`collect_base_names`] for the inline types of one content model.
+fn collect_content_base_names<'m>(
+    content: &'m ContentModel,
+    bases: &mut std::collections::HashSet<&'m str>,
+) {
+    let (ContentModel::Sequence(particles)
+    | ContentModel::All(particles)
+    | ContentModel::Choice(particles)) = content
+    else {
+        return;
+    };
+    for particle in particles {
+        match &particle.element {
+            ElementRef::Inline(decl) => {
+                if let XsdType::Complex(inner) = &decl.type_def {
+                    collect_base_names(inner, bases);
+                }
+            }
+            ElementRef::Group(group) => collect_content_base_names(group, bases),
+            ElementRef::Ref(_) | ElementRef::Any(_) => {}
+        }
     }
 }
 
@@ -786,6 +946,11 @@ impl CopyCost {
                 }
                 ElementRef::Group(group) => self.add_content(group),
                 ElementRef::Ref(name) => self.add_qname(name),
+                ElementRef::Any(wildcard) => {
+                    self.add_text(&wildcard.namespace);
+                    self.add_text(&wildcard.process_contents);
+                    self.add_optional_text(wildcard.target_namespace.as_ref());
+                }
             }
         }
     }
@@ -904,7 +1069,7 @@ fn resolve_complex_type<'a>(
                     | ContentModel::SimpleContent(_) => {}
                 }
                 // Inherited attributes come first, then locally declared ones.
-                base_attrs.append(&mut ct.attributes);
+                extend_attributes(&mut base_attrs, std::mem::take(&mut ct.attributes));
             }
             ct.attributes = base_attrs;
         }
@@ -958,7 +1123,7 @@ fn resolve_element_ref<'a>(
                 }
             }
         }
-        ElementRef::Ref(_) => {}
+        ElementRef::Ref(_) | ElementRef::Any(_) => {}
     }
     Ok(())
 }
@@ -1053,7 +1218,7 @@ fn collect_base<'a>(
                 &base.prohibited_attributes,
             );
         } else {
-            attrs.extend(base.attributes.iter().cloned());
+            extend_attributes(&mut attrs, base.attributes.clone());
         }
     }
     let text = match text {
@@ -1072,6 +1237,35 @@ fn collect_base<'a>(
         None => None,
     };
     Ok(Some((particles, attrs, text)))
+}
+
+/// Appends an extension's attribute declarations to the attributes it
+/// inherits, one attribute per name.
+///
+/// A declaration whose name is already inherited replaces the inherited one
+/// where it stands: the derived type's own declaration wins. Any other is
+/// appended.
+fn extend_attributes(inherited: &mut Vec<AttributeDecl>, own: Vec<AttributeDecl>) {
+    if own.is_empty() {
+        return;
+    }
+    let mut positions: std::collections::HashMap<String, usize> = inherited
+        .iter()
+        .enumerate()
+        .map(|(position, attribute)| (attribute.name.clone(), position))
+        .collect();
+    for attribute in own {
+        match positions
+            .get(&attribute.name)
+            .and_then(|position| inherited.get_mut(*position))
+        {
+            Some(existing) => *existing = attribute,
+            None => {
+                positions.insert(attribute.name.clone(), inherited.len());
+                inherited.push(attribute);
+            }
+        }
+    }
 }
 
 /// Applies a restriction's attribute declarations to the attributes it
