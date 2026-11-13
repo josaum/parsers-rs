@@ -18,6 +18,12 @@ use serde::{Deserialize, Serialize};
 use crate::parser::SchemaSet;
 use crate::schema::{ComplexType, ContentModel, ElementRef, SchemaModel, SimpleTypeDef, XsdType};
 
+/// Deepest nesting of list item types checked.
+///
+/// XML Schema allows no list of lists, so one level is all a valid schema
+/// has; the bound only keeps a model built by hand from recursing far.
+const MAX_LIST_NESTING: usize = 8;
+
 /// Most bytes of allowed values quoted in one enumeration finding.
 ///
 /// A finding names the values the element could have had. An enumeration can
@@ -730,6 +736,15 @@ impl<'m> ValidationContext<'m> {
                 }
             }
         };
+        self.check_simple_value(st, text, 0);
+    }
+
+    /// Checks one value against a simple type's facets.
+    ///
+    /// The value of a list is checked as a whole against the list's own
+    /// facets, its length counted in items, and then item by item against
+    /// the item type. `depth` is the nesting of lists, which the parser bounds.
+    fn check_simple_value(&mut self, st: &'m SimpleTypeDef, text: &str, depth: usize) {
         let facets = &st.facets;
         let kind = &st.kind;
 
@@ -741,7 +756,11 @@ impl<'m> ValidationContext<'m> {
             );
         }
 
-        let char_len = text.chars().count() as u32;
+        // A list's length is its number of items.
+        let char_len = match st.list_item {
+            Some(_) => text.split_whitespace().count(),
+            None => text.chars().count(),
+        } as u32;
         if let Some(min) = facets.min_length {
             if char_len < min {
                 self.push_error(
@@ -786,6 +805,14 @@ impl<'m> ValidationContext<'m> {
                     ValidationSeverity::Warning,
                     format!("expected numeric value for {:?}, got {:?}", kind, text),
                 );
+            }
+        }
+
+        if let Some(item) = st.list_item.as_deref() {
+            if depth < MAX_LIST_NESTING {
+                for value in text.split_whitespace() {
+                    self.check_simple_value(item, value, depth + 1);
+                }
             }
         }
     }

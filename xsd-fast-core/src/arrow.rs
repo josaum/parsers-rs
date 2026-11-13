@@ -33,7 +33,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use crate::parser::SchemaSet;
 use crate::schema::{
     ComplexType, ContentModel, ElementDecl, ElementRef, OccurrenceConstraint, Particle,
-    SchemaModel, SimpleTypeKind, XsdType,
+    SchemaModel, SimpleTypeDef, SimpleTypeKind, XsdType,
 };
 
 /// Deepest flattening performed, whatever [`ArrowOptions::max_depth`] asks for.
@@ -331,7 +331,7 @@ impl Derivation<'_> {
 
         let model = self.model;
         match xsd {
-            XsdType::Simple(st) => self.emit_leaf(prefix, Some(&st.kind), fields),
+            XsdType::Simple(st) => self.emit_leaf(prefix, Some(st), fields),
             XsdType::Complex(ct) => self.fields_from_complex(ct, depth, &prefix, fields),
             XsdType::Ref(qn) => {
                 if let Some(ct) = model.complex_types.get(&qn.local) {
@@ -344,22 +344,22 @@ impl Derivation<'_> {
                     Ok(())
                 } else {
                     // A named simple type, or unresolved: fall back to Utf8.
-                    let kind = model.simple_types.get(&qn.local).map(|st| &st.kind);
-                    self.emit_leaf(prefix, kind, fields)
+                    let simple = model.simple_types.get(&qn.local);
+                    self.emit_leaf(prefix, simple, fields)
                 }
             }
         }
     }
 
-    /// Emits the single column of a leaf; `kind` is `None` for raw text.
+    /// Emits the single column of a leaf; `simple` is `None` for raw text.
     fn emit_leaf(
         &mut self,
         prefix: String,
-        kind: Option<&SimpleTypeKind>,
+        simple: Option<&SimpleTypeDef>,
         fields: &mut Vec<Field>,
     ) -> Result<()> {
-        let data_type = match kind {
-            Some(kind) => simple_kind_to_arrow(kind, self.opts),
+        let data_type = match simple {
+            Some(simple) => simple_type_to_arrow(simple, self.opts),
             None => DataType::Utf8,
         };
         self.emit(fields, Field::new(value_name(prefix), data_type, true))
@@ -393,7 +393,7 @@ impl Derivation<'_> {
         fields: &mut Vec<Field>,
     ) -> Result<()> {
         for attr in &ct.attributes {
-            let dt = simple_kind_to_arrow(&attr.type_def.kind, self.opts);
+            let dt = simple_type_to_arrow(&attr.type_def, self.opts);
             let name = if prefix.is_empty() {
                 format!("@{}", attr.name)
             } else {
@@ -422,7 +422,7 @@ impl Derivation<'_> {
         }
         let particles = match content {
             ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
-            ContentModel::SimpleContent(st) => return self.emit_text(&st.kind, prefix, fields),
+            ContentModel::SimpleContent(st) => return self.emit_text(st, prefix, fields),
             ContentModel::Empty => return Ok(()),
         };
         self.nesting += 1;
@@ -434,11 +434,11 @@ impl Derivation<'_> {
     /// Emits the `$text` column of a simple-content type.
     fn emit_text(
         &mut self,
-        kind: &SimpleTypeKind,
+        simple: &SimpleTypeDef,
         prefix: &str,
         fields: &mut Vec<Field>,
     ) -> Result<()> {
-        let dt = simple_kind_to_arrow(kind, self.opts);
+        let dt = simple_type_to_arrow(simple, self.opts);
         let name = if prefix.is_empty() {
             "$text".to_string()
         } else {
@@ -608,6 +608,19 @@ fn value_name(prefix: String) -> String {
 }
 
 // ── SimpleTypeKind → Arrow DataType ──────────────────────────────────────────
+
+/// The Arrow type of a simple type's value: a list of its items for an
+/// `xs:list`, and the type of its kind otherwise.
+fn simple_type_to_arrow(simple: &SimpleTypeDef, opts: &ArrowOptions) -> DataType {
+    match &simple.list_item {
+        Some(item) => DataType::List(Arc::new(Field::new(
+            "item",
+            simple_kind_to_arrow(&item.kind, opts),
+            true,
+        ))),
+        None => simple_kind_to_arrow(&simple.kind, opts),
+    }
+}
 
 pub(crate) fn simple_kind_to_arrow(kind: &SimpleTypeKind, opts: &ArrowOptions) -> DataType {
     match kind {

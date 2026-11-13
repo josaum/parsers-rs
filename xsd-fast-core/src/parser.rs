@@ -844,59 +844,223 @@ fn is_unprefixed_builtin_name(type_ref: &str, ns_map: &HashMap<String, String>) 
 fn named_simple_kind(type_ref: &str, ns_map: &HashMap<String, String>) -> SimpleTypeKind {
     let local = split_prefix(type_ref).1;
     if is_unprefixed_builtin_name(type_ref, ns_map) {
-        SimpleTypeKind::Other(format!("{UNPREFIXED_BUILTIN_NAME}{local}"))
-    } else {
-        SimpleTypeKind::from_local(local)
+        return SimpleTypeKind::Other(format!("{UNPREFIXED_BUILTIN_NAME}{local}"));
+    }
+    match SimpleTypeKind::from_local(local) {
+        // A name outside the XML Schema namespace that is no built-in kind
+        // may be the schema set's own simple type, known once every file is
+        // loaded. `xs:ID` and the like are built-ins and stay as they are.
+        SimpleTypeKind::Other(_) if !names_xs_namespace(type_ref, ns_map) => {
+            SimpleTypeKind::Other(format!("{OWN_SIMPLE_TYPE_NAME}{local}"))
+        }
+        kind => kind,
     }
 }
 
-/// The schema set's own types that are named like built-ins.
-struct OwnTypes {
-    /// Names of the simple and complex types.
-    names: HashSet<String>,
-    /// The simple types as parsed, before any of them is settled.
-    simple: HashMap<String, SimpleTypeDef>,
+/// Whether `type_ref` is in the XML Schema namespace by its prefix, or by
+/// the default namespace when it has none.
+fn names_xs_namespace(type_ref: &str, ns_map: &HashMap<String, String>) -> bool {
+    let prefix = split_prefix(type_ref).0.unwrap_or("");
+    ns_map
+        .get(prefix)
+        .is_some_and(|uri| XS_URIS.contains(&uri.as_str()))
 }
 
-/// Longest chain of own types, each restricting the next, that is followed.
+/// Marks a simple type kind, while files are loading, as naming a simple type
+/// the schema set may declare itself.
 ///
-/// Real chains are one or two long. The bound, with the check for a name met
-/// twice, keeps a cyclic schema from being followed for ever.
-const MAX_OWN_TYPE_CHAIN: usize = 8;
+/// Like [`UNPREFIXED_BUILTIN_NAME`] it starts with a NUL, which no name read
+/// from XML can hold, and no kind keeps it once
+/// [`settle_unprefixed_builtin_names`] has run: it becomes the kind of the
+/// named type, or the name itself, as it was before simple types were
+/// followed, when the schema set declares no simple type of that name.
+const OWN_SIMPLE_TYPE_NAME: &str = "\0own-simple-type:";
 
-/// Decides a simple type whose kind is a marked built-in name.
+/// The simple type a marked kind names, and the kind it means when the schema
+/// set declares no simple type of that name; `None` for an unmarked kind.
+fn marked_reference(kind: &SimpleTypeKind) -> Option<(&str, SimpleTypeKind)> {
+    let SimpleTypeKind::Other(marked) = kind else {
+        return None;
+    };
+    if let Some(name) = marked.strip_prefix(UNPREFIXED_BUILTIN_NAME) {
+        return Some((name, SimpleTypeKind::from_local(name)));
+    }
+    marked
+        .strip_prefix(OWN_SIMPLE_TYPE_NAME)
+        .map(|name| (name, SimpleTypeKind::Other(name.to_owned())))
+}
+
+/// The schema set's own types, as the settling pass needs them.
+struct OwnTypes {
+    /// Names of the simple and complex types that are named like built-ins.
+    names: HashSet<String>,
+    /// Every simple type as parsed, before any of them is settled.
+    simple: HashMap<String, SimpleTypeDef>,
+    /// Names of every complex type.
+    complex: HashSet<String>,
+}
+
+/// Longest chain of own simple types, each restricting the next, that is
+/// followed, and deepest nesting of list items and union members settled.
 ///
-/// Where the schema set declares a simple type of that name, the type takes
-/// its kind and every facet it does not state itself, following a chain of
-/// such types. Where it does not, or the name leads back to `own_name` (the
-/// type being settled), the name is the built-in. Other types are left alone.
-fn settle_simple_type(simple: &mut SimpleTypeDef, own_name: Option<&str>, own: &OwnTypes) {
-    let SimpleTypeKind::Other(marked) = &simple.kind else {
-        return;
+/// Real chains are a few links long. The bound, with the check for a name met
+/// twice, keeps a cyclic or hostile schema from being followed for ever, and
+/// bounds the recursion of [`SimpleKinds::named`]. What lies beyond it keeps
+/// the name it was written with, as every name did before chains were
+/// followed.
+const MAX_OWN_TYPE_CHAIN: usize = 64;
+
+/// The kind each own simple type settles to, worked out once per name.
+struct SimpleKinds<'a> {
+    own: &'a OwnTypes,
+    /// The settled kind of each name met so far: `None` inside the outer
+    /// option while it is being worked out, so a name met again is a cycle;
+    /// `None` inside the inner one when the name settles to no kind of its
+    /// own (see [`SimpleKinds::named`]).
+    kinds: HashMap<String, Option<Option<SimpleTypeKind>>>,
+}
+
+impl SimpleKinds<'_> {
+    /// The kind of a simple type as parsed: a union's shared member kind, a
+    /// string for a list, the settled kind of the type a marked kind names.
+    ///
+    /// `None` when the type names an own type that settles to no kind.
+    fn of(&mut self, simple: &SimpleTypeDef, depth: usize) -> Option<SimpleTypeKind> {
+        if !simple.union_members.is_empty() {
+            return Some(self.shared(&simple.union_members, depth));
+        }
+        if simple.list_item.is_some() {
+            return Some(SimpleTypeKind::String);
+        }
+        let Some((name, fallback)) = marked_reference(&simple.kind) else {
+            return Some(simple.kind.clone());
+        };
+        let builtin = matches!(&simple.kind, SimpleTypeKind::Other(marked)
+            if marked.starts_with(UNPREFIXED_BUILTIN_NAME));
+        match self.named(name, depth) {
+            Some(kind) => Some(kind),
+            // A built-in name the chain cannot follow is the built-in.
+            None if builtin => Some(fallback),
+            None => None,
+        }
+    }
+
+    /// The settled kind of the own simple type `name`.
+    ///
+    /// `None` when there is no such type, it leads back to itself, the chain
+    /// is longer than [`MAX_OWN_TYPE_CHAIN`], or it ends at a name that is
+    /// none of these: the type that names it then keeps the name it was
+    /// written with.
+    fn named(&mut self, name: &str, depth: usize) -> Option<SimpleTypeKind> {
+        if depth >= MAX_OWN_TYPE_CHAIN {
+            return None;
+        }
+        if let Some(known) = self.kinds.get(name) {
+            return known.clone().flatten();
+        }
+        let own = self.own;
+        let simple = own.simple.get(name)?;
+        self.kinds.insert(name.to_owned(), None);
+        let kind = self.of(simple, depth + 1);
+        self.kinds.insert(name.to_owned(), Some(kind.clone()));
+        kind
+    }
+
+    /// The kind every member has, or a string when they differ or one of
+    /// them settles to no kind.
+    fn shared(&mut self, members: &[SimpleTypeDef], depth: usize) -> SimpleTypeKind {
+        let mut shared: Option<SimpleTypeKind> = None;
+        for member in members {
+            let Some(kind) = self.of(member, depth + 1) else {
+                return SimpleTypeKind::String;
+            };
+            match &shared {
+                Some(seen) if *seen != kind => return SimpleTypeKind::String,
+                Some(_) => {}
+                None => shared = Some(kind),
+            }
+        }
+        shared.unwrap_or(SimpleTypeKind::String)
+    }
+}
+
+/// Decides a simple type whose kind names another simple type, and the
+/// items or members it is built from.
+///
+/// Where the schema set declares a simple type of the name, the type takes
+/// its kind and every facet it does not state itself, following the chain
+/// of such types; a restriction of a list or a union takes the items or the
+/// members too. Where it does not, or the name leads back to `own_name` (the
+/// type being settled), a built-in name is the built-in and any other name
+/// stays as written. A union takes the kind its members share. Other types
+/// are left alone.
+fn settle_simple_type(
+    simple: &mut SimpleTypeDef,
+    own_name: Option<&str>,
+    kinds: &mut SimpleKinds<'_>,
+) {
+    settle_simple_type_at(simple, own_name, kinds, 0);
+}
+
+/// [`settle_simple_type`] for a type nested `depth` lists or unions deep.
+///
+/// Below the top level, items and members are not taken from a base: their
+/// kind is settled, and what they are built from is not copied again.
+fn settle_simple_type_at(
+    simple: &mut SimpleTypeDef,
+    own_name: Option<&str>,
+    kinds: &mut SimpleKinds<'_>,
+    depth: usize,
+) {
+    let fallback = marked_reference(&simple.kind).map(|(_, fallback)| fallback);
+    let kind = match own_name {
+        Some(name) if fallback.is_some() => kinds.named(name, 0).or(fallback),
+        _ if fallback.is_some() || !simple.union_members.is_empty() => {
+            kinds.of(simple, 0).or(fallback)
+        }
+        _ => None,
     };
-    let Some(first) = marked.strip_prefix(UNPREFIXED_BUILTIN_NAME) else {
-        return;
-    };
-    let mut name = first.to_owned();
+    let own = kinds.own;
+    let mut next = marked_reference(&simple.kind).map(|(name, _)| name.to_owned());
     let mut seen: Vec<String> = own_name.map(str::to_owned).into_iter().collect();
     for _ in 0..MAX_OWN_TYPE_CHAIN {
+        let Some(name) = next.take() else {
+            break;
+        };
         let Some(base) = own.simple.get(&name).filter(|_| !seen.contains(&name)) else {
             break;
         };
         inherit_facets(&mut simple.facets, &base.facets);
-        seen.push(name);
-        match &base.kind {
-            SimpleTypeKind::Other(next) if next.starts_with(UNPREFIXED_BUILTIN_NAME) => {
-                name = next[UNPREFIXED_BUILTIN_NAME.len()..].to_owned();
+        if depth == 0 {
+            if simple.list_item.is_none() {
+                simple.list_item.clone_from(&base.list_item);
             }
-            kind => {
-                simple.kind = kind.clone();
-                return;
+            if simple.union_members.is_empty() {
+                simple.union_members.clone_from(&base.union_members);
             }
         }
+        seen.push(name);
+        next = marked_reference(&base.kind).map(|(name, _)| name.to_owned());
     }
-    simple.kind = SimpleTypeKind::from_local(&name);
+    if let Some(kind) = kind {
+        simple.kind = kind;
+    }
+    if depth < MAX_SIMPLE_TYPE_NESTING {
+        if let Some(item) = &mut simple.list_item {
+            settle_simple_type_at(item, None, kinds, depth + 1);
+        }
+        for member in &mut simple.union_members {
+            settle_simple_type_at(member, None, kinds, depth + 1);
+        }
+    }
 }
+
+/// Deepest nesting of list items and union members read and settled.
+///
+/// A list of a union of a list is already more than XML Schema allows; the
+/// bound keeps a hostile schema from recursing without end. A list or union
+/// nested deeper is read as a string, as every list and union was before.
+const MAX_SIMPLE_TYPE_NESTING: usize = 8;
 
 /// Fills each facet `facets` does not state from `base`.
 fn inherit_facets(facets: &mut SimpleFacets, base: &SimpleFacets) {
@@ -920,20 +1084,33 @@ fn inherit_facets(facets: &mut SimpleFacets, base: &SimpleFacets) {
 }
 
 /// Settles a complex type: its attributes and everything in its content.
-fn settle_complex_type(complex_type: &mut ComplexType, own: &OwnTypes) {
-    for attribute in &mut complex_type.attributes {
-        settle_simple_type(&mut attribute.type_def, None, own);
+fn settle_complex_type(complex_type: &mut ComplexType, kinds: &mut SimpleKinds<'_>) {
+    // `simpleContent` extending the schema set's own simple type was read as
+    // extending a complex type, which no complex type of that name can fold
+    // in; the text takes the simple type instead.
+    if let (Some(base), Derivation::Extension, ContentModel::Sequence(particles)) = (
+        &complex_type.base,
+        complex_type.derivation,
+        &complex_type.content,
+    ) {
+        if particles.is_empty()
+            && !kinds.own.complex.contains(&base.local)
+            && kinds.own.simple.contains_key(&base.local)
+        {
+            let text = SimpleTypeKind::Other(format!("{OWN_SIMPLE_TYPE_NAME}{}", base.local));
+            complex_type.content =
+                ContentModel::SimpleContent(Box::new(SimpleTypeDef::of_kind(text)));
+        }
     }
-    settle_content(&mut complex_type.content, own);
+    for attribute in &mut complex_type.attributes {
+        settle_simple_type(&mut attribute.type_def, None, kinds);
+    }
+    settle_content(&mut complex_type.content, kinds);
 }
 
 /// The built-in simple type called `local`, with no facets.
 fn builtin_type(local: &str) -> XsdType {
-    XsdType::Simple(SimpleTypeDef {
-        name: None,
-        kind: SimpleTypeKind::from_local(local),
-        facets: SimpleFacets::default(),
-    })
+    XsdType::Simple(SimpleTypeDef::of_kind(SimpleTypeKind::from_local(local)))
 }
 
 /// Marks a reference, while files are loading, as an unprefixed built-in name.
@@ -963,36 +1140,44 @@ fn settle_unprefixed_builtin_names(model: &mut SchemaModel) {
     let simple = model
         .simple_types
         .iter()
-        .filter(|(name, _)| names.contains(*name))
         .map(|(name, simple)| (name.clone(), simple.clone()))
         .collect();
-    let own = OwnTypes { names, simple };
+    let complex = model.complex_types.keys().cloned().collect();
+    let own = OwnTypes {
+        names,
+        simple,
+        complex,
+    };
+    let mut kinds = SimpleKinds {
+        own: &own,
+        kinds: HashMap::new(),
+    };
     for (name, simple) in &mut model.simple_types {
-        settle_simple_type(simple, Some(name), &own);
+        settle_simple_type(simple, Some(name), &mut kinds);
     }
     for element in model.global_elements.values_mut() {
-        settle_type(&mut element.type_def, &own);
+        settle_type(&mut element.type_def, &mut kinds);
     }
     for complex_type in model.complex_types.values_mut() {
-        settle_complex_type(complex_type, &own);
+        settle_complex_type(complex_type, &mut kinds);
     }
 }
 
 /// Settles one declared type, and the types declared inside it.
 ///
 /// The recursion follows the nesting of the model, which the parser bounds.
-fn settle_type(declared: &mut XsdType, own: &OwnTypes) {
+fn settle_type(declared: &mut XsdType, kinds: &mut SimpleKinds<'_>) {
     let builtin = match declared {
         XsdType::Ref(name) if name.namespace.as_deref() == Some(UNPREFIXED_BUILTIN_NAME) => {
             name.namespace = None;
-            (!own.names.contains(&name.local)).then(|| builtin_type(&name.local))
+            (!kinds.own.names.contains(&name.local)).then(|| builtin_type(&name.local))
         }
         XsdType::Complex(complex_type) => {
-            settle_complex_type(complex_type, own);
+            settle_complex_type(complex_type, kinds);
             None
         }
         XsdType::Simple(simple) => {
-            settle_simple_type(simple, None, own);
+            settle_simple_type(simple, None, kinds);
             None
         }
         XsdType::Ref(_) => None,
@@ -1003,9 +1188,9 @@ fn settle_type(declared: &mut XsdType, own: &OwnTypes) {
 }
 
 /// Settles the types of the elements declared in one content model.
-fn settle_content(content: &mut ContentModel, own: &OwnTypes) {
+fn settle_content(content: &mut ContentModel, kinds: &mut SimpleKinds<'_>) {
     if let ContentModel::SimpleContent(simple) = content {
-        settle_simple_type(simple, None, own);
+        settle_simple_type(simple, None, kinds);
         return;
     }
     let (ContentModel::Sequence(particles)
@@ -1016,8 +1201,8 @@ fn settle_content(content: &mut ContentModel, own: &OwnTypes) {
     };
     for particle in particles {
         match &mut particle.element {
-            ElementRef::Inline(element) => settle_type(&mut element.type_def, own),
-            ElementRef::Group(group) => settle_content(group, own),
+            ElementRef::Inline(element) => settle_type(&mut element.type_def, kinds),
+            ElementRef::Group(group) => settle_content(group, kinds),
             ElementRef::Ref(_) => {}
         }
     }
@@ -1349,11 +1534,9 @@ fn simple_extension_content(
     if !is_xs_primitive(base, ns_map) {
         return None;
     }
-    Some(ContentModel::SimpleContent(Box::new(SimpleTypeDef {
-        name: None,
-        kind: named_simple_kind(base, ns_map),
-        facets: SimpleFacets::default(),
-    })))
+    Some(ContentModel::SimpleContent(Box::new(
+        SimpleTypeDef::of_kind(named_simple_kind(base, ns_map)),
+    )))
 }
 
 // ── Simple type parser ───────────────────────────────────────────────────────
@@ -1362,6 +1545,21 @@ fn parse_simple_type(
     reader: &mut Reader<&[u8]>,
     ns_map: &HashMap<String, String>,
 ) -> Result<SimpleTypeDef> {
+    parse_simple_type_at(reader, ns_map, 0)
+}
+
+/// Parses the children of an `<xs:simpleType>` nested `depth` lists or
+/// unions deep, up to and including its end tag.
+///
+/// A restriction gives the kind and the facets. A list gives the type of its
+/// items and a union its members, named by `itemType` / `memberTypes` or
+/// written inline; past [`MAX_SIMPLE_TYPE_NESTING`] an inline one is skipped.
+fn parse_simple_type_at(
+    reader: &mut Reader<&[u8]>,
+    ns_map: &HashMap<String, String>,
+    depth: usize,
+) -> Result<SimpleTypeDef> {
+    let mut simple = SimpleTypeDef::string_unbounded();
     let mut kind = SimpleTypeKind::String;
     let mut facets = SimpleFacets::default();
     let mut buf = Vec::with_capacity(256);
@@ -1383,7 +1581,10 @@ fn parse_simple_type(
                         parse_facets(reader, &mut facets)?;
                     }
                     "list" | "union" => {
-                        skip_element(reader, local)?;
+                        let local = local.to_owned();
+                        let named = named_parts(&attrs, &local, ns_map);
+                        let inline = parse_simple_type_parts(reader, ns_map, &local, depth)?;
+                        set_parts(&mut simple, &local, named.into_iter().chain(inline));
                     }
                     "annotation" => {
                         skip_element(reader, "annotation")?;
@@ -1405,6 +1606,9 @@ fn parse_simple_type(
                     if let Some(base) = attrs.get("base") {
                         kind = named_simple_kind(base, ns_map);
                     }
+                } else if local == "list" || local == "union" {
+                    let named = named_parts(&collect_attrs(e), local, ns_map);
+                    set_parts(&mut simple, local, named);
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -1424,11 +1628,83 @@ fn parse_simple_type(
         buf.clear();
     }
 
-    Ok(SimpleTypeDef {
-        name: None,
-        kind,
-        facets,
-    })
+    simple.kind = kind;
+    simple.facets = facets;
+    Ok(simple)
+}
+
+/// The item type `itemType` names on a list, or the member types
+/// `memberTypes` names on a union.
+fn named_parts(
+    attrs: &HashMap<String, String>,
+    local: &str,
+    ns_map: &HashMap<String, String>,
+) -> Vec<SimpleTypeDef> {
+    let attribute = if local == "list" {
+        "itemType"
+    } else {
+        "memberTypes"
+    };
+    attrs
+        .get(attribute)
+        .map(|names| {
+            names
+                .split_whitespace()
+                .map(|name| SimpleTypeDef::of_kind(named_simple_kind(name, ns_map)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reads the inline simple types of an `<xs:list>` or `<xs:union>` up to and
+/// including its end tag.
+fn parse_simple_type_parts(
+    reader: &mut Reader<&[u8]>,
+    ns_map: &HashMap<String, String>,
+    end_tag: &str,
+    depth: usize,
+) -> Result<Vec<SimpleTypeDef>> {
+    let mut parts = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        match next_tag(reader, &mut buf, "simpleType")? {
+            Tag::Start { local, .. }
+                if local == "simpleType" && depth < MAX_SIMPLE_TYPE_NESTING =>
+            {
+                parts.push(parse_simple_type_at(reader, ns_map, depth + 1)?);
+            }
+            Tag::Start { local, .. } => skip_element(reader, &local)?,
+            Tag::Empty { local, .. } => {
+                if local == "simpleType" {
+                    parts.push(SimpleTypeDef::string_unbounded());
+                }
+            }
+            Tag::End { local } => {
+                if local == end_tag {
+                    break;
+                }
+            }
+            Tag::Eof => break,
+        }
+    }
+    Ok(parts)
+}
+
+/// Makes `simple` the list or union `local` names, built from `parts`.
+///
+/// A list takes its first part as the item type; a union takes every part,
+/// in order. A list or union with no parts stays a string.
+fn set_parts(
+    simple: &mut SimpleTypeDef,
+    local: &str,
+    parts: impl IntoIterator<Item = SimpleTypeDef>,
+) {
+    let mut parts = parts.into_iter();
+    if local == "list" {
+        simple.list_item = parts.next().map(Box::new);
+    } else {
+        simple.union_members = parts.collect();
+    }
 }
 
 fn parse_facets(reader: &mut Reader<&[u8]>, facets: &mut SimpleFacets) -> Result<()> {
@@ -1497,11 +1773,7 @@ fn parse_attribute_decl(
     let default = attrs.get("default").cloned();
     let fixed = attrs.get("fixed").cloned();
     let type_def = if let Some(type_attr) = attrs.get("type") {
-        SimpleTypeDef {
-            name: None,
-            kind: named_simple_kind(type_attr, ns_map),
-            facets: SimpleFacets::default(),
-        }
+        SimpleTypeDef::of_kind(named_simple_kind(type_attr, ns_map))
     } else {
         inline_type.unwrap_or_else(SimpleTypeDef::string_unbounded)
     };

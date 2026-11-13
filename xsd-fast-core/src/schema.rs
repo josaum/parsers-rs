@@ -227,18 +227,46 @@ pub struct SimpleTypeDef {
     /// Optional qualified name for named simple types.
     pub name: Option<QName>,
     /// Primitive base kind (after chasing the restriction chain).
+    ///
+    /// [`SimpleTypeKind::String`] for a list. For a union, the kind every
+    /// member has, or [`SimpleTypeKind::String`] when the members differ.
     pub kind: SimpleTypeKind,
     /// Supported restriction facets.
+    ///
+    /// On a list, `min_length` and `max_length` count items, as XML Schema
+    /// measures the length of a list.
     pub facets: SimpleFacets,
+    /// The type of each item when this is an `xs:list`, or a restriction of
+    /// one.
+    ///
+    /// `None` for every other type, and for a model serialized before the
+    /// field existed. Left out of the serialized form when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_item: Option<Box<SimpleTypeDef>>,
+    /// The member types when this is an `xs:union`, or a restriction of one,
+    /// in the order they are written: `memberTypes` first, then the inline
+    /// members.
+    ///
+    /// Empty for every other type, and for a model serialized before the
+    /// field existed. Left out of the serialized form when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub union_members: Vec<SimpleTypeDef>,
 }
 
 impl SimpleTypeDef {
-    pub(crate) fn string_unbounded() -> Self {
+    /// A simple type of `kind` with no name, facets, items or members.
+    pub(crate) fn of_kind(kind: SimpleTypeKind) -> Self {
         Self {
             name: None,
-            kind: SimpleTypeKind::String,
+            kind,
             facets: SimpleFacets::default(),
+            list_item: None,
+            union_members: Vec::new(),
         }
+    }
+
+    pub(crate) fn string_unbounded() -> Self {
+        Self::of_kind(SimpleTypeKind::String)
     }
 }
 
