@@ -3,16 +3,18 @@
 //! Geospatial GeoJSON / shapefile parse → WKT, geodesic bbox IoU,
 //! antimeridian-aware bbox split, and STRtree queries.
 
+use geo_fast_core::geotiff::{parse_geotiff_geokey_params_reader, parse_geotiff_metadata_reader};
 use geo_fast_core::hyperspectral::HyperspectralParser;
 use geo_fast_core::{
     bbox_area_km2, bbox_iou_geodesic, parse_geojson_str, parse_geotiff_bands,
-    parse_geotiff_bands_with_limit, parse_geotiff_geokey_params, parse_geotiff_metadata,
-    parse_shapefile, BBox, GeoError, SpatialIndex,
+    parse_geotiff_bands_with_limit, parse_shapefile, BBox, GeoError, SpatialIndex,
 };
 use napi::bindgen_prelude::*;
+use napi::{JsNumber, JsObject, JsTypedArray, JsUnknown, TypedArrayType};
 use napi_derive::napi;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::io::Seek;
 
 fn err(e: impl ToString) -> Error {
     Error::from_reason(e.to_string())
@@ -120,8 +122,15 @@ pub fn strtree_query_json(boxes_json: String, query_bbox: String) -> Result<Stri
 /// Keys are sorted. A non-finite number has no JSON form and is written as
 /// `null`.
 fn geotiff_metadata_value(path: &str) -> std::result::Result<serde_json::Value, GeoError> {
-    let meta = parse_geotiff_metadata(path)?;
-    let params = parse_geotiff_geokey_params(path)?;
+    // One open file serves both reads; only the tags are read, never the
+    // raster, so a large image costs no more than a small one.
+    let file = std::fs::File::open(path).map_err(GeoError::Io)?;
+    let mut reader = std::io::BufReader::new(file);
+    let meta = parse_geotiff_metadata_reader(&mut reader)?;
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(GeoError::Io)?;
+    let params = parse_geotiff_geokey_params_reader(&mut reader)?;
     let geokeys: BTreeMap<String, u32> = meta
         .geokeys
         .iter()
@@ -166,14 +175,66 @@ pub fn geotiff_metadata_json(path: String) -> Result<String> {
     serde_json::to_string(&value).map_err(err)
 }
 
+/// Convert a JavaScript byte limit to `usize`, refusing what `u32` would wrap.
+fn byte_limit(name: &str, value: f64) -> Result<usize> {
+    // 2^53 is the largest count a JavaScript number holds exactly.
+    const MAX_SAFE: f64 = 9_007_199_254_740_992.0;
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_SAFE {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{name} must be a non-negative whole number of bytes, got {value}"),
+        ));
+    }
+    usize::try_from(value as u64).map_err(|_| {
+        Error::new(
+            Status::InvalidArg,
+            format!("{name} is larger than this platform can address: {value}"),
+        )
+    })
+}
+
+/// Read samples from a `Float32Array`, a `Float64Array` or an array of numbers.
+fn samples(name: &str, value: JsUnknown) -> Result<Vec<f32>> {
+    if value.is_typedarray()? {
+        // SAFETY: `is_typedarray` has just confirmed the value's type.
+        let array = unsafe { value.cast::<JsTypedArray>() }.into_value()?;
+        return match array.typedarray_type {
+            TypedArrayType::Float32 => Ok(AsRef::<[f32]>::as_ref(&array).to_vec()),
+            TypedArrayType::Float64 => Ok(AsRef::<[f64]>::as_ref(&array)
+                .iter()
+                .map(|v| *v as f32)
+                .collect()),
+            _ => Err(Error::new(
+                Status::InvalidArg,
+                format!("{name} must be a Float32Array, a Float64Array or an array of numbers"),
+            )),
+        };
+    }
+    if value.is_array()? {
+        // SAFETY: `is_array` has just confirmed the value is an array object.
+        let array = unsafe { value.cast::<JsObject>() };
+        let len = array.get_array_length()?;
+        let mut out = Vec::with_capacity(len as usize);
+        for index in 0..len {
+            out.push(array.get_element::<JsNumber>(index)?.get_double()? as f32);
+        }
+        return Ok(out);
+    }
+    Err(Error::new(
+        Status::InvalidArg,
+        format!("{name} must be a Float32Array, a Float64Array or an array of numbers"),
+    ))
+}
+
 /// Read every band of a GeoTIFF, one `Float32Array` per band.
 ///
 /// `max_band_bytes` is the most band data to return, in bytes (four per
 /// sample, all bands together); without it the core's default limit applies.
+/// It must be a non-negative whole number.
 #[napi(catch_unwind)]
-pub fn geotiff_bands(path: String, max_band_bytes: Option<u32>) -> Result<Vec<Float32Array>> {
+pub fn geotiff_bands(path: String, max_band_bytes: Option<f64>) -> Result<Vec<Float32Array>> {
     let bands = match max_band_bytes {
-        Some(limit) => parse_geotiff_bands_with_limit(&path, limit as usize),
+        Some(limit) => parse_geotiff_bands_with_limit(&path, byte_limit("maxBandBytes", limit)?),
         None => parse_geotiff_bands(&path),
     }
     .map_err(err)?;
@@ -181,20 +242,25 @@ pub fn geotiff_bands(path: String, max_band_bytes: Option<u32>) -> Result<Vec<Fl
 }
 
 /// NDVI per sample from near-infrared and red bands of equal length.
+///
+/// Each band is a `Float32Array` (what `geotiff_bands` returns), a
+/// `Float64Array` or an array of numbers.
 #[napi(catch_unwind)]
-pub fn compute_ndvi(nir_band: Vec<f64>, red_band: Vec<f64>) -> Result<Float32Array> {
-    let nir: Vec<f32> = nir_band.iter().map(|v| *v as f32).collect();
-    let red: Vec<f32> = red_band.iter().map(|v| *v as f32).collect();
+pub fn compute_ndvi(nir_band: JsUnknown, red_band: JsUnknown) -> Result<Float32Array> {
+    let nir = samples("nirBand", nir_band)?;
+    let red = samples("redBand", red_band)?;
     HyperspectralParser::try_compute_ndvi(&nir, &red)
         .map(Float32Array::new)
         .map_err(err)
 }
 
 /// Spectral angle, in radians, between a pixel spectrum and a reference.
+///
+/// Each spectrum is a `Float32Array`, a `Float64Array` or an array of numbers.
 #[napi(catch_unwind)]
-pub fn spectral_angle(pixel_spectrum: Vec<f64>, reference: Vec<f64>) -> Result<f64> {
-    let pixel: Vec<f32> = pixel_spectrum.iter().map(|v| *v as f32).collect();
-    let reference: Vec<f32> = reference.iter().map(|v| *v as f32).collect();
+pub fn spectral_angle(pixel_spectrum: JsUnknown, reference: JsUnknown) -> Result<f64> {
+    let pixel = samples("pixelSpectrum", pixel_spectrum)?;
+    let reference = samples("reference", reference)?;
     HyperspectralParser::try_spectral_angle(&pixel, &reference)
         .map(f64::from)
         .map_err(err)

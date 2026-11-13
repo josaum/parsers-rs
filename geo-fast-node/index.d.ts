@@ -38,9 +38,15 @@ export interface GeoTiffMetadata {
 
 /** Read a GeoTIFF's georeferencing as a JSON string (see `GeoTiffMetadata`). Throws on an unreadable file. */
 export declare function geotiffMetadataJson(path: string): string;
-/** Read every band, one `Float32Array` per band. Throws when the bands exceed `maxBandBytes`. */
+/** Samples as a typed array (what `geotiffBands` returns) or an array of numbers. */
+export type Samples = Float32Array | Float64Array | number[];
+
+/**
+ * Read every band, one `Float32Array` per band. `maxBandBytes` must be a
+ * non-negative whole number; throws when it is not, or when the bands exceed it.
+ */
 export declare function geotiffBands(path: string, maxBandBytes?: number | null): Float32Array[];
 /** NDVI per sample. Throws when the bands differ in length. */
-export declare function computeNdvi(nirBand: number[], redBand: number[]): Float32Array;
+export declare function computeNdvi(nirBand: Samples, redBand: Samples): Float32Array;
 /** Spectral angle in radians. Throws when the spectra differ in length. */
-export declare function spectralAngle(pixelSpectrum: number[], reference: number[]): number;
+export declare function spectralAngle(pixelSpectrum: Samples, reference: Samples): number;

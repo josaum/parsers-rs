@@ -200,6 +200,14 @@ const checks = {
     const bands = m.geotiffBands(file);
     if (!(bands[0] instanceof Float32Array) || bands[0].length !== 4 || Array.from(bands[0]).some((v, i) => Math.abs(v - (i + 1) / 255) > 1e-6)) throw new Error('band samples missing');
     mustThrow(() => m.geotiffBands(file, 15), 'band limit');
+    for (const bad of [-1, NaN, Infinity, 1.5, 2 ** 60]) mustThrow(() => m.geotiffBands(file, bad), `maxBandBytes ${bad}`);
+    if (m.geotiffBands(file, 2 ** 33).length !== 1) throw new Error('a limit above 4 GiB was refused');
+    // A band from geotiffBands goes straight into computeNdvi and spectralAngle.
+    const ndvi = m.computeNdvi(bands[0], bands[0]);
+    if (!(ndvi instanceof Float32Array) || ndvi.length !== 4 || ndvi.some((v) => v !== 0)) throw new Error('ndvi of a band with itself');
+    if (Math.abs(m.spectralAngle(bands[0], Float64Array.from(bands[0]))) > 1e-3) throw new Error('spectral angle of a band with itself');
+    mustThrow(() => m.computeNdvi(new Uint8Array(4), bands[0]), 'ndvi of an integer array');
+    mustThrow(() => m.computeNdvi('abcd', bands[0]), 'ndvi of a string');
     mustThrow(() => m.geotiffMetadataJson(file + '.missing'), 'missing file');
     if (Math.abs(m.computeNdvi([0.5], [0.1])[0] - 2 / 3) > 1e-6) throw new Error('ndvi value');
     mustThrow(() => m.computeNdvi([0.5], [0.1, 0.2]), 'ndvi length');
@@ -245,6 +253,11 @@ const checks = {
     if (!readFileSync(out).includes('Hello PDF')) throw new Error('subset file missing its page');
     if (m.extractPagesFromBytes(readFileSync(file), [1, 2]).length === 0) throw new Error('empty subset');
     mustThrow(() => m.extractPagesToBytes(file, [99]), 'page out of range');
+    for (const bad of [[1.9], ['2'], [-1], [0], [NaN]]) {
+      mustThrow(() => m.extractPagesToBytes(file, bad), `pages ${JSON.stringify(bad)} to bytes`);
+      mustThrow(() => m.extractPagesFromBytes(readFileSync(file), bad), `pages ${JSON.stringify(bad)} from bytes`);
+      mustThrow(() => m.extractPages(file, bad, path.join(dir, 'never.pdf')), `pages ${JSON.stringify(bad)} to a path`);
+    }
     mustThrow(() => m.extractPagesFromBytes(Buffer.from('not a pdf'), [1]), 'malformed pdf');
     return `${one.length} bytes for one page`;
   },
