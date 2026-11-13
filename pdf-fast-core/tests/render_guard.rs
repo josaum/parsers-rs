@@ -1061,6 +1061,61 @@ fn the_guards_own_decoding_never_refuses_a_page_whatever_the_document_budget() {
     assert!(rendered > 0, "no budget in the sweep rendered the page");
 }
 
+/// A page drawing an image XObject that declares `width` x `height` 8-bit
+/// grey pixels but holds only 16 bytes of samples.
+fn declared_image(width: u32, height: u32) -> Vec<u8> {
+    one_page(
+        "/Resources << /XObject << /I 10 0 R >> >>",
+        "q 50 0 0 50 0 0 cm /I Do Q",
+        vec![(
+            10,
+            stream(
+                &format!(
+                    "/Type /XObject /Subtype /Image /Width {width} /Height {height} \
+                     /ColorSpace /DeviceGray /BitsPerComponent 8"
+                ),
+                &"A".repeat(16),
+            ),
+        )],
+    )
+}
+
+/// The same as an inline image.
+fn declared_inline_image(width: u32, height: u32) -> Vec<u8> {
+    let content = format!(
+        "q 50 0 0 50 0 0 cm BI /W {width} /H {height} /CS /G /BPC 8 ID {} EI Q",
+        "A".repeat(16)
+    );
+    one_page("", &content, Vec::new())
+}
+
+#[test]
+fn images_declaring_more_pixels_than_the_render_may_decode_are_refused() {
+    // This crate already reserves an image XObject's declared RGBA size
+    // against the document budget before rendering, so the guard is only
+    // reached here with a budget large enough to hold that reservation.
+    let options = ParseOptions {
+        max_total_decoded_bytes: 8 << 30,
+        ..ParseOptions::default()
+    };
+    let document =
+        PdfDocument::from_slice(&declared_image(20_000, 20_000), options).expect("parses");
+    let error = match document.page_rasterized_png_interpreted_checked(0, 72.0) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a 20,000 x 20,000 image XObject: the interpreted renderer accepted it"),
+    };
+    assert!(
+        error.contains("interpreted render refused"),
+        "a 20,000 x 20,000 image XObject: unexpected error {error}"
+    );
+    assert_refused(
+        "a 20,000 x 20,000 inline image",
+        &declared_inline_image(20_000, 20_000),
+    );
+    assert_renders("a 4 x 4 image XObject", &declared_image(4, 4));
+    assert_renders("a 4 x 4 inline image", &declared_inline_image(4, 4));
+}
+
 /// Runs the interpreter with no guard, on a thread with a chosen stack.
 ///
 /// Not a test: it exists to confirm that a fixture aborts the process and to

@@ -66,7 +66,9 @@
 //!
 //! * **A page tree the two parsers read differently.** The page-tree bound
 //!   uses this crate's parser, not the interpreter's.
-//! * **The image decoders** were not examined.
+//! * **The image decoders** (`hayro-jpeg2000`, `hayro-jbig2`, `hayro-ccitt`
+//!   and JPEG) were not traced. Each may size its buffers from the
+//!   codestream's own header rather than the dictionary.
 //! * **Memory and time.** Every soft mask gets a renderer the size of the
 //!   one it is drawn in, and every tiling cell one sized by its `/XStep`
 //!   and `/YStep` at the cell's scale, which is not the page's: up to
@@ -74,8 +76,9 @@
 //!   Each saved graphics state copies the clip paths in force, and the
 //!   number of those is not bounded.
 //!
-//! Bounded beyond recursion: the interpreter's saved-state stack, by
-//! [`MAX_SAVED_STATES`]; a sampled function's table, by
+//! Bounded beyond recursion: the pixels an image XObject, its soft mask or
+//! an inline image declares, by [`image_pixel_budget`]; the interpreter's
+//! saved-state stack, by [`MAX_SAVED_STATES`]; a sampled function's table, by
 //! [`MAX_SAMPLED_FUNCTION_ENTRIES`], and its cost per evaluation, which
 //! doubles with each input, by [`MAX_SAMPLED_FUNCTION_INPUTS`]. Every font a
 //! stream selects, and every object it reaches, is held to
@@ -269,6 +272,37 @@ pub(crate) fn vet_decode_allowance(file_decoded_bytes: usize) -> usize {
         .max(VET_DECODE_FLOOR)
 }
 
+/// Fewest pixels an image may have whatever the render size: 256 megapixels.
+///
+/// The interpreter converts an image to 8-bit RGB, three bytes a pixel, in
+/// buffers sized from its `/Width` and `/Height`, plus the decoded samples.
+/// A 600 dpi scan of an A3 sheet is about 70 megapixels, so real scans sit
+/// well under this, even embedded in a page rendered small.
+const IMAGE_PIXEL_FLOOR: u64 = 256_000_000;
+
+/// How many times the page's own rendered pixel count an image may have,
+/// when that is more than [`IMAGE_PIXEL_FLOOR`]: an image four times the
+/// render's resolution on each axis.
+const IMAGE_PIXELS_PER_PAGE_PIXEL: u64 = 16;
+
+/// Most pixels one image may declare on a page rendered to `page_pixels`.
+pub(crate) fn image_pixel_budget(page_pixels: u64) -> u64 {
+    page_pixels
+        .saturating_mul(IMAGE_PIXELS_PER_PAGE_PIXEL)
+        .max(IMAGE_PIXEL_FLOOR)
+}
+
+/// Pixels an image dictionary declares, read as the interpreter reads them:
+/// `/W` or `/Width` times `/H` or `/Height`; zero when either is missing.
+fn declared_pixels(dict: &Dict<'_>) -> u64 {
+    let side = |short: &[u8], long: &[u8]| {
+        dict.get::<u32>(short)
+            .or_else(|| dict.get::<u32>(long))
+            .map_or(0, u64::from)
+    };
+    side(&b"W"[..], &b"Width"[..]).saturating_mul(side(&b"H"[..], &b"Height"[..]))
+}
+
 /// What `vet_object` names in a refusal for objects reached from resources.
 const RESOURCE_OBJECTS: &str = "a colour space, function or shading";
 
@@ -309,6 +343,8 @@ struct Scan {
     ext_g_states: Vec<Vec<u8>>,
     /// Font operands of `Tf`.
     fonts: Vec<Vec<u8>>,
+    /// Most pixels any inline image in this stream declares.
+    inline_pixels: u64,
     /// Most graphics states this stream holds saved at once: the deepest
     /// `q` nesting, with a `Q` past the first ignored.
     saves: usize,
@@ -338,6 +374,9 @@ impl Scan {
                 }
                 TypedInstruction::TextFont(op) => {
                     remember(&mut scan.seen, 3, &mut scan.fonts, &op.0);
+                }
+                TypedInstruction::InlineImage(op) => {
+                    scan.inline_pixels = scan.inline_pixels.max(declared_pixels(op.0.dict()));
                 }
                 TypedInstruction::SaveState(_) => {
                     depth += 1;
@@ -484,6 +523,8 @@ struct Walk<'a> {
     /// Decoded bytes scanned so far, and the most this render may scan.
     decoded: usize,
     decode_allowance: usize,
+    /// Most pixels one image may declare, from [`image_pixel_budget`].
+    image_pixels: u64,
     next_id: u32,
 }
 
@@ -532,6 +573,7 @@ impl<'a> Walk<'a> {
         check_nesting(content, MAX_CONTENT_NESTING)?;
         let scan = Scan::of(content);
         check_saves(scan.saves)?;
+        self.check_image_pixels(scan.inline_pixels)?;
         Ok(scan)
     }
 
@@ -618,6 +660,10 @@ impl<'a> Walk<'a> {
             Object::Array(array) => return Ok(array.iter::<Object<'a>>().filter(nested).collect()),
             Object::Dict(dict) => dict,
             Object::Stream(stream) => {
+                // An image XObject, or the soft mask of one.
+                if has_subtype(stream.dict(), b"Image") {
+                    self.check_image_pixels(declared_pixels(stream.dict()))?;
+                }
                 match stream.dict().get::<u8>(&b"FunctionType"[..]) {
                     Some(4) => {
                         // The calculator parser recurses once per `{`.
@@ -697,6 +743,17 @@ impl<'a> Walk<'a> {
             if held > MAX_SAMPLED_FUNCTION_ENTRIES {
                 return Err(over_budget());
             }
+        }
+        Ok(())
+    }
+
+    /// Refuses an image that declares more than [`image_pixel_budget`]
+    /// pixels for this render.
+    fn check_image_pixels(&self, pixels: u64) -> Result<()> {
+        if pixels > self.image_pixels {
+            return Err(refused(
+                "an image declares more pixels than this render may decode",
+            ));
         }
         Ok(())
     }
@@ -1255,6 +1312,8 @@ fn decode_is_fixed(stream: &Stream<'_>) -> bool {
 /// this must run on the thread that will render it. `decode_allowance` is
 /// how many decoded bytes the check may look at, from
 /// [`vet_decode_allowance`]; nothing is taken from the document's budget.
+/// `image_pixels` is the most pixels one image may declare, from
+/// [`image_pixel_budget`].
 ///
 /// # Errors
 ///
@@ -1262,7 +1321,7 @@ fn decode_is_fixed(stream: &Stream<'_>) -> bool {
 /// itself, when the streams nest deeper than the budget allows, when a Type 3
 /// glyph procedure could enter another content stream, or when checking
 /// would take more contexts or decoded bytes than its bounds allow.
-pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
+pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize, image_pixels: u64) -> Result<()> {
     let mut walk = Walk {
         scans: HashMap::new(),
         fonts: HashMap::new(),
@@ -1273,6 +1332,7 @@ pub(crate) fn vet_page(page: &Page<'_>, decode_allowance: usize) -> Result<()> {
         root: page.resources().clone(),
         decoded: 0,
         decode_allowance,
+        image_pixels,
         next_id: 1,
     };
 

@@ -1217,13 +1217,25 @@ impl PdfDocument {
         // own object model, so there is no second parser to disagree with
         // it. The check has a decode allowance of its own and takes nothing
         // from the document's budget.
-        render_guard::vet_page(page, vet_allowance)?;
         let (width, height) = page.render_dimensions();
+        let scale = dpi / 72.0;
+        // Pixels the page renders to, for the image bound; a size that is not
+        // a positive finite number counts as none and leaves the floor.
+        let page_pixels = f64::from(width * scale) * f64::from(height * scale);
+        let page_pixels = if page_pixels.is_finite() && page_pixels > 0.0 {
+            page_pixels as u64
+        } else {
+            0
+        };
+        render_guard::vet_page(
+            page,
+            vet_allowance,
+            render_guard::image_pixel_budget(page_pixels),
+        )?;
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return Ok(None);
         }
 
-        let scale = dpi / 72.0;
         let px_width = (width * scale) as u16;
         let px_height = (height * scale) as u16;
         if px_width == 0 || px_height == 0 {
