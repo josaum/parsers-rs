@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status, Streaming};
 #[path = "../../flight-ipc-config/test-support/mod.rs"]
 mod flight_auth_test_support;
 use xlsx_fast_core::arrow::{self, ArrowOptions, RangeFilter};
-use xlsx_fast_core::ParseOptions;
+use xlsx_fast_core::{find_first_digit, ParseOptions};
 
 #[derive(Clone)]
 struct XlsxFlightService {
@@ -817,7 +817,9 @@ fn parse_ref_kind(input: &str) -> Option<RefKind> {
         if b.is_ascii_alphabetic() {
             has_col = true;
             let upper = b & 0xDF;
-            col = col * 26 + (upper - b'A' + 1) as u32;
+            col = col
+                .checked_mul(26)?
+                .checked_add(u32::from(upper - b'A' + 1))?;
         } else {
             break;
         }
@@ -830,7 +832,7 @@ fn parse_ref_kind(input: &str) -> Option<RefKind> {
             }
             if b.is_ascii_digit() {
                 has_row = true;
-                row = row * 10 + (b - b'0') as u32;
+                row = row.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
             } else {
                 break;
             }
@@ -845,162 +847,126 @@ fn parse_ref_kind(input: &str) -> Option<RefKind> {
     }
 }
 
-#[inline]
-fn find_first_digit(bytes: &[u8]) -> Option<usize> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if bytes.len() >= 16 {
-            // SAFETY: NEON is baseline on aarch64.
-            unsafe {
-                if let Some(idx) = find_first_digit_neon(bytes) {
-                    return Some(idx);
-                }
-            }
-        }
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    {
-        if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
-            // SAFETY: we gate on AVX2 support.
-            unsafe {
-                if let Some(idx) = find_first_digit_avx2(bytes) {
-                    return Some(idx);
-                }
-            }
-        }
-        if bytes.len() >= 16
-            && (cfg!(target_arch = "x86_64") || std::is_x86_feature_detected!("sse2"))
-        {
-            // SAFETY: we gate on SSE2 support.
-            unsafe {
-                if let Some(idx) = find_first_digit_sse2(bytes) {
-                    return Some(idx);
-                }
-            }
-        }
-    }
-
-    for (idx, &b) in bytes.iter().enumerate() {
-        if b.is_ascii_digit() {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
-    use std::arch::aarch64 as arch;
-
-    let mut i = 0usize;
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-    let lower = arch::vdupq_n_u8(b'0');
-    let upper = arch::vdupq_n_u8(b'9');
-
-    while i + 16 <= len {
-        let chunk = arch::vld1q_u8(ptr.add(i));
-        let ge0 = arch::vcgeq_u8(chunk, lower);
-        let le9 = arch::vcleq_u8(chunk, upper);
-        let mask = arch::vandq_u8(ge0, le9);
-        if arch::vmaxvq_u8(mask) != 0 {
-            for j in 0..16 {
-                let b = *ptr.add(i + j);
-                if b.is_ascii_digit() {
-                    return Some(i + j);
-                }
-            }
-        }
-        i += 16;
-    }
-
-    while i < len {
-        let b = *ptr.add(i);
-        if b.is_ascii_digit() {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse2")]
-unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86 as arch;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64 as arch;
-
-    let mut i = 0usize;
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-    let lower = arch::_mm_set1_epi8((b'0' - 1) as i8);
-    let upper = arch::_mm_set1_epi8((b'9' + 1) as i8);
-
-    while i + 16 <= len {
-        let chunk = arch::_mm_loadu_si128(ptr.add(i) as *const arch::__m128i);
-        let ge0 = arch::_mm_cmpgt_epi8(chunk, lower);
-        let le9 = arch::_mm_cmplt_epi8(chunk, upper);
-        let mask = arch::_mm_and_si128(ge0, le9);
-        let bits = arch::_mm_movemask_epi8(mask) as u32;
-        if bits != 0 {
-            let offset = bits.trailing_zeros() as usize;
-            return Some(i + offset);
-        }
-        i += 16;
-    }
-
-    while i < len {
-        let b = *ptr.add(i);
-        if b.is_ascii_digit() {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx2")]
-unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86 as arch;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64 as arch;
-
-    let mut i = 0usize;
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-    let lower = arch::_mm256_set1_epi8((b'0' - 1) as i8);
-    let upper = arch::_mm256_set1_epi8((b'9' + 1) as i8);
-
-    while i + 32 <= len {
-        let chunk = arch::_mm256_loadu_si256(ptr.add(i) as *const arch::__m256i);
-        let ge0 = arch::_mm256_cmpgt_epi8(chunk, lower);
-        let le9 = arch::_mm256_cmpgt_epi8(upper, chunk);
-        let mask = arch::_mm256_and_si256(ge0, le9);
-        let bits = arch::_mm256_movemask_epi8(mask) as u32;
-        if bits != 0 {
-            let offset = bits.trailing_zeros() as usize;
-            return Some(i + offset);
-        }
-        i += 32;
-    }
-
-    while i < len {
-        let b = *ptr.add(i);
-        if b.is_ascii_digit() {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
 fn to_status(err: impl std::fmt::Display) -> Status {
     Status::internal(err.to_string())
+}
+
+#[cfg(test)]
+mod range_reference_tests {
+    use super::*;
+
+    /// Inputs for the digit scan: every length up to 80 bytes, a digit at
+    /// every position, surrounded by letters, `$`, the ASCII neighbours of
+    /// the digits, and bytes that differ from a digit only in the high bit.
+    fn digit_scan_inputs() -> Vec<Vec<u8>> {
+        let fillers = [b'A', b'$', b'/', b':', 0x00, 0x7F, 0xB0, 0xB9, 0xFF];
+        let mut inputs = Vec::new();
+        for len in 0..=80usize {
+            for &filler in &fillers {
+                inputs.push(vec![filler; len]);
+                for position in 0..len {
+                    for digit in *b"059" {
+                        let mut bytes = vec![filler; len];
+                        bytes[position] = digit;
+                        inputs.push(bytes.clone());
+                        bytes[len - 1] = b'7';
+                        inputs.push(bytes);
+                    }
+                }
+            }
+        }
+        inputs
+    }
+
+    /// WHY: this server used to carry its own copy of the vectorized digit
+    /// scan. It now calls the one in xlsx-fast-core, which must keep giving
+    /// the answer a plain byte-by-byte scan gives.
+    #[test]
+    fn the_shared_digit_scan_agrees_with_a_byte_by_byte_scan() {
+        let inputs = digit_scan_inputs();
+        assert!(inputs.len() > 150_000, "{} inputs", inputs.len());
+        for input in &inputs {
+            assert_eq!(
+                find_first_digit(input),
+                input.iter().position(u8::is_ascii_digit),
+                "input {input:?}"
+            );
+        }
+    }
+
+    fn range(input: &str) -> Option<(u32, u32, u32, u32)> {
+        parse_range_part(input).ok().map(|range| {
+            (
+                range.row_start,
+                range.row_end,
+                range.col_start,
+                range.col_end,
+            )
+        })
+    }
+
+    /// WHY: range queries are parsed around the digit scan. These results
+    /// were recorded with the server's own copy of the scan and must not move
+    /// when it is replaced by the shared one. The long references are 16
+    /// bytes or more, which is where the vectorized path starts.
+    #[test]
+    fn range_queries_parse_the_same_references() {
+        let all = u32::MAX;
+        assert_eq!(range("A1:C3"), Some((1, 3, 1, 3)));
+        assert_eq!(range("c3:a1"), Some((1, 3, 1, 3)));
+        assert_eq!(range("$B$2:$D$10"), Some((2, 10, 2, 4)));
+        assert_eq!(range("B2"), Some((2, all, 2, all)));
+        assert_eq!(range(":B2"), Some((1, 2, 1, 2)));
+        assert_eq!(range("2:5"), Some((2, 5, 1, all)));
+        assert_eq!(range("B:D"), Some((1, all, 2, 4)));
+        assert_eq!(range("AA10:XFD1048576"), Some((10, 1_048_576, 27, 16_384)));
+        assert_eq!(range("$$$$$$$$$$$$$$$$AB$12"), Some((12, all, 28, all)));
+        assert_eq!(
+            range("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$C7:$$$$$$$$$$$$$$$$$$$$E9"),
+            Some((7, 9, 3, 5))
+        );
+        assert_eq!(
+            range("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$ZZ"),
+            Some((1, all, 702, all))
+        );
+        assert_eq!(
+            range("0000000000000000000000000000000000042"),
+            Some((42, all, 1, all))
+        );
+        assert_eq!(range("A1:5"), None);
+    }
+
+    /// WHY: a range comes straight from the client's query. A column or row
+    /// too large for the arithmetic used to panic in a debug build and wrap
+    /// to an unrelated range in a release build; it is an invalid argument.
+    #[test]
+    fn a_reference_too_large_to_compute_is_an_invalid_argument() {
+        for input in [
+            "AAAAAAAAAAAAAAAA1",
+            "ZZZZZZZ",
+            "A99999999999",
+            "99999999999",
+            "A1:ZZZZZZZZ9",
+            "1:4294967296",
+        ] {
+            let err = parse_range_part(input).expect_err(input);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{input}");
+        }
+        // The largest values that still fit are accepted as before.
+        assert_eq!(
+            range("4294967295"),
+            Some((4_294_967_295, u32::MAX, 1, u32::MAX))
+        );
+    }
+
+    #[test]
+    fn range_queries_reject_malformed_references() {
+        assert_eq!(range("A:5"), None);
+        assert_eq!(range("A0"), None);
+        assert_eq!(range("!!"), None);
+        assert_eq!(range(""), None);
+        assert_eq!(range(":"), None);
+    }
 }
 
 #[cfg(test)]

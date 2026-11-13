@@ -4746,7 +4746,7 @@ dependencies = [
  "chrono",
  "lexical-core",
  "ooxml-archive",
- "quick-xml 0.36.2",
+ "quick-xml 0.41.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -4798,7 +4798,7 @@ dependencies = [
 name = "xlsx-fast-write"
 version = "0.2.2"
 dependencies = [
- "quick-xml 0.36.2",
+ "quick-xml 0.41.0",
  "serde",
  "serde_json",
  "tempfile",
