@@ -47,6 +47,9 @@ pub enum WebParseError {
     /// `rowspan`/`colspan` covered more than [`MAX_TABLE_SPAN_CELLS`] cells.
     #[error("HTML table spans cover more cells than the supported limit")]
     TableSpanLimitExceeded,
+    /// The `dom_path` strings exceeded [`MAX_DOM_PATH_BYTES`].
+    #[error("HTML structural paths exceed the supported total size")]
+    DomPathLimitExceeded,
     /// Reading a local source failed.
     #[error("failed to read HTML source: {0}")]
     Io(#[from] std::io::Error),
@@ -76,6 +79,18 @@ pub const MAX_NESTING_DEPTH: usize = 512;
 /// parse fails with [`WebParseError::TableSpanLimitExceeded`].
 pub const MAX_TABLE_SPAN_CELLS: usize = 1_000_000;
 
+/// Most bytes of `dom_path` one document may emit, over all of its blocks,
+/// links, images and tables.
+///
+/// A `dom_path` is as long as its element is deep, and no other budget
+/// counted it: 250,000 blocks at depth 512 would carry about 2 GB. It has
+/// its own budget, not the one for extracted text, because an ordinary
+/// large document's paths outweigh its text (240,000 short paragraphs in 12
+/// sections have 38 MB of paths). 256 MiB is 1 KiB of path for each of the
+/// 250,000 nodes the default node limit allows. Beyond it the parse fails
+/// with [`WebParseError::DomPathLimitExceeded`].
+pub const MAX_DOM_PATH_BYTES: usize = 256 * 1024 * 1024;
+
 /// Largest `colspan` honored: the maximum the HTML standard allows.
 const MAX_COLSPAN: usize = 1_000;
 
@@ -90,8 +105,8 @@ pub struct ParseOptions {
     pub max_input_bytes: usize,
     /// Maximum number of emitted blocks, links, images, tables, and JSON-LD values.
     pub max_nodes: usize,
-    /// Maximum UTF-8 byte size of all emitted text combined, including the
-    /// `dom_path` of every block, link, image and table.
+    /// Maximum UTF-8 byte size of all emitted text combined. `dom_path`
+    /// strings are bounded separately by [`MAX_DOM_PATH_BYTES`].
     pub max_text_bytes: usize,
     /// Optional WHATWG encoding label. UTF-8 is required when absent.
     pub encoding_label: Option<String>,
@@ -390,8 +405,8 @@ fn parse_html_inner(
             positions.insert(child.id(), *count);
         }
     }
-    // `dom_path` is emitted text as long as the element is deep, so it is
-    // charged to the text budget like any other emitted text.
+    // `dom_path` is as long as the element is deep, so it is charged to a
+    // budget of its own.
     let structural_path =
         |element: ElementRef<'_>, budget: &mut Budget| -> Result<String, WebParseError> {
             let mut parts = std::iter::once(element)
@@ -413,7 +428,7 @@ fn parse_html_inner(
             if path.is_empty() {
                 path.push('/');
             }
-            budget.add_text(&path)?;
+            budget.add_path(&path)?;
             Ok(path)
         };
 
@@ -599,17 +614,24 @@ struct RowSpan {
     rows_left: usize,
 }
 
-/// Reads a `rowspan`/`colspan` attribute.
+/// Reads a `rowspan`/`colspan` attribute the way browsers do.
 ///
-/// A missing attribute is 1. A value that is not a number from 1 to
-/// `maximum` is treated as 1 and counted in `ignored`, so a hostile span
+/// The value is the run of digits at the start, after optional whitespace
+/// and one `+`; what follows is ignored, so `2px` and `2.5` are 2. A missing
+/// attribute is 1. A value with no leading digits, or outside 1 to
+/// `maximum`, is treated as 1 and counted in `ignored`, so a hostile span
 /// neither expands the table nor passes unnoticed. `rowspan="0"` (to the end
-/// of the table, per HTML) is returned as `usize::MAX`.
+/// of the row group, per HTML) is returned as `usize::MAX`.
 fn span_attr(cell: ElementRef<'_>, name: &str, maximum: usize, ignored: &mut usize) -> usize {
     let Some(raw) = cell.value().attr(name) else {
         return 1;
     };
-    match raw.trim().parse::<usize>() {
+    let trimmed = raw.trim_start();
+    let unsigned = trimmed.strip_prefix('+').unwrap_or(trimmed);
+    let digits = unsigned
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(unsigned, |end| &unsigned[..end]);
+    match digits.parse::<usize>() {
         Ok(0) if name == "rowspan" => usize::MAX,
         Ok(value) if (1..=maximum).contains(&value) => value,
         _ => {
@@ -632,7 +654,14 @@ fn table_rows(
     // Spans carried down from earlier rows: sorted by column, never overlapping.
     let mut active: Vec<RowSpan> = Vec::new();
     let mut grid = Vec::new();
+    let mut group = None;
     for row in rows {
+        // A cell cannot span past its row group (`thead`/`tbody`/`tfoot`).
+        let row_group = row.parent().map(|parent| parent.id());
+        if row_group != group {
+            active.clear();
+            group = row_group;
+        }
         let mut out: Vec<String> = Vec::new();
         let mut carried: Vec<RowSpan> = Vec::new();
         let mut next_active = 0usize;
@@ -648,20 +677,28 @@ fn table_rows(
             }
             let text = normalized_text(cell);
             budget.add_text(&text)?;
-            let mut width = span_attr(cell, "colspan", MAX_COLSPAN, ignored_spans);
+            let width = span_attr(cell, "colspan", MAX_COLSPAN, ignored_spans);
             let height = span_attr(cell, "rowspan", MAX_ROWSPAN, ignored_spans);
-            if let Some(span) = active.get(next_active) {
-                // A cell may not run into a column covered from above.
-                width = width.min(span.column - out.len());
-            }
             let column = out.len();
             out.push(text);
             add_empty_cells(&mut out, width - 1, budget)?;
-            if height > 1 {
+            // The cell keeps its full width even where it runs into columns
+            // covered from above, as in a browser. Those spans are absorbed:
+            // their columns are already emitted, and the merged span is what
+            // carries down.
+            let mut rows_left = height - 1;
+            while let Some(span) = active.get(next_active).filter(|s| s.column < out.len()) {
+                let end = span.column + span.width;
+                let missing = end.saturating_sub(out.len());
+                add_empty_cells(&mut out, missing, budget)?;
+                rows_left = rows_left.max(span.rows_left - 1);
+                next_active += 1;
+            }
+            if rows_left > 0 {
                 carried.push(RowSpan {
                     column,
-                    width,
-                    rows_left: height - 1,
+                    width: out.len() - column,
+                    rows_left,
                 });
             }
         }
@@ -856,6 +893,7 @@ fn ordinal(value: usize) -> Result<u32, WebParseError> {
 }
 
 struct Budget {
+    path_bytes: usize,
     span_cells: usize,
     nodes: usize,
     text_bytes: usize,
@@ -866,6 +904,7 @@ struct Budget {
 impl Budget {
     fn new(max_nodes: usize, max_text_bytes: usize) -> Self {
         Self {
+            path_bytes: 0,
             span_cells: 0,
             nodes: 0,
             text_bytes: 0,
@@ -881,6 +920,14 @@ impl Budget {
             .ok_or(WebParseError::NodeLimitExceeded)?;
         if self.nodes > self.max_nodes {
             return Err(WebParseError::NodeLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn add_path(&mut self, path: &str) -> Result<(), WebParseError> {
+        self.path_bytes = self.path_bytes.saturating_add(path.len());
+        if self.path_bytes > MAX_DOM_PATH_BYTES {
+            return Err(WebParseError::DomPathLimitExceeded);
         }
         Ok(())
     }

@@ -214,6 +214,49 @@ fn spanning_cells_keep_columns_aligned() {
     assert!(document.diagnostics.is_empty());
 }
 
+fn first_table(html: &str) -> Vec<Vec<String>> {
+    let document = parse_html(html, None, ParseOptions::default()).expect("parses");
+    document.tables[0].rows.clone()
+}
+
+/// A cell cannot span past its row group: a header `rowspan` that outlives
+/// the `thead` must not push the body's cells to the right.
+#[test]
+fn rowspan_stops_at_the_end_of_its_row_group() {
+    let rows = first_table(
+        "<table><thead><tr><th rowspan=3>h</th><th>a</th></tr></thead>\
+         <tbody><tr><td>1</td><td>2</td></tr><tr><td rowspan=5>3</td><td>4</td></tr></tbody>\
+         <tfoot><tr><td>5</td><td>6</td></tr></tfoot></table>",
+    );
+    assert_eq!(rows, [["h", "a"], ["1", "2"], ["3", "4"], ["5", "6"]]);
+}
+
+/// Span values are read the way browsers read them (leading digits), and a
+/// cell that runs into a column covered from above still takes its full
+/// width, so the cells after it stay where a browser puts them.
+#[test]
+fn span_values_are_read_like_a_browser_reads_them() {
+    let rows = first_table(
+        "<table><tr><td colspan=\"2px\">a</td><td colspan=\" +2.5\">b</td><td colspan=x>c</td></tr></table>",
+    );
+    assert_eq!(rows, [["a", "", "b", "", "c"]]);
+    let rows = first_table(
+        "<table><tr><td>a</td><td rowspan=2>b</td><td>c</td><td>d</td></tr>\
+         <tr><td colspan=3>e</td><td>f</td></tr></table>",
+    );
+    assert_eq!(rows, [["a", "b", "c", "d"], ["e", "", "", "f"]]);
+}
+
+/// An ordinary large document: 240,000 paragraphs inside 12 sections. Its
+/// `dom_path` strings total about 38 MB, which must not count against the
+/// 32 MiB budget for extracted text.
+#[test]
+fn many_shallow_blocks_fit_the_default_budgets() {
+    let html = "<section>".repeat(12) + &"<p>x</p>".repeat(240_000);
+    let document = parse_html(&html, None, ParseOptions::default()).expect("parses");
+    assert_eq!(document.blocks.len(), 240_000);
+}
+
 /// Spans are bounded: a million-row `rowspan` adds no rows, and the empty
 /// cells that spans add are capped for the whole document, as an error.
 #[test]
@@ -244,26 +287,19 @@ fn span_created_cells_are_capped_as_an_error() {
     assert_eq!(document.tables[0].rows[0].len(), 1_000_000);
 }
 
-/// `dom_path` grows with depth and is stored per block, so it counts toward
-/// the text budget: 2,000 blocks at depth 500 carry about 6 KiB of path each.
+/// `dom_path` is built from per-parent counters, so it is the same string
+/// the sibling-counting version produced, deep or wide.
 #[test]
-fn dom_paths_are_charged_to_the_text_budget() {
+fn dom_paths_name_each_level_and_sibling_position() {
     let html = "<div>".repeat(500) + &"<p>x".repeat(2_000);
-    let options = ParseOptions {
-        max_text_bytes: 1 << 20,
-        ..ParseOptions::default()
-    };
-    assert!(matches!(
-        parse_html(&html, None, options),
-        Err(WebParseError::TextLimitExceeded)
-    ));
-    let document = parse_html(&html, None, ParseOptions::default()).expect("default budget");
+    let document = parse_html(&html, None, ParseOptions::default()).expect("parses");
     let last = document.blocks.last().expect("blocks");
     assert!(
         last.dom_path.ends_with("/div[1]/p[2000]"),
         "{}",
         last.dom_path
     );
+    assert!(last.dom_path.starts_with("/html[1]/body[1]/div[1]/"));
 }
 
 #[test]
