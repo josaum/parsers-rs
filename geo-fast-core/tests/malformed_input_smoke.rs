@@ -2005,3 +2005,35 @@ fn mutated_boxes_never_panic() {
         let _ = index.query_antimeridian_aware(&query);
     });
 }
+
+/// The seeds above are also the starting corpus of the fuzz targets in
+/// `fuzz/`; `WRITE_FUZZ_SEEDS=1` writes them out again after a seed changes.
+#[test]
+fn the_fuzz_corpus_holds_these_seeds() {
+    smoke::fuzz_seeds(
+        env!("CARGO_MANIFEST_DIR"),
+        &[
+            ("shapefile", "plain.shp", shp_plain_seed()),
+            ("shapefile", "measured.shp", shp_measured_seed()),
+            ("shapefile", "table.dbf", dbf_seed()),
+            ("shapefile", "deleted-row.dbf", dbf_seed_with_deleted_row()),
+            ("geotiff", "gray8.tif", geotiff_gray8_seed()),
+            ("geotiff", "bigtiff-gray8.tif", bigtiff_gray8_seed()),
+            ("geotiff", "gray16.tif", tiff_gray16_seed()),
+            ("geotiff", "rgb8.tif", geotiff_rgb8_seed()),
+            ("geotiff", "float32.tif", geotiff_float32_seed()),
+            ("geotiff", "packbits.tif", tiff_packbits_seed()),
+            ("geotiff", "deflate.tif", tiff_deflate_seed()),
+            (
+                "geojson",
+                "geometries.geojson",
+                GEOJSON_SEED.as_bytes().to_vec(),
+            ),
+            (
+                "geojson",
+                "feature.geojson",
+                GEOJSON_COLLECTION_SEED.as_bytes().to_vec(),
+            ),
+        ],
+    );
+}

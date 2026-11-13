@@ -5,7 +5,7 @@
 //!
 //! | Format          | Module                  | Notes |
 //! |-----------------|-------------------------|-------|
-//! | JSON (6 types)  | [`parse`], [`parse_value`], [`stringify`], [`types`] | SIMD via sonic-rs |
+//! | JSON (6 types)  | [`parse`], [`parse_value`], [`stringify()`], [`types`] | SIMD via sonic-rs |
 //! | JSONL / NDJSON  | [`jsonl`]               | line-delimited streaming |
 //! | JSON Schema     | [`schema`]              | draft-07 through 2020-12 constraint keywords, local `$ref`, allocation-free walk |
 //! | JSON-RPC 2.0    | [`jsonrpc`]             | request / response envelopes |
@@ -54,6 +54,16 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 /// Default maximum JSON array/object nesting depth.
 pub const DEFAULT_MAX_NESTING_DEPTH: usize = 64;
+/// Deepest nesting any caller-supplied [`JsonLimits`] can allow.
+///
+/// The parsing backend recurses once per array/object level and refuses
+/// input more than 128 levels deep with an error of its own that quotes the
+/// input. A `max_nesting_depth` above this ceiling is treated as this
+/// ceiling, so deeper input is always this crate's `resource_limit` error
+/// and the backend's limit is never reached. 128 levels is the most the
+/// backend parses; an unoptimized build needs a large stack to get there
+/// (63 nested objects already take 2 to 4 MiB).
+pub const MAX_SUPPORTED_NESTING_DEPTH: usize = 128;
 /// Default maximum lexical JSON tokens.
 pub const DEFAULT_MAX_TOKENS: usize = 1_000_000;
 /// Default maximum physical lines in one JSONL input.
@@ -70,7 +80,8 @@ pub const DEFAULT_MAX_IPC_BYTES: usize = 64 * 1024 * 1024;
 pub struct JsonLimits {
     /// Maximum UTF-8 bytes in one input.
     pub max_input_bytes: usize,
-    /// Maximum object/array nesting depth.
+    /// Maximum object/array nesting depth; values above
+    /// [`MAX_SUPPORTED_NESTING_DEPTH`] are treated as that ceiling.
     pub max_nesting_depth: usize,
     /// Maximum lexical tokens across one JSON document or JSONL batch.
     pub max_tokens: usize,
@@ -136,7 +147,11 @@ pub(crate) fn scan_json(input: &str, limits: &JsonLimits) -> Result<JsonUsage> {
             }
             b'[' | b'{' => {
                 depth = depth.saturating_add(1);
-                check_limit(JsonResource::NestingDepth, depth, limits.max_nesting_depth)?;
+                check_limit(
+                    JsonResource::NestingDepth,
+                    depth,
+                    limits.max_nesting_depth.min(MAX_SUPPORTED_NESTING_DEPTH),
+                )?;
                 tokens = tokens.saturating_add(1);
                 check_limit(JsonResource::Tokens, tokens, limits.max_tokens)?;
                 index += 1;

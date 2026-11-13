@@ -4725,6 +4725,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "encoding_rs",
+ "html5ever",
  "scraper",
  "serde",
  "serde_json",

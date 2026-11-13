@@ -925,3 +925,16 @@ fn large_recursive_types_are_not_copied_per_instance_element() {
         .expect("validation reports findings");
     assert!(errors.is_empty(), "{:?}", errors.first());
 }
+
+/// The seeds above are also the starting corpus of the fuzz targets in
+/// `fuzz/`; `WRITE_FUZZ_SEEDS=1` writes them out again after a seed changes.
+#[test]
+fn the_fuzz_corpus_holds_these_seeds() {
+    smoke::fuzz_seeds(
+        env!("CARGO_MANIFEST_DIR"),
+        &[
+            ("xsd_schema", "schema.xsd", schema_seed()),
+            ("xsd_validate", "instance.xml", instance_seed()),
+        ],
+    );
+}

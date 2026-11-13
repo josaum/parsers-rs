@@ -91,24 +91,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
-name = "libdeflate-sys"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1f7b0817f85e2ba608892f30fbf4c9d03f3ebf9db0c952d1b7c8f7387b54785"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "libdeflater"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "671e63282f642c7bcc7d292b212d5a4739fef02a77fe98429a75d308f96e7931"
-dependencies = [
- "libdeflate-sys",
-]
-
-[[package]]
 name = "libfuzzer-sys"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -145,11 +127,10 @@ dependencies = [
 
 [[package]]
 name = "ooxml-archive"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "flate2",
- "libdeflater",
  "memmap2",
  "quick-xml",
  "rawzip",
@@ -165,9 +146,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.36.2"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
 ]
@@ -180,9 +161,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rawzip"
-version = "0.4.4"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d9575f44c8cf85bc843ad666dcdf20d05a7753772bef56eb2a5140282b32150"
+checksum = "ac9999039f74cd73c03158cddfe4362991703c74efe5ce5c8073026f80a5e48c"
 
 [[package]]
 name = "shlex"
