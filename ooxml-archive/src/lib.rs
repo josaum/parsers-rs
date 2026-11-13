@@ -93,6 +93,10 @@ pub struct OoxmlArchive {
 
 impl OoxmlArchive {
     /// Open a package from a filesystem path, preferring a read-only mmap.
+    ///
+    /// The mapping lives as long as the archive. The file must not be
+    /// modified or truncated, by this process or any other, while the archive
+    /// is alive; see [`Self::open_with_budget`].
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_budget(path, InflateBudget::shared())
     }
@@ -102,14 +106,25 @@ impl OoxmlArchive {
     /// This is required when parallel workers reopen the same package: each
     /// archive owns its ZIP index, while every part read charges one common
     /// aggregate limit.
+    ///
+    /// The file is mapped read-only and the mapping lives as long as the
+    /// archive; when it cannot be mapped, it is read into memory instead.
+    /// The file must not be modified or truncated, by this process or any
+    /// other, while the archive is alive. Nothing here can enforce that: a
+    /// truncated file makes reads of the mapping fault (`SIGBUS` on Unix),
+    /// and a modified one changes the bytes under the archive. Read the file
+    /// yourself and use [`Self::from_bytes_with_budget`] when another writer
+    /// may touch it.
     pub fn open_with_budget(path: &Path, inflate_budget: SharedInflateBudget) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open file: {}", path.display()))?;
-        let storage = match unsafe {
-            // SAFETY: the file is mapped read-only and treated as an
-            // immutable Office package. Callers never write through this
-            // mapping; `Mmap` is dropped with the archive.
-            Mmap::map(&file)
-        } {
+        // SAFETY: `Mmap::map` is unsafe because the mapping is only sound
+        // while no one modifies or truncates the file, which no code here can
+        // enforce. The crate states that contract on this function and on
+        // `open`: the caller must not let the file change while the archive
+        // lives. Within this process the mapping is read-only, never written
+        // through, and owned by the archive, which unmaps it when dropped.
+        let mapped = unsafe { Mmap::map(&file) };
+        let storage = match mapped {
             Ok(mmap) => ArchiveStorage::Mmap(mmap),
             Err(_) => ArchiveStorage::Owned(read_all(&file)?),
         };

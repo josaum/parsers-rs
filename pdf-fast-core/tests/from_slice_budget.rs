@@ -15,6 +15,10 @@ fn record_probe_allocation(bytes: usize) {
     }
 }
 
+// SAFETY: every method forwards the caller's unchanged pointer, layout and
+// size to `System`, so `System` upholds `GlobalAlloc`'s contract for the
+// memory handed out. The only addition is the probe count: an atomic load and
+// an atomic increment, which neither allocate nor unwind.
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record_probe_allocation(layout.size());

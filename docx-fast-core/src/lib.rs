@@ -49,6 +49,14 @@
 //! The parser uses a state machine (`DocxBodyParser`) to handle nested
 //! XML structures. Tables can contain paragraphs, which can contain
 //! runs, which can contain text, comments, and revisions.
+//!
+//! # Files on disk
+//!
+//! Functions that take a path memory-map the file. It must not be modified
+//! or truncated, by this process or any other, while it is being read: a
+//! truncated file can make reads of the mapping fault (`SIGBUS` on Unix),
+//! and a modified one can change the bytes under the parser. Functions that
+//! take bytes have no such requirement.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::DateTime;

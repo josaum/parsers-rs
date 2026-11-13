@@ -52,3 +52,6 @@ rayon = "1.10"
 
 [build-dependencies]
 pyo3-build-config = "0.29.3"
+
+[lints]
+workspace = true

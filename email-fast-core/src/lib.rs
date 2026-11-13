@@ -373,6 +373,11 @@ pub fn detect_format(path: &Path) -> Result<EmailFormat> {
 }
 
 /// Parse email from file (auto-detects format)
+///
+/// An `.eml` file is memory-mapped: it must not be modified or truncated,
+/// by this process or any other, while it is parsed. A truncated file can
+/// make reads of the mapping fault (`SIGBUS` on Unix), and a modified one
+/// can change the bytes under the parser.
 pub fn parse_email(path: impl AsRef<Path>, options: ParseOptions) -> Result<Email> {
     let path = path.as_ref();
     let format = detect_format(path)?;
@@ -404,9 +409,23 @@ pub fn parse_email_bytes(
 }
 
 /// Parse EML (RFC 5322 MIME) file
+///
+/// The file is memory-mapped read-only for the duration of the call; the
+/// returned [`Email`] owns its data, so the mapping is gone on return.
+///
+/// The file must not be modified or truncated, by this process or any other,
+/// while the call runs. Nothing here can enforce that: a truncated file makes
+/// reads of the mapping fault (`SIGBUS` on Unix), and a modified one changes
+/// the bytes being parsed. Read the file yourself and call
+/// [`parse_eml_bytes`] when another writer may touch it.
 pub fn parse_eml(path: impl AsRef<Path>, options: ParseOptions) -> Result<Email> {
     let path = path.as_ref();
     let file = File::open(path).with_context(|| format!("open file: {}", path.display()))?;
+    // SAFETY: `Mmap::map` is unsafe because the mapping is only sound while
+    // no one modifies or truncates the file, which no code here can enforce.
+    // The crate states that contract on this function: the caller must not
+    // let the file change during the call. Within this process the mapping
+    // is read-only, never written through, and dropped before this returns.
     let mmap = unsafe { Mmap::map(&file)? };
 
     parse_eml_bytes(&mmap, options)
