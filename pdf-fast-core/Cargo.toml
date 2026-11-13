@@ -41,11 +41,12 @@ glyph-catalog = []   # retained only to keep downstream cfg compatibility; not p
 # ── Core (always on) ─────────────────────────────────────────────────────
 anyhow      = "1.0"
 bumpalo     = "3.17"
-# Held at 0.12: libdeflater 1.26 bundles a libdeflate whose AVX-512 VNNI
-# adler32 does not compile under the zig clang the release builds its
-# manylinux x86_64 wheels with ("requires target feature 'evex512'"), which
-# failed the v2026.11.13.1 release. See the hold in .github/dependabot.yml.
-libdeflater = "0.12"
+# Below 1: libdeflater 1.26 bundles a libdeflate whose AVX-512 VNNI adler32
+# does not compile under the zig clang the release builds its manylinux
+# x86_64 wheels with ("requires target feature 'evex512'"), which failed the
+# v2026.11.13.1 release. 0.14 builds through zig. See the hold in
+# .github/dependabot.yml; ci.yml's Linux wheel leg builds the same way.
+libdeflater = "0.14"
 memchr      = "2.7"
 
 # ── Optional ─────────────────────────────────────────────────────────────
