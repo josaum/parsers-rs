@@ -90,6 +90,10 @@ pub struct JsonLimits {
     /// Maximum non-blank records in one JSONL batch.
     pub max_records: usize,
     /// Maximum conservative retained bytes for parsed values.
+    ///
+    /// Estimated before parsing as the input length plus 64 bytes per token,
+    /// an upper bound on what the parsed values hold. Even `[]` counts as
+    /// 66 bytes, so a limit below that refuses every document.
     pub max_retained_bytes: usize,
     /// Maximum bytes in one returned Arrow IPC stream.
     pub max_ipc_bytes: usize,
