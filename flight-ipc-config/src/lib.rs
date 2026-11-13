@@ -571,54 +571,65 @@ pub struct FlightQuery {
     pub max_inflate: Option<usize>,
 }
 
-/// Resolve a `FlightDescriptor` (path components or UTF-8 cmd) to a rooted
-/// path plus its parsed query overrides.
-pub fn descriptor_to_request(
-    root: &Path,
+/// The path and the raw query string a `FlightDescriptor` names, before the
+/// path is looked up. The query is empty when the descriptor carries none.
+///
+/// Servers with their own query keys parse the query themselves and then
+/// call [`resolve_path`]; [`descriptor_to_request`] does both for the shared
+/// keys.
+pub fn descriptor_path_and_query(
     descriptor: &FlightDescriptor,
-) -> Result<(PathBuf, FlightQuery), Status> {
+) -> Result<(PathBuf, String), Status> {
     if !descriptor.path.is_empty() {
         let mut parts = descriptor.path.clone();
-        let mut query = FlightQuery::default();
+        let mut query = String::new();
         if let Some(last) = parts.last_mut() {
             let last_value = last.clone();
             if let Some((base, q)) = split_query(&last_value) {
                 *last = base.to_string();
-                query = parse_query(q)?;
+                query = q.to_string();
             }
         }
         let path = parts.into_iter().fold(PathBuf::new(), |mut buf, part| {
             buf.push(part);
             buf
         });
-        resolve_path(root, &path).map(|path| (path, query))
+        Ok((path, query))
     } else if !descriptor.cmd.is_empty() {
         let cmd = std::str::from_utf8(&descriptor.cmd)
             .map_err(|_| Status::invalid_argument("descriptor cmd must be utf-8 path"))?;
         let (path_str, query) = split_query(cmd).unwrap_or((cmd, ""));
-        let query = if query.is_empty() {
-            FlightQuery::default()
-        } else {
-            parse_query(query)?
-        };
-        resolve_path(root, Path::new(path_str)).map(|path| (path, query))
+        Ok((PathBuf::from(path_str), query.to_string()))
     } else {
         Err(Status::invalid_argument("missing flight descriptor path"))
     }
 }
 
+/// The path and the raw query string a `Ticket` names, before the path is
+/// looked up. The query is empty when the ticket carries none.
+pub fn ticket_path_and_query(ticket: &Ticket) -> Result<(&str, &str), Status> {
+    let path = std::str::from_utf8(&ticket.ticket)
+        .map_err(|_| Status::invalid_argument("ticket must be utf-8 path"))?;
+    Ok(split_query(path).unwrap_or((path, "")))
+}
+
+/// Resolve a `FlightDescriptor` (path components or UTF-8 cmd) to a rooted
+/// path plus its parsed query overrides.
+pub fn descriptor_to_request(
+    root: &Path,
+    descriptor: &FlightDescriptor,
+) -> Result<(PathBuf, FlightQuery), Status> {
+    let (path, query) = descriptor_path_and_query(descriptor)?;
+    let query = parse_query(&query)?;
+    resolve_path(root, &path).map(|path| (path, query))
+}
+
 /// Resolve a `Ticket` (UTF-8 path with optional query string) to a rooted
 /// path plus its parsed query overrides.
 pub fn ticket_to_request(root: &Path, ticket: &Ticket) -> Result<(PathBuf, FlightQuery), Status> {
-    let path = std::str::from_utf8(&ticket.ticket)
-        .map_err(|_| Status::invalid_argument("ticket must be utf-8 path"))?;
-    let (path_str, query_str) = split_query(path).unwrap_or((path, ""));
-    let query = if query_str.is_empty() {
-        FlightQuery::default()
-    } else {
-        parse_query(query_str)?
-    };
-    resolve_path(root, Path::new(path_str)).map(|path| (path, query))
+    let (path, query) = ticket_path_and_query(ticket)?;
+    let query = parse_query(query)?;
+    resolve_path(root, Path::new(path)).map(|path| (path, query))
 }
 
 /// Parse `table` / `batch`|`batch_size` / `max_inflate` query pairs; unknown
