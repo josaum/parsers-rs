@@ -59,6 +59,21 @@ updates:
       - dependency-name: "tiny-skia"
         versions:
           - ">=0.12"
+      # hayro 0.6 and later changes what pdf-fast-core's render guard
+      # (src/render_guard.rs) mirrors. A trial of 0.9.0 on 2026-11-13 found:
+      # resources no longer fall back name by name (`Resources::from_parent`
+      # is gone); an ExtGState `/Font` now selects a Type 3 font the guard
+      # never walks, and a chain of 20,000 of them overflowed the 64 MiB
+      # render stack and aborted the process through the guarded entry; a
+      # tiling cell now runs its content once per copy, and a 0.004 step ran
+      # past 45 s and 578 MB; annotation appearance-state dictionaries are
+      # drawn; and the guard's stack cost per level was measured on 0.5.
+      # Unblocked by porting the guard to 0.9's model with those routes
+      # bounded, re-measuring the costs with `probe_interpreter_stack`, and a
+      # before-and-after pixel comparison in the upgrade's pull request.
+      - dependency-name: "hayro"
+        versions:
+          - ">=0.6"
       # Arrow is pinned to the version the consumers use (Cargo.toml says
       # why), and flight-ipc-config reports it to them as
       # CAPABILITY_ARROW_VERSION, so a new major is the consumers' move first.
