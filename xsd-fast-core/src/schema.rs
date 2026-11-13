@@ -742,6 +742,8 @@ fn resolve_complex_type<'a>(
 ) -> anyhow::Result<()> {
     check_inheritance_nesting(depth)?;
     let outer = folding.len();
+    // How many of the type's particles are copies of its bases'.
+    let mut copied = 0;
     // Fold the base chain into this type's content + attributes.
     let base = ct
         .base
@@ -763,12 +765,16 @@ fn resolve_complex_type<'a>(
                 match &mut ct.content {
                     // The type's own particles move behind the inherited ones.
                     ContentModel::Sequence(own) => {
+                        copied = base_particles.len();
                         base_particles.append(own);
                         *own = base_particles;
                     }
                     // Pure extension that only adds attributes: keep the base's
                     // particles verbatim.
-                    ContentModel::Empty => ct.content = ContentModel::Sequence(base_particles),
+                    ContentModel::Empty => {
+                        copied = base_particles.len();
+                        ct.content = ContentModel::Sequence(base_particles);
+                    }
                     ContentModel::All(_)
                     | ContentModel::Choice(_)
                     | ContentModel::SimpleContent(_) => {}
@@ -785,9 +791,14 @@ fn resolve_complex_type<'a>(
         folding.truncate(outer);
     }
     // The bases folded into a nested type stay named while their copies
-    // are walked.
+    // are walked, and only then: the particles the type declares itself are
+    // not a copy of anything, so an extension of the same base among them is
+    // not recursion.
     if let Some(particles) = content_particles_mut(&mut ct.content) {
-        for particle in particles {
+        for (position, particle) in particles.iter_mut().enumerate() {
+            if position == copied {
+                folding.truncate(outer);
+            }
             resolve_element_ref(&mut particle.element, originals, depth + 1, folding, budget)?;
         }
     }
