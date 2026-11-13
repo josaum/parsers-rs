@@ -984,19 +984,21 @@ const NESTED_OBJECT_SHAPES: [(&[u8], &[u8], usize); 3] = [
     (b"[ << /A ", b" >> ]", 64),
 ];
 
-/// Nesting far past the limits, on a quarter of the small stack.
+/// Nesting far past the limits, on half the small stack.
 ///
 /// Passing on the small stack says the parsers fit; it does not say by how
 /// much. When both parsers recursed, these inputs needed over three quarters
 /// of that stack in an unoptimized macOS build, which passed here and
 /// overflowed now and then on Windows, where frames are larger. Neither
-/// parser recurses now, and a refused input builds no value, so a quarter of
-/// the stack is several times what this needs: a parser that goes back to
-/// following input depth on the call stack fails here on every platform.
+/// parser recurses now, and a refused input builds no value: on macOS this
+/// passes on 24 KiB. A quarter of the small stack (64 KiB) was still too
+/// little for an unoptimized Windows build, whose fixed cost is higher, so
+/// the margin asserted is half. A parser that goes back to following input
+/// depth on the call stack fails here on every platform.
 #[test]
-fn refused_nesting_leaves_three_quarters_of_the_small_stack_unused() {
+fn refused_nesting_leaves_half_the_small_stack_unused() {
     let _serial = serial();
-    let stack_bytes = smoke::SMALL_STACK_BYTES / 4;
+    let stack_bytes = smoke::SMALL_STACK_BYTES / 2;
     for (open, close, _) in NESTED_OBJECT_SHAPES {
         for closed in [true, false] {
             parse_nested_object(open, close, 200_000, closed, stack_bytes);
