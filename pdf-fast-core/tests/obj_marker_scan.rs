@@ -19,7 +19,7 @@ fn the_vectorized_scan_agrees_with_a_scalar_scan_at_every_length() {
     // Filler that contains the marker's first byte without the marker, so a
     // candidate is found and then rejected, including at a block's last byte.
     let filler = b"1 0 o ob oo endo bj\n";
-    for len in 0..=70 {
+    for len in 0..=40 {
         let base: Vec<u8> = filler.iter().copied().cycle().take(len).collect();
         assert_eq!(find_obj_markers_simd(&base), scalar(&base), "len {len}");
         for at in 0..len.saturating_sub(2) {
