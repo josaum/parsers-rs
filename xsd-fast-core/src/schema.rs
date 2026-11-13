@@ -932,7 +932,7 @@ fn resolve_complex_type<'a>(
                     | ContentModel::SimpleContent(_) => {}
                 }
                 // Inherited attributes come first, then locally declared ones.
-                base_attrs.append(&mut ct.attributes);
+                extend_attributes(&mut base_attrs, std::mem::take(&mut ct.attributes));
             }
             ct.attributes = base_attrs;
         }
@@ -1081,7 +1081,7 @@ fn collect_base<'a>(
                 &base.prohibited_attributes,
             );
         } else {
-            attrs.extend(base.attributes.iter().cloned());
+            extend_attributes(&mut attrs, base.attributes.clone());
         }
     }
     let text = match text {
@@ -1100,6 +1100,35 @@ fn collect_base<'a>(
         None => None,
     };
     Ok(Some((particles, attrs, text)))
+}
+
+/// Appends an extension's attribute declarations to the attributes it
+/// inherits, one attribute per name.
+///
+/// A declaration whose name is already inherited replaces the inherited one
+/// where it stands: the derived type's own declaration wins. Any other is
+/// appended.
+fn extend_attributes(inherited: &mut Vec<AttributeDecl>, own: Vec<AttributeDecl>) {
+    if own.is_empty() {
+        return;
+    }
+    let mut positions: std::collections::HashMap<String, usize> = inherited
+        .iter()
+        .enumerate()
+        .map(|(position, attribute)| (attribute.name.clone(), position))
+        .collect();
+    for attribute in own {
+        match positions
+            .get(&attribute.name)
+            .and_then(|position| inherited.get_mut(*position))
+        {
+            Some(existing) => *existing = attribute,
+            None => {
+                positions.insert(attribute.name.clone(), inherited.len());
+                inherited.push(attribute);
+            }
+        }
+    }
 }
 
 /// Applies a restriction's attribute declarations to the attributes it
