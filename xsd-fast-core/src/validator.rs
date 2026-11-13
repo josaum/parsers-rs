@@ -6,12 +6,12 @@
 //! Each [`TypeFrame`] on the stack borrows its type from the schema model, so
 //! the cost of an open element does not depend on the size of its type.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use anyhow::Result;
 use quick_xml::escape::resolve_predefined_entity;
-use quick_xml::events::{BytesRef, Event};
+use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +130,9 @@ struct TypeFrame<'m> {
     xsd_type: Option<ResolvedType<'m>>,
     /// Counts of child element occurrences.
     child_counts: HashMap<String, usize>,
+    /// Whether the element is nillable and carries `xsi:nil="true"`: it then
+    /// has no content to check.
+    nil: bool,
 }
 
 // ── Validation context ────────────────────────────────────────────────────────
@@ -154,6 +157,8 @@ struct ContentIndex<'m> {
     /// group, as the first declaration found in document order gives it.
     /// `None` is a declared child whose type names nothing known.
     child_types: HashMap<&'m str, Option<ResolvedType<'m>>>,
+    /// Child names with a nillable declaration here or in a nested group.
+    nillable: HashSet<&'m str>,
     /// Positions of the direct particles declaring each child name.
     by_name: HashMap<&'m str, Vec<usize>>,
     /// Positions of the direct particles that are nested groups.
@@ -191,6 +196,7 @@ impl<'m> ValidationContext<'m> {
                     self.report_undeclared_root(&local);
 
                     let xsd_type = self.resolve_child_type(&local);
+                    let nil = says_nil(e) && self.child_is_nillable(&local);
 
                     if let Some(parent) = self.type_stack.last_mut() {
                         *parent.child_counts.entry(local).or_insert(0) += 1;
@@ -200,6 +206,7 @@ impl<'m> ValidationContext<'m> {
                         text: String::new(),
                         xsd_type,
                         child_counts: HashMap::new(),
+                        nil,
                     });
                 }
                 Ok(Event::Empty(ref e)) => {
@@ -212,6 +219,7 @@ impl<'m> ValidationContext<'m> {
                     self.report_undeclared_root(&local);
 
                     let xsd_type = self.resolve_child_type(&local);
+                    let nil = says_nil(e) && self.child_is_nillable(&local);
 
                     if let Some(parent) = self.type_stack.last_mut() {
                         *parent.child_counts.entry(local).or_insert(0) += 1;
@@ -219,7 +227,7 @@ impl<'m> ValidationContext<'m> {
 
                     // A self-closing element is an element with no text and
                     // no children, and is checked as one.
-                    if let Some(t) = xsd_type {
+                    if let Some(t) = xsd_type.filter(|_| !nil) {
                         if self.opts.check_facets {
                             self.check_text_for_type_val(t, "");
                         }
@@ -257,7 +265,7 @@ impl<'m> ValidationContext<'m> {
                 }
                 Ok(Event::End(_)) => {
                     if let Some(frame) = self.type_stack.pop() {
-                        if let Some(t) = frame.xsd_type {
+                        if let Some(t) = frame.xsd_type.filter(|_| !frame.nil) {
                             if self.opts.check_facets {
                                 self.check_text_for_type_val(t, frame.text.trim());
                             }
@@ -371,6 +379,26 @@ impl<'m> ValidationContext<'m> {
         self.resolve_xsd_type(&decl.type_def)
     }
 
+    /// Whether the declaration of the element being opened is nillable.
+    ///
+    /// Called before the element's own frame is pushed, like
+    /// [`Self::resolve_child_type`].
+    fn child_is_nillable(&mut self, child_local: &str) -> bool {
+        let Some(parent) = self.type_stack.last() else {
+            return self
+                .model
+                .global_elements
+                .get(child_local)
+                .is_some_and(|decl| decl.nillable);
+        };
+        let Some(ResolvedType::Complex(parent_type)) = parent.xsd_type else {
+            return false;
+        };
+        self.content_index(&parent_type.content)
+            .nillable
+            .contains(child_local)
+    }
+
     /// Find a child element type within a content model, descending into nested
     /// model groups (e.g. an `xs:choice` inside an `xs:sequence`).
     fn find_child_in_content(
@@ -392,6 +420,7 @@ impl<'m> ValidationContext<'m> {
         }
         let mut index = ContentIndex {
             child_types: HashMap::new(),
+            nillable: HashSet::new(),
             by_name: HashMap::new(),
             groups: Vec::new(),
             always: Vec::new(),
@@ -405,6 +434,9 @@ impl<'m> ValidationContext<'m> {
             let (name, occurrence) = match &particle.element {
                 ElementRef::Inline(decl) => {
                     let resolved = self.resolve_xsd_type(&decl.type_def);
+                    if decl.nillable {
+                        index.nillable.insert(decl.name.local.as_str());
+                    }
                     index
                         .child_types
                         .entry(decl.name.local.as_str())
@@ -416,6 +448,9 @@ impl<'m> ValidationContext<'m> {
                     // nothing: a later declaration of the name still counts.
                     if let Some(decl) = self.model.global_elements.get(&name.local) {
                         let resolved = self.resolve_xsd_type(&decl.type_def);
+                        if decl.nillable {
+                            index.nillable.insert(name.local.as_str());
+                        }
                         index
                             .child_types
                             .entry(name.local.as_str())
@@ -431,6 +466,7 @@ impl<'m> ValidationContext<'m> {
                             index.child_types.entry(name).or_insert(*resolved);
                         }
                     }
+                    index.nillable.extend(inner.nillable.iter().copied());
                     index.groups.push(position);
                     index.always.push(position);
                     continue;
@@ -538,6 +574,13 @@ impl<'m> ValidationContext<'m> {
         child_counts: &HashMap<String, usize>,
     ) {
         if let ResolvedType::Complex(ct) = xsd {
+            // Content whose model group may occur zero times can be left out
+            // whole, required children included.
+            if ct.content_occurrence.min == 0
+                && self.group_branch_count(&ct.content, child_counts) == 0
+            {
+                return;
+            }
             self.check_cardinality_for_content(&ct.content, child_counts);
         }
     }
@@ -598,7 +641,11 @@ impl<'m> ValidationContext<'m> {
                             "required choice group has no selected branch".to_string(),
                         );
                     }
-                    self.check_cardinality_for_content(group, child_counts);
+                    // A group that is optional and not used has nothing to
+                    // complete.
+                    if selected > 0 || particle.occurrence.min >= 1 {
+                        self.check_cardinality_for_content(group, child_counts);
+                    }
                     continue;
                 }
             };
@@ -697,6 +744,22 @@ impl<'m> ValidationContext<'m> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Whether a start tag carries `xsi:nil` with a true value.
+///
+/// Any prefixed `nil` attribute is taken for it; an unprefixed `nil` is the
+/// document's own attribute. Duplicate checking is skipped: it is quadratic
+/// in the number of attributes.
+fn says_nil(start: &BytesStart<'_>) -> bool {
+    start
+        .attributes()
+        .with_checks(false)
+        .flatten()
+        .any(|attribute| {
+            attribute.key.as_ref().ends_with(b":nil")
+                && matches!(attribute.value.as_ref().trim_ascii(), b"true" | b"1")
+        })
+}
 
 fn strip_prefix(name: &str) -> &str {
     match name.find(':') {

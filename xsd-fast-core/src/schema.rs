@@ -286,6 +286,13 @@ pub struct ComplexType {
     /// [`attributes`]: ComplexType::attributes
     #[serde(default)]
     pub base: Option<QName>,
+    /// Occurrence bounds of the model group that is the type's content: the
+    /// `minOccurs` / `maxOccurs` written on its `xs:sequence`, `xs:all` or
+    /// `xs:choice`. With a minimum of zero the whole content may be left out,
+    /// required children included. Once by default, and for content that is
+    /// not a model group.
+    #[serde(default)]
+    pub content_occurrence: OccurrenceConstraint,
 }
 
 impl ComplexType {

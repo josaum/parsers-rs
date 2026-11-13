@@ -592,6 +592,7 @@ fn empty_complex_type() -> ComplexType {
         content: ContentModel::Empty,
         attributes: Vec::new(),
         base: None,
+        content_occurrence: OccurrenceConstraint::default(),
     }
 }
 
@@ -628,6 +629,7 @@ fn parse_complex_type_into(
                 depth += 1;
                 match local.as_str() {
                     "sequence" => {
+                        complex_type.content_occurrence = parse_occurrence(&attrs);
                         complex_type.content = ContentModel::Sequence(parse_particles(
                             reader,
                             ns_map,
@@ -637,11 +639,13 @@ fn parse_complex_type_into(
                         depth -= 1; // parse_particles consumed the End tag
                     }
                     "all" => {
+                        complex_type.content_occurrence = parse_occurrence(&attrs);
                         complex_type.content =
                             ContentModel::All(parse_particles(reader, ns_map, "all", nesting + 1)?);
                         depth -= 1;
                     }
                     "choice" => {
+                        complex_type.content_occurrence = parse_occurrence(&attrs);
                         complex_type.content = ContentModel::Choice(parse_particles(
                             reader,
                             ns_map,
