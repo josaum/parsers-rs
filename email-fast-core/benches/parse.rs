@@ -126,6 +126,12 @@ fn bench(c: &mut Criterion) {
     };
 
     let message = multipart_message();
+    // Peak memory is measured outside criterion: set this to write the
+    // generated input to a file a one-shot driver can parse.
+    if let Some(path) = std::env::var_os("PARSERS_BENCH_DUMP_INPUT") {
+        std::fs::write(path, &message).unwrap();
+    }
+
     let parsed = parse_eml_bytes(&message, options).unwrap();
     assert_eq!(parsed.attachments.len(), 2);
     assert_eq!(parsed.to.len(), 2);

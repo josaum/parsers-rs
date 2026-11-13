@@ -120,6 +120,12 @@ fn bench(c: &mut Criterion) {
     let (bytes, inflated) = deck();
     let options = ParseOptions::default();
 
+    // Peak memory is measured outside criterion: set this to write the
+    // generated input to a file a one-shot driver can parse.
+    if let Some(path) = std::env::var_os("PARSERS_BENCH_DUMP_INPUT") {
+        std::fs::write(path, &bytes).unwrap();
+    }
+
     // A package that parses to nothing would look very fast: check it first.
     let parsed = parse_pptx_bytes(bytes.clone(), options).unwrap();
     assert_eq!(parsed.slides.len(), SLIDES);
