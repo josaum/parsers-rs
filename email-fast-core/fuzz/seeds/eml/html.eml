@@ -1,0 +1,6 @@
+From: "Maria" <maria@example.com>
+To: joao@example.com
+Subject: html
+Content-Type: text/html; charset=UTF-8
+
+<html><head><style>p { color: red; }</style><script>var a = 1 < 2;</script></head><body><!-- note --><p>Ol&aacute; &lt;b&gt; &#233; &#x20AC;<br>mundo</p></body></html>

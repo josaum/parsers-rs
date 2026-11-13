@@ -328,3 +328,32 @@ fn a_start_tag_with_twenty_thousand_attributes_is_parsed() {
     assert_eq!(shape.name.as_deref(), Some("Wide"));
     assert_eq!(shape.paragraphs[0].text, "kept");
 }
+
+/// The seeds above are also the starting corpus of the fuzz targets in
+/// `fuzz/`; `WRITE_FUZZ_SEEDS=1` writes them out again after a seed changes.
+#[test]
+fn the_fuzz_corpus_holds_these_seeds() {
+    let parts = seed_parts();
+    let slide = parts
+        .iter()
+        .find(|(name, _)| *name == "ppt/slides/slide1.xml")
+        .expect("the seed has a first slide")
+        .1
+        .clone();
+    smoke::fuzz_seeds(
+        env!("CARGO_MANIFEST_DIR"),
+        &[
+            (
+                "pptx_container",
+                "stored.pptx",
+                package(&parts, None, CompressionMethod::Stored),
+            ),
+            (
+                "pptx_container",
+                "deflated.pptx",
+                package(&parts, None, CompressionMethod::Deflated),
+            ),
+            ("pptx_slide_xml", "slide1.xml", slide),
+        ],
+    );
+}

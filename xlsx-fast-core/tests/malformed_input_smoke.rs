@@ -407,3 +407,32 @@ fn a_start_tag_with_twenty_thousand_attributes_is_parsed() {
     assert_eq!((cell.row, cell.col), (1, 2));
     assert!(matches!(&cell.value, CellValue::String { v } if v.as_ref() == "kept"));
 }
+
+/// The seeds above are also the starting corpus of the fuzz targets in
+/// `fuzz/`; `WRITE_FUZZ_SEEDS=1` writes them out again after a seed changes.
+#[test]
+fn the_fuzz_corpus_holds_these_seeds() {
+    let parts = seed_parts();
+    let sheet = parts
+        .iter()
+        .find(|(name, _)| *name == "xl/worksheets/sheet1.xml")
+        .expect("the seed has a first worksheet")
+        .1
+        .clone();
+    smoke::fuzz_seeds(
+        env!("CARGO_MANIFEST_DIR"),
+        &[
+            (
+                "xlsx_container",
+                "stored.xlsx",
+                package(&parts, None, CompressionMethod::Stored),
+            ),
+            (
+                "xlsx_container",
+                "deflated.xlsx",
+                package(&parts, None, CompressionMethod::Deflated),
+            ),
+            ("xlsx_sheet_xml", "sheet1.xml", sheet),
+        ],
+    );
+}

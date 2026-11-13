@@ -187,3 +187,10 @@ fn deeply_nested_tables_and_text_blocks_are_bounded() {
     let document = smoke::nested(b"<blockquote>", b"x", b"</blockquote>", 100_000);
     smoke::run_on_small_stack(move || exercise(&document));
 }
+
+/// The seeds above are also the starting corpus of the fuzz targets in
+/// `fuzz/`; `WRITE_FUZZ_SEEDS=1` writes them out again after a seed changes.
+#[test]
+fn the_fuzz_corpus_holds_these_seeds() {
+    smoke::fuzz_seeds(env!("CARGO_MANIFEST_DIR"), &[("html", "page.html", seed())]);
+}

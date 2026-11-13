@@ -402,3 +402,38 @@ where
     }
     panic!("{report}");
 }
+
+/// Set to any value to make [`fuzz_seeds`] write the seed files.
+pub const WRITE_FUZZ_SEEDS: &str = "WRITE_FUZZ_SEEDS";
+
+/// Keeps the starting corpus of a crate's fuzz targets tied to the seeds its
+/// smoke tests use.
+///
+/// Each entry is `(target, file name, bytes)` and lives at
+/// `<crate_dir>/fuzz/seeds/<target>/<file name>`. With [`WRITE_FUZZ_SEEDS`]
+/// set, the files are written; without it, each must already exist. Their
+/// bytes are deliberately not compared: a ZIP writer or a line-ending
+/// conversion on checkout may change them without changing what they mean.
+///
+/// # Panics
+///
+/// Panics if a seed cannot be written, or is missing or empty.
+pub fn fuzz_seeds(crate_dir: &str, seeds: &[(&str, &str, Vec<u8>)]) {
+    let write = std::env::var_os(WRITE_FUZZ_SEEDS).is_some();
+    for (target, name, bytes) in seeds {
+        let dir = std::path::Path::new(crate_dir)
+            .join("fuzz/seeds")
+            .join(target);
+        let path = dir.join(name);
+        if write {
+            std::fs::create_dir_all(&dir).expect("create the seed directory");
+            std::fs::write(&path, bytes).expect("write the seed");
+        }
+        let stored = std::fs::metadata(&path).map(|file| file.len()).unwrap_or(0);
+        assert!(
+            stored > 0 && !bytes.is_empty(),
+            "{} is missing or empty; run this test once with {WRITE_FUZZ_SEEDS}=1",
+            path.display()
+        );
+    }
+}

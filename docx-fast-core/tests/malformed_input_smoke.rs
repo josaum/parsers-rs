@@ -428,3 +428,32 @@ fn a_start_tag_with_twenty_thousand_attributes_is_parsed() {
     assert_eq!(paragraph.id.as_deref(), Some("0A1B2C3D"));
     assert_eq!(paragraph.text, "kept");
 }
+
+/// The seeds above are also the starting corpus of the fuzz targets in
+/// `fuzz/`; `WRITE_FUZZ_SEEDS=1` writes them out again after a seed changes.
+#[test]
+fn the_fuzz_corpus_holds_these_seeds() {
+    let parts = seed_parts();
+    let document = parts
+        .iter()
+        .find(|(name, _)| *name == "word/document.xml")
+        .expect("the seed has a main document part")
+        .1
+        .clone();
+    smoke::fuzz_seeds(
+        env!("CARGO_MANIFEST_DIR"),
+        &[
+            (
+                "docx_container",
+                "stored.docx",
+                package(&parts, None, CompressionMethod::Stored),
+            ),
+            (
+                "docx_container",
+                "deflated.docx",
+                package(&parts, None, CompressionMethod::Deflated),
+            ),
+            ("docx_document_xml", "document.xml", document),
+        ],
+    );
+}
