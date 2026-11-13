@@ -1368,6 +1368,32 @@ mod tests {
         );
     }
 
+    /// WHY: the writer escapes by hand, not through quick-xml, so a
+    /// quick-xml upgrade that changes how its own escaping treats `\r`,
+    /// `\n` and `\t` must not change these bytes. A carriage return in
+    /// text is written `_x000D_` because XML end-of-line handling would read
+    /// a raw one as a line feed; in an attribute all three are character
+    /// references because attribute-value normalization would read each raw
+    /// one as a space.
+    #[test]
+    fn line_break_and_tab_bytes_are_pinned() {
+        let name = "n\r\n\tm";
+        let text = "a\rb\nc\td\r\n";
+        let (bytes, read_name, read) = round_trip(name, &[text]);
+        assert_eq!(read_name, name);
+        assert_eq!(read, [text]);
+        let workbook_xml = part_xml(&bytes, "xl/workbook.xml");
+        assert!(
+            workbook_xml.contains("name=\"n&#13;&#10;&#9;m\""),
+            "workbook xml:\n{workbook_xml}"
+        );
+        let sheet_xml = sheet1_xml(&bytes);
+        assert!(
+            sheet_xml.contains("<t xml:space=\"preserve\">a_x000D_b\nc\td_x000D_\n</t>"),
+            "sheet xml:\n{sheet_xml}"
+        );
+    }
+
     /// WHY: XML 1.0 cannot carry most control characters, so Excel writes
     /// them as `_xHHHH_`; text that already looks like such an escape must be
     /// protected or a reader turns it into another character.
