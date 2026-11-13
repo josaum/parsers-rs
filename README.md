@@ -76,6 +76,8 @@ field can be changed by the caller; a `const` cannot.
 | | Chain of named simple types followed | 64 | `MAX_OWN_TYPE_CHAIN` |
 | | Attributes copied by `xs:attribute ref` / `xs:attributeGroup ref` | 262,144 | `MAX_EXPANDED_NODES` |
 | | Nested attribute groups followed | 32 | `MAX_ATTRIBUTE_GROUP_NESTING` |
+| | Attribute text copied by references (names, defaults, fixed values); past it the attribute is left out | 16 MiB | `MAX_EXPANDED_TEXT_BYTES` |
+| | Facets copied into derived simple types that add their own; past it the type keeps only its own | 262,144 units | `MAX_SETTLE_COPY_UNITS` |
 | | Validation findings reported | 100 | `ValidateOptions::max_errors`, `xsd-fast-core/src/validator.rs` |
 | `web-fast-core` | Input size | 32 MiB | `ParseOptions::max_input_bytes`, `web-fast-core/src/lib.rs` |
 | | Emitted nodes | 250,000 | `ParseOptions::max_nodes` |
