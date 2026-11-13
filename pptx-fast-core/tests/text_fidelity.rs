@@ -577,7 +577,7 @@ fn modern_comment_text_is_the_body_and_nothing_else() {
 fn indented_property_parts_read_like_compact_ones() {
     // A property's value is the text of its value element. The whitespace an
     // indented part has between elements is not a value, and the root element
-    // is not a property.
+    // is not a property. A vector is the value of the property that holds it.
     let core = [
         r#"<cp:coreProperties xmlns:cp="c" xmlns:dc="d">"#,
         "<dc:title>Plan</dc:title>",
@@ -633,7 +633,7 @@ fn indented_property_parts_read_like_compact_ones() {
             [
                 pair("Application", "Deck Tool"),
                 pair("Slides", "3"),
-                pair("lpstr", "Intro")
+                pair("TitlesOfParts", "Intro")
             ],
             "app, separator {separator:?}"
         );
@@ -643,4 +643,32 @@ fn indented_property_parts_read_like_compact_ones() {
             "custom, separator {separator:?}"
         );
     }
+}
+
+// An element with no content, written across lines, holds only the
+// indentation of its end tag. That is layout, not a value, in the core and
+// app property parts; spaces with no line break are still a value.
+#[test]
+fn a_property_holding_only_a_line_break_has_no_value() {
+    let deck = Deck {
+        core: concat!(
+            r#"<cp:coreProperties xmlns:cp="c" xmlns:dc="d">"#,
+            "<dc:title>Plan</dc:title>",
+            "<dc:description>\n  </dc:description>",
+            "<dc:subject> </dc:subject>",
+            "</cp:coreProperties>",
+        )
+        .as_bytes()
+        .to_vec(),
+        ..Deck::default()
+    };
+    let mut core: Vec<_> = deck.parse().metadata.core.into_iter().collect();
+    core.sort();
+    assert_eq!(
+        core,
+        [
+            ("subject".to_string(), " ".to_string()),
+            ("title".to_string(), "Plan".to_string())
+        ]
+    );
 }

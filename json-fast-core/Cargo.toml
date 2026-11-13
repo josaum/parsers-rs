@@ -58,3 +58,6 @@ optional = true
 [dependencies.arrow-schema]
 workspace = true
 optional = true
+
+[lints]
+workspace = true

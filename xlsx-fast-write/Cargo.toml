@@ -28,3 +28,6 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 [[bench]]
 name = "write"
 harness = false
+
+[lints]
+workspace = true

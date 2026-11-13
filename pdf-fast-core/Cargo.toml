@@ -65,3 +65,6 @@ flate2      = "1.0"
 tempfile    = "3.10"
 base64      = "0.22"
 csv         = "1"
+
+[lints]
+workspace = true
