@@ -209,3 +209,25 @@ fn a_start_tag_with_twenty_thousand_attributes_is_parsed() {
     );
     assert_eq!(rels.by_id.get("rId1").map(String::as_str), Some("kept.xml"));
 }
+
+/// The seeds above are also the starting corpus of the fuzz targets in
+/// `fuzz/`; `WRITE_FUZZ_SEEDS=1` writes them out again after a seed changes.
+#[test]
+fn the_fuzz_corpus_holds_these_seeds() {
+    smoke::fuzz_seeds(
+        env!("CARGO_MANIFEST_DIR"),
+        &[
+            (
+                "store_from_bytes",
+                "stored.zip",
+                seed_package(CompressionMethod::Stored),
+            ),
+            (
+                "store_from_bytes",
+                "deflated.zip",
+                seed_package(CompressionMethod::Deflated),
+            ),
+            ("relationships", "root.rels", ROOT_RELS.to_vec()),
+        ],
+    );
+}

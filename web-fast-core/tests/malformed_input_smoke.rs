@@ -1,12 +1,15 @@
 //! Malformed HTML must be parsed within its limits or rejected with an error.
 //!
-//! Covers `parse_html` and `parse_html_bytes`, with and without a base URL and
+//! Covers `parse_html`, `parse_html_bytes` and `parse_html_file`, with and without a base URL and
 //! with odd encoding labels, plus the Arrow output behind the `arrow` feature.
 
 #[path = "../../tools/mutation_smoke.rs"]
 mod smoke;
 
-use web_fast_core::{parse_html, parse_html_bytes, ParseOptions, WebDocument};
+use web_fast_core::{
+    parse_html, parse_html_bytes, parse_html_file, ParseOptions, WebDocument, WebParseError,
+    MAX_NESTING_DEPTH,
+};
 
 #[global_allocator]
 static ALLOCATOR: smoke::CappedAllocator = smoke::CappedAllocator;
@@ -90,6 +93,49 @@ fn mutated_html_never_panics() {
     smoke::assert_no_panics("web-fast-core html", &[seed()], 4_000, exercise);
 }
 
+/// `parse_html_file` reads the file and must then behave exactly like
+/// `parse_html_bytes`: same success or failure, same document.
+#[test]
+fn mutated_html_files_never_panic_and_match_the_bytes_parse() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("input.html");
+    smoke::assert_no_panics("web-fast-core html file", &[seed()], 400, |bytes| {
+        std::fs::write(&path, bytes).expect("write input");
+        let from_file = parse_html_file(&path, None, ParseOptions::default());
+        let from_bytes = parse_html_bytes(bytes, None, ParseOptions::default());
+        match (from_file, from_bytes) {
+            (Ok(file), Ok(bytes)) => {
+                assert_eq!(file.source_sha256, bytes.source_sha256);
+                assert_eq!(file.blocks, bytes.blocks);
+                assert_eq!(file.tables, bytes.tables);
+            }
+            (Err(_), Err(_)) => {}
+            (file, bytes) => panic!("file ok={} bytes ok={}", file.is_ok(), bytes.is_ok()),
+        }
+    });
+
+    std::fs::write(&path, seed()).expect("write seed");
+    let tiny = ParseOptions {
+        max_input_bytes: 16,
+        ..ParseOptions::default()
+    };
+    assert!(matches!(
+        parse_html_file(&path, None, tiny),
+        Err(WebParseError::InputTooLarge)
+    ));
+    for missing in [
+        directory.path().join("absent.html"),
+        directory.path().to_owned(),
+    ] {
+        assert!(matches!(
+            parse_html_file(&missing, None, ParseOptions::default()),
+            Err(WebParseError::Io(_))
+        ));
+    }
+    std::fs::write(&path, b"").expect("write empty");
+    assert!(parse_html_file(&path, None, ParseOptions::default()).is_ok());
+}
+
 #[test]
 fn every_encoding_label_is_handled() {
     let mut inputs = vec![seed(), b"\xff\xfe<\x00p\x00>\x00".to_vec(), vec![0xff; 64]];
@@ -142,6 +188,120 @@ fn huge_spans_do_not_expand_tables() {
     emit(&document);
 }
 
+/// A spanning cell's text appears once, at its top-left position, and the
+/// positions it covers are empty cells, so a column index means one column.
+#[test]
+fn spanning_cells_keep_columns_aligned() {
+    let html = "<table>\
+        <tr><th colspan=2>name</th><th rowspan=2>age</th><th>x</th></tr>\
+        <tr><td>first</td><td>last</td><td></td></tr>\
+        <tr><td rowspan=9>ana</td><td>b</td><td>7</td><td>y</td></tr>\
+        <tr><td colspan=3>c</td></tr>\
+        <tr></tr>\
+        </table>";
+    let document = parse_html(html, None, ParseOptions::default()).expect("parses");
+    assert_eq!(
+        document.tables[0].rows,
+        [
+            vec!["name", "", "age", "x"],
+            vec!["first", "last", "", ""],
+            vec!["ana", "b", "7", "y"],
+            vec!["", "c", "", ""],
+            // `rowspan=9` covers the empty last row but creates no rows.
+            vec![""],
+        ]
+    );
+    assert!(document.diagnostics.is_empty());
+}
+
+fn first_table(html: &str) -> Vec<Vec<String>> {
+    let document = parse_html(html, None, ParseOptions::default()).expect("parses");
+    document.tables[0].rows.clone()
+}
+
+/// A cell cannot span past its row group: a header `rowspan` that outlives
+/// the `thead` must not push the body's cells to the right.
+#[test]
+fn rowspan_stops_at_the_end_of_its_row_group() {
+    let rows = first_table(
+        "<table><thead><tr><th rowspan=3>h</th><th>a</th></tr></thead>\
+         <tbody><tr><td>1</td><td>2</td></tr><tr><td rowspan=5>3</td><td>4</td></tr></tbody>\
+         <tfoot><tr><td>5</td><td>6</td></tr></tfoot></table>",
+    );
+    assert_eq!(rows, [["h", "a"], ["1", "2"], ["3", "4"], ["5", "6"]]);
+}
+
+/// Span values are read the way browsers read them (leading digits), and a
+/// cell that runs into a column covered from above still takes its full
+/// width, so the cells after it stay where a browser puts them.
+#[test]
+fn span_values_are_read_like_a_browser_reads_them() {
+    let rows = first_table(
+        "<table><tr><td colspan=\"2px\">a</td><td colspan=\" +2.5\">b</td><td colspan=x>c</td></tr></table>",
+    );
+    assert_eq!(rows, [["a", "", "b", "", "c"]]);
+    let rows = first_table(
+        "<table><tr><td>a</td><td rowspan=2>b</td><td>c</td><td>d</td></tr>\
+         <tr><td colspan=3>e</td><td>f</td></tr></table>",
+    );
+    assert_eq!(rows, [["a", "b", "c", "d"], ["e", "", "", "f"]]);
+}
+
+/// An ordinary large document: 240,000 paragraphs inside 12 sections. Its
+/// `dom_path` strings total about 38 MB, which must not count against the
+/// 32 MiB budget for extracted text.
+#[test]
+fn many_shallow_blocks_fit_the_default_budgets() {
+    let html = "<section>".repeat(12) + &"<p>x</p>".repeat(240_000);
+    let document = parse_html(&html, None, ParseOptions::default()).expect("parses");
+    assert_eq!(document.blocks.len(), 240_000);
+}
+
+/// Spans are bounded: a million-row `rowspan` adds no rows, and the empty
+/// cells that spans add are capped for the whole document, as an error.
+#[test]
+fn span_created_cells_are_capped_as_an_error() {
+    let tall = "<table><tr><td rowspan=65534>a</td><td>b</td></tr><tr><td>c</td></tr></table>";
+    let document = parse_html(tall, None, ParseOptions::default()).expect("parses");
+    assert_eq!(document.tables[0].rows, [["a", "b"], ["", "c"]]);
+
+    let over = "<table><tr><td rowspan=1000000>a</td></tr></table>";
+    let document = parse_html(over, None, ParseOptions::default()).expect("parses");
+    assert_eq!(document.tables[0].rows, [["a"]]);
+    assert_eq!(document.diagnostics, ["ignored_table_spans:1"]);
+
+    // 1,100 cells of colspan=1000 ask for 1,098,900 empty cells.
+    let wide = format!(
+        "<table><tr>{}</tr></table>",
+        "<td colspan=1000>a".repeat(1_100)
+    );
+    assert!(matches!(
+        parse_html(&wide, None, ParseOptions::default()),
+        Err(WebParseError::TableSpanLimitExceeded)
+    ));
+    let within = format!(
+        "<table><tr>{}</tr></table>",
+        "<td colspan=1000>a".repeat(1_000)
+    );
+    let document = parse_html(&within, None, ParseOptions::default()).expect("parses");
+    assert_eq!(document.tables[0].rows[0].len(), 1_000_000);
+}
+
+/// `dom_path` is built from per-parent counters, so it is the same string
+/// the sibling-counting version produced, deep or wide.
+#[test]
+fn dom_paths_name_each_level_and_sibling_position() {
+    let html = "<div>".repeat(500) + &"<p>x".repeat(2_000);
+    let document = parse_html(&html, None, ParseOptions::default()).expect("parses");
+    let last = document.blocks.last().expect("blocks");
+    assert!(
+        last.dom_path.ends_with("/div[1]/p[2000]"),
+        "{}",
+        last.dom_path
+    );
+    assert!(last.dom_path.starts_with("/html[1]/body[1]/div[1]/"));
+}
+
 #[test]
 fn deeply_nested_divs_are_bounded_on_a_small_stack() {
     for (open, close) in [
@@ -154,13 +314,171 @@ fn deeply_nested_divs_are_bounded_on_a_small_stack() {
     }
 }
 
-/// 100,000 nested `<div>` did not finish within 60 seconds in a debug build;
-/// it was stopped before any stack or allocation failure was observed.
+/// 100,000 nested `<div>` did not finish within 60 seconds in a debug build.
+///
+/// The time went to the HTML tree builder, which walks its stack of open
+/// elements for every block-level start tag (5,000 / 10,000 / 20,000 levels
+/// took 1.1 s / 5.4 s / 24 s on their own). Input nested deeper than
+/// `MAX_NESTING_DEPTH` is now refused before it reaches the tree builder.
 #[test]
-#[ignore = "100,000 nested <div> runs for more than 60 s in a debug build; cause not established"]
 fn a_hundred_thousand_nested_divs_are_bounded_on_a_small_stack() {
     let document = smoke::nested(b"<div>", b"<p>leaf</p>", b"</div>", 100_000);
     smoke::run_on_small_stack(move || exercise(&document));
+}
+
+fn parse_text(html: &str) -> Result<WebDocument, WebParseError> {
+    parse_html(html, None, ParseOptions::default())
+}
+
+#[test]
+fn nesting_beyond_the_limit_is_an_error_not_truncation() {
+    // `html` and `body` are the first two levels.
+    let at_limit = "<div>".repeat(MAX_NESTING_DEPTH - 2) + "x";
+    let document = parse_text(&at_limit).expect("nesting at the limit parses");
+    assert_eq!(document.text, "x");
+    for html in [
+        "<div>".repeat(MAX_NESTING_DEPTH - 1) + "x",
+        "<div>".repeat(100_000) + "<p>leaf</p>",
+        "<blockquote>".repeat(100_000) + "x",
+        "<ul><li>".repeat(MAX_NESTING_DEPTH) + "x",
+        "<table><tr><td>".repeat(MAX_NESTING_DEPTH) + "x",
+    ] {
+        assert!(matches!(
+            parse_text(&html),
+            Err(WebParseError::NestingLimitExceeded)
+        ));
+    }
+}
+
+/// The nesting limit is enforced on the tree as it is built, so it follows
+/// the HTML parsing rules exactly: markup that only looks deep is accepted,
+/// and markup that only looks shallow is refused before the cost grows.
+#[test]
+fn the_nesting_limit_follows_the_real_tree() {
+    let divs = "<div>".repeat(600);
+    for shallow in [
+        "<image>".repeat(600),
+        format!("<title/>{divs}"),
+        format!("<script src=x/>{divs}"),
+        format!("<svg><![CDATA[ > {divs} ]]></svg><p>x"),
+        "<table><tr><td><tbody>".repeat(200),
+    ] {
+        let result = parse_text(&shallow);
+        assert!(result.is_ok(), "refused: {}", &shallow[..40]);
+    }
+    let many = "<div>".repeat(100_000);
+    for deep in [
+        "<div/>".repeat(100_000),
+        format!("<!-- c --!>{many}"),
+        format!("<svg><title>{many}"),
+        format!("<p><b><i>{many}"),
+    ] {
+        assert!(
+            matches!(parse_text(&deep), Err(WebParseError::NestingLimitExceeded)),
+            "accepted: {}",
+            &deep[..40]
+        );
+    }
+    // Whatever the tree builder makes of these, it must be bounded.
+    let _ = parse_text(&format!("<select>{many}"));
+    let _ = parse_text(&format!("<template>{many}"));
+    let _ = parse_text(&"<a><table>".repeat(50_000));
+}
+
+/// Elements below the document, on the tree `scraper` builds on its own.
+fn real_depth(html: &str) -> usize {
+    let document = scraper::Html::parse_document(html);
+    let mut deepest = 0;
+    let mut pending = vec![(document.tree.root(), 0usize)];
+    while let Some((node, above)) = pending.pop() {
+        let depth = above + usize::from(node.value().is_element());
+        deepest = deepest.max(depth);
+        pending.extend(node.children().map(|child| (child, depth)));
+    }
+    deepest
+}
+
+/// Around the limit, a document is refused exactly when its real tree is
+/// deeper than the limit: including trees the builder rearranges after
+/// appending (formatting elements moved by the adoption agency, tables
+/// fostering their content) and content under `<template>`.
+#[test]
+fn the_nesting_limit_is_exact_around_the_boundary() {
+    let shapes: [fn(usize) -> String; 6] = [
+        |n| "<div>".repeat(n) + "x",
+        |n| "<div>".repeat(n) + "<b><i><p>x</b></i>y",
+        |n| "<b>".repeat(4) + &"<div>".repeat(n) + "</b></b></b></b><p>x",
+        |n| "<template>".to_owned() + &"<div>".repeat(n) + "x",
+        |n| "<div>".repeat(n) + "<table><div>x<tr><td><p>y",
+        |n| "<div>".repeat(n) + "<a>1<div><a>2<p>3</a>",
+    ];
+    for shape in shapes {
+        for n in MAX_NESTING_DEPTH - 8..MAX_NESTING_DEPTH + 3 {
+            let html = shape(n);
+            let within = real_depth(&html) <= MAX_NESTING_DEPTH;
+            let parsed = parse_text(&html);
+            assert_eq!(
+                parsed.is_ok(),
+                within,
+                "n={n}: {}",
+                &html[html.len() - 30..]
+            );
+        }
+    }
+}
+
+/// Markup that makes the tree builder clone open formatting elements into
+/// every following paragraph turns 86 KB of input into millions of
+/// elements. The parse stops while the tree is being built.
+#[test]
+fn element_amplification_is_stopped_during_tree_construction() {
+    let mut html = String::from("<p>");
+    for i in 0..200 {
+        html.push_str(&format!("<b a={i}>"));
+    }
+    html.push_str(&"<p>x".repeat(20_000));
+    assert!(matches!(
+        parse_text(&html),
+        Err(WebParseError::NodeLimitExceeded)
+    ));
+    // A few open formatting elements over many paragraphs is ordinary.
+    let ordinary = "<b><i><u>".to_owned() + &"<p>x".repeat(20_000);
+    assert_eq!(parse_text(&ordinary).expect("parses").blocks.len(), 20_000);
+}
+
+/// Long documents that are not deeply nested must not trip the nesting limit:
+/// implied end tags, void elements, self-closing SVG shapes, and markup that
+/// only appears inside a script, a comment or an attribute value.
+#[test]
+fn long_flat_documents_are_not_mistaken_for_deep_ones() {
+    let fake = "<div>".repeat(5_000);
+    let cases = [
+        ("<p>x".repeat(3_000), 3_000),
+        (format!("<ul>{}</ul>", "<li>x".repeat(3_000)), 3_000),
+        ("x<br>".repeat(3_000) + "<p>end", 1),
+        (
+            format!("<table>{}</table>", "<tr><td>a<td>b".repeat(5_000)),
+            10_000,
+        ),
+        (format!("<dl>{}</dl>", "<dt>t<dd>d".repeat(1_500)), 3_000),
+        ("<p><font size=2>x<p><b><i>y".repeat(2_000), 4_000),
+        (
+            format!("<svg>{}</svg><p>end", "<path d=\"M0 0\"/>".repeat(5_000)),
+            1,
+        ),
+        (format!("<script>{fake}</script><p>end"), 1),
+        (format!("<!-- {fake} --><p title=\"{fake}\">end"), 1),
+        (
+            format!("<select>{}</select><p>end", "<option>o".repeat(5_000)),
+            1,
+        ),
+    ];
+    for (html, blocks) in cases {
+        let document = parse_text(&html).unwrap_or_else(|error| {
+            panic!("{error}: {}", &html[..html.len().min(60)]);
+        });
+        assert_eq!(document.blocks.len(), blocks, "{}", &html[..40]);
+    }
 }
 
 #[test]
@@ -175,15 +493,40 @@ fn nested_tables_and_blocks_are_bounded_on_a_small_stack() {
     }
 }
 
-/// 300 nested tables ran for more than 60 seconds in a debug build and were
-/// stopped. Table extraction selects every descendant row of every table and
-/// every descendant cell of every row, and each text block stores its full
-/// `dom_path`, so the cost grows much faster than the nesting depth.
+/// Each table owns its own rows and each row its own cells.
+///
+/// Before the fix every table repeated the rows of every table nested in it
+/// and every row repeated the cells of every nested row, so 100 levels
+/// produced 5,050 rows and 171,700 cells and visited 17 million nodes for
+/// their text. The shape below is linear in the nesting depth.
 #[test]
-#[ignore = "nested tables are superlinear: 300 levels ran over 60 s in a debug build; not fixed yet"]
+fn nested_tables_report_only_their_own_rows_and_cells() {
+    let depth = 100;
+    let html = smoke::nested(b"<table><tr><td>", b"x", b"</td></tr></table>", depth);
+    let html = String::from_utf8(html).expect("ascii");
+    let document = parse_html(&html, None, ParseOptions::default()).expect("parses");
+    assert_eq!(document.tables.len(), depth);
+    for table in &document.tables {
+        assert_eq!(table.rows, [["x"]], "table {}", table.ordinal);
+    }
+}
+
+/// 300 nested tables ran for more than 60 seconds in a debug build because
+/// every table repeated the rows and cells of the tables inside it; 100,000
+/// nested block quotes were never run. Both now exceed `MAX_NESTING_DEPTH`
+/// and are refused; `nested_tables_report_only_their_own_rows_and_cells`
+/// covers the table shape inside the limit.
+#[test]
 fn deeply_nested_tables_and_text_blocks_are_bounded() {
     let document = smoke::nested(b"<table><tr><td>", b"x", b"</td></tr></table>", 300);
     smoke::run_on_small_stack(move || exercise(&document));
     let document = smoke::nested(b"<blockquote>", b"x", b"</blockquote>", 100_000);
     smoke::run_on_small_stack(move || exercise(&document));
+}
+
+/// The seeds above are also the starting corpus of the fuzz targets in
+/// `fuzz/`; `WRITE_FUZZ_SEEDS=1` writes them out again after a seed changes.
+#[test]
+fn the_fuzz_corpus_holds_these_seeds() {
+    smoke::fuzz_seeds(env!("CARGO_MANIFEST_DIR"), &[("html", "page.html", seed())]);
 }

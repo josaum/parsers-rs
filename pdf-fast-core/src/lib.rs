@@ -1649,7 +1649,7 @@ impl PdfDocument {
     /// order: columns left-to-right, top-to-bottom within each column.
     ///
     /// Each block carries the indices into the slice returned by
-    /// [`semantic_text_runs_for_page`] that belong to it. Within a block
+    /// `semantic_text_runs_for_page` that belong to it. Within a block
     /// the indices are *not* re-sorted — callers should keep the runs in
     /// PDF emission order so kerning sequences and per-glyph runs stay
     /// adjacent.
@@ -2570,7 +2570,7 @@ impl PdfDocument {
     /// TRUE-SCAN path: glyph geometry from the RASTER, not the content
     /// stream. Renders the page, binarizes, extracts connected-component ink
     /// glyphs with Moore-traced outlines (see [`raster_glyphs`]), and bands
-    /// them with the same [`band_text_lines`] pass as the vector path. Output
+    /// them with the same `band_text_lines` pass as the vector path. Output
     /// is shape-identical to [`Self::vector_glyph_descriptor_lines`] for one
     /// page, so the entire self-labelled decoding stack runs unchanged on
     /// scanned input.
@@ -2670,7 +2670,7 @@ impl PdfDocument {
     /// Visual text lines with per-glyph cluster membership — the substrate
     /// for self-labelled glyph decoding. For each page: `(crop_box,
     /// [(x, cluster_id), ...])` per line, glyphs sorted by x. The crop box and
-    /// the membership come from the SAME banding pass ([`band_text_lines`]),
+    /// the membership come from the SAME banding pass (`band_text_lines`),
     /// so a recognised crop and its glyph sequence can never disagree about
     /// which glyphs are on the line.
     pub fn vector_glyph_cluster_lines(
@@ -2700,7 +2700,7 @@ impl PdfDocument {
 
     /// Extract text from `page_index` using the glyph-shape catalog, bypassing
     /// the CMap/ToUnicode path entirely.  Useful as a fallback when
-    /// [`semantic_text_runs_for_page`] returns a high `cmap_fallback_chars`
+    /// `semantic_text_runs_for_page` returns a high `cmap_fallback_chars`
     /// ratio, indicating the font uses a custom encoding without a proper
     /// ToUnicode entry.  Returns `None` if the page has no vector glyph runs
     /// or if no glyph in the runs is known to the catalog.
@@ -4825,7 +4825,7 @@ impl Default for ContentState {
     }
 }
 
-/// How a [`FontBinding`] resolves a byte string to characters.
+/// How a `FontBinding` resolves a byte string to characters.
 ///
 /// Higher tiers (earlier variants) are preferred and produce zero `cmap_fallback_chars`;
 /// lower tiers either map approximately or fall through to a Latin-1 byte cast.

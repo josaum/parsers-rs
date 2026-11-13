@@ -1,0 +1,29 @@
+{
+  "type": "FeatureCollection",
+  "bbox": [-180.0, -90.0, 180.0, 90.0],
+  "features": [
+    {"type": "Feature", "id": "p1",
+     "geometry": {"type": "Point", "coordinates": [-47.9172, -15.7797, 1172.0]},
+     "properties": {"name": "Brasília", "population": 2817000, "tags": ["capital", null]}},
+    {"type": "Feature", "id": 2,
+     "geometry": {"type": "MultiPoint", "coordinates": [[-47.0, -15.0], [179.5, 10.0]]},
+     "properties": {}},
+    {"type": "Feature", "id": null,
+     "geometry": {"type": "LineString", "coordinates": [[179.0, 10.0], [-179.0, 11.0], [-178.0, 12.0]]},
+     "properties": {"nested": {"a": {"b": [1, 2.5e3, true]}}}},
+    {"type": "Feature",
+     "geometry": {"type": "MultiLineString",
+       "coordinates": [[[-47.0, -15.0], [-46.0, -14.0]], [[10.0, 10.0], [11.0, 11.0], [12.0, 10.0]]]},
+     "properties": null},
+    {"type": "Feature",
+     "geometry": {"type": "Polygon",
+       "coordinates": [[[-48.0, -16.0], [-47.0, -16.0], [-47.0, -15.0], [-48.0, -15.0], [-48.0, -16.0]],
+                       [[-47.6, -15.6], [-47.4, -15.6], [-47.4, -15.4], [-47.6, -15.6]]]},
+     "properties": {"area": 1.0e4}},
+    {"type": "Feature",
+     "geometry": {"type": "MultiPolygon",
+       "coordinates": [[[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
+                       [[[170.0, -10.0], [-170.0, -10.0], [-170.0, 10.0], [170.0, 10.0], [170.0, -10.0]]]]},
+     "properties": {"name": "two"}}
+  ]
+}

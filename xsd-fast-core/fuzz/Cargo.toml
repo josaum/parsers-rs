@@ -1,0 +1,32 @@
+[package]
+name = "xsd-fast-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+xsd-fast-core = { path = ".." }
+serde_json = "1.0"
+
+[[bin]]
+name = "xsd_schema"
+path = "fuzz_targets/xsd_schema.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xsd_validate"
+path = "fuzz_targets/xsd_validate.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone fuzz crate: intentionally outside the office-parsers-rs
+# workspace (members are explicit) and outside any parent workspace, so the
+# workspace lockfile and build never see libFuzzer.
+[workspace]

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<t:order xmlns:t="urn:test" version="1">
+  <t:code>AB12</t:code>
+  <t:status>OPEN</t:status>
+  <t:total currency="BRL">1234.50</t:total>
+  <t:amount>10.5</t:amount>
+  <t:buyer id="p1" country="BR">
+    <t:name>Acme &amp; Sons</t:name>
+    <t:email>a@example.org</t:email>
+    <t:taxId>X1</t:taxId>
+    <t:subsidiary id="p2"><t:name>Sub</t:name><t:taxId>X2</t:taxId><t:branch>South</t:branch></t:subsidiary>
+  </t:buyer>
+  <t:placed>2026-01-02T03:04:05Z</t:placed>
+  <t:note>first</t:note><t:note/>
+  <t:tree><t:label>a</t:label><t:node><t:label>b</t:label><t:node><t:label>c</t:label></t:node></t:node></t:tree>
+  <t:line position="1">
+    <t:sku>SKU1</t:sku><t:quantity>2</t:quantity>
+    <t:options><t:color>red</t:color><t:size>42</t:size></t:options>
+  </t:line>
+  <!-- trailing comment --><![CDATA[ignored]]>
+</t:order>
