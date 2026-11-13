@@ -6,7 +6,7 @@
 //!
 //! Each recursive parsing function allocates its own `Vec<u8>` read buffer so
 //! that borrow lifetimes never conflict across nested calls, and reads element
-//! boundaries as owned [`Tag`] values so its stack frame stays small.
+//! boundaries as owned `Tag` values so its stack frame stays small.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};

@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:t="urn:test"
+           targetNamespace="urn:test" elementFormDefault="qualified">
+  <xs:annotation><xs:documentation>Orders &amp; parties</xs:documentation></xs:annotation>
+  <xs:simpleType name="Code">
+    <xs:restriction base="xs:string">
+      <xs:minLength value="1"/><xs:maxLength value="10"/><xs:pattern value="[A-Z0-9]+"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Status">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="OPEN"/><xs:enumeration value="CLOSED"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Amount">
+    <xs:restriction base="xs:decimal">
+      <xs:minInclusive value="0"/><xs:maxInclusive value="99999.99"/>
+      <xs:totalDigits value="7"/><xs:fractionDigits value="2"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Codes"><xs:list itemType="t:Code"/></xs:simpleType>
+  <xs:simpleType name="CodeOrStatus"><xs:union memberTypes="t:Code t:Status"/></xs:simpleType>
+  <xs:attributeGroup name="Audit">
+    <xs:attribute name="createdBy" type="xs:string"/>
+    <xs:attribute name="revision" type="xs:int" default="1"/>
+  </xs:attributeGroup>
+  <xs:group name="Contact">
+    <xs:sequence>
+      <xs:element name="email" type="xs:string" minOccurs="0"/>
+      <xs:element name="phone" type="xs:string" minOccurs="0" maxOccurs="3"/>
+    </xs:sequence>
+  </xs:group>
+  <xs:complexType name="Party">
+    <xs:sequence>
+      <xs:element name="name" type="xs:string"/>
+      <xs:group ref="t:Contact"/>
+    </xs:sequence>
+    <xs:attribute name="id" type="xs:ID" use="required"/>
+    <xs:attributeGroup ref="t:Audit"/>
+  </xs:complexType>
+  <xs:complexType name="Company">
+    <xs:complexContent>
+      <xs:extension base="t:Party">
+        <xs:sequence>
+          <xs:element name="taxId" type="t:Code"/>
+          <xs:choice minOccurs="0">
+            <xs:element name="branch" type="xs:string"/>
+            <xs:element name="subsidiary" type="t:Company"/>
+          </xs:choice>
+        </xs:sequence>
+        <xs:attribute name="country" type="xs:string" fixed="BR"/>
+      </xs:extension>
+    </xs:complexContent>
+  </xs:complexType>
+  <xs:complexType name="Restricted">
+    <xs:complexContent>
+      <xs:restriction base="t:Party">
+        <xs:sequence><xs:element name="name" type="xs:string"/></xs:sequence>
+      </xs:restriction>
+    </xs:complexContent>
+  </xs:complexType>
+  <xs:complexType name="Money">
+    <xs:simpleContent>
+      <xs:extension base="xs:decimal">
+        <xs:attribute name="currency" type="xs:string" use="required"/>
+      </xs:extension>
+    </xs:simpleContent>
+  </xs:complexType>
+  <xs:complexType name="Tree">
+    <xs:sequence>
+      <xs:element name="label" type="xs:string"/>
+      <xs:element name="node" type="t:Tree" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:element name="note" type="xs:string" nillable="true"/>
+  <xs:element name="order">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="code" type="t:Code"/>
+        <xs:element name="status" type="t:Status"/>
+        <xs:element name="total" type="t:Money"/>
+        <xs:element name="amount" type="t:Amount" minOccurs="0"/>
+        <xs:element name="buyer" type="t:Company"/>
+        <xs:element name="placed" type="xs:dateTime" minOccurs="0"/>
+        <xs:element ref="t:note" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element name="tree" type="t:Tree" minOccurs="0"/>
+        <xs:element name="line" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:all>
+              <xs:element name="sku" type="t:Code"/>
+              <xs:element name="quantity" type="xs:positiveInteger"/>
+              <xs:element name="options" minOccurs="0">
+                <xs:complexType>
+                  <xs:choice maxOccurs="unbounded">
+                    <xs:element name="color" type="xs:string"/>
+                    <xs:element name="size">
+                      <xs:simpleType>
+                        <xs:restriction base="xs:int">
+                          <xs:minInclusive value="1"/><xs:maxInclusive value="60"/>
+                        </xs:restriction>
+                      </xs:simpleType>
+                    </xs:element>
+                  </xs:choice>
+                </xs:complexType>
+              </xs:element>
+            </xs:all>
+            <xs:attribute name="position" type="xs:int" use="required"/>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+      <xs:attribute name="version" type="xs:string"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>
