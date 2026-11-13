@@ -67,3 +67,27 @@ fn copied_attribute_text_is_bounded() {
     // 16 MiB of copied text holds 15 copies of the value and its name.
     assert_eq!(copies, 15);
 }
+
+#[test]
+fn copies_of_a_group_attribute_share_its_union_members_and_list_item() {
+    const GROUP: &[u8] = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:t" targetNamespace="urn:t">
+      <xs:attributeGroup name="G">
+        <xs:attribute name="u"><xs:simpleType><xs:union memberTypes="xs:int xs:date"/></xs:simpleType></xs:attribute>
+        <xs:attribute name="l"><xs:simpleType><xs:list itemType="xs:int"/></xs:simpleType></xs:attribute>
+      </xs:attributeGroup>
+      <xs:complexType name="A"><xs:attributeGroup ref="t:G"/></xs:complexType>
+      <xs:complexType name="B"><xs:attributeGroup ref="t:G"/></xs:complexType>
+    </xs:schema>"#;
+    let schema = SchemaSet::load_bytes(GROUP, ParseOptions::default()).expect("schema loads");
+    let types = &schema.model().complex_types;
+    let (a, b) = (&types["A"].attributes, &types["B"].attributes);
+    assert!(Arc::ptr_eq(
+        &a[0].type_def.union_members,
+        &b[0].type_def.union_members
+    ));
+    let (Some(a_item), Some(b_item)) = (&a[1].type_def.list_item, &b[1].type_def.list_item) else {
+        panic!("l is a list");
+    };
+    assert!(Arc::ptr_eq(a_item, b_item));
+}

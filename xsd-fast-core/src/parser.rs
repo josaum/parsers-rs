@@ -996,6 +996,9 @@ struct OwnTypes {
 /// followed.
 const MAX_OWN_TYPE_CHAIN: usize = 64;
 
+/// Union members as written, and settled.
+type SettledMembers = (Arc<Vec<SimpleTypeDef>>, Arc<Vec<SimpleTypeDef>>);
+
 /// The kind each own simple type settles to, worked out once per name, and
 /// each own simple type settled, for the types that name it to share.
 struct SimpleKinds<'a> {
@@ -1005,6 +1008,11 @@ struct SimpleKinds<'a> {
     settled: HashMap<String, Option<Arc<SimpleTypeDef>>>,
     /// Units [`MAX_SETTLE_COPY_UNITS`] still allows.
     remaining: usize,
+    /// Each list item type settled so far, by the address of the item as
+    /// written, which the entry keeps alive so no other item can take it.
+    settled_items: HashMap<usize, (Arc<SimpleTypeDef>, Arc<SimpleTypeDef>)>,
+    /// Each set of union members settled so far, keyed as `settled_items`.
+    settled_members: HashMap<usize, SettledMembers>,
     /// The settled kind of each name met so far: `None` inside the outer
     /// option while it is being worked out, so a name met again is a cycle;
     /// `None` inside the inner one when the name settles to no kind of its
@@ -1173,11 +1181,29 @@ fn settle_simple_type_at(
     }
     if depth < MAX_SIMPLE_TYPE_NESTING {
         if let Some(item) = simple.list_item.as_mut().filter(|_| own_items) {
-            settle_simple_type_at(Arc::make_mut(item), None, kinds, chain, depth + 1);
+            // Copies of one attribute share one item type: it is settled
+            // once, and the copies share the result.
+            let key = Arc::as_ptr(item) as usize;
+            if let Some((_, settled)) = kinds.settled_items.get(&key) {
+                *item = Arc::clone(settled);
+            } else {
+                let written = Arc::clone(item);
+                settle_simple_type_at(Arc::make_mut(item), None, kinds, chain, depth + 1);
+                kinds.settled_items.insert(key, (written, Arc::clone(item)));
+            }
         }
         if own_members && !simple.union_members.is_empty() {
-            for member in Arc::make_mut(&mut simple.union_members) {
-                settle_simple_type_at(member, None, kinds, chain, depth + 1);
+            let key = Arc::as_ptr(&simple.union_members) as usize;
+            if let Some((_, settled)) = kinds.settled_members.get(&key) {
+                simple.union_members = Arc::clone(settled);
+            } else {
+                let written = Arc::clone(&simple.union_members);
+                for member in Arc::make_mut(&mut simple.union_members) {
+                    settle_simple_type_at(member, None, kinds, chain, depth + 1);
+                }
+                kinds
+                    .settled_members
+                    .insert(key, (written, Arc::clone(&simple.union_members)));
             }
         }
     }
@@ -1333,6 +1359,8 @@ fn settle_unprefixed_builtin_names(model: &mut SchemaModel) {
         own: &own,
         settled: HashMap::new(),
         remaining: MAX_SETTLE_COPY_UNITS,
+        settled_items: HashMap::new(),
+        settled_members: HashMap::new(),
         kinds: HashMap::new(),
     };
     for (name, simple) in &mut model.simple_types {
