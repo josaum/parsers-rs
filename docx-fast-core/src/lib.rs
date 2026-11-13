@@ -620,9 +620,14 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
 
     let document_dir = part_dir(&document_path);
     let document_rels_path = rels_path_for_part(&document_path);
+    // The part the relationships were read from, so that nothing reads it a
+    // second time: every read counts against `max_inflate`.
+    let mut document_rels_part = None;
+    let fallback_rels_part;
     let document_rels = if archive.has_part(&document_rels_path) {
         let xml = read_part_bytes(&archive, &document_rels_path, options.max_inflate)
             .with_context(|| format!("read document rels: {document_rels_path}"))?;
+        document_rels_part = Some(document_rels_path.as_str());
         parse_relationships(&utf8_xml(&xml))?
     } else {
         // Compatibility fallback for malformed names seen in legacy producers.
@@ -630,6 +635,8 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         if fallback != document_rels_path && archive.has_part(&fallback) {
             let xml = read_part_bytes(&archive, &fallback, options.max_inflate)
                 .with_context(|| format!("read document rels fallback: {fallback}"))?;
+            fallback_rels_part = fallback;
+            document_rels_part = Some(fallback_rels_part.as_str());
             parse_relationships(&utf8_xml(&xml))?
         } else {
             Relationships::default()
@@ -718,17 +725,22 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         .get("Pages")
         .and_then(|v| v.parse::<u32>().ok());
     let images = if options.extract_images {
-        collect_images(&archive, options.max_inflate)?
+        let known = document_rels_part.map(|part| (part, &document_rels));
+        collect_images(&archive, options.max_inflate, known)?
     } else {
         Vec::new()
     };
 
     let mut fields = Vec::new();
     let mut revisions = Vec::new();
+    // The document part is needed twice, for the header and footer
+    // references and for the body. It is read once: a second read would
+    // count it against `max_inflate` a second time.
+    let document_xml = read_part_bytes(&archive, &document_path, options.max_inflate)
+        .with_context(|| format!("read document: {document_path}"))?;
+    let document_xml = utf8_xml(&document_xml);
     let header_footer_refs = if options.extract_headers {
-        let reader = open_part_reader(&archive, &document_path, options.max_inflate)
-            .with_context(|| format!("read document for header/footer refs: {document_path}"))?;
-        parse_header_footer_refs(reader)?
+        parse_header_footer_refs(Cursor::new(&*document_xml))?
     } else {
         Vec::new()
     };
@@ -760,10 +772,8 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         }
     }
 
-    let document_reader = open_part_reader(&archive, &document_path, options.max_inflate)
-        .with_context(|| format!("read document: {document_path}"))?;
     let blocks = parse_document_blocks(
-        document_reader,
+        Cursor::new(&*document_xml),
         &styles,
         &style_fonts,
         &mut fields,
@@ -1017,7 +1027,7 @@ pub fn extract_docx_images(
     out_dir: impl AsRef<Path>,
 ) -> Result<Vec<PathBuf>> {
     let archive = open_archive(path.as_ref())?;
-    let images = collect_images(&archive, 256 * 1024 * 1024)?;
+    let images = collect_images(&archive, 256 * 1024 * 1024, None)?;
     let mut out_paths = Vec::new();
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
@@ -1857,34 +1867,49 @@ fn collect_toc(blocks: &[Block], out: &mut Vec<TocEntry>) {
     }
 }
 
-fn collect_images(archive: &DocxArchive, max_inflate: usize) -> Result<Vec<ImageRef>> {
+/// Lists the images every relationships part of the package points at.
+///
+/// `known` is a relationships part the caller has already read and parsed;
+/// it is used as it is, not read again.
+fn collect_images(
+    archive: &DocxArchive,
+    max_inflate: usize,
+    known: Option<(&str, &Relationships)>,
+) -> Result<Vec<ImageRef>> {
     let content_types = parse_content_types(archive, max_inflate)?;
     let mut images = Vec::new();
     for path in archive.part_names() {
         if !path.ends_with(".rels") {
             continue;
         }
-        let xml = read_part_bytes(archive, path, max_inflate)
-            .with_context(|| format!("read DOCX relationships part: {path}"))?;
+        let read_here;
+        let rels = match known {
+            Some((known_path, rels)) if known_path == path => rels,
+            _ => {
+                let xml = read_part_bytes(archive, path, max_inflate)
+                    .with_context(|| format!("read DOCX relationships part: {path}"))?;
+                read_here = parse_relationships(&utf8_xml(&xml))?;
+                &read_here
+            }
+        };
         {
-            let rels = parse_relationships(&utf8_xml(&xml))?;
             let source_part = source_part_from_rels(path).unwrap_or_else(|| path.to_string());
             for RelEntry {
                 id,
                 rel_type,
                 target,
-            } in rels.entries
+            } in &rels.entries
             {
-                if !relationship_matches(&rel_type, REL_IMAGE) {
+                if !relationship_matches(rel_type, REL_IMAGE) {
                     continue;
                 }
-                let target_path = resolve_part(&part_dir(&source_part), &target);
+                let target_path = resolve_part(&part_dir(&source_part), target);
                 let content_type = content_types
                     .get(&target_path)
                     .cloned()
                     .or_else(|| guess_content_type(&target_path));
                 images.push(ImageRef {
-                    id,
+                    id: id.clone(),
                     source_part: source_part.clone(),
                     target: target_path,
                     content_type,
