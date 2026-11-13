@@ -2580,7 +2580,7 @@ dependencies = [
  "flate2",
  "memmap2",
  "proptest",
- "quick-xml 0.36.2",
+ "quick-xml 0.41.0",
  "rawzip",
  "tempfile",
  "zip",
@@ -2941,7 +2941,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "ooxml-archive",
- "quick-xml 0.36.2",
+ "quick-xml 0.41.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -3292,9 +3292,9 @@ dependencies = [
 
 [[package]]
 name = "rawzip"
-version = "0.4.4"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d9575f44c8cf85bc843ad666dcdf20d05a7753772bef56eb2a5140282b32150"
+checksum = "ac9999039f74cd73c03158cddfe4362991703c74efe5ce5c8073026f80a5e48c"
 
 [[package]]
 name = "rayon"
