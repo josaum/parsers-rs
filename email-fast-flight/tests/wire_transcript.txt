@@ -1,0 +1,100 @@
+Handshake without a bearer
+    0 responses
+Handshake
+    0 responses
+ListFlights without a bearer
+    Unauthenticated: missing authorization metadata
+ListFlights
+    2 flights
+    path=mail.eml tickets=[""] total_bytes=-1 total_records=-1 schema_len=0 schema_fnv=cbf29ce484222325
+    path=sub/Upper.EML tickets=[""] total_bytes=-1 total_records=-1 schema_len=0 schema_fnv=cbf29ce484222325
+GetFlightInfo mail.eml without a bearer
+    Unauthenticated: missing authorization metadata
+GetFlightInfo mail.eml
+    path=mail.eml tickets=["mail.eml"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+GetFlightInfo mail.eml?batch=1
+    InvalidArgument: Invalid path: <os error>
+GetFlightInfo sub/Upper.EML
+    path=sub/Upper.EML tickets=["sub/Upper.EML"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+GetFlightInfo sub\Upper.EML
+    InvalidArgument: Invalid path: <os error>
+GetFlightInfo notes.txt
+    path=notes.txt tickets=["notes.txt"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+GetFlightInfo sub
+    path=sub tickets=["sub"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+GetFlightInfo missing.eml
+    InvalidArgument: Invalid path: <os error>
+GetFlightInfo ../outside.eml
+    PermissionDenied: Path outside root directory
+GetFlightInfo link.eml
+    PermissionDenied: Path outside root directory
+GetFlightInfo <base>/outside.eml
+    PermissionDenied: Path outside root directory
+GetFlightInfo 
+    path= tickets=[""] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+GetFlightInfo parts ["sub", "Upper.EML"]
+    path=sub/Upper.EML tickets=["sub/Upper.EML"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+GetFlightInfo parts ["sub", "..", "mail.eml"]
+    path=sub/../mail.eml tickets=["sub/../mail.eml"] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+GetFlightInfo cmd mail.eml
+    path=cmd:mail.eml tickets=[""] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+GetFlightInfo cmd 
+    path=cmd: tickets=[""] total_bytes=-1 total_records=-1 schema_len=832 schema_fnv=955daa7630325989
+PollFlightInfo mail.eml without a bearer
+    Unimplemented: poll_flight_info
+PollFlightInfo mail.eml
+    Unimplemented: poll_flight_info
+GetSchema mail.eml without a bearer
+    Unauthenticated: missing authorization metadata
+GetSchema mail.eml
+    schema_len=832 schema_fnv=955daa7630325989
+GetSchema missing.eml
+    schema_len=832 schema_fnv=955daa7630325989
+DoGet mail.eml without a bearer
+    Unauthenticated: missing authorization metadata
+DoGet mail.eml
+    messages=2 bytes=3280 fnv=adf6b53864f3d380 batches=1 rows=1 columns=["message_id", "from_address", "from_name", "to_addresses", "cc_addresses", "subject", "date", "body_text", "body_html", "has_attachments", "attachment_count", "in_reply_to", "references", "priority"]
+DoGet mail.eml?batch=1
+    InvalidArgument: Invalid path: <os error>
+DoGet sub/Upper.EML
+    messages=2 bytes=3280 fnv=adf6b53864f3d380 batches=1 rows=1 columns=["message_id", "from_address", "from_name", "to_addresses", "cc_addresses", "subject", "date", "body_text", "body_html", "has_attachments", "attachment_count", "in_reply_to", "references", "priority"]
+DoGet sub\Upper.EML
+    InvalidArgument: Invalid path: <os error>
+DoGet notes.txt
+    Internal: Failed to parse email: Cannot detect email format for: <base>/root/notes.txt
+DoGet sub
+    Internal: Failed to parse email: <os error>
+DoGet missing.eml
+    InvalidArgument: Invalid path: <os error>
+DoGet ../outside.eml
+    PermissionDenied: Path outside root directory
+DoGet sub/../mail.eml
+    messages=2 bytes=3280 fnv=adf6b53864f3d380 batches=1 rows=1 columns=["message_id", "from_address", "from_name", "to_addresses", "cc_addresses", "subject", "date", "body_text", "body_html", "has_attachments", "attachment_count", "in_reply_to", "references", "priority"]
+DoGet link.eml
+    PermissionDenied: Path outside root directory
+DoGet <base>/outside.eml
+    PermissionDenied: Path outside root directory
+DoGet 
+    Internal: Failed to parse email: <os error>
+DoGet �
+    InvalidArgument: Invalid ticket: invalid utf-8 sequence of 1 bytes from index 0
+DoPut without a bearer
+    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
+DoPut
+    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
+DoExchange descriptor mail.eml without a bearer
+    Unimplemented: DoExchange not implemented
+DoExchange descriptor mail.eml
+    Unimplemented: DoExchange not implemented
+DoExchange no message
+    Unimplemented: DoExchange not implemented
+DoAction parsers.flight.codec_capabilities.v1  without a bearer
+    Unauthenticated: missing authorization metadata
+DoAction parsers.flight.codec_capabilities.v1 
+    result lengths [233]
+DoAction unknown 
+    Unimplemented: DoAction not implemented
+ListActions without a bearer
+    Unauthenticated: missing authorization metadata
+ListActions
+    ["parsers.flight.codec_capabilities.v1: cached codec capabilities"]

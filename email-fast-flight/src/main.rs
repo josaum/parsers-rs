@@ -547,3 +547,125 @@ mod read_only_flight_contract_tests {
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "../../flight-ipc-config/test-support/wire.rs"]
+mod flight_wire_test_support;
+
+#[cfg(all(test, unix))]
+mod wire_parity_tests {
+    //! What a Flight client sees from this server, pinned as text in
+    //! `tests/wire_transcript.txt`.
+    //!
+    //! The transcript was captured from the server while it still carried its
+    //! own copy of the Flight skeleton, so a change to any answer in it is a
+    //! change in behaviour, not in structure. Unix only: the probes include a
+    //! symbolic link and a backslash in a file name.
+    use super::*;
+    use crate::flight_auth_test_support::required_auth_verifier;
+    use crate::flight_wire_test_support::Wire;
+
+    const EXPECTED: &str = include_str!("../tests/wire_transcript.txt");
+
+    const FIXTURE: &[u8] = b"From: Ada <ada@example.com>\r\n\
+To: Bob <bob@example.com>\r\n\
+Subject: Wire test\r\n\
+Date: Mon, 01 Jan 2024 10:00:00 +0000\r\n\
+Message-ID: <wire-1@example.com>\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Hello from the wire test.\r\n";
+
+    #[tokio::test]
+    async fn every_rpc_answers_as_it_did_before_the_shared_server() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("directories");
+        std::fs::write(root.join("mail.eml"), FIXTURE).expect("fixture");
+        std::fs::write(root.join("sub").join("Upper.EML"), FIXTURE).expect("nested");
+        std::fs::write(root.join("notes.txt"), b"not a message").expect("other file");
+        std::fs::write(base.path().join("outside.eml"), FIXTURE).expect("outside");
+        std::os::unix::fs::symlink(base.path().join("outside.eml"), root.join("link.eml"))
+            .expect("symlink");
+        let outside = base.path().join("outside.eml");
+        let outside = outside.to_string_lossy();
+
+        let service = EmailFlightService::new(
+            root.clone(),
+            ParseOptions::default(),
+            required_auth_verifier(),
+        )
+        .expect("service");
+        let mut wire = Wire::start(service, base.path()).await;
+
+        wire.handshake(false).await;
+        wire.handshake(true).await;
+        wire.list_flights(false).await;
+        wire.list_flights(true).await;
+
+        wire.get_flight_info("mail.eml", false).await;
+        for path in [
+            "mail.eml",
+            "mail.eml?batch=1",
+            "sub/Upper.EML",
+            "sub\\Upper.EML",
+            "notes.txt",
+            "sub",
+            "missing.eml",
+            "../outside.eml",
+            "link.eml",
+            outside.as_ref(),
+            "",
+        ] {
+            wire.get_flight_info(path, true).await;
+        }
+        wire.get_flight_info_parts(&["sub", "Upper.EML"], true)
+            .await;
+        wire.get_flight_info_parts(&["sub", "..", "mail.eml"], true)
+            .await;
+        wire.get_flight_info_cmd(b"mail.eml", true).await;
+        wire.get_flight_info_cmd(b"", true).await;
+
+        wire.poll_flight_info("mail.eml", false).await;
+        wire.poll_flight_info("mail.eml", true).await;
+
+        wire.get_schema("mail.eml", false).await;
+        wire.get_schema("mail.eml", true).await;
+        wire.get_schema("missing.eml", true).await;
+
+        wire.do_get(b"mail.eml", false).await;
+        for ticket in [
+            "mail.eml",
+            "mail.eml?batch=1",
+            "sub/Upper.EML",
+            "sub\\Upper.EML",
+            "notes.txt",
+            "sub",
+            "missing.eml",
+            "../outside.eml",
+            "sub/../mail.eml",
+            "link.eml",
+            outside.as_ref(),
+            "",
+        ] {
+            wire.do_get(ticket.as_bytes(), true).await;
+        }
+        wire.do_get(b"\xff", true).await;
+
+        wire.do_put(false).await;
+        wire.do_put(true).await;
+
+        wire.do_exchange_path("mail.eml", false).await;
+        wire.do_exchange_path("mail.eml", true).await;
+        wire.do_exchange("no message", Vec::new(), true).await;
+
+        wire.do_action_lengths(CAPABILITY_ACTION, "", false).await;
+        wire.do_action_lengths(CAPABILITY_ACTION, "", true).await;
+        wire.do_action("unknown", "", true, true).await;
+        wire.list_actions(false).await;
+        wire.list_actions(true).await;
+
+        assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+    }
+}
