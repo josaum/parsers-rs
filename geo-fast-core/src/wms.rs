@@ -120,6 +120,13 @@ impl WmsClient {
     }
 
     /// Fetch and parse `GetCapabilities`, returning a list of available layers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeoError::Http`] when the request fails, and whatever
+    /// [`parse_capabilities_xml`] returns for the document: among them
+    /// [`GeoError::InvalidFormat`] when the reference systems its layers
+    /// inherit would take more than [`MAX_INHERITED_CRS_BYTES`].
     pub async fn get_capabilities(&self) -> Result<Vec<WmsLayer>, GeoError> {
         let url = self.capabilities_url();
         let xml = self
@@ -146,7 +153,9 @@ impl WmsClient {
 ///
 /// As the WMS specification has it, a layer's reference systems are those of
 /// its ancestors followed by its own, each once, and a layer that declares
-/// no bounding box has its parent's. Name and title are never inherited, and
+/// no bounding box has its parent's. A layer inherits everything its
+/// ancestors declare, wherever in them it is written: before the layer or
+/// after it. Name and title are never inherited, and
 /// both are read only from the layer's own `<Name>` and `<Title>` children:
 /// those of a `<Style>` or an `<Attribution>` are not the layer's.
 ///
@@ -156,9 +165,16 @@ impl WmsClient {
 /// some other reference system is used only where there is no geographic
 /// box on the layer or above it.
 ///
+/// Each layer is given its own copy of the reference systems it inherits,
+/// so a small document with many layers under a long list would grow into
+/// a very large result. The copies are limited to
+/// [`MAX_INHERITED_CRS_BYTES`] for the whole document.
+///
 /// # Errors
 ///
-/// Returns [`GeoError`] when `xml` is not well-formed.
+/// Returns [`GeoError::Xml`] when `xml` is not well-formed, and
+/// [`GeoError::InvalidFormat`] when the reference systems its layers
+/// inherit would take more than [`MAX_INHERITED_CRS_BYTES`].
 pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
     let mut reader = Reader::from_str(xml);
     // The reader does not trim: a value arrives in pieces (see `TextRun`),
@@ -171,7 +187,7 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
 
     // One slot per `<Layer>`, taken when it opens and filled when it closes,
     // so that a parent comes before the children that close before it.
-    let mut layers: Vec<Option<WmsLayer>> = Vec::new();
+    let mut layers: Vec<Option<OpenLayer>> = Vec::new();
     // The layers still open, outermost first.
     let mut open: Vec<OpenLayer> = Vec::new();
     let mut capture = Capture::Nothing;
@@ -261,11 +277,8 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
                 if let Some(layer) = open.last_mut() {
                     if name.as_ref() == b"Layer" && depth == layer.depth {
                         if let Some(closed) = open.pop() {
-                            let slot = closed.slot;
-                            if let (Some(place), Some(layer)) =
-                                (layers.get_mut(slot), closed.into_layer())
-                            {
-                                *place = Some(layer);
+                            if let Some(place) = layers.get_mut(closed.slot) {
+                                *place = Some(closed);
                             }
                         }
                     } else if layer.in_geographic_box && depth == layer.depth + 1 {
@@ -283,7 +296,68 @@ pub fn parse_capabilities_xml(xml: &str) -> Result<Vec<WmsLayer>, GeoError> {
         }
     }
 
-    Ok(layers.into_iter().flatten().collect())
+    // A layer the document ends inside of is not returned, but the layers
+    // that closed in it still inherit what it declared.
+    for mut unclosed in open {
+        unclosed.name.clear();
+        if let Some(place) = layers.get_mut(unclosed.slot) {
+            *place = Some(unclosed);
+        }
+    }
+
+    resolve_inheritance(layers)
+}
+
+/// Most bytes [`parse_capabilities_xml`] spends on the copies of inherited
+/// reference systems, over all the layers of one document: 64 MiB.
+///
+/// Every copy counts as the length of its text plus
+/// [`std::mem::size_of::<String>()`](std::mem::size_of). A reference system
+/// a layer declares itself is not counted; the document already holds it.
+/// As a measure, a root layer that lists 6000 `EPSG:` codes can have about
+/// 300 layers under it.
+pub const MAX_INHERITED_CRS_BYTES: usize = 64 * 1024 * 1024;
+
+/// Gives every layer what its ancestors declare and returns the named ones.
+///
+/// `declared` holds each `<Layer>` in the order they opened, so a parent is
+/// always before its children and one pass in that order is enough. It is
+/// done once the whole document is read because a parent may declare a
+/// reference system or a box after a child has closed.
+fn resolve_inheritance(declared: Vec<Option<OpenLayer>>) -> Result<Vec<WmsLayer>, GeoError> {
+    let mut resolved: Vec<Option<OpenLayer>> = Vec::with_capacity(declared.len());
+    let mut budget = MAX_INHERITED_CRS_BYTES;
+    for layer in declared {
+        let Some(mut layer) = layer else {
+            resolved.push(None);
+            continue;
+        };
+        let parent = layer
+            .parent
+            .and_then(|slot| resolved.get(slot))
+            .and_then(Option::as_ref);
+        if let Some(parent) = parent {
+            // Charged before the copy is made.
+            budget = budget.checked_sub(parent.crs_bytes).ok_or_else(|| {
+                GeoError::InvalidFormat(format!(
+                    "WMS capabilities: the reference systems the layers inherit                      take more than {MAX_INHERITED_CRS_BYTES} bytes"
+                ))
+            })?;
+            let own = std::mem::replace(&mut layer.crs_list, parent.crs_list.clone());
+            layer.crs_bytes = parent.crs_bytes;
+            for crs in own {
+                layer.add_crs(crs);
+            }
+            layer.geographic = layer.geographic.or(parent.geographic);
+            layer.bounding = layer.bounding.or(parent.bounding);
+        }
+        resolved.push(Some(layer));
+    }
+    Ok(resolved
+        .into_iter()
+        .flatten()
+        .filter_map(OpenLayer::into_layer)
+        .collect())
 }
 
 /// Positions of the four edges in [`OpenLayer::edges`].
@@ -309,17 +383,25 @@ enum Capture {
     Edge(usize),
 }
 
-/// A `<Layer>` whose end tag has not been read yet.
+/// A `<Layer>` as the document declares it: what it inherits is added by
+/// [`resolve_inheritance`].
 struct OpenLayer {
     /// Depth of the `<Layer>` element in the document.
     depth: usize,
     /// Where the layer goes in the list of all layers.
     slot: usize,
+    /// The slot of the layer this one is in.
+    parent: Option<usize>,
     name: String,
     title: String,
-    /// Reference systems: the ancestors', then the layer's own.
+    /// Reference systems, each once: the layer's own, and once resolved the
+    /// ancestors' before them.
     crs_list: Vec<String>,
-    /// Geographic box, the layer's own or else the one it inherits.
+    /// What a copy of `crs_list` counts for against
+    /// [`MAX_INHERITED_CRS_BYTES`].
+    crs_bytes: usize,
+    /// Geographic box: the layer's own, or once resolved the one it
+    /// inherits.
     geographic: Option<BBox>,
     /// Box in another reference system, likewise.
     bounding: Option<BBox>,
@@ -331,16 +413,18 @@ struct OpenLayer {
 }
 
 impl OpenLayer {
-    /// A layer opening at `depth` inside `parent`, with what it inherits.
+    /// A layer opening at `depth` inside `parent`, with nothing declared.
     fn inside(parent: Option<&OpenLayer>, depth: usize, slot: usize) -> Self {
         OpenLayer {
             depth,
             slot,
             name: String::new(),
             title: String::new(),
-            crs_list: parent.map(|p| p.crs_list.clone()).unwrap_or_default(),
-            geographic: parent.and_then(|p| p.geographic),
-            bounding: parent.and_then(|p| p.bounding),
+            parent: parent.map(|p| p.slot),
+            crs_list: Vec::new(),
+            crs_bytes: 0,
+            geographic: None,
+            bounding: None,
             edges: [None; 4],
             in_geographic_box: false,
         }
@@ -349,13 +433,17 @@ impl OpenLayer {
     /// Adds a reference system unless the layer already has it.
     fn add_crs(&mut self, crs: String) {
         if !self.crs_list.contains(&crs) {
+            self.crs_bytes = self
+                .crs_bytes
+                .saturating_add(crs.len())
+                .saturating_add(std::mem::size_of::<String>());
             self.crs_list.push(crs);
         }
     }
 
     /// Reads a bounding box written as attributes of `element`.
     ///
-    /// The box replaces the one inherited or read before it, of its kind:
+    /// The box replaces the one read before it, of its kind:
     /// geographic for every element but `BoundingBox`. An element without
     /// all four edges as numbers changes nothing.
     fn read_box(&mut self, element: &BytesStart<'_>) {
@@ -621,5 +709,120 @@ mod tests {
                 ("c", "", Some(BBox::new(5.0, 6.0, 7.0, 8.0))),
             ]
         );
+    }
+
+    /// `children` named layers under a root without a name that declares
+    /// `systems` reference systems: the shape of a GeoServer root layer.
+    fn wide_capabilities(systems: usize, children: usize) -> String {
+        let mut xml = String::from("<C><Layer><Title>root</Title>");
+        for system in 0..systems {
+            xml.push_str(&format!("<CRS>EPSG:{system}</CRS>"));
+        }
+        for child in 0..children {
+            xml.push_str(&format!("<Layer><Name>l{child}</Name></Layer>"));
+        }
+        xml.push_str("</Layer></C>");
+        xml
+    }
+
+    /// Every layer has a copy of what it inherits, so 265 KB of XML used to
+    /// come back as 18,000,000 strings in over 700 MB.
+    #[test]
+    fn inherited_reference_systems_past_the_budget_are_refused() {
+        let xml = wide_capabilities(6000, 3000);
+        assert!(xml.len() < 300_000);
+        match parse_capabilities_xml(&xml) {
+            Err(GeoError::InvalidFormat(message)) => {
+                assert!(message.contains("reference systems"), "{message}");
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|l| l.len())),
+        }
+
+        // The same amplification with few entries: one long name, many layers.
+        let long = "x".repeat(100_000);
+        let mut xml = format!("<C><Layer><CRS>{long}</CRS>");
+        xml.push_str(&"<Layer><Name>n</Name></Layer>".repeat(2000));
+        xml.push_str("</Layer></C>");
+        assert!(matches!(
+            parse_capabilities_xml(&xml),
+            Err(GeoError::InvalidFormat(_))
+        ));
+
+        // Layers nested 3000 deep, one reference system each.
+        let mut xml = String::from("<C>");
+        for level in 0..3000 {
+            xml.push_str(&format!("<Layer><Name>n{level}</Name><CRS>c{level}</CRS>"));
+        }
+        xml.push_str(&"</Layer>".repeat(3000));
+        xml.push_str("</C>");
+        assert!(matches!(
+            parse_capabilities_xml(&xml),
+            Err(GeoError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn inherited_reference_systems_within_the_budget_are_returned() {
+        let layers = parse_capabilities_xml(&wide_capabilities(6000, 200)).expect("capabilities");
+        assert_eq!(layers.len(), 200);
+        assert!(layers.iter().all(|layer| layer.crs_list.len() == 6000));
+    }
+
+    /// Inheritance used to be taken when the child opened, so what a parent
+    /// declared after a child was not inherited by it.
+    #[test]
+    fn what_a_parent_declares_after_a_child_is_inherited() {
+        let layers = parse_capabilities_xml(
+            "<C><Layer><Name>root</Name><CRS>EPSG:4326</CRS>\
+             <LatLonBoundingBox minx=\"-180\" miny=\"-90\" maxx=\"180\" maxy=\"90\"/>\
+             <Layer><Name>mid2</Name>\
+             <Layer><Name>late</Name><CRS>EPSG:1</CRS></Layer>\
+             <CRS>EPSG:9999</CRS>\
+             <EX_GeographicBoundingBox>\
+             <westBoundLongitude>10</westBoundLongitude>\
+             <eastBoundLongitude>20</eastBoundLongitude>\
+             <southBoundLatitude>30</southBoundLatitude>\
+             <northBoundLatitude>40</northBoundLatitude>\
+             </EX_GeographicBoundingBox>\
+             </Layer></Layer></C>",
+        )
+        .expect("capabilities");
+        let strings = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        let summary: Vec<_> = layers
+            .iter()
+            .map(|layer| (layer.name.as_str(), layer.crs_list.clone(), layer.bbox))
+            .collect();
+        let mid_box = Some(BBox::new(10.0, 30.0, 20.0, 40.0));
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "root",
+                    strings(&["EPSG:4326"]),
+                    Some(BBox::new(-180.0, -90.0, 180.0, 90.0))
+                ),
+                ("mid2", strings(&["EPSG:4326", "EPSG:9999"]), mid_box),
+                (
+                    "late",
+                    strings(&["EPSG:4326", "EPSG:9999", "EPSG:1"]),
+                    mid_box
+                ),
+            ]
+        );
+    }
+
+    /// A document cut short: a layer that closed inside one that did not is
+    /// still returned, with what the open one had declared.
+    #[test]
+    fn layer_inside_one_that_never_closes_is_returned() {
+        let layers = parse_capabilities_xml(
+            "<C><Layer><Name>open</Name><CRS>A</CRS><Layer><Name>x</Name></Layer>",
+        )
+        .expect("capabilities");
+        let summary: Vec<_> = layers
+            .iter()
+            .map(|layer| (layer.name.as_str(), layer.crs_list.clone()))
+            .collect();
+        assert_eq!(summary, vec![("x", vec!["A".to_string()])]);
     }
 }
