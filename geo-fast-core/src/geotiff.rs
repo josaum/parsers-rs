@@ -165,8 +165,16 @@ impl GeoTiffMetadata {
 /// resolved.
 ///
 /// A key is left out, and nothing fails, when its parameter tag is missing
-/// or unreadable, when the key points outside the tag, or when its string is
-/// not UTF-8 (a citation in a legacy encoding).
+/// or unreadable, when the key has no values, or when it points outside the
+/// tag.
+///
+/// Text that is not ASCII costs more than its own key. `GeoAsciiParamsTag`
+/// is one tag holding every string, and the decoder refuses the whole tag
+/// when any byte of it is not ASCII: a single citation in a legacy encoding
+/// (Latin-1, say) leaves every string key unresolved. The double keys are
+/// in another tag and are still read. Only when a writer stored the text as
+/// BYTE values is each string decoded on its own, and then a string that is
+/// not UTF-8 is the only one left out.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GeoKeyParams {
     /// Values of the keys stored in `GeoDoubleParamsTag`, by key ID.
@@ -1762,10 +1770,34 @@ mod tests {
         assert_eq!(short.inverse_flattening(), Some(298.257_223_563));
     }
 
-    /// A citation in Latin-1 is not UTF-8: it stays unresolved, the keys
-    /// beside it are read, and the metadata parse is untouched by it.
+    /// One Latin-1 byte in an ASCII-typed tag: the decoder refuses the tag,
+    /// so every string key is unresolved, not only the citation with the
+    /// byte in it. The file still parses and the double keys are read.
     #[test]
-    fn citation_in_a_legacy_encoding_is_left_unresolved() {
+    fn non_ascii_byte_in_the_ascii_parameters_leaves_every_string_unresolved() {
+        let mut bytes = geotiff_with_params(&PARAM_KEYS, Some(&PARAM_DOUBLES), Some(PARAM_ASCII));
+        let at = bytes
+            .windows(PARAM_ASCII.len())
+            .position(|window| window == PARAM_ASCII.as_bytes())
+            .expect("the tag's text in the file");
+        bytes[at + 1] = 0xFD; // "M\u{fd} citation" in Latin-1
+        let params =
+            parse_geotiff_geokey_params_reader(Cursor::new(bytes.clone())).expect("params");
+        assert_eq!(params.citation(), None);
+        assert_eq!(params.geographic_citation(), None);
+        assert!(params.strings.is_empty());
+        assert_eq!(params.doubles.len(), 3);
+        assert_eq!(params.semi_major_axis(), Some(6_378_137.0));
+        let parsed = metadata(bytes);
+        assert!(parsed.is_geographic);
+        assert_eq!(parsed.geokeys.len(), 6);
+    }
+
+    /// When the text is stored as BYTE values each string is decoded on its
+    /// own: a citation in Latin-1 stays unresolved and the one beside it is
+    /// read.
+    #[test]
+    fn non_utf8_citation_stored_as_bytes_is_the_only_string_left_out() {
         let keys: [u16; 16] = [
             1, 1, 0, 3, //
             1024, 0, 1, 2, //
