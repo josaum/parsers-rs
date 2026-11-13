@@ -37,8 +37,12 @@ print(meta["upper_left"], meta["lower_right"])   # in the raster's own CRS
 print(meta["bbox"])             # degrees; None for a projected raster
 print(meta["geokey_params"])    # {"doubles": {...}, "strings": {...}} by GeoKey ID
 
-# Every band as a list of samples. 8-bit samples are scaled to 0..1.
+# Every band as bytes: little-endian 32-bit floats in row order, four bytes
+# per sample. 8-bit samples are scaled to 0..1.
+import array
 bands = geo_fast.geotiff_bands("scene.tif")
+samples = array.array("f")
+samples.frombytes(bands[0])       # byteswap() afterwards on a big-endian machine
 # The same, refusing a raster whose bands would take more than 64 MiB.
 bands = geo_fast.geotiff_bands("scene.tif", max_band_bytes=64 * 1024 * 1024)
 

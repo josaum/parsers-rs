@@ -72,11 +72,18 @@ def geotiff_metadata(path: str) -> dict[str, Any]:
     return json.loads(geotiff_metadata_json(path))
 
 
-def geotiff_bands(path: str, max_band_bytes: Optional[int] = None) -> list[list[float]]:
-    """Read every band of a GeoTIFF, one list of samples per band.
+def geotiff_bands(path: str, max_band_bytes: Optional[int] = None) -> list[bytes]:
+    """Read every band of a GeoTIFF, one `bytes` object per band.
 
-    `max_band_bytes` is the most band data to return, in bytes (four per
-    sample, all bands together); without it the default limit applies.
+    Each `bytes` holds the band's samples as little-endian 32-bit floats in
+    row order: four bytes per sample, `width * height` samples. To get
+    numbers without copying on a little-endian machine use
+    `memoryview(band).cast("f")`; portably, `array.array("f")` with
+    `frombytes(band)` (and `byteswap()` on a big-endian machine), or
+    `struct.unpack(f"<{len(band) // 4}f", band)`.
+
+    `max_band_bytes` is the most band data to return, in bytes: the total
+    length of the returned objects. Without it the default limit applies.
     Raises `RuntimeError` when the bands would exceed the limit.
     """
     return geotiff_bands_py(path, max_band_bytes=max_band_bytes)

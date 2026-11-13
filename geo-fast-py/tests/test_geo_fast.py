@@ -11,6 +11,7 @@ import json
 import math
 import struct
 import inspect
+import sys
 import threading
 from pathlib import Path
 
@@ -19,20 +20,41 @@ import pytest
 MODULE = pytest.importorskip("geo_fast")
 
 
-def in_two_threads(call):
-    """Run `call` on two threads at once and return both results."""
-    results: list = [None, None]
+def times_another_thread_ran_during(call, attempts: int = 5) -> int:
+    """How many of `attempts` calls let a second Python thread run meanwhile.
 
-    def work(slot: int) -> None:
-        results[slot] = call()
+    The switch interval is raised so the interpreter never hands the GIL over
+    between bytecodes of the calling thread. A second thread, made runnable
+    just before `call`, can then run only if `call` releases the GIL itself:
+    with the GIL held the count is exactly 0, whatever the machine's load.
+    No duration is compared with a threshold.
+    """
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1000.0)
+    count = 0
+    try:
+        for _ in range(attempts):
+            go = threading.Event()
+            ran: list = []
 
-    threads = [threading.Thread(target=work, args=(slot,)) for slot in (0, 1)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=60)
-    assert not any(thread.is_alive() for thread in threads)
-    return results
+            def waiter() -> None:
+                go.wait()
+                ran.append(True)
+
+            thread = threading.Thread(target=waiter)
+            thread.start()  # returns once the waiter is blocked in go.wait()
+            go.set()
+            call()
+            count += bool(ran)
+            thread.join()
+    finally:
+        sys.setswitchinterval(previous)
+    return count
+
+
+def holds_the_gil() -> int:
+    """A call that never releases the GIL: the control for the test below."""
+    return sum(range(3_000_000))
 
 
 GEOJSON = json.dumps(
@@ -174,12 +196,17 @@ def test_geotiff_metadata_reports_size_crs_and_raster_type(tiff_path: str, tmp_p
 
 
 def test_geotiff_bands_reads_samples_and_honours_the_limit(tiff_path: str) -> None:
-    # The core scales 8-bit samples to 0..1.
+    # The core scales 8-bit samples to 0..1. A band is little-endian f32 bytes.
     expected = [n / 255 for n in (1, 2, 3, 4)]
     (band,) = MODULE.geotiff_bands(tiff_path)
-    assert band == pytest.approx(expected, abs=1e-6)
+    assert isinstance(band, bytes) and len(band) == 16
+    assert struct.unpack("<4f", band) == pytest.approx(expected, abs=1e-6)
+    # The limit counts the bytes returned: 16 fits, 15 does not.
     (limited,) = MODULE.geotiff_bands(tiff_path, max_band_bytes=16)
     assert limited == band
+    # A band feeds straight into NDVI once unpacked.
+    samples = list(struct.unpack("<4f", band))
+    assert MODULE.compute_ndvi(samples, samples) == pytest.approx([0.0] * 4)
     with pytest.raises(RuntimeError):
         MODULE.geotiff_bands(tiff_path, max_band_bytes=15)
 
@@ -209,14 +236,14 @@ def test_spectral_angle_and_its_length_check() -> None:
         MODULE.spectral_angle([1.0], [1.0, 0.0])
 
 
-def test_two_threads_parse_at_once() -> None:
+def test_parsing_releases_the_gil() -> None:
     features = [
         {"type": "Feature", "geometry": {"type": "Point", "coordinates": [i % 90, i % 45]}, "properties": {}}
-        for i in range(5_000)
+        for i in range(50_000)
     ]
     text = json.dumps({"type": "FeatureCollection", "features": features})
-    first, second = in_two_threads(lambda: MODULE.parse_geojson_records(text))
-    assert len(first) == len(second) == 5_000 and first == second
+    assert times_another_thread_ran_during(holds_the_gil) == 0
+    assert times_another_thread_ran_during(lambda: MODULE.parse_geojson_records(text)) >= 1
 
 
 def test_the_wheel_ships_type_information_that_matches_the_module() -> None:

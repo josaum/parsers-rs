@@ -6,16 +6,18 @@
 
 #![deny(missing_docs)]
 
+use geo_fast_core::geotiff::{parse_geotiff_geokey_params_reader, parse_geotiff_metadata_reader};
 use geo_fast_core::hyperspectral::HyperspectralParser;
 use geo_fast_core::{
     bbox_area_km2, bbox_iou_geodesic, parse_geojson_str, parse_geotiff_bands,
-    parse_geotiff_bands_with_limit, parse_geotiff_geokey_params, parse_geotiff_metadata,
-    parse_shapefile, BBox, GeoError, SpatialIndex,
+    parse_geotiff_bands_with_limit, parse_shapefile, BBox, GeoError, SpatialIndex,
 };
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::io::Seek;
 
 fn err(e: impl ToString) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -139,8 +141,15 @@ fn strtree_query_json(py: Python<'_>, boxes_json: &str, query_bbox: &str) -> PyR
 /// Keys are sorted. A non-finite number has no JSON form and is written as
 /// `null`.
 fn geotiff_metadata_value(path: &str) -> Result<serde_json::Value, GeoError> {
-    let meta = parse_geotiff_metadata(path)?;
-    let params = parse_geotiff_geokey_params(path)?;
+    // One open file serves both reads; only the tags are read, never the
+    // raster, so a large image costs no more than a small one.
+    let file = std::fs::File::open(path).map_err(GeoError::Io)?;
+    let mut reader = std::io::BufReader::new(file);
+    let meta = parse_geotiff_metadata_reader(&mut reader)?;
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(GeoError::Io)?;
+    let params = parse_geotiff_geokey_params_reader(&mut reader)?;
     let geokeys: BTreeMap<String, u32> = meta
         .geokeys
         .iter()
@@ -188,24 +197,39 @@ fn geotiff_metadata_json(py: Python<'_>, path: &str) -> PyResult<String> {
     })
 }
 
-/// Read every band of a GeoTIFF as a list of `float` lists, one per band.
+/// Read every band of a GeoTIFF, one `bytes` object per band.
 ///
-/// `max_band_bytes` is the most band data to return, in bytes (four per
-/// sample, all bands together); without it the core's default limit applies.
+/// Each `bytes` holds the band's samples as little-endian 32-bit floats, in
+/// row order: four bytes per sample, `width * height` samples.
+/// `max_band_bytes` is the most band data to return, in bytes (the total
+/// length of the returned objects); without it the core's default limit
+/// applies.
 #[pyfunction]
 #[pyo3(signature = (path, max_band_bytes=None))]
-fn geotiff_bands_py(
-    py: Python<'_>,
+fn geotiff_bands_py<'py>(
+    py: Python<'py>,
     path: &str,
     max_band_bytes: Option<usize>,
-) -> PyResult<Vec<Vec<f32>>> {
-    py.detach(|| -> PyResult<Vec<Vec<f32>>> {
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let bands = py.detach(|| -> PyResult<Vec<Vec<f32>>> {
         match max_band_bytes {
             Some(limit) => parse_geotiff_bands_with_limit(path, limit),
             None => parse_geotiff_bands(path),
         }
         .map_err(err)
-    })
+    })?;
+    bands
+        .iter()
+        .map(|band| {
+            // One copy, straight into the object Python will own.
+            PyBytes::new_with(py, band.len() * 4, |out| {
+                for (chunk, sample) in out.as_chunks_mut::<4>().0.iter_mut().zip(band) {
+                    *chunk = sample.to_le_bytes();
+                }
+                Ok(())
+            })
+        })
+        .collect()
 }
 
 /// NDVI per sample from near-infrared and red bands of equal length.
