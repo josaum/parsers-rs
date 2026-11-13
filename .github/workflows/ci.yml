@@ -227,12 +227,16 @@ jobs:
           persist-credentials: false
       - name: Install elan and verify Lean 4 proofs (0 sorry)
         run: |
-          # The installer is fetched at one commit and run only if its bytes
-          # are the ones reviewed; a branch name can be moved under us.
-          curl -sSfL -o "$RUNNER_TEMP/elan-init.sh" \
-            https://raw.githubusercontent.com/leanprover/elan/55dc2814ca42ace25f05ba4dd7a43a8c701a0549/elan-init.sh
-          echo "a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53  $RUNNER_TEMP/elan-init.sh" \
+          # elan's own release binary for this runner (x86_64 Linux), at one
+          # version, run only if its bytes match. The installer script is not
+          # used: it would download whichever elan is newest, unchecked.
+          # What this does not pin: elan then downloads the Lean toolchain
+          # that formal/lean-toolchain names, by version and not by hash.
+          curl -sSfL -o "$RUNNER_TEMP/elan.tar.gz" \
+            https://github.com/leanprover/elan/releases/download/v4.2.4/elan-x86_64-unknown-linux-gnu.tar.gz
+          echo "42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63  $RUNNER_TEMP/elan.tar.gz" \
             | sha256sum --check --strict
-          sh "$RUNNER_TEMP/elan-init.sh" -y --no-modify-path --default-toolchain none
+          tar -xzf "$RUNNER_TEMP/elan.tar.gz" -C "$RUNNER_TEMP" elan-init
+          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-toolchain none
           export PATH="$HOME/.elan/bin:$PATH"
           ./formal/check.sh

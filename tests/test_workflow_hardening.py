@@ -148,19 +148,46 @@ def assert_checkouts_keep_no_credentials(text: str) -> None:
         )
 
 
+DOWNLOAD = re.compile(
+    r'curl -sSfL -o "\$RUNNER_TEMP/(?P<file>[\w.-]+)" \\\n\s+(?P<url>https://\S+)\n'
+    r'\s+echo "[0-9a-f]{64}  \$RUNNER_TEMP/(?P=file)" \\\n\s+\| sha256sum --check --strict\n'
+)
+# A download names exactly what it fetches: a file at a full commit, or one
+# asset of one numbered release.
+IMMUTABLE_URL = re.compile(
+    r"https://raw\.githubusercontent\.com/[\w.-]+/[\w.-]+/[0-9a-f]{40}/\S+"
+    r"|https://github\.com/[\w.-]+/[\w.-]+/releases/download/v\d+\.\d+\.\d+/[\w.-]+"
+)
+
+
 def assert_installers_are_pinned(text: str) -> None:
-    """Nothing is piped from the network into a shell or installed unversioned."""
+    """Nothing fetched from the network runs unchecked, and no tool floats.
+
+    The only download spelling accepted is `curl` writing a file under
+    $RUNNER_TEMP from an immutable URL, with the very next command checking
+    that file against a SHA-256. Every other way of fetching, or of running
+    fetched bytes, is refused outright instead of being recognized case by case.
+    """
     body = code(text)
-    assert not re.search(r"\|\s*(?:ba)?sh\b", body), "a download is piped into a shell"
-    for url in re.findall(r"https://raw\.githubusercontent\.com/\S+", body):
-        assert re.fullmatch(
-            r"https://raw\.githubusercontent\.com/[\w.-]+/[\w.-]+/[0-9a-f]{40}/\S+", url
-        ), f"{url}: not fetched at a full commit SHA"
-        name = url.rsplit("/", 1)[1]
-        assert re.search(
-            rf'echo "[0-9a-f]{{64}}  \$RUNNER_TEMP/{re.escape(name)}" \\\n\s+\| sha256sum --check --strict\n\s+sh "\$RUNNER_TEMP/{re.escape(name)}"',
-            body,
-        ), f"{name}: must be checked against a SHA-256 before it runs"
+    accepted = list(DOWNLOAD.finditer(body))
+    assert len(re.findall(r"\bcurl\b", body)) == len(accepted), (
+        "every curl must write a file and be followed at once by its SHA-256 check"
+    )
+    for download in accepted:
+        assert IMMUTABLE_URL.fullmatch(download["url"]), (
+            f"{download['url']}: not a commit-pinned file or a versioned release asset"
+        )
+    for fetcher in ("wget", "Invoke-WebRequest", "iwr ", "irm "):
+        assert fetcher not in body, f"{fetcher.strip()}: downloads go through the checked curl spelling"
+    # Fetched bytes reaching an interpreter without touching the checked file.
+    assert not re.search(r"\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", body), "something is piped into a shell"
+    assert not re.search(r"\|\s*(?:python3?|node|perl|ruby|pwsh|iex)\b", body), (
+        "something is piped into an interpreter"
+    )
+    assert "<(" not in body, "process substitution can run a download unchecked"
+    assert not re.search(r"\beval\b|\bsource\s+/dev/stdin", body), (
+        "a command built from output can run a download unchecked"
+    )
     for install in re.findall(r"cargo install [^\n]+", body):
         assert re.search(r" --locked\b", install) and re.search(
             r" --version [0-9]+\.[0-9]+\.[0-9]+(?:\s|$)", install
@@ -624,6 +651,8 @@ def test_dependabot_updates_cargo_and_actions_weekly():
 
 
 SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+ELAN_URL = "https://github.com/leanprover/elan/releases/download/v4.2.4/elan-x86_64-unknown-linux-gnu.tar.gz"
+ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-toolchain none\n'
 
 
 @pytest.mark.parametrize(
@@ -646,9 +675,21 @@ SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
         (assert_checkouts_keep_no_credentials, CI, "          persist-credentials: false\n      - name: Install elan", "          persist-credentials: true\n      - name: Install elan"),
         (assert_checkouts_keep_no_credentials, RELEASE, "        with:\n          persist-credentials: false\n      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master\n        with:\n          toolchain: 1.98.1\n      - uses: actions/setup-python", "      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master\n        with:\n          toolchain: 1.98.1\n      - uses: actions/setup-python"),
         (assert_checkouts_keep_no_credentials, AUDIT, "          persist-credentials: false\n", "          persist-credentials: false\n          fetch-depth: 0\n"),
-        (assert_installers_are_pinned, CI, "elan/55dc2814ca42ace25f05ba4dd7a43a8c701a0549/elan-init.sh", "elan/master/elan-init.sh"),
+        (assert_installers_are_pinned, CI, "releases/download/v4.2.4/elan-x86_64", "releases/latest/download/elan-x86_64"),
+        (assert_installers_are_pinned, CI, "releases/download/v4.2.4/elan-x86_64", "releases/download/v4/elan-x86_64"),
+        (assert_installers_are_pinned, CI, ELAN_URL, "https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh"),
+        (assert_installers_are_pinned, CI, ELAN_URL, "https://example.invalid/elan.tar.gz"),
         (assert_installers_are_pinned, CI, "            | sha256sum --check --strict\n", "            | cat\n"),
-        (assert_installers_are_pinned, CI, '          sh "$RUNNER_TEMP/elan-init.sh" -y', '          curl -sSf https://example.invalid/install.sh | sh -s -- -y'),
+        (assert_installers_are_pinned, CI, '$RUNNER_TEMP/elan.tar.gz" \\\n            | sha256sum', '$RUNNER_TEMP/other.tar.gz" \\\n            | sha256sum'),
+        (assert_installers_are_pinned, CI, '          echo "42b94d42', '          tar -tzf "$RUNNER_TEMP/elan.tar.gz"\n          echo "42b94d42'),
+        (assert_installers_are_pinned, CI, ELAN_RUN, "          curl -sSf https://example.invalid/install.sh | sh -s -- -y\n"),
+        (assert_installers_are_pinned, CI, ELAN_RUN, "          bash <(curl -sSf https://example.invalid/install.sh)\n"),
+        (assert_installers_are_pinned, CI, ELAN_RUN, "          curl -sSfL -o /tmp/install.sh https://example.invalid/install.sh\n          sh /tmp/install.sh\n"),
+        (assert_installers_are_pinned, CI, ELAN_RUN, '          sh -c "$(curl -sSf https://example.invalid/install.sh)"\n'),
+        (assert_installers_are_pinned, CI, ELAN_RUN, '          eval "$(cat "$RUNNER_TEMP/elan.tar.gz")"\n'),
+        (assert_installers_are_pinned, CI, ELAN_RUN, "          wget -qO- https://example.invalid/install.sh | sh\n"),
+        (assert_installers_are_pinned, CI, ELAN_RUN, "          wget -q https://example.invalid/elan-init && chmod +x elan-init && ./elan-init -y\n"),
+        (assert_installers_are_pinned, CI, ELAN_RUN, '          cat "$RUNNER_TEMP/elan.tar.gz" | python3\n'),
         (assert_installers_are_pinned, RELEASE, "cargo install cargo-cyclonedx --locked --version 0.5.10", "cargo install cargo-cyclonedx --locked"),
         (assert_installers_are_pinned, RELEASE, "cargo install cargo-cyclonedx --locked --version 0.5.10", "cargo install cargo-cyclonedx --version 0.5.10"),
         (assert_installers_are_pinned, AUDIT, " --locked --version 0.23.0", " --locked --version 0.23"),
