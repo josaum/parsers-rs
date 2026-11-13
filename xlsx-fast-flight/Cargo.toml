@@ -1,6 +1,6 @@
 [package]
 name = "xlsx-fast-flight"
-version = "0.2.5"
+version = "0.2.6"
 edition.workspace = true
 authors.workspace = true
 description = "Apache Arrow Flight server for xlsx-fast-core"

@@ -4,7 +4,16 @@ Changes a consumer of the wheels, Node packages, crates or Flight servers
 can observe. Each release also has generated notes listing every pull
 request.
 
-## Unreleased
+## v2026.11.13.1
+
+Every crate's patch version moves, and `xsd-fast-core` moves to 0.3.0 with
+its Python and Node packages, for a source-breaking change to its model
+types (see "Public Rust API"). The headline is a memory-safety fix in the
+`pdf_fast` Python module, JSON Schema `$id`/`$anchor`/`$dynamicRef`
+resolution with unresolvable references failing closed, PDF 1.5+ sources in
+pdf-write, named simple types and attribute groups in xsd, and quick-xml
+0.42 without rejecting documents 0.41 read. Read "Changed output" and "New
+refusals" before upgrading a pipeline that stores parsed output.
 
 ### Changed output
 
@@ -64,6 +73,30 @@ request.
   (plus 1 MiB), as a long base URI under many relative `$id`s would. A
   fragment-only reference (`#...`) is charged its fragment only.
 
+- **pptx:** `docProps/app.xml` is read by the parser docx uses (#68).
+  `HeadingPairs` and `TitlesOfParts`, and any property holding a vector,
+  appear under their own names, one line per item; the keys `lpstr` and
+  `i4` are gone. A property holding only white space with a line break is
+  no longer stored. On 100 real `.pptx` files metadata changed in 89, all
+  in `app`; nothing outside metadata changed.
+- **xsd (Arrow):** named simple types are followed through restrictions,
+  `xs:list` and `xs:union`, and `xs:attribute ref` / `xs:attributeGroup
+  ref` contribute their attributes (#85). New columns appear for those
+  attributes, text columns become numeric, boolean or temporal where the
+  resolved type is, and `xs:list` becomes `List<item>`. On 452 real
+  schemas column paths went from 3,231,555 to 8,261,655 (the attributes
+  that were dropped), 82 columns changed from text to `Int64`/`Float64`,
+  and none was removed. Referenced attributes on a child that otherwise
+  gives one column are left out so no existing column changes shape;
+  `ArrowShape::with_attributes_on_simple_children` includes them.
+- **xsd (validation):** facets along simple-type chains and list items are
+  checked; a choice whose matching branch is a wildcard (`xs:any`) is no
+  longer reported as missing (#85).
+- **Flight servers:** jsonwebtoken 11.1 accepts a correctly signed token
+  whose header carries a non-string extra field (signature, algorithm,
+  expiry, issuer and audience all still verify), and refuses an empty
+  `aud` array (#79).
+
 ### Fixed
 
 - **json:** `$id` base URIs (RFC 3986, including embedded resources),
@@ -88,6 +121,32 @@ request.
   TIFFs, 3 rasters that returned such values are refused, and no other
   result changes.
 
+- **pdf (Python), memory safety:** `pdf_fast.release_arrow_c_data` passed
+  any two integers to `Box::from_raw`, so a made-up pair, or a pair
+  released twice, corrupted the heap. Only a pair this module issued and has
+  not freed is accepted now; anything else raises `ValueError`. The
+  deprecated `*_c_data` import helper leaked two small structs per call; it
+  frees them now (#70).
+- **json bindings:** a Rust panic in `json-fast-node` is a thrown `Error`,
+  not the end of the Node process; `json_fast` releases the GIL around every
+  core call and installs on Python 3.8, and ships `py.typed` and a stub
+  (#66). The ten binding pairs now behave alike; this closes the two "not
+  yet" notes under v2026.11.13.
+- **pdf-write:** sources with cross-reference streams, object streams,
+  hybrid `/XRefStm` sections and `/Prev` chains through them (PDF 1.5 and
+  later) extract instead of failing; 29 of 92 real PDFs in an earlier
+  sample failed this way (#76). Output is still a classic table. This
+  closes the pdf-write known gap listed under v2026.11.13.
+- **geo (`http` feature):** WFS and `get_map` responses have size limits,
+  and `parse_capabilities_xml_with_report` / `get_capabilities_with_report`
+  report the WMS layers whose inherited reference systems were cut
+  (#67). This closes the two geo known gaps listed under v2026.11.13.
+- **Packaging:** every Python wheel names the repository, documentation and
+  issue tracker in its metadata (`Project-URL`) (#84).
+- **CI:** the geo `http`, json `mmap` and pdf `glyph-catalog` features are
+  linted and tested (#65), closing the CI known gap listed under
+  v2026.11.13.
+
 ### New refusals
 
 - **docx, xlsx, pptx, xsd, geo:** a part or document that holds bytes that
@@ -111,12 +170,68 @@ request.
   (1, 2, 4, 10 or 12 bits), and an uncompressed raster with a strip or tile
   shorter than its pixels, including a sparse one.
 
+- **pdf:** the interpreted renderer's guard refuses, before the interpreter
+  runs (#78): more than 4,096 consecutive CMap comment lines; a sampled
+  function over 2^20 samples or 8 inputs; more than 4,096 saved graphics
+  states along one path; an image (XObject, soft mask, inline) over
+  max(256 M, 16 × the page's pixels at the requested resolution); tiling
+  cells, summed along a nesting path, over the same pixel budget. On 150
+  real PDFs at four resolutions none is newly refused.
+- **pdf-write:** decoding past 16 × the file length plus 64 KiB, more than
+  one cross-reference entry per 8 bytes of file, more than 1,024 chained
+  sections, a malformed `/W`, `/Index` or predictor, a hybrid file whose
+  `/XRefStm` stream is corrupt, and a page that refers to a
+  cross-reference or object-stream object (#76).
+- **geo (`http` feature):** a WFS response over 256 MiB
+  (`MAX_WFS_RESPONSE_BYTES`) or nested deeper than 32 levels; a `get_map`
+  whose width × height × 4 is over 256 MiB is refused before connecting,
+  and its response is held to width × height × 4 plus an eighth (#67).
+- **pdf (Python):** `page_table_from_ocr_arrow_ipc` and its layout and
+  `scan_*` forms raise `ValueError` naming the column when `text`, `px_x`,
+  `px_y` or `px_height` is missing or mistyped (#78).
+
+### Public Rust API
+
+- **xsd-fast-core 0.3.0 (source-breaking):** `SimpleTypeDef.facets` is now
+  `Arc<SimpleFacets>`, with new fields `list_item` and `union_members`;
+  `AttributeDecl` gains `referenced`; `ElementRef` gains `Any(Wildcard)`;
+  `ElementRef`, `AttributeDecl`, `SimpleTypeDef` and `Wildcard` are
+  `#[non_exhaustive]`, so struct literals and exhaustive matches of them
+  break. New: `ArrowShape::with_attributes_on_simple_children` and
+  `to_arrow_schema_with_shape`. Models serialized by v2026.11.13 still
+  load. `xsd-fast-py` and `xsd-fast-node` move to 0.3.0 with it; their own
+  APIs are unchanged (#85).
+- **json-fast-core:** new `schema::validate_with_resources` and
+  `schema::WELL_KNOWN_META_SCHEMAS` (#77). `json_fast.validate` gains a
+  keyword-only `resources`, and `validate` in `json-fast-node` a trailing
+  object, both from URI to schema text.
+- **geo-fast-core:** new `parse_capabilities_xml_with_report`,
+  `WmsClient::get_capabilities_with_report`, `WmsCapabilities` and
+  `LayerRef` (both `#[non_exhaustive]`), and the constants
+  `MAX_WFS_RESPONSE_BYTES`, `MAX_MAP_RESPONSE_BYTES` and
+  `MAP_RESPONSE_FLOOR_BYTES` (#67).
+- **ooxml-archive:** new `properties::parse_simple_props`, shared by docx
+  and pptx (#68). `xsd-fast-core` and `geo-fast-core` now depend on
+  `ooxml-archive` for its UTF-8 repair reader (#92).
+- Checked with cargo-semver-checks against v2026.11.13: every other library
+  crate needs no more than its patch release; the Flight servers have no
+  library API.
+
 ### Known gaps
 
 - **docx, xlsx, pptx, xsd, geo:** a reader remembers where it replaced
   bytes that are not UTF-8 in up to 4,096 separate runs per part. Past
   that, the runs merge into one, and a strictly read value inside the
   merged run that holds a real U+FFFD is treated as not UTF-8.
+- **pdf:** still open from v2026.11.13: three documented cases where text
+  extraction and the renderer read different copies of an object in a
+  malformed file, and a glyph procedure re-read for every code shown. The
+  render guard cannot read the page tree as hayro does without an upstream
+  API, has not traced the image decoders' internals (JPEG, JPX, JBIG2,
+  CCITT), and does not bound the clip paths each saved state copies.
+- **Dependencies held** (`.github/dependabot.yml` gives each reason):
+  hayro 0.6 and later, tiff 0.10 and later, mailparse 0.16 and later, napi
+  3, tiny-skia 0.12 and Arrow 59 and later.
 
 ## v2026.11.13
 

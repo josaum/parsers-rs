@@ -1,6 +1,6 @@
 {
   "name": "email-fast-node",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "High-performance email parser for .eml and .msg formats",
   "main": "index.js",
   "types": "index.d.ts",

@@ -1,6 +1,6 @@
 [package]
 name = "xlsx-fast-write"
-version = "0.2.3"
+version = "0.2.4"
 edition.workspace = true
 authors.workspace = true
 description = "Sovereign XLSX writer — generates .xlsx files without external dependencies"

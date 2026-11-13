@@ -1,6 +1,6 @@
 [package]
 name = "ooxml-archive"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 authors.workspace = true
 description = "Shared OOXML ZIP archive, inflate, relationship and document property helpers"
