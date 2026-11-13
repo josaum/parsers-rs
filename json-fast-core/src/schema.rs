@@ -610,6 +610,39 @@ fn start_large_stack_worker() -> Option<std::sync::mpsc::Sender<Job>> {
     Some(jobs)
 }
 
+/// Boxes `work` so that it is gone before its reply sender is.
+///
+/// [`on_large_stack`] hands the box to another thread and treats the loss of
+/// the reply sender as proof that nothing borrowed by `work` is in use there
+/// any more. That has to hold when the box is run, when `work` panics, and
+/// when the box is dropped without ever running, so the order is written
+/// down in a struct (fields drop in declaration order) instead of being left
+/// to the order in which a closure happens to drop its captures.
+fn reply_last<'env, T: Send + 'env>(
+    work: impl FnOnce() -> T + Send + 'env,
+    reply: std::sync::mpsc::SyncSender<T>,
+) -> Box<dyn FnOnce() + Send + 'env> {
+    struct ReplyLast<F, T> {
+        // Dropped first: holds everything borrowed for `'env`.
+        work: Option<F>,
+        // Dropped second: its loss releases the waiting caller.
+        reply: std::sync::mpsc::SyncSender<T>,
+    }
+    let pending = ReplyLast {
+        work: Some(work),
+        reply,
+    };
+    Box::new(move || {
+        // Take the struct as a whole; capturing its fields one by one would
+        // bring back the unspecified order.
+        let mut pending = pending;
+        if let Some(work) = pending.work.take() {
+            let value = work();
+            let _ = pending.reply.send(value);
+        }
+    })
+}
+
 /// Runs `work` on this thread's large-stack worker and waits for it.
 ///
 /// Starting a thread per validation cost more than a shallow validation
@@ -623,16 +656,18 @@ fn on_large_stack<'env, T: Send + 'env>(
     work: impl FnOnce() -> T + Send + 'env,
 ) -> Result<T, &'static str> {
     let (reply, result) = std::sync::mpsc::sync_channel::<T>(1);
-    let job: Box<dyn FnOnce() + Send + 'env> = Box::new(move || {
-        let _ = reply.send(work());
-    });
+    let job = reply_last(work, reply);
     // SAFETY: only the lifetime bound of the boxed closure changes. The
     // closure borrows data that lives for `'env`, which outlives this call,
-    // and this function does not return until the closure is gone: every
-    // path below ends by dropping the closure unrun on this thread or by
-    // `result.recv()`, which returns only after the worker has run the
-    // closure to completion (a reply arrives) or has dropped it, either
-    // unrun or by unwinding out of it (the reply sender it owns is dropped).
+    // and this function does not return while anything borrowed for `'env`
+    // is still alive on another thread. Every path below ends in one of two
+    // ways. Either the job is dropped on this thread, unsent. Or
+    // `result.recv()` returns, which needs a reply or the loss of the reply
+    // sender, and `reply_last` orders both after the end of `work`: a reply
+    // is sent only once `work` has been consumed by its call, and the
+    // sender is dropped only after `work` (run, unrun or unwinding).
+    // The value sent back is owned by this thread from then on, and a panic
+    // payload is `'static`.
     let job: Job = unsafe {
         std::mem::transmute::<Box<dyn FnOnce() + Send + 'env>, Box<dyn FnOnce() + Send + 'static>>(
             job,
@@ -2994,6 +3029,45 @@ mod tests {
             .expect("joins")
             .expect("runs");
         assert_ne!(Ok(other), on_large_stack(|| std::thread::current().id()));
+    }
+
+    /// The caller is released by the reply sender going away, so a slow
+    /// destructor in the borrowed work has to finish first on every path.
+    #[test]
+    fn the_work_is_gone_before_the_reply_sender_on_every_path() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SlowDrop<'a>(&'a AtomicBool);
+        impl Drop for SlowDrop<'_> {
+            fn drop(&mut self) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for path in ["dropped unrun", "run", "panics"] {
+            let gone = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let (reply, result) = std::sync::mpsc::sync_channel::<()>(1);
+                let probe = SlowDrop(&gone);
+                let job = reply_last(
+                    move || {
+                        let _probe = &probe;
+                        assert!(path != "panics", "inside the job");
+                    },
+                    reply,
+                );
+                scope.spawn(move || {
+                    if path == "dropped unrun" {
+                        drop(job);
+                    } else {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    }
+                });
+                let _ = result.recv();
+                assert!(gone.load(Ordering::SeqCst), "released early: {path}");
+            });
+        }
     }
 
     #[test]
