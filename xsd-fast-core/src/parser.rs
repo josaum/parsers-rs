@@ -13,8 +13,9 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 
 use crate::schema::{
     AttributeDecl, ComplexType, ContentModel, ElementDecl, ElementRef, EnumValue,
@@ -259,28 +260,55 @@ impl Loader {
         Ok(())
     }
 
+    /// The file a `schemaLocation` names, relative to the including file.
+    ///
+    /// A location may go up with `..` as long as it stays inside the root
+    /// schema's directory at every step. The path is folded by its text, not
+    /// by the filesystem, so a location that would leave the root is refused
+    /// without anything outside the root being looked at, and a `..` cannot
+    /// be carried elsewhere by a symbolic link. Links are settled afterwards,
+    /// when the file is opened: its canonical path must be inside the root.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a URL, an absolute path, a location that steps outside the
+    /// root schema's directory, and any location of an in-memory schema.
     fn resolve_schema_location(&self, location: &str) -> Result<PathBuf> {
+        let rejected = || anyhow::anyhow!("rejected schemaLocation: {location}");
+        let Some(root_dir) = &self.root_dir else {
+            return Err(rejected());
+        };
         let path = Path::new(location);
-        if location.contains("://")
-            || path.is_absolute()
-            || path.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
-        {
-            return Err(anyhow::anyhow!("rejected schemaLocation: {location}"));
+        if location.contains("://") || path.is_absolute() {
+            return Err(rejected());
         }
-        if self.root_dir.is_none() {
-            return Err(anyhow::anyhow!("rejected schemaLocation: {location}"));
+        let mut resolved = self.base_dir.clone();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => resolved.push(part),
+                Component::ParentDir => {
+                    if !resolved.pop() || !resolved.starts_with(root_dir) {
+                        return Err(rejected());
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => return Err(rejected()),
+            }
         }
-        Ok(self.base_dir.join(path))
+        Ok(resolved)
     }
 
     fn parse_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         let mut reader = Reader::from_reader(bytes);
+        // No reader of a schema document collects element text: declarations
+        // are read from attributes alone, and annotations are skipped. So
+        // trimming, which works on each piece of text between references,
+        // cannot change a value here.
         reader.config_mut().trim_text(true);
+        // For the same reason a bare `&` in that text, which is not
+        // well-formed, is passed over and does not fail the load: published
+        // schemas carry them in documentation.
+        reader.config_mut().allow_dangling_amp = true;
 
         let mut file = FileState {
             ns_map: HashMap::new(),
@@ -404,7 +432,9 @@ impl Loader {
         }
     }
 
-    fn finish(self) -> SchemaModel {
+    /// The loaded model, with every type reference settled.
+    fn finish(mut self) -> SchemaModel {
+        settle_unprefixed_builtin_names(&mut self.model);
         self.model
     }
 }
@@ -562,6 +592,7 @@ fn empty_complex_type() -> ComplexType {
         content: ContentModel::Empty,
         attributes: Vec::new(),
         base: None,
+        content_occurrence: OccurrenceConstraint::default(),
     }
 }
 
@@ -598,6 +629,7 @@ fn parse_complex_type_into(
                 depth += 1;
                 match local.as_str() {
                     "sequence" => {
+                        complex_type.content_occurrence = parse_occurrence(&attrs);
                         complex_type.content = ContentModel::Sequence(parse_particles(
                             reader,
                             ns_map,
@@ -607,11 +639,13 @@ fn parse_complex_type_into(
                         depth -= 1; // parse_particles consumed the End tag
                     }
                     "all" => {
+                        complex_type.content_occurrence = parse_occurrence(&attrs);
                         complex_type.content =
                             ContentModel::All(parse_particles(reader, ns_map, "all", nesting + 1)?);
                         depth -= 1;
                     }
                     "choice" => {
+                        complex_type.content_occurrence = parse_occurrence(&attrs);
                         complex_type.content = ContentModel::Choice(parse_particles(
                             reader,
                             ns_map,
@@ -625,7 +659,16 @@ fn parse_complex_type_into(
                         depth -= 1;
                     }
                     "attribute" => {
-                        push_attribute_decl(&attrs, &mut complex_type.attributes);
+                        // The attribute's children are read here, up to its
+                        // end tag, so they are not taken for children of the
+                        // complex type.
+                        let inline_type = parse_attribute_children(reader, ns_map)?;
+                        push_attribute_decl(
+                            &attrs,
+                            inline_type,
+                            ns_map,
+                            &mut complex_type.attributes,
+                        );
                         depth -= 1;
                     }
                     "annotation" => {
@@ -637,7 +680,7 @@ fn parse_complex_type_into(
             }
             Tag::Empty { local, attrs } => {
                 if local == "attribute" {
-                    push_attribute_decl(&attrs, &mut complex_type.attributes);
+                    push_attribute_decl(&attrs, None, ns_map, &mut complex_type.attributes);
                 }
             }
             Tag::End { .. } => {
@@ -728,21 +771,230 @@ fn reference_particle(attrs: &HashMap<String, String>) -> Option<Particle> {
 ///
 /// A built-in type becomes a simple type; anything else stays a reference to
 /// be resolved against the named types of the schema set.
+///
+/// A name is resolved by its namespace. With a prefix bound to the XML Schema
+/// namespace, or without a prefix where XML Schema is the default namespace,
+/// a built-in name is the built-in. Without a prefix anywhere else, a name
+/// like `short` or `date` is the schema's own type if the schema set declares
+/// one, which is only known once every file is loaded: such a reference is
+/// marked with [`UNPREFIXED_BUILTIN_NAME`] and settled by
+/// [`settle_unprefixed_builtin_names`].
 fn declared_type(
     attrs: &HashMap<String, String>,
     ns_map: &HashMap<String, String>,
 ) -> Option<Box<XsdType>> {
     let type_attr = attrs.get("type")?;
     let (_, type_local) = split_prefix(type_attr);
-    Some(Box::new(if is_xs_primitive(type_attr, ns_map) {
-        XsdType::Simple(SimpleTypeDef {
-            name: None,
-            kind: SimpleTypeKind::from_local(type_local),
-            facets: SimpleFacets::default(),
+    Some(Box::new(if !is_xs_primitive(type_attr, ns_map) {
+        XsdType::Ref(QName::local(type_local))
+    } else if is_unprefixed_builtin_name(type_attr, ns_map) {
+        XsdType::Ref(QName {
+            namespace: Some(UNPREFIXED_BUILTIN_NAME.to_owned()),
+            local: type_local.to_owned(),
         })
     } else {
-        XsdType::Ref(QName::local(type_local))
+        builtin_type(type_local)
     }))
+}
+
+/// Whether `type_ref` is a built-in name that may mean the schema's own type.
+///
+/// True for a built-in name written without a prefix where XML Schema is not
+/// the default namespace. Which type it means is known once every file is
+/// loaded; see [`settle_unprefixed_builtin_names`].
+fn is_unprefixed_builtin_name(type_ref: &str, ns_map: &HashMap<String, String>) -> bool {
+    let xs_is_default = ns_map
+        .get("")
+        .is_some_and(|uri| XS_URIS.contains(&uri.as_str()));
+    split_prefix(type_ref).0.is_none() && !xs_is_default && is_xs_primitive(type_ref, ns_map)
+}
+
+/// The kind of the simple type a `base` or attribute `type` names.
+///
+/// A name that may mean the schema's own type is kept, marked with
+/// [`UNPREFIXED_BUILTIN_NAME`], as a kind for
+/// [`settle_unprefixed_builtin_names`] to decide. Any other name goes by its
+/// local part: a built-in kind, or the name itself.
+fn named_simple_kind(type_ref: &str, ns_map: &HashMap<String, String>) -> SimpleTypeKind {
+    let local = split_prefix(type_ref).1;
+    if is_unprefixed_builtin_name(type_ref, ns_map) {
+        SimpleTypeKind::Other(format!("{UNPREFIXED_BUILTIN_NAME}{local}"))
+    } else {
+        SimpleTypeKind::from_local(local)
+    }
+}
+
+/// The schema set's own types that are named like built-ins.
+struct OwnTypes {
+    /// Names of the simple and complex types.
+    names: HashSet<String>,
+    /// The simple types as parsed, before any of them is settled.
+    simple: HashMap<String, SimpleTypeDef>,
+}
+
+/// Longest chain of own types, each restricting the next, that is followed.
+///
+/// Real chains are one or two long. The bound, with the check for a name met
+/// twice, keeps a cyclic schema from being followed for ever.
+const MAX_OWN_TYPE_CHAIN: usize = 8;
+
+/// Decides a simple type whose kind is a marked built-in name.
+///
+/// Where the schema set declares a simple type of that name, the type takes
+/// its kind and every facet it does not state itself, following a chain of
+/// such types. Where it does not, or the name leads back to `own_name` (the
+/// type being settled), the name is the built-in. Other types are left alone.
+fn settle_simple_type(simple: &mut SimpleTypeDef, own_name: Option<&str>, own: &OwnTypes) {
+    let SimpleTypeKind::Other(marked) = &simple.kind else {
+        return;
+    };
+    let Some(first) = marked.strip_prefix(UNPREFIXED_BUILTIN_NAME) else {
+        return;
+    };
+    let mut name = first.to_owned();
+    let mut seen: Vec<String> = own_name.map(str::to_owned).into_iter().collect();
+    for _ in 0..MAX_OWN_TYPE_CHAIN {
+        let Some(base) = own.simple.get(&name).filter(|_| !seen.contains(&name)) else {
+            break;
+        };
+        inherit_facets(&mut simple.facets, &base.facets);
+        seen.push(name);
+        match &base.kind {
+            SimpleTypeKind::Other(next) if next.starts_with(UNPREFIXED_BUILTIN_NAME) => {
+                name = next[UNPREFIXED_BUILTIN_NAME.len()..].to_owned();
+            }
+            kind => {
+                simple.kind = kind.clone();
+                return;
+            }
+        }
+    }
+    simple.kind = SimpleTypeKind::from_local(&name);
+}
+
+/// Fills each facet `facets` does not state from `base`.
+fn inherit_facets(facets: &mut SimpleFacets, base: &SimpleFacets) {
+    if facets.enumerations.is_empty() {
+        facets.enumerations.clone_from(&base.enumerations);
+    }
+    fn inherit<T: Clone>(own: &mut Option<T>, base: &Option<T>) {
+        if own.is_none() {
+            own.clone_from(base);
+        }
+    }
+    inherit(&mut facets.pattern, &base.pattern);
+    inherit(&mut facets.min_length, &base.min_length);
+    inherit(&mut facets.max_length, &base.max_length);
+    inherit(&mut facets.min_inclusive, &base.min_inclusive);
+    inherit(&mut facets.max_inclusive, &base.max_inclusive);
+    inherit(&mut facets.min_exclusive, &base.min_exclusive);
+    inherit(&mut facets.max_exclusive, &base.max_exclusive);
+    inherit(&mut facets.total_digits, &base.total_digits);
+    inherit(&mut facets.fraction_digits, &base.fraction_digits);
+}
+
+/// Settles a complex type: its attributes and everything in its content.
+fn settle_complex_type(complex_type: &mut ComplexType, own: &OwnTypes) {
+    for attribute in &mut complex_type.attributes {
+        settle_simple_type(&mut attribute.type_def, None, own);
+    }
+    settle_content(&mut complex_type.content, own);
+}
+
+/// The built-in simple type called `local`, with no facets.
+fn builtin_type(local: &str) -> XsdType {
+    XsdType::Simple(SimpleTypeDef {
+        name: None,
+        kind: SimpleTypeKind::from_local(local),
+        facets: SimpleFacets::default(),
+    })
+}
+
+/// Marks a reference, while files are loading, as an unprefixed built-in name.
+///
+/// Stored in the reference's namespace, which the parser otherwise leaves
+/// unset. It is not a namespace: it starts with a NUL, which no namespace
+/// read from XML can hold, and no reference keeps it once
+/// [`settle_unprefixed_builtin_names`] has run.
+const UNPREFIXED_BUILTIN_NAME: &str = "\0unprefixed-builtin-name";
+
+/// Decides every reference marked with [`UNPREFIXED_BUILTIN_NAME`].
+///
+/// The reference becomes a plain reference to the schema set's own type of
+/// that name when there is one, declared earlier, later or in another file,
+/// and the built-in type otherwise. A schema set that declares no type named
+/// like a built-in therefore comes out exactly as if this pass did not exist.
+fn settle_unprefixed_builtin_names(model: &mut SchemaModel) {
+    let is_builtin_name =
+        |name: &&String| !matches!(SimpleTypeKind::from_local(name), SimpleTypeKind::Other(_));
+    let names: HashSet<String> = model
+        .simple_types
+        .keys()
+        .chain(model.complex_types.keys())
+        .filter(is_builtin_name)
+        .cloned()
+        .collect();
+    let simple = model
+        .simple_types
+        .iter()
+        .filter(|(name, _)| names.contains(*name))
+        .map(|(name, simple)| (name.clone(), simple.clone()))
+        .collect();
+    let own = OwnTypes { names, simple };
+    for (name, simple) in &mut model.simple_types {
+        settle_simple_type(simple, Some(name), &own);
+    }
+    for element in model.global_elements.values_mut() {
+        settle_type(&mut element.type_def, &own);
+    }
+    for complex_type in model.complex_types.values_mut() {
+        settle_complex_type(complex_type, &own);
+    }
+}
+
+/// Settles one declared type, and the types declared inside it.
+///
+/// The recursion follows the nesting of the model, which the parser bounds.
+fn settle_type(declared: &mut XsdType, own: &OwnTypes) {
+    let builtin = match declared {
+        XsdType::Ref(name) if name.namespace.as_deref() == Some(UNPREFIXED_BUILTIN_NAME) => {
+            name.namespace = None;
+            (!own.names.contains(&name.local)).then(|| builtin_type(&name.local))
+        }
+        XsdType::Complex(complex_type) => {
+            settle_complex_type(complex_type, own);
+            None
+        }
+        XsdType::Simple(simple) => {
+            settle_simple_type(simple, None, own);
+            None
+        }
+        XsdType::Ref(_) => None,
+    };
+    if let Some(builtin) = builtin {
+        *declared = builtin;
+    }
+}
+
+/// Settles the types of the elements declared in one content model.
+fn settle_content(content: &mut ContentModel, own: &OwnTypes) {
+    if let ContentModel::SimpleContent(simple) = content {
+        settle_simple_type(simple, None, own);
+        return;
+    }
+    let (ContentModel::Sequence(particles)
+    | ContentModel::All(particles)
+    | ContentModel::Choice(particles)) = content
+    else {
+        return;
+    };
+    for particle in particles {
+        match &mut particle.element {
+            ElementRef::Inline(element) => settle_type(&mut element.type_def, own),
+            ElementRef::Group(group) => settle_content(group, own),
+            ElementRef::Ref(_) => {}
+        }
+    }
 }
 
 /// Appends the particle for a named `<xs:element>` whose type is `type_def`.
@@ -780,10 +1032,44 @@ fn push_choice_group(
 }
 
 /// Appends the declaration for an `<xs:attribute>`, if it has a name.
-fn push_attribute_decl(attrs: &HashMap<String, String>, attributes: &mut Vec<AttributeDecl>) {
-    if let Some(attr_decl) = parse_attribute_decl(attrs) {
+///
+/// `inline_type` is the `<xs:simpleType>` written inside the attribute, if any.
+fn push_attribute_decl(
+    attrs: &HashMap<String, String>,
+    inline_type: Option<SimpleTypeDef>,
+    ns_map: &HashMap<String, String>,
+    attributes: &mut Vec<AttributeDecl>,
+) {
+    if let Some(attr_decl) = parse_attribute_decl(attrs, inline_type, ns_map) {
         attributes.push(attr_decl);
     }
+}
+
+/// Reads the children of an `<xs:attribute>` up to and including its end tag.
+///
+/// Returns the attribute's inline `<xs:simpleType>`, if it has one. Anything
+/// else inside the attribute (an annotation) is skipped.
+///
+/// Kept out of line so the complex-type parser, which recurses once per
+/// nested inline type, does not carry this function's locals in its frame.
+#[inline(never)]
+fn parse_attribute_children(
+    reader: &mut Reader<&[u8]>,
+    ns_map: &HashMap<String, String>,
+) -> Result<Option<SimpleTypeDef>> {
+    let mut inline_type = None;
+    let mut buf = Vec::new();
+    loop {
+        match next_tag(reader, &mut buf, "attribute")? {
+            Tag::Start { local, .. } => match local.as_str() {
+                "simpleType" => inline_type = Some(parse_simple_type(reader, ns_map)?),
+                other => skip_element(reader, other)?,
+            },
+            Tag::Empty { .. } => {}
+            Tag::End { .. } | Tag::Eof => break,
+        }
+    }
+    Ok(inline_type)
 }
 
 /// Parses a `simpleContent`/`complexContent` element into `complex_type`.
@@ -826,7 +1112,18 @@ fn parse_content_extension(
                 }
                 other => skip_element(reader, other)?,
             },
-            Tag::Empty { .. } => {}
+            // `<xs:extension base="..."/>` adds nothing to its base, and is
+            // read as the open-and-close form with no children is.
+            Tag::Empty { local, attrs } => {
+                if local == "extension" {
+                    if let Some(content) = simple_extension_content(&attrs, ns_map) {
+                        complex_type.content = content;
+                    } else {
+                        complex_type.content = ContentModel::Sequence(Vec::new());
+                        complex_type.base = Some(extension_base(&attrs));
+                    }
+                }
+            }
             Tag::End { local } => {
                 if local == outer_tag {
                     break;
@@ -855,7 +1152,7 @@ fn simple_extension_content(
     }
     Some(ContentModel::SimpleContent(Box::new(SimpleTypeDef {
         name: None,
-        kind: SimpleTypeKind::from_local(split_prefix(base).1),
+        kind: named_simple_kind(base, ns_map),
         facets: SimpleFacets::default(),
     })))
 }
@@ -882,8 +1179,7 @@ fn parse_simple_type(
                 match local {
                     "restriction" => {
                         if let Some(base) = attrs.get("base") {
-                            let (_, base_local) = split_prefix(base);
-                            kind = SimpleTypeKind::from_local(base_local);
+                            kind = named_simple_kind(base, ns_map);
                         }
                         parse_facets(reader, &mut facets)?;
                     }
@@ -908,8 +1204,7 @@ fn parse_simple_type(
                 if local == "restriction" {
                     let attrs = collect_attrs(e);
                     if let Some(base) = attrs.get("base") {
-                        let (_, base_local) = split_prefix(base);
-                        kind = SimpleTypeKind::from_local(base_local);
+                        kind = named_simple_kind(base, ns_map);
                     }
                 }
             }
@@ -930,7 +1225,6 @@ fn parse_simple_type(
         buf.clear();
     }
 
-    let _ = ns_map;
     Ok(SimpleTypeDef {
         name: None,
         kind,
@@ -990,20 +1284,27 @@ fn parse_facets(reader: &mut Reader<&[u8]>, facets: &mut SimpleFacets) -> Result
 
 // ── Attribute declaration parser ─────────────────────────────────────────────
 
-fn parse_attribute_decl(attrs: &HashMap<String, String>) -> Option<AttributeDecl> {
+/// The declaration an `<xs:attribute>` makes, or `None` without a `name`.
+///
+/// A `type` attribute decides the type; without one the inline simple type
+/// does, and without either the attribute is an unconstrained string.
+fn parse_attribute_decl(
+    attrs: &HashMap<String, String>,
+    inline_type: Option<SimpleTypeDef>,
+    ns_map: &HashMap<String, String>,
+) -> Option<AttributeDecl> {
     let name = attrs.get("name")?.clone();
     let required = attrs.get("use").is_some_and(|u| u == "required");
     let default = attrs.get("default").cloned();
     let fixed = attrs.get("fixed").cloned();
     let type_def = if let Some(type_attr) = attrs.get("type") {
-        let (_, local) = split_prefix(type_attr);
         SimpleTypeDef {
             name: None,
-            kind: SimpleTypeKind::from_local(local),
+            kind: named_simple_kind(type_attr, ns_map),
             facets: SimpleFacets::default(),
         }
     } else {
-        SimpleTypeDef::string_unbounded()
+        inline_type.unwrap_or_else(SimpleTypeDef::string_unbounded)
     };
     Some(AttributeDecl {
         name,
@@ -1039,13 +1340,33 @@ fn is_xs_primitive(type_ref: &str, ns_map: &HashMap<String, String>) -> bool {
     !matches!(SimpleTypeKind::from_local(local), SimpleTypeKind::Other(_))
 }
 
+/// The value of one attribute as an XML processor reports it.
+///
+/// Entity and character references are resolved, and the value is normalized
+/// as the XML specification requires of every attribute value: a literal tab,
+/// newline or carriage return (a CR LF pair counting once) becomes one space.
+/// A tab or newline written as a character reference (`&#9;`, `&#10;`) is
+/// kept. The schema documents read here are XML 1.0, whose rules
+/// [`XmlVersion::Implicit1_0`] selects.
+///
+/// # Errors
+///
+/// Fails on a value that is not UTF-8, names an entity that is not predefined,
+/// holds a character reference to no character (`&#0;`) or holds a bare `&`.
+/// Callers that collect attributes drop such an attribute.
+fn attribute_value<'a>(
+    attribute: &Attribute<'a>,
+) -> Result<std::borrow::Cow<'a, str>, quick_xml::Error> {
+    attribute.normalized_value(XmlVersion::Implicit1_0)
+}
+
 fn collect_attrs(e: &quick_xml::events::BytesStart<'_>) -> HashMap<String, String> {
     e.attributes()
         .with_checks(false)
         .flatten()
         .filter_map(|attr| {
             let key = std::str::from_utf8(attr.key.as_ref()).ok()?.to_string();
-            let val = attr.unescape_value().ok()?.to_string();
+            let val = attribute_value(&attr).ok()?.into_owned();
             Some((key, val))
         })
         .collect()
@@ -1067,8 +1388,7 @@ fn schema_location(
                 "resource_limit: schema_location_bytes: observed {observed} exceeds limit {max_bytes}"
             ));
         }
-        return attribute
-            .unescape_value()
+        return attribute_value(&attribute)
             .map(|value| Some(value.into_owned()))
             .map_err(|error| anyhow::anyhow!("invalid schemaLocation: {error}"));
     }
@@ -1081,8 +1401,8 @@ fn collect_xmlns(e: &quick_xml::events::BytesStart<'_>, ns_map: &mut HashMap<Str
             Ok(k) => k.to_string(),
             Err(_) => continue,
         };
-        let val = match attr.unescape_value() {
-            Ok(v) => v.to_string(),
+        let val = match attribute_value(&attr) {
+            Ok(v) => v.into_owned(),
             Err(_) => continue,
         };
         if key == "xmlns" {

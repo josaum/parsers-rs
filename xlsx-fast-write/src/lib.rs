@@ -253,7 +253,7 @@ impl Workbook {
         for (i, s) in self.sheets.iter().enumerate() {
             wb_xml.push_str(&format!(
                 "<sheet name=\"{}\" sheetId=\"{}\" r:id=\"rId{}\"/>",
-                xe(&s.name),
+                xa(&s.name),
                 i + 1,
                 i + 1
             ));
@@ -321,9 +321,10 @@ impl Workbook {
                 match value {
                     CellValue::String(s) => {
                         xml.push_str(&format!(
-                            "<c r=\"{}\" t=\"inlineStr\"{}><is><t>{}</t></is></c>",
+                            "<c r=\"{}\" t=\"inlineStr\"{}><is><t{}>{}</t></is></c>",
                             cell_ref,
                             s_attr,
+                            space_attr(s),
                             xe(s)
                         ));
                     }
@@ -491,13 +492,94 @@ fn col_letter(col: u16) -> String {
     s
 }
 
+/// Returns whether XML 1.0 cannot carry `ch` as a literal character.
+///
+/// A carriage return is legal XML, but every XML reader turns a literal one
+/// into a line feed, so it is treated like the characters that are forbidden.
+fn needs_xstring_escape(ch: char) -> bool {
+    matches!(ch, '\u{0}'..='\u{8}' | '\u{b}' | '\u{c}' | '\r' | '\u{e}'..='\u{1f}' | '\u{fffe}' | '\u{ffff}')
+}
+
+/// Returns whether the underscore `rest` starts with must be protected.
+///
+/// A reader decodes `_xHHHH_` as an escape. The closing underscore can come
+/// from the caller's text, or from this writer: a character that is itself
+/// written as an escape (a carriage return becomes `_x000D_`) puts an
+/// underscore right after `_xHHHH`. Both cases are protected.
+fn looks_like_xstring_escape(rest: &str) -> bool {
+    let bytes = rest.as_bytes();
+    let prefix = bytes.len() > 6
+        && bytes[0] == b'_'
+        && bytes[1] == b'x'
+        && bytes[2..6].iter().all(u8::is_ascii_hexdigit);
+    // The six prefix bytes are ASCII, so index 6 is a character boundary.
+    prefix
+        && rest[6..]
+            .chars()
+            .next()
+            .is_some_and(|next| next == '_' || needs_xstring_escape(next))
+}
+
+/// Escapes cell text for the content of a `<t>` element.
+///
+/// Markup characters become entities. A character XML 1.0 cannot carry is
+/// written the way Excel writes it, as `_xHHHH_` (ECMA-376 `ST_Xstring`), and
+/// an underscore that would start such an escape in the caller's own text is
+/// written `_x005F_` so readers give the text back unchanged.
+///
+/// Compatibility: Excel and xlsx-fast-core decode `_xHHHH_` in string values,
+/// but openpyxl returns these escapes literally. A consumer reading these
+/// workbooks with openpyxl sees `_x000D_` for a carriage return and
+/// `_x005F_x0041_` for the literal text `_x0041_`.
 fn xe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (index, ch) in s.char_indices() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '_' if looks_like_xstring_escape(&s[index..]) => out.push_str("_x005F_"),
+            c if needs_xstring_escape(c) => {
+                out.push_str(&format!("_x{:04X}_", u32::from(c)));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Returns the attribute that keeps the whitespace at the ends of `<t>` text.
+///
+/// Without `xml:space="preserve"` a reader may drop leading and trailing
+/// whitespace. Text without any gets no attribute, so its bytes do not change.
+fn space_attr(s: &str) -> &'static str {
+    let edge = |ch: Option<char>| matches!(ch, Some(' ' | '\t' | '\n'));
+    if edge(s.chars().next()) || edge(s.chars().next_back()) {
+        " xml:space=\"preserve\""
+    } else {
+        ""
+    }
+}
+
+/// Escapes a value written between double quotes in an attribute.
+///
+/// Besides the markup characters and the quote, a tab, line feed or carriage
+/// return is written as a character reference: typed literally, XML
+/// attribute-value normalization turns each into a space. A character XML
+/// 1.0 cannot carry at all becomes U+FFFD, because attributes have no
+/// `_xHHHH_` form.
+fn xa(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            c if needs_xstring_escape(c) => out.push(char::REPLACEMENT_CHARACTER),
             c => out.push(c),
         }
     }
@@ -710,9 +792,188 @@ mod tests {
         );
     }
 
+    /// WHY: the bytes this writer emits for markup characters are a contract
+    /// with every reader. They must not move when a dependency does, and what
+    /// is written must come back unchanged through our own reader, which sees
+    /// each `&amp;` as a reference event separate from the text around it.
+    #[test]
+    fn markup_characters_are_escaped_the_same_way_and_read_back() {
+        let name = "A&B <c> 'q' \u{e9}";
+        let texts = [
+            "a & b",
+            "<tag> x > y",
+            "\"double\" 'single'",
+            "&amp; &#233; &foo;",
+            " lead & trail ",
+            "tab\there",
+            "caf\u{e9} \u{1F600}",
+        ];
+        let mut wb = Workbook::new();
+        let sheet = wb.add_sheet(name);
+        for (row, text) in (0u32..).zip(texts) {
+            sheet.write(row, 0, text);
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+
+        let workbook_xml = part_xml(&bytes, "xl/workbook.xml");
+        assert!(
+            workbook_xml.contains("<sheet name=\"A&amp;B &lt;c&gt; 'q' \u{e9}\" sheetId=\"1\""),
+            "workbook xml:\n{workbook_xml}"
+        );
+        let sheet_xml = sheet1_xml(&bytes);
+        for escaped in [
+            "<t>a &amp; b</t>",
+            "<t>&lt;tag&gt; x &gt; y</t>",
+            "<t>\"double\" 'single'</t>",
+            "<t>&amp;amp; &amp;#233; &amp;foo;</t>",
+            "<t xml:space=\"preserve\"> lead &amp; trail </t>",
+            "<t>tab\there</t>",
+            "<t>caf\u{e9} \u{1F600}</t>",
+        ] {
+            assert!(
+                sheet_xml.contains(escaped),
+                "missing {escaped:?}; sheet xml:\n{sheet_xml}"
+            );
+        }
+
+        let read_back =
+            xlsx_fast_core::parse_xlsx_bytes(bytes, xlsx_fast_core::ParseOptions::default())
+                .unwrap();
+        assert_eq!(read_back.sheets[0].name, name);
+        let read: Vec<String> = read_back.sheets[0]
+            .cells
+            .iter()
+            .map(|cell| match &cell.value {
+                xlsx_fast_core::CellValue::String { v } => v.to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(read, texts);
+    }
+
+    fn round_trip(name: &str, texts: &[&str]) -> (Vec<u8>, String, Vec<String>) {
+        let mut wb = Workbook::new();
+        let sheet = wb.add_sheet(name);
+        for (row, text) in (0u32..).zip(texts) {
+            sheet.write(row, 0, *text);
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        let read_back = xlsx_fast_core::parse_xlsx_bytes(
+            bytes.clone(),
+            xlsx_fast_core::ParseOptions::default(),
+        )
+        .unwrap();
+        let read = read_back.sheets[0]
+            .cells
+            .iter()
+            .map(|cell| match &cell.value {
+                xlsx_fast_core::CellValue::String { v } => v.to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        (bytes, read_back.sheets[0].name.clone(), read)
+    }
+
+    /// WHY: a sheet name is written into an attribute. An unescaped double
+    /// quote ends the attribute early and the workbook no longer opens; a
+    /// literal tab or line break would be read back as a space.
+    #[test]
+    fn a_sheet_name_with_quotes_and_whitespace_reads_back() {
+        let name = "say \"hi\" & 'bye' <x>\ttab\nline";
+        let (bytes, read_name, _) = round_trip(name, &["x"]);
+        assert_eq!(read_name, name);
+        let workbook_xml = part_xml(&bytes, "xl/workbook.xml");
+        assert!(
+            workbook_xml
+                .contains("name=\"say &quot;hi&quot; &amp; 'bye' &lt;x&gt;&#9;tab&#10;line\""),
+            "workbook xml:\n{workbook_xml}"
+        );
+    }
+
+    /// WHY: XML 1.0 cannot carry most control characters, so Excel writes
+    /// them as `_xHHHH_`; text that already looks like such an escape must be
+    /// protected or a reader turns it into another character.
+    #[test]
+    fn control_characters_and_escape_lookalikes_read_back() {
+        let texts = [
+            "ctl\u{1}\u{8}\u{b}\u{c}\u{1f}end",
+            "cr\rlf\ncrlf\r\n",
+            "literal _x0041_ and _x000D_ stay",
+            "_x005F_x0041_",
+            "not escapes: _x41_ _xZZZZ_ _x0041 a_b",
+            "\u{fffe}\u{ffff}",
+            "nul\u{0}",
+        ];
+        let (bytes, _, read) = round_trip("S", &texts);
+        assert_eq!(read, texts);
+        let sheet_xml = sheet1_xml(&bytes);
+        assert!(sheet_xml.contains("<t>ctl_x0001__x0008__x000B__x000C__x001F_end</t>"));
+        assert!(sheet_xml.contains("<t>literal _x005F_x0041_ and _x005F_x000D_ stay</t>"));
+        assert!(sheet_xml.contains("<t>not escapes: _x41_ _xZZZZ_ _x0041 a_b</t>"));
+        assert!(
+            !sheet_xml
+                .bytes()
+                .any(|b| b < 0x20 && b != b'\n' && b != b'\t'),
+            "a forbidden control character was written raw"
+        );
+    }
+
+    /// WHY: the character after `_xHHHH` decides whether a reader sees an
+    /// escape, and the writer may itself turn that character into something
+    /// that starts with `_` (a control character becomes `_x000D_`). Every
+    /// combination of prefix and follower must read back as written.
+    #[test]
+    fn an_escape_prefix_followed_by_any_character_reads_back() {
+        let prefixes = [
+            "_x0041", "_x000D", "_x000d", "_x005F", "_xFFFF", "_xD83D", "_x0000", "_xabcd",
+            "_xZZZZ", "_x004", "_X0041",
+        ];
+        let followers = [
+            "", "_", "__", "\r", "\n", "\t", "\u{0}", "\u{1}", "\u{1f}", "\u{fffe}", "A", "x", "0",
+            "_x0042_", "_x0042", "\r_", "_\r", "_x", "&", " ",
+        ];
+        let mut texts = Vec::new();
+        for prefix in prefixes {
+            for follower in followers {
+                texts.push(format!("{prefix}{follower}"));
+                texts.push(format!("a{prefix}{follower}b"));
+                texts.push(format!("{prefix}{prefix}{follower}"));
+            }
+        }
+        let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let (_, _, read) = round_trip("S", &borrowed);
+        assert_eq!(read.len(), texts.len());
+        for (written, read) in texts.iter().zip(&read) {
+            assert_eq!(read, written, "written {written:?}");
+        }
+    }
+
+    /// WHY: without `xml:space="preserve"` a reader is free to drop the
+    /// whitespace at either end of a text element, and Excel does.
+    #[test]
+    fn leading_and_trailing_whitespace_is_marked_to_be_preserved() {
+        let texts = [" lead", "trail ", "\ttab", "line\n", "  ", "in side"];
+        let (bytes, _, read) = round_trip("S", &texts);
+        assert_eq!(read, texts);
+        let sheet_xml = sheet1_xml(&bytes);
+        assert!(sheet_xml.contains("<t xml:space=\"preserve\"> lead</t>"));
+        assert!(sheet_xml.contains("<t xml:space=\"preserve\">trail </t>"));
+        assert!(sheet_xml.contains("<t xml:space=\"preserve\">  </t>"));
+        assert!(sheet_xml.contains("<t>in side</t>"));
+        assert_eq!(sheet_xml.matches("xml:space").count(), 5);
+    }
+
     fn sheet1_xml(xlsx_bytes: &[u8]) -> String {
+        part_xml(xlsx_bytes, "xl/worksheets/sheet1.xml")
+    }
+
+    fn part_xml(xlsx_bytes: &[u8], part: &str) -> String {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(xlsx_bytes)).unwrap();
-        let mut file = archive.by_name("xl/worksheets/sheet1.xml").unwrap();
+        let mut file = archive.by_name(part).unwrap();
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut file, &mut xml).unwrap();
         xml

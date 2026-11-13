@@ -1,8 +1,11 @@
 # Every push and pull request: the workspace must format, lint clean and pass.
 # This is the gate a consumer relies on when it pins a commit of this repository.
 #
-# release.yml calls this file as its `verify` job, so every job here also runs
-# before a release builds. Two consequences bind every job below:
+# release.yml calls this file as its `verify` job, so the jobs here also run
+# before a release builds. The one exception is spelled out at `workflow_call`
+# below: the release asks this file to leave out `python-bindings` and
+# `node-bindings`, because its own `wheels` and `node` jobs build the same
+# artifacts. Two consequences bind every job below:
 #   - GitHub-hosted runners only. Pull requests from forks run this file, and a
 #     fork's code must never execute on a machine the project owns.
 #   - No secrets and a read-only token. Nothing here publishes anything.
@@ -15,6 +18,15 @@ on:
     branches: [main]
   pull_request:
   workflow_call:
+    inputs:
+      # Set only by release.yml. A push or a pull request has no inputs at all,
+      # so the two jobs that read this must treat an absent value as "run":
+      # their condition is `!= true`, never `== false`.
+      skip_binding_jobs:
+        description: Leave out python-bindings and node-bindings; the caller builds the wheels and Node packages itself.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -37,6 +49,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Pinned by commit, so the toolchain is named here instead of in the ref.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
@@ -66,6 +80,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -79,6 +95,11 @@ jobs:
     # Build, install and test the Python bindings the way a release does, so a
     # binding that only fails as a wheel fails on the pull request and not on
     # the tag. The tool versions are the ones release.yml pins.
+    #
+    # Left out only when release.yml calls this file with `skip_binding_jobs`:
+    # its `wheels` job builds every wheel again. On a push or a pull request
+    # the input does not exist and this job runs.
+    if: ${{ inputs.skip_binding_jobs != true }}
     strategy:
       fail-fast: false
       matrix:
@@ -94,6 +115,8 @@ jobs:
       TESTED_BINDINGS: email-fast-py json-fast-py ontology-fast-py pdf-fast-py xsd-fast-py
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -123,6 +146,10 @@ jobs:
   node-bindings:
     # Build every Node-API binding, load each one and pack its tarball, as a
     # release does.
+    #
+    # Left out only when release.yml calls this file with `skip_binding_jobs`:
+    # its `node` job builds, loads and packs every binding again.
+    if: ${{ inputs.skip_binding_jobs != true }}
     strategy:
       fail-fast: false
       matrix:
@@ -134,6 +161,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -165,6 +194,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -176,6 +207,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.1
@@ -190,9 +223,20 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install elan and verify Lean 4 proofs (0 sorry)
         run: |
-          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
-            | sh -s -- -y --no-modify-path --default-toolchain none
+          # elan's own release binary for this runner (x86_64 Linux), at one
+          # version, run only if its bytes match. The installer script is not
+          # used: it would download whichever elan is newest, unchecked.
+          # What this does not pin: elan then downloads the Lean toolchain
+          # that formal/lean-toolchain names, by version and not by hash.
+          curl -sSfL -o "$RUNNER_TEMP/elan.tar.gz" \
+            https://github.com/leanprover/elan/releases/download/v4.2.4/elan-x86_64-unknown-linux-gnu.tar.gz
+          echo "42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63  $RUNNER_TEMP/elan.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/elan.tar.gz" -C "$RUNNER_TEMP" elan-init
+          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-toolchain none
           export PATH="$HOME/.elan/bin:$PATH"
           ./formal/check.sh
