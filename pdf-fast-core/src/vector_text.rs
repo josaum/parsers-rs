@@ -6,7 +6,7 @@
 //! [`VectorGlyph`] (normalized contours + a stable `shape_hash`) grouped into
 //! page-local [`GlyphRun`]s for the table/text reconstruction layer above.
 //!
-//! With the `glyph-catalog` feature, [`learn_page_glyph_mappings`] correlates
+//! With the `glyph-catalog` feature, `learn_page_glyph_mappings` correlates
 //! these shape hashes against CMap-resolved (`/ToUnicode`) text so the
 //! scanner can learn glyph→grapheme mappings for downstream pages that lack
 //! a CMap.
@@ -176,7 +176,7 @@ pub struct GlyphRun {
 ///
 /// `normalized` holds that normalized geometry, kept alongside the hash rather
 /// than recomputed on demand. The hash alone cannot carry identity — see
-/// [`crate::glyph_catalog`] — so a shape lookup needs the points, and recomputing
+/// `crate::glyph_catalog` — so a shape lookup needs the points, and recomputing
 /// normalization at every lookup would both cost more and risk disagreeing with
 /// the normalization the hash was taken from.
 #[derive(Debug, Clone)]

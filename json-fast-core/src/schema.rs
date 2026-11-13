@@ -45,8 +45,8 @@
 //! `items` / `properties` apply to borrowed slices with no intermediate
 //! copies. Pairwise string/byte work rides the `regex` crate's memchr/SIMD
 //! fast paths; the JSON parse itself is sonic-rs (SIMD). The `mmap` crate
-//! feature adds zero-cpu-copy file entry points ([`crate::parse_file`],
-//! [`crate::validate_file`]).
+//! feature adds zero-cpu-copy file entry points (`crate::parse_file`,
+//! `crate::validate_file`).
 //!
 //! `validate` never panics and never allocates outside the findings list and
 //! the evaluation tracker.
@@ -75,7 +75,7 @@ pub const MAX_VALIDATION_NESTING_DEPTH: usize = crate::DEFAULT_MAX_NESTING_DEPTH
 /// Stack: an application measured 4 to 8 KiB in an unoptimized build. The
 /// worst-case depth is worked out before validating, from the longest chain
 /// of subschemas and the document's depth. Up to
-/// [`INLINE_APPLICATION_DEPTH`] it runs on the caller's stack; beyond that it
+/// 48 nested applications it runs on the caller's stack; beyond that it
 /// runs, once, on a worker thread that each calling thread starts on first
 /// need and keeps: its stack is this limit times
 /// `STACK_BYTES_PER_APPLICATION`, 64 MiB of address space, touched only as

@@ -18,6 +18,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "relationships"
+path = "fuzz_targets/relationships.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone fuzz crate: intentionally outside the office-parsers-rs
 # workspace (members are explicit) and outside any parent workspace.
 [workspace]

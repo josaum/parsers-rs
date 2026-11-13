@@ -5,7 +5,7 @@
 //!
 //! | Format          | Module                  | Notes |
 //! |-----------------|-------------------------|-------|
-//! | JSON (6 types)  | [`parse`], [`parse_value`], [`stringify`], [`types`] | SIMD via sonic-rs |
+//! | JSON (6 types)  | [`parse`], [`parse_value`], [`stringify()`], [`types`] | SIMD via sonic-rs |
 //! | JSONL / NDJSON  | [`jsonl`]               | line-delimited streaming |
 //! | JSON Schema     | [`schema`]              | draft-07 through 2020-12 constraint keywords, local `$ref`, allocation-free walk |
 //! | JSON-RPC 2.0    | [`jsonrpc`]             | request / response envelopes |
