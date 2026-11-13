@@ -39,6 +39,7 @@
 //! | `function::type4::parse_procedure_inner` | [`MAX_PROGRAM_NESTING`] |
 //! | `function::type4::eval_inner` | the same: it recurses once per parsed procedure level |
 //! | array and dictionary `skip`/`read` in a content stream (one hop) | [`MAX_CONTENT_NESTING`] |
+//! | `font::cmap::CMapLexer::get_obj`, once per consecutive comment line in a font's `/Encoding` or `/ToUnicode` CMap | [`MAX_CMAP_COMMENT_RUN`] |
 //!
 //! Bounded by the interpreter itself:
 //!
@@ -53,7 +54,6 @@
 //! | recursion | what drives it |
 //! |---|---|
 //! | array and dictionary `skip`/`read` on objects in the file itself | nesting in any object's text; it runs while the document is opened, before this module sees anything |
-//! | `font::cmap::CMapLexer::get_obj` | one level per consecutive comment line in a CMap |
 //! | `function::type0::interpolate_inner` | one level per input of a sampled function, and twice the work per input |
 //! | `function::type0::increment_index` | one level per input of a sampled function |
 //!
@@ -66,7 +66,11 @@
 //!
 //! * **A page tree the two parsers read differently.** The page-tree bound
 //!   uses this crate's parser, not the interpreter's.
-//! * **`usecmap` chains and the image decoders** were not examined.
+//! * **The image decoders** were not examined.
+//!
+//! `/UseCMap` chains need no bound: `hayro-interpret` 0.5.0 logs the key
+//! and treats the `usecmap` operator as a no-op, so it never loads a second
+//! CMap, and a chain or a cycle costs it nothing.
 //! * **Objects reached only through fonts.** Font dictionaries are not
 //!   followed by the object-depth check.
 //! * **Memory and time.** Every nested tiling cell and soft mask gets a
@@ -184,6 +188,16 @@ const MAX_CONTENT_NESTING: usize = 4_096;
 /// function, whose parser recurses once per level at about 400 bytes
 /// optimized: under 1 MiB unoptimized at this depth.
 const MAX_PROGRAM_NESTING: usize = 256;
+
+/// Most consecutive comment lines accepted in a font's CMap.
+///
+/// The interpreter's CMap lexer calls itself once for every comment that
+/// follows another with only white space between them; a million such lines
+/// overflow the 64 MiB render stack. CMaps in real files open with a header
+/// of ten to twenty comment lines. At 2 KB a level, more than an
+/// unoptimized frame of that lexer needs, this many levels cost 8 MiB of
+/// [`RENDER_STACK_BYTES`] beyond [`STACK_BUDGET`].
+const MAX_CMAP_COMMENT_RUN: usize = 4_096;
 
 /// Identity of a stream: where its dictionary sits in the file.
 type StreamId = (usize, usize);
@@ -682,10 +696,7 @@ impl<'a> Walk<'a> {
             level = resources.parent();
             above += 1;
         };
-        if !has_subtype(&font, b"Type3") {
-            return Ok(());
-        }
-        frame.glyphs = Some(frame.glyphs.unwrap_or(GLYPH_COST));
+        let type3 = has_subtype(&font, b"Type3");
         // The stack holds this frame's ancestors; `above` levels up is one of
         // them, or one of the page tree's own resource levels past the root.
         let ancestors = self.stack.len();
@@ -697,9 +708,17 @@ impl<'a> Walk<'a> {
         let beyond_root = u32::try_from(above.saturating_sub(ancestors)).unwrap_or(u32::MAX);
         let memo = (owner, beyond_root, name.to_vec());
         if let Some(known) = self.fonts.get(&memo) {
-            frame.glyphs = Some(frame.glyphs.unwrap_or(0).max(*known));
+            if type3 {
+                frame.glyphs = Some(frame.glyphs.unwrap_or(0).max(*known));
+            }
             return Ok(());
         }
+        self.vet_font_dict(&font)?;
+        if !type3 {
+            self.fonts.insert(memo, 0);
+            return Ok(());
+        }
+        frame.glyphs = Some(frame.glyphs.unwrap_or(GLYPH_COST));
 
         let font_resources = own_resources(&font);
         let procedures = font.get::<Dict<'_>>(&b"CharProcs"[..]).unwrap_or_default();
@@ -716,6 +735,24 @@ impl<'a> Walk<'a> {
         }
         self.fonts.insert(memo, cost);
         frame.glyphs = Some(frame.glyphs.unwrap_or(0).max(cost));
+        Ok(())
+    }
+
+    /// Checks what the interpreter builds from a font dictionary as soon as
+    /// the font is selected: the CMaps of its `/Encoding` and `/ToUnicode`.
+    ///
+    /// `/UseCMap` and the `usecmap` operator are not followed: the
+    /// interpreter ignores both.
+    fn vet_font_dict(&mut self, font: &Dict<'a>) -> Result<()> {
+        for key in [&b"Encoding"[..], b"ToUnicode"] {
+            let Some(cmap) = font.get::<Stream<'a>>(key) else {
+                continue;
+            };
+            if let Ok(text) = cmap.decoded() {
+                self.spend(text.len())?;
+                check_cmap_comments(&text)?;
+            }
+        }
         Ok(())
     }
 
@@ -796,6 +833,7 @@ impl<'a> Walk<'a> {
                 let font = find(&chain, b"Font", name)
                     .and_then(Object::into_dict)
                     .ok_or_else(outside)?;
+                self.vet_font_dict(&font)?;
                 if !has_subtype(&font, b"Type3") {
                     continue;
                 }
@@ -977,6 +1015,41 @@ fn check_nesting(content: &[u8], limit: usize) -> Result<()> {
             return Err(refused(
                 "a stream nests arrays or dictionaries deeper than the tokenizer can safely follow",
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a CMap with more consecutive comment lines than
+/// [`MAX_CMAP_COMMENT_RUN`].
+///
+/// The interpreter parses a CMap only when it is all ASCII, and its lexer
+/// calls itself once for each comment that follows another with only white
+/// space (as `char::is_whitespace` sees it) between them. This counts the
+/// same runs with no recursion. A `%` inside a string is counted as a
+/// comment too, which can only make a run look longer.
+fn check_cmap_comments(text: &[u8]) -> Result<()> {
+    if !text.is_ascii() {
+        return Ok(());
+    }
+    let mut run = 0usize;
+    let mut index = 0usize;
+    while let Some(&byte) = text.get(index) {
+        index += 1;
+        match byte {
+            b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' => {}
+            b'%' => {
+                run += 1;
+                if run > MAX_CMAP_COMMENT_RUN {
+                    return Err(refused(
+                        "a font's CMap holds more consecutive comment lines than its parser can safely follow",
+                    ));
+                }
+                while text.get(index).is_some_and(|&b| b != b'\n' && b != b'\r') {
+                    index += 1;
+                }
+            }
+            _ => run = 0,
         }
     }
     Ok(())

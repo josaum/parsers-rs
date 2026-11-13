@@ -846,6 +846,78 @@ fn a_repeated_kids_entry_does_not_move_the_guard_off_the_rendered_page() {
     ));
 }
 
+/// A page that shows text in a Type 0 font (object 10) whose `/Encoding`
+/// is the CMap stream object 20; `cmaps` supplies object 20 and any others.
+fn type0_page(cmaps: Vec<(u32, Vec<u8>)>) -> Vec<u8> {
+    let font = b"<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding 20 0 R \
+        /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X \
+        /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+        /FontDescriptor << /Type /FontDescriptor /FontName /X /Flags 4 \
+        /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+        /CapHeight 700 /StemV 80 >> >>] >>"
+        .to_vec();
+    let mut rest = vec![(10, font)];
+    rest.extend(cmaps);
+    one_page(
+        "/Resources << /Font << /F1 10 0 R >> >>",
+        "BT /F1 12 Tf 10 10 Td <0102> Tj ET 0 0 10 10 re f",
+        rest,
+    )
+}
+
+const CMAP_BODY: &str = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+    1 begincodespacerange <00> <FF> endcodespacerange \
+    1 begincidrange <00> <FF> 0 endcidrange endcmap end end";
+
+/// `count` CMaps from object 20 on, each naming the next with both
+/// `/UseCMap` and `usecmap`; with `cycle` the last names the first.
+fn usecmap_chain(count: u32, cycle: bool) -> Vec<u8> {
+    let mut cmaps = Vec::new();
+    for index in 0..count {
+        let number = 20 + index;
+        let next = if index + 1 < count {
+            Some(number + 1)
+        } else if cycle {
+            Some(20)
+        } else {
+            None
+        };
+        let (dict, body) = match next {
+            Some(next) => (
+                format!("/Type /CMap /CMapName /C{number} /UseCMap {next} 0 R"),
+                format!("/C{next} usecmap {CMAP_BODY}"),
+            ),
+            None => (
+                format!("/Type /CMap /CMapName /C{number}"),
+                CMAP_BODY.to_string(),
+            ),
+        };
+        cmaps.push((number, stream(&dict, &body)));
+    }
+    type0_page(cmaps)
+}
+
+/// A Type 0 font whose CMap opens with `comments` consecutive comment lines.
+fn cmap_with_comments(comments: usize) -> Vec<u8> {
+    let body = format!("{}{CMAP_BODY}", "%\n".repeat(comments));
+    type0_page(vec![(20, stream("/Type /CMap /CMapName /C", &body))])
+}
+
+#[test]
+fn usecmap_chains_and_cycles_render_because_the_interpreter_never_follows_them() {
+    // hayro-interpret 0.5.0 only logs `/UseCMap` and treats `usecmap` as a
+    // no-op, so neither a cycle nor a long chain costs it anything.
+    assert_renders("two CMaps using each other", &usecmap_chain(2, true));
+    assert_renders("a chain of 1,000 CMaps", &usecmap_chain(1_000, false));
+}
+
+#[test]
+fn a_cmap_opening_with_a_million_comment_lines_is_refused() {
+    // The CMap lexer calls itself once per consecutive comment line.
+    assert_refused("a million comment lines", &cmap_with_comments(1_000_000));
+    assert_renders("twenty comment lines", &cmap_with_comments(20));
+}
+
 /// Runs the interpreter with no guard, on a thread with a chosen stack.
 ///
 /// Not a test: it exists to confirm that a fixture aborts the process and to
