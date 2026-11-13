@@ -531,8 +531,10 @@ fn local_name(name: &[u8]) -> &[u8] {
 
 fn build_index(archive: &ZipSliceArchive<ArchiveStorage>) -> Result<HashMap<String, EntryMeta>> {
     let mut map = HashMap::new();
+    let mut seen: u64 = 0;
     for entry_result in archive.entries() {
         let entry = entry_result.map_err(|err| anyhow!("read zip entry: {err}"))?;
+        seen += 1;
         if entry.is_dir() {
             continue;
         }
@@ -546,6 +548,16 @@ fn build_index(archive: &ZipSliceArchive<ArchiveStorage>) -> Result<HashMap<Stri
             compression: entry.compression_method(),
         };
         map.insert(path, meta);
+    }
+    // The directory can end early without an error: a digital-signature
+    // record inside it stops the listing, hiding every entry after it. The
+    // count the archive declares is written by whoever made the file, so it
+    // is compared and nothing else: never used to size anything.
+    let declared = archive.entries_hint();
+    if seen != declared {
+        return Err(anyhow!(
+            "zip central directory lists {seen} entries but declares {declared}"
+        ));
     }
     Ok(map)
 }
