@@ -404,6 +404,20 @@ impl Loader {
 
         match local.as_str() {
             "include" | "import" => return self.include_target(e),
+            // A self-closing named type declares a type with nothing in it:
+            // no content and no attributes, or no restriction.
+            "complexType" if file.in_schema => {
+                if let Some(name) = collect_attrs(e).remove("name") {
+                    self.model.complex_types.insert(name, empty_complex_type());
+                }
+            }
+            "simpleType" if file.in_schema => {
+                if let Some(name) = collect_attrs(e).remove("name") {
+                    let mut simple = SimpleTypeDef::string_unbounded();
+                    simple.name = Some(QName::local(name.as_str()));
+                    self.model.simple_types.insert(name, simple);
+                }
+            }
             "element" if file.in_schema => {
                 let attrs = collect_attrs(e);
                 // Self-closing top-level element with type= attribute.
