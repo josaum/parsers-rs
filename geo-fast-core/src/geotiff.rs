@@ -12,6 +12,7 @@
 //!
 //! Returns [`GeoTiffMetadata`] and, optionally, raster band data as `Vec<f32>`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -251,8 +252,11 @@ pub fn parse_geotiff_geokey_params<P: AsRef<Path>>(path: P) -> Result<GeoKeyPara
 ///
 /// As [`parse_geotiff_geokey_params`], without the file to open.
 pub fn parse_geotiff_geokey_params_reader<R: Read + Seek>(
-    reader: R,
+    mut reader: R,
 ) -> Result<GeoKeyParams, GeoError> {
+    let start = reader.stream_position().map_err(GeoError::Io)?;
+    let input_len = reader.seek(SeekFrom::End(0)).map_err(GeoError::Io)?;
+    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
     let mut decoder = open_tag_decoder(reader)?;
     let entries = read_geokey_entries(&mut decoder)?;
 
@@ -263,10 +267,20 @@ pub fn parse_geotiff_geokey_params_reader<R: Read + Seek>(
         .then(|| decoder.find_tag(tag(TAG_GEO_DOUBLE_PARAMS)).ok().flatten())
         .flatten()
         .and_then(|value| value.into_f64_vec().ok());
-    let ascii: Option<Vec<u8>> = points_into(TAG_GEO_ASCII_PARAMS)
-        .then(|| decoder.find_tag(tag(TAG_GEO_ASCII_PARAMS)).ok().flatten())
-        .flatten()
-        .and_then(tag_bytes);
+    let ascii: Option<Vec<u8>> = if points_into(TAG_GEO_ASCII_PARAMS) {
+        match decoder.find_tag(tag(TAG_GEO_ASCII_PARAMS)) {
+            Ok(value) => value.and_then(tag_bytes),
+            // The decoder refuses an ASCII tag with a byte above 0x7F in it,
+            // and with the tag every string in it. Writers do put Latin-1
+            // there (a citation with an accent), so the bytes are read as
+            // they are stored and decoded string by string below.
+            Err(_) => read_raw_text_tag(&mut decoder, (start, input_len), TAG_GEO_ASCII_PARAMS)
+                .ok()
+                .flatten(),
+        }
+    } else {
+        None
+    };
 
     let mut params = GeoKeyParams::default();
     for [key_id, location, count, offset] in entries {
@@ -285,8 +299,8 @@ pub fn parse_geotiff_geokey_params_reader<R: Read + Seek>(
                 let text = ascii
                     .as_deref()
                     .and_then(|all| all.get(range))
-                    .and_then(|bytes| std::str::from_utf8(bytes).ok());
-                if let Some(text) = text {
+                    .map(decode_text);
+                if let Some(text) = text.as_deref() {
                     // One `|` ends a string in the tag, standing in for the
                     // NUL that ends the tag itself; any `|` before it is
                     // part of the string.
@@ -299,6 +313,115 @@ pub fn parse_geotiff_geokey_params_reader<R: Read + Seek>(
         }
     }
     Ok(params)
+}
+
+/// Decodes the bytes of one string of a text tag.
+///
+/// UTF-8 where the bytes are UTF-8, which covers ASCII. Any other bytes are
+/// read as Latin-1 (ISO 8859-1), in which every byte is the character of the
+/// same number, so the fallback cannot fail.
+fn decode_text(bytes: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Cow::Borrowed(text),
+        Err(_) => Cow::Owned(bytes.iter().copied().map(char::from).collect()),
+    }
+}
+
+/// Reads the stored bytes of a one-byte-per-value tag of the first directory.
+///
+/// For a text tag the decoder will not hand over: see the caller. The walk
+/// is that of [`check_directory_fits`], made through the decoder's own
+/// reader, for a TIFF of `input_len` bytes that starts at `start`. `None`
+/// when the directory has no such tag, when its values are wider than a
+/// byte, or when it declares more bytes than the file has.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Io`] when the header, the directory or the value
+/// cannot be read.
+fn read_raw_text_tag<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    (start, input_len): (u64, u64),
+    wanted: u16,
+) -> Result<Option<Vec<u8>>, GeoError> {
+    // The decoder reads integers in the file's byte order; the order itself
+    // is the first byte of the file, `I` or `M`.
+    decoder.goto_offset_u64(start).map_err(GeoError::Io)?;
+    let big_endian = decoder.read_byte().map_err(GeoError::Io)? == b'M';
+    decoder.read_byte().map_err(GeoError::Io)?;
+    let bigtiff = match decoder.read_short().map_err(GeoError::Io)? {
+        42 => false,
+        43 => {
+            // Offset size and a reserved word.
+            decoder.read_long().map_err(GeoError::Io)?;
+            true
+        }
+        _ => return Ok(None),
+    };
+    let word = |decoder: &mut Decoder<R>| {
+        if bigtiff {
+            decoder.read_long8()
+        } else {
+            decoder.read_long().map(u64::from)
+        }
+        .map_err(GeoError::Io)
+    };
+    let directory = word(decoder)?;
+    decoder.goto_offset_u64(directory).map_err(GeoError::Io)?;
+    let entries = if bigtiff {
+        decoder.read_long8().map_err(GeoError::Io)?
+    } else {
+        u64::from(decoder.read_short().map_err(GeoError::Io)?)
+    };
+    // Every pass reads at least twelve bytes or fails, so a count that
+    // exceeds the file ends in an error.
+    for _ in 0..entries {
+        let tag = decoder.read_short().map_err(GeoError::Io)?;
+        let field_type = decoder.read_short().map_err(GeoError::Io)?;
+        let Some(value_size) = field_type_size(field_type) else {
+            // As the decoder does: eight more bytes, in BigTIFF too.
+            decoder.read_long8().map_err(GeoError::Io)?;
+            continue;
+        };
+        let count = word(decoder)?;
+        // The value itself when it fits in the field, or else its offset.
+        let mut field = [0u8; 8];
+        let field_len = if bigtiff { 8 } else { 4 };
+        for byte in &mut field[..field_len] {
+            *byte = decoder.read_byte().map_err(GeoError::Io)?;
+        }
+        if tag != wanted {
+            continue;
+        }
+        if value_size != 1 || count > input_len {
+            return Ok(None);
+        }
+        // No more than the length of an input that was read; where `usize`
+        // cannot hold that there is no tag to return.
+        let Ok(len) = usize::try_from(count) else {
+            return Ok(None);
+        };
+        if len <= field_len {
+            return Ok(Some(field[..len].to_vec()));
+        }
+        let [a, b, c, d, ..] = field;
+        let offset = match (bigtiff, big_endian) {
+            (true, true) => u64::from_be_bytes(field),
+            (true, false) => u64::from_le_bytes(field),
+            (false, true) => u64::from(u32::from_be_bytes([a, b, c, d])),
+            (false, false) => u64::from(u32::from_le_bytes([a, b, c, d])),
+        };
+        if offset.checked_add(count).is_none_or(|end| end > input_len) {
+            return Ok(None);
+        }
+        decoder.goto_offset_u64(offset).map_err(GeoError::Io)?;
+        let mut bytes = Vec::with_capacity(len);
+        for _ in 0..len {
+            bytes.push(decoder.read_byte().map_err(GeoError::Io)?);
+        }
+        return Ok(Some(bytes));
+    }
+    Ok(None)
 }
 
 /// The bytes of a tag holding text.
@@ -2127,10 +2250,10 @@ mod tests {
     }
 
     /// One Latin-1 byte in an ASCII-typed tag: the decoder refuses the tag,
-    /// so every string key is unresolved, not only the citation with the
-    /// byte in it. The file still parses and the double keys are read.
+    /// which left every string key unresolved, not only the citation with
+    /// the byte in it. The tag is read as Latin-1 instead.
     #[test]
-    fn non_ascii_byte_in_the_ascii_parameters_leaves_every_string_unresolved() {
+    fn non_ascii_byte_in_the_ascii_parameters_is_read_as_latin_1() {
         let mut bytes = geotiff_with_params(&PARAM_KEYS, Some(&PARAM_DOUBLES), Some(PARAM_ASCII));
         let at = bytes
             .windows(PARAM_ASCII.len())
@@ -2139,9 +2262,9 @@ mod tests {
         bytes[at + 1] = 0xFD; // "M\u{fd} citation" in Latin-1
         let params =
             parse_geotiff_geokey_params_reader(Cursor::new(bytes.clone())).expect("params");
-        assert_eq!(params.citation(), None);
-        assert_eq!(params.geographic_citation(), None);
-        assert!(params.strings.is_empty());
+        assert_eq!(params.citation(), Some("M\u{fd} citation"));
+        assert_eq!(params.geographic_citation(), Some("WGS 84"));
+        assert_eq!(params.strings.len(), 2);
         assert_eq!(params.doubles.len(), 3);
         assert_eq!(params.semi_major_axis(), Some(6_378_137.0));
         let parsed = metadata(bytes);
@@ -2149,11 +2272,67 @@ mod tests {
         assert_eq!(parsed.geokeys.len(), 6);
     }
 
-    /// When the text is stored as BYTE values each string is decoded on its
-    /// own: a citation in Latin-1 stays unresolved and the one beside it is
-    /// read.
+    /// The same in a big-endian file, where the tag is found by a walk of
+    /// the directory in the other byte order, and for a tag short enough to
+    /// be stored in the directory entry itself.
     #[test]
-    fn non_utf8_citation_stored_as_bytes_is_the_only_string_left_out() {
+    fn latin_1_ascii_parameters_are_found_in_any_directory_layout() {
+        const ASCII: u16 = 2;
+        const SHORT: u16 = 3;
+        // A 1x1 gray big-endian TIFF: one pixel at 8, eight GeoKey shorts
+        // at 10, a seven-byte citation at 26, the directory at 34.
+        let directory = |inline: bool| {
+            let mut file = Vec::new();
+            file.extend_from_slice(b"MM");
+            file.extend_from_slice(&42u16.to_be_bytes());
+            file.extend_from_slice(&34u32.to_be_bytes());
+            file.extend_from_slice(&[0, 0]); // the pixel, and padding
+            let text: &[u8] = if inline { b"\xC5b|\0" } else { b"\xC5ngstr|\0" };
+            for key in [1u16, 1, 0, 1, 1026, 34737, text.len() as u16 - 1, 0] {
+                file.extend_from_slice(&key.to_be_bytes());
+            }
+            file.extend_from_slice(b"\xC5ngstr|\0"); // 8 bytes at 26
+            let mut entries: Vec<(u16, u16, u32, [u8; 4])> = vec![
+                (256, SHORT, 1, [0, 1, 0, 0]),
+                (257, SHORT, 1, [0, 1, 0, 0]),
+                (258, SHORT, 1, [0, 8, 0, 0]),
+                (259, SHORT, 1, [0, 1, 0, 0]),
+                (262, SHORT, 1, [0, 1, 0, 0]),
+                (273, SHORT, 1, [0, 8, 0, 0]),
+                (278, SHORT, 1, [0, 1, 0, 0]),
+                (279, SHORT, 1, [0, 1, 0, 0]),
+                (34735, SHORT, 8, 10u32.to_be_bytes()),
+            ];
+            entries.push(if inline {
+                (34737, ASCII, 4, [0xC5, b'b', b'|', 0])
+            } else {
+                (34737, ASCII, 8, 26u32.to_be_bytes())
+            });
+            file.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+            for (tag, field_type, count, value) in entries {
+                file.extend_from_slice(&tag.to_be_bytes());
+                file.extend_from_slice(&field_type.to_be_bytes());
+                file.extend_from_slice(&count.to_be_bytes());
+                file.extend_from_slice(&value);
+            }
+            file.extend_from_slice(&0u32.to_be_bytes());
+            file
+        };
+        let citation = |inline: bool| {
+            parse_geotiff_geokey_params_reader(Cursor::new(directory(inline)))
+                .expect("params")
+                .citation()
+                .map(str::to_string)
+        };
+        assert_eq!(citation(false).as_deref(), Some("\u{c5}ngstr"));
+        assert_eq!(citation(true).as_deref(), Some("\u{c5}b"));
+    }
+
+    /// When the text is stored as BYTE values each string is decoded on its
+    /// own: a citation that is not UTF-8 was left unresolved, and is read as
+    /// Latin-1; the one beside it is read as before.
+    #[test]
+    fn non_utf8_citation_stored_as_bytes_is_read_as_latin_1() {
         let keys: [u16; 16] = [
             1, 1, 0, 3, //
             1024, 0, 1, 2, //
@@ -2176,7 +2355,7 @@ mod tests {
         let bytes = file.into_inner();
         let params =
             parse_geotiff_geokey_params_reader(Cursor::new(bytes.clone())).expect("params");
-        assert_eq!(params.citation(), None);
+        assert_eq!(params.citation(), Some("C\u{f3}rrego Alegre"));
         assert_eq!(params.geographic_citation(), Some("WGS 84"));
         assert!(metadata(bytes).is_geographic);
     }
