@@ -39,28 +39,38 @@ fn map_err(e: impl std::fmt::Display) -> PyErr {
 /// Follows `xs:include` / `xs:import` relative paths automatically.
 #[pyfunction]
 #[pyo3(signature = (schema_path, max_includes=None))]
-fn list_elements_py(schema_path: &str, max_includes: Option<usize>) -> PyResult<Vec<String>> {
-    let opts = ParseOptions {
-        max_includes: max_includes.unwrap_or(64),
-        ..Default::default()
-    };
-    let schema = SchemaSet::load(schema_path, opts).map_err(map_err)?;
-    Ok(sorted_elements(&schema))
+fn list_elements_py(
+    py: Python<'_>,
+    schema_path: &str,
+    max_includes: Option<usize>,
+) -> PyResult<Vec<String>> {
+    py.detach(|| -> PyResult<Vec<String>> {
+        let opts = ParseOptions {
+            max_includes: max_includes.unwrap_or(64),
+            ..Default::default()
+        };
+        let schema = SchemaSet::load(schema_path, opts).map_err(map_err)?;
+        Ok(sorted_elements(&schema))
+    })
 }
 
 /// List all global element names in an in-memory schema.
 #[pyfunction]
 #[pyo3(signature = (schema_bytes, max_includes=None))]
 fn list_elements_bytes_py(
+    py: Python<'_>,
     schema_bytes: &Bound<'_, PyBytes>,
     max_includes: Option<usize>,
 ) -> PyResult<Vec<String>> {
-    let opts = ParseOptions {
-        max_includes: max_includes.unwrap_or(64),
-        ..Default::default()
-    };
-    let schema = SchemaSet::load_bytes(schema_bytes.as_bytes(), opts).map_err(map_err)?;
-    Ok(sorted_elements(&schema))
+    let schema_bytes_raw = schema_bytes.as_bytes();
+    py.detach(|| -> PyResult<Vec<String>> {
+        let opts = ParseOptions {
+            max_includes: max_includes.unwrap_or(64),
+            ..Default::default()
+        };
+        let schema = SchemaSet::load_bytes(schema_bytes_raw, opts).map_err(map_err)?;
+        Ok(sorted_elements(&schema))
+    })
 }
 
 fn sorted_elements(schema: &SchemaSet) -> Vec<String> {
@@ -80,42 +90,49 @@ fn sorted_elements(schema: &SchemaSet) -> Vec<String> {
 #[pyfunction]
 #[pyo3(signature = (schema_path, element, max_depth=None, map_dates=None, include_attributes=None))]
 fn describe_element_json_py(
+    py: Python<'_>,
     schema_path: &str,
     element: &str,
     max_depth: Option<usize>,
     map_dates: Option<bool>,
     include_attributes: Option<bool>,
 ) -> PyResult<String> {
-    let parse_opts = ParseOptions::default();
-    let arrow_opts = ArrowOptions {
-        max_depth: max_depth.unwrap_or(8),
-        map_date_types: map_dates.unwrap_or(true),
-        include_attributes: include_attributes.unwrap_or(true),
-        batch_size: 8_192,
-    };
-    let schema = SchemaSet::load(schema_path, parse_opts).map_err(map_err)?;
-    describe_schema_json(&schema, element, arrow_opts)
+    py.detach(|| -> PyResult<String> {
+        let parse_opts = ParseOptions::default();
+        let arrow_opts = ArrowOptions {
+            max_depth: max_depth.unwrap_or(8),
+            map_date_types: map_dates.unwrap_or(true),
+            include_attributes: include_attributes.unwrap_or(true),
+            batch_size: 8_192,
+        };
+        let schema = SchemaSet::load(schema_path, parse_opts).map_err(map_err)?;
+        describe_schema_json(&schema, element, arrow_opts)
+    })
 }
 
 /// Return Arrow schema description for an in-memory root schema as JSON.
 #[pyfunction]
 #[pyo3(signature = (schema_bytes, element, max_depth=None, map_dates=None, include_attributes=None))]
 fn describe_element_bytes_json_py(
+    py: Python<'_>,
     schema_bytes: &Bound<'_, PyBytes>,
     element: &str,
     max_depth: Option<usize>,
     map_dates: Option<bool>,
     include_attributes: Option<bool>,
 ) -> PyResult<String> {
-    let arrow_opts = ArrowOptions {
-        max_depth: max_depth.unwrap_or(8),
-        map_date_types: map_dates.unwrap_or(true),
-        include_attributes: include_attributes.unwrap_or(true),
-        batch_size: 8_192,
-    };
-    let schema =
-        SchemaSet::load_bytes(schema_bytes.as_bytes(), ParseOptions::default()).map_err(map_err)?;
-    describe_schema_json(&schema, element, arrow_opts)
+    let schema_bytes_raw = schema_bytes.as_bytes();
+    py.detach(|| -> PyResult<String> {
+        let arrow_opts = ArrowOptions {
+            max_depth: max_depth.unwrap_or(8),
+            map_date_types: map_dates.unwrap_or(true),
+            include_attributes: include_attributes.unwrap_or(true),
+            batch_size: 8_192,
+        };
+        let schema =
+            SchemaSet::load_bytes(schema_bytes_raw, ParseOptions::default()).map_err(map_err)?;
+        describe_schema_json(&schema, element, arrow_opts)
+    })
 }
 
 fn describe_schema_json(
@@ -148,22 +165,25 @@ fn describe_schema_json(
 #[pyfunction]
 #[pyo3(signature = (schema_path, xml_path, max_errors=None, check_facets=None, check_cardinality=None))]
 fn validate_json_py(
+    py: Python<'_>,
     schema_path: &str,
     xml_path: &str,
     max_errors: Option<usize>,
     check_facets: Option<bool>,
     check_cardinality: Option<bool>,
 ) -> PyResult<String> {
-    let parse_opts = ParseOptions::default();
-    let validate_opts = ValidateOptions {
-        max_errors: max_errors.unwrap_or(100),
-        check_facets: check_facets.unwrap_or(true),
-        check_cardinality: check_cardinality.unwrap_or(true),
-    };
-    let xml = std::fs::read(xml_path).map_err(map_err)?;
-    let schema = SchemaSet::load(schema_path, parse_opts).map_err(map_err)?;
-    let errors = schema.validate(&xml, validate_opts).map_err(map_err)?;
-    serde_json::to_string(&errors).map_err(map_err)
+    py.detach(|| -> PyResult<String> {
+        let parse_opts = ParseOptions::default();
+        let validate_opts = ValidateOptions {
+            max_errors: max_errors.unwrap_or(100),
+            check_facets: check_facets.unwrap_or(true),
+            check_cardinality: check_cardinality.unwrap_or(true),
+        };
+        let xml = std::fs::read(xml_path).map_err(map_err)?;
+        let schema = SchemaSet::load(schema_path, parse_opts).map_err(map_err)?;
+        let errors = schema.validate(&xml, validate_opts).map_err(map_err)?;
+        serde_json::to_string(&errors).map_err(map_err)
+    })
 }
 
 /// Validate an XML bytes object against the schema.
@@ -171,24 +191,25 @@ fn validate_json_py(
 /// Returns a JSON string: `[{"severity": "Error"|"Warning", "path": "...", "message": "..."}]`.
 #[pyfunction]
 #[pyo3(signature = (schema_path, xml_bytes, max_errors=None, check_facets=None, check_cardinality=None))]
-fn validate_bytes_json_py<'py>(
+fn validate_bytes_json_py(
+    py: Python<'_>,
     schema_path: &str,
-    xml_bytes: &Bound<'py, PyBytes>,
+    xml_bytes: &Bound<'_, PyBytes>,
     max_errors: Option<usize>,
     check_facets: Option<bool>,
     check_cardinality: Option<bool>,
 ) -> PyResult<String> {
-    let parse_opts = ParseOptions::default();
-    let validate_opts = ValidateOptions {
-        max_errors: max_errors.unwrap_or(100),
-        check_facets: check_facets.unwrap_or(true),
-        check_cardinality: check_cardinality.unwrap_or(true),
-    };
-    let schema = SchemaSet::load(schema_path, parse_opts).map_err(map_err)?;
-    let errors = schema
-        .validate(xml_bytes.as_bytes(), validate_opts)
-        .map_err(map_err)?;
-    serde_json::to_string(&errors).map_err(map_err)
+    let xml = xml_bytes.as_bytes();
+    py.detach(|| -> PyResult<String> {
+        let validate_opts = ValidateOptions {
+            max_errors: max_errors.unwrap_or(100),
+            check_facets: check_facets.unwrap_or(true),
+            check_cardinality: check_cardinality.unwrap_or(true),
+        };
+        let schema = SchemaSet::load(schema_path, ParseOptions::default()).map_err(map_err)?;
+        let errors = schema.validate(xml, validate_opts).map_err(map_err)?;
+        serde_json::to_string(&errors).map_err(map_err)
+    })
 }
 
 /// Return Arrow IPC schema description bytes for a root element.
@@ -201,19 +222,71 @@ fn schema_ipc_bytes_py(
     max_depth: Option<usize>,
     map_dates: Option<bool>,
 ) -> PyResult<Py<PyBytes>> {
-    let parse_opts = ParseOptions::default();
-    let arrow_opts = ArrowOptions {
-        max_depth: max_depth.unwrap_or(8),
-        map_date_types: map_dates.unwrap_or(true),
-        include_attributes: true,
-        batch_size: 8_192,
-    };
-    let schema = SchemaSet::load(schema_path, parse_opts).map_err(map_err)?;
-    let mut buf = Vec::new();
-    schema
-        .write_schema_ipc(element, arrow_opts, &mut buf)
-        .map_err(map_err)?;
+    let buf = py.detach(|| -> PyResult<Vec<u8>> {
+        let arrow_opts = ArrowOptions {
+            max_depth: max_depth.unwrap_or(8),
+            map_date_types: map_dates.unwrap_or(true),
+            include_attributes: true,
+            batch_size: 8_192,
+        };
+        let schema = SchemaSet::load(schema_path, ParseOptions::default()).map_err(map_err)?;
+        let mut buf = Vec::new();
+        schema
+            .write_schema_ipc(element, arrow_opts, &mut buf)
+            .map_err(map_err)?;
+        Ok(buf)
+    })?;
     Ok(PyBytes::new(py, &buf).unbind())
+}
+
+/// Describe the Arrow schema of every global element in one pass.
+///
+/// Returns a JSON object mapping each element name to its field list, in the
+/// shape `describe_element_json_py` returns for one element. Unlike asking
+/// for elements one at a time, an element whose schema cannot be derived is
+/// an error rather than a silent omission.
+#[pyfunction]
+#[pyo3(signature = (schema_path, max_depth=None, map_dates=None, include_attributes=None, max_includes=None))]
+fn all_arrow_schemas_json_py(
+    py: Python<'_>,
+    schema_path: &str,
+    max_depth: Option<usize>,
+    map_dates: Option<bool>,
+    include_attributes: Option<bool>,
+    max_includes: Option<usize>,
+) -> PyResult<String> {
+    py.detach(|| -> PyResult<String> {
+        let parse_opts = ParseOptions {
+            max_includes: max_includes.unwrap_or(64),
+            ..Default::default()
+        };
+        let arrow_opts = ArrowOptions {
+            max_depth: max_depth.unwrap_or(8),
+            map_date_types: map_dates.unwrap_or(true),
+            include_attributes: include_attributes.unwrap_or(true),
+            batch_size: 8_192,
+        };
+        let schema = SchemaSet::load(schema_path, parse_opts).map_err(map_err)?;
+        let schemas = schema.try_all_arrow_schemas(arrow_opts).map_err(map_err)?;
+        let described: serde_json::Map<String, serde_json::Value> = schemas
+            .into_iter()
+            .map(|(name, arrow_schema)| {
+                let fields: Vec<serde_json::Value> = arrow_schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "path": f.name(),
+                            "arrow_type": format!("{:?}", f.data_type()),
+                            "nullable": f.is_nullable(),
+                        })
+                    })
+                    .collect();
+                (name, serde_json::Value::Array(fields))
+            })
+            .collect();
+        serde_json::to_string(&described).map_err(map_err)
+    })
 }
 
 #[pymodule]
@@ -225,5 +298,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_json_py, m)?)?;
     m.add_function(wrap_pyfunction!(validate_bytes_json_py, m)?)?;
     m.add_function(wrap_pyfunction!(schema_ipc_bytes_py, m)?)?;
+    m.add_function(wrap_pyfunction!(all_arrow_schemas_json_py, m)?)?;
     Ok(())
 }

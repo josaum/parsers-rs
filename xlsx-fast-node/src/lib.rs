@@ -61,14 +61,14 @@ fn js_error(err: impl std::fmt::Display) -> Error {
 }
 
 /// Parse an XLSX workbook and return every sheet and cell as a JSON value.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_xlsx_js(path: String, options: Option<ParseOptionsJs>) -> Result<serde_json::Value> {
     let workbook = parse_xlsx(path, to_parse_options(options)).map_err(js_error)?;
     serde_json::to_value(&workbook).map_err(js_error)
 }
 
 /// Parse an XLSX workbook and write one NDJSON record per cell to `out_path`.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_xlsx_ndjson_js(
     path: String,
     out_path: String,
@@ -78,7 +78,7 @@ pub fn parse_xlsx_ndjson_js(
 }
 
 /// Parse an XLSX workbook and write an Arrow IPC file to `out_path`.
-#[napi]
+#[napi(catch_unwind)]
 pub fn parse_xlsx_arrow_ipc_js(
     path: String,
     out_path: String,

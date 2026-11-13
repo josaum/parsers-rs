@@ -345,6 +345,8 @@ def assert_ci_exercises_release_paths(ci: str, release: str | None = None) -> No
     assert "        run: scripts/build-node.sh\n" in node
     assert "        run: node scripts/smoke-node.mjs\n" in node
     assert node.index("scripts/build-node.sh") < node.index("node scripts/smoke-node.mjs")
+    assert "        run: node scripts/check-node-types.mjs\n" in node
+    assert node.index("scripts/build-node.sh") < node.index("node scripts/check-node-types.mjs")
     # Looping over `*-node` would also pick up dist-node, the pack destination.
     assert "for manifest in *-node/package.json; do" in node
     assert "pnpm pack --pack-destination ../dist-node" in node
@@ -478,6 +480,7 @@ def assert_release_waits_for_ci(release: str, ci: str | None = None) -> None:
     node = blocks["node"]
     assert 'scripts/build-node.sh "${node_bindings[@]}"' in node
     assert "        run: node scripts/smoke-node.mjs\n" in node
+    assert "        run: node scripts/check-node-types.mjs\n" in node
     assert "pnpm pack --pack-destination ../dist-node" in node
 
 
@@ -773,6 +776,8 @@ ELAN_RUN = '          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-too
         (assert_ci_exercises_release_paths, CI, "python -I -m pytest --import-mode=importlib -q", "python -m pytest -q"),
         (assert_ci_exercises_release_paths, CI, "python -m pip install --no-index --no-deps dist/*.whl", "python -m pip install -e ."),
         (assert_ci_exercises_release_paths, CI, "        run: node scripts/smoke-node.mjs\n", "        run: node --version\n"),
+        (assert_ci_exercises_release_paths, CI, "        run: node scripts/check-node-types.mjs\n", "        run: node --version\n"),
+        (assert_release_waits_for_ci, RELEASE, "        run: node scripts/check-node-types.mjs\n", "        run: node --version\n"),
         (assert_ci_exercises_release_paths, CI, "        run: scripts/build-node.sh\n", "        run: cargo build\n"),
         (assert_ci_exercises_release_paths, CI, "for manifest in *-node/package.json; do", "for manifest in *-node; do"),
         (assert_ci_exercises_release_paths, CI, "pnpm pack --pack-destination ../dist-node", "true"),
