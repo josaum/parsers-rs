@@ -243,7 +243,7 @@ def _import_record_batch_from_c(array_ptr, schema_ptr):
     import pyarrow as pa
 
     try:
-        return pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
+        batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
     except Exception as exc:
         try:
             release_arrow_c_data_py(array_ptr, schema_ptr)
@@ -253,6 +253,11 @@ def _import_record_batch_from_c(array_ptr, schema_ptr):
         raise RuntimeError(
             f"Failed to wrap Arrow C Data pointers from Rust: {exc}"
         ) from exc
+    # The import moved the array and schema out of the two structs and marked
+    # them released; what is left is the two boxes, freed here so that each
+    # issued pair is freed exactly once.
+    release_arrow_c_data_py(array_ptr, schema_ptr)
+    return batch
 
 
 def _import_record_batch_from_capsules(schema_capsule, array_capsule):

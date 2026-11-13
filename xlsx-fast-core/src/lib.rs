@@ -46,6 +46,14 @@
 //! │  Output: Workbook struct | Arrow RecordBatch callbacks      │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! # Files on disk
+//!
+//! Functions that take a path memory-map the file. It must not be modified
+//! or truncated, by this process or any other, while it is being read: a
+//! truncated file can make reads of the mapping fault (`SIGBUS` on Unix),
+//! and a modified one can change the bytes under the parser. Functions that
+//! take bytes have no such requirement.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};

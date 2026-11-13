@@ -373,6 +373,11 @@ pub fn detect_format(path: &Path) -> Result<EmailFormat> {
 }
 
 /// Parse email from file (auto-detects format)
+///
+/// An `.eml` file is memory-mapped: it must not be modified or truncated,
+/// by this process or any other, while it is parsed. A truncated file can
+/// make reads of the mapping fault (`SIGBUS` on Unix), and a modified one
+/// can change the bytes under the parser.
 pub fn parse_email(path: impl AsRef<Path>, options: ParseOptions) -> Result<Email> {
     let path = path.as_ref();
     let format = detect_format(path)?;
