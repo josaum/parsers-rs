@@ -151,6 +151,10 @@ impl SchemaSet {
         let walked = derivation.fields_from_type(&decl.type_def, 0, String::new(), &mut fields);
         *steps_left -= allowed - derivation.steps_left;
         walked?;
+        let fields = fields
+            .into_iter()
+            .map(unmark_referenced)
+            .collect::<Vec<_>>();
         Ok(Arc::new(Schema::new(fields)))
     }
 
@@ -399,7 +403,11 @@ impl Derivation<'_> {
             } else {
                 format!("{prefix}.@{}", attr.name)
             };
-            self.emit(fields, Field::new(name, dt, !attr.required))?;
+            let mut field = Field::new(name, dt, !attr.required);
+            if attr.referenced {
+                field = mark_referenced(field);
+            }
+            self.emit(fields, field)?;
         }
         Ok(())
     }
@@ -513,9 +521,21 @@ impl Derivation<'_> {
     ) -> Result<()> {
         let col_path = column_path(prefix, &decl.name.local);
         let nillable = decl.nillable;
+        let own = inner_fields.iter().filter(|f| !is_referenced(f)).count();
+        if own == 1 {
+            // A child whose other content derives one column keeps the shape
+            // it had before attribute references were resolved: that column,
+            // named after the child.
+            inner_fields.retain(|f| !is_referenced(f));
+        }
+        let mut inner_fields: Vec<Field> =
+            inner_fields.into_iter().map(unmark_referenced).collect();
+        // A repeated child with no column of its own was a list of empty
+        // structs; one referenced attribute keeps it a list of structs.
+        let keep_struct = own == 0 && occ.is_multi();
         if occ.is_multi() {
             // Wrap the inner type in a List.
-            let item_field = if inner_fields.len() == 1 {
+            let item_field = if inner_fields.len() == 1 && !keep_struct {
                 inner_fields
                     .remove(0)
                     .with_name("item")
@@ -529,19 +549,27 @@ impl Derivation<'_> {
             )
         } else {
             let nullable = occ.min == 0 || nillable;
+            // A child with no column of its own had no column at all before
+            // attribute references were resolved: its column is as new as
+            // the attributes that make it, to the parent too.
+            let new = |field: Field| {
+                if own == 0 {
+                    mark_referenced(field)
+                } else {
+                    field
+                }
+            };
             if inner_fields.len() == 1 {
                 let f = inner_fields
                     .remove(0)
                     .with_name(&col_path)
                     .with_nullable(nullable);
                 // Already charged when the inner walk emitted it.
-                fields.push(f);
+                fields.push(new(f));
                 Ok(())
             } else if !inner_fields.is_empty() {
-                self.emit(
-                    fields,
-                    Field::new(col_path, DataType::Struct(inner_fields.into()), nullable),
-                )
+                let f = Field::new(col_path, DataType::Struct(inner_fields.into()), nullable);
+                self.emit(fields, new(f))
             } else {
                 Ok(())
             }
@@ -577,6 +605,34 @@ fn declares_nothing(ct: &ComplexType) -> bool {
         && ct.base.is_none()
         && ct.attributes.is_empty()
         && matches!(ct.content, ContentModel::Empty)
+}
+
+/// Metadata key marking, during one derivation, a column of a referenced
+/// attribute; see [`crate::schema::AttributeDecl::referenced`]. It never
+/// reaches the derived schema.
+const REFERENCED_MARK: &str = "xsd-fast-core.referenced";
+
+/// `field` marked as the column of a referenced attribute.
+fn mark_referenced(field: Field) -> Field {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(REFERENCED_MARK.to_owned(), String::new());
+    field.with_metadata(metadata)
+}
+
+/// Whether `field` is the column of a referenced attribute.
+fn is_referenced(field: &Field) -> bool {
+    field.metadata().contains_key(REFERENCED_MARK)
+}
+
+/// `field` without the referenced-attribute mark.
+fn unmark_referenced(field: Field) -> Field {
+    if is_referenced(&field) {
+        let mut metadata = field.metadata().clone();
+        metadata.remove(REFERENCED_MARK);
+        field.with_metadata(metadata)
+    } else {
+        field
+    }
 }
 
 /// Marks every field nullable: a choice selects at most one branch, so none

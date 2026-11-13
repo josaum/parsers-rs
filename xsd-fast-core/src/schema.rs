@@ -440,6 +440,26 @@ pub struct AttributeDecl {
     pub default: Option<String>,
     /// Optional fixed lexical value.
     pub fixed: Option<String>,
+    /// Whether the attribute reached its type through `xs:attribute ref` or
+    /// `xs:attributeGroup ref`, which earlier versions did not resolve.
+    ///
+    /// Arrow derivation leaves such an attribute out of a child element
+    /// whose other content derives exactly one column, so that element keeps
+    /// the shape it had before references were resolved. `false` for a
+    /// model serialized before the field existed, and left out of the
+    /// serialized form when `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub referenced: bool,
+}
+
+/// Whether `value` is `false`; decides when [`AttributeDecl::referenced`]
+/// is left out of the serialized form.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The resolved schema: named types + global elements.

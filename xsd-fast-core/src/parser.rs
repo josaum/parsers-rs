@@ -156,6 +156,8 @@ struct Loader {
     /// The named attribute groups, by local name, as written: references
     /// to other groups are still placeholders.
     attribute_groups: HashMap<String, Vec<AttributeDecl>>,
+    /// The global attribute declarations, by local name.
+    global_attributes: HashMap<String, AttributeDecl>,
 }
 
 impl Loader {
@@ -172,6 +174,7 @@ impl Loader {
             max_schema_location_bytes: options.max_schema_location_bytes,
             include_nesting: 0,
             attribute_groups: HashMap::new(),
+            global_attributes: HashMap::new(),
         }
     }
 
@@ -391,6 +394,14 @@ impl Loader {
                     self.model.simple_types.insert(n.clone(), st);
                 }
             }
+            "attribute" if file.in_schema => {
+                let attrs = collect_attrs(e);
+                let inline_type = parse_attribute_children(reader, &file.ns_map)?;
+                if let Some(attribute) = parse_attribute_decl(&attrs, inline_type, &file.ns_map) {
+                    self.global_attributes
+                        .insert(attribute.name.clone(), attribute);
+                }
+            }
             "attributeGroup" if file.in_schema => {
                 let attrs = collect_attrs(e);
                 let attributes = parse_attribute_group(reader, &file.ns_map)?;
@@ -425,6 +436,13 @@ impl Loader {
             "attributeGroup" if file.in_schema => {
                 if let Some(name) = collect_attrs(e).remove("name") {
                     self.attribute_groups.insert(name, Vec::new());
+                }
+            }
+            "attribute" if file.in_schema => {
+                if let Some(attribute) = parse_attribute_decl(&collect_attrs(e), None, &file.ns_map)
+                {
+                    self.global_attributes
+                        .insert(attribute.name.clone(), attribute);
                 }
             }
             "simpleType" if file.in_schema => {
@@ -466,6 +484,7 @@ impl Loader {
     fn finish(mut self) -> SchemaModel {
         let mut expansion = Expansion {
             attribute_groups: &self.attribute_groups,
+            global_attributes: &self.global_attributes,
             remaining: MAX_EXPANDED_NODES,
         };
         expansion.expand_model(&mut self.model);
@@ -1304,6 +1323,17 @@ fn push_attribute_decl(
 ) {
     if let Some(attr_decl) = parse_attribute_decl(attrs, inline_type, ns_map) {
         attributes.push(attr_decl);
+    } else if let Some(reference) = attrs.get("ref") {
+        // The global declaration is known once every file is loaded; the
+        // reference keeps what it states itself: `use`, `default`, `fixed`.
+        attributes.push(AttributeDecl {
+            name: format!("{ATTRIBUTE_REF}{}", split_prefix(reference).1),
+            type_def: SimpleTypeDef::string_unbounded(),
+            required: attrs.get("use").is_some_and(|u| u == "required"),
+            default: attrs.get("default").cloned(),
+            fixed: attrs.get("fixed").cloned(),
+            referenced: true,
+        });
     }
 }
 
@@ -1528,6 +1558,8 @@ fn push_prohibited(attrs: &HashMap<String, String>, prohibited: Option<&mut Vec<
     }
     if let Some(name) = attrs.get("name") {
         prohibited.push(name.clone());
+    } else if let Some(reference) = attrs.get("ref") {
+        prohibited.push(split_prefix(reference).1.to_owned());
     }
     true
 }
@@ -1812,12 +1844,27 @@ fn push_attribute_group_ref(attrs: &HashMap<String, String>, attributes: &mut Ve
         required: false,
         default: None,
         fixed: None,
+        referenced: true,
     });
 }
 
 /// The attribute group an attribute placeholder names, if it is one.
 fn attribute_group_ref(attribute: &AttributeDecl) -> Option<&str> {
     attribute.name.strip_prefix(ATTRIBUTE_GROUP_REF)
+}
+
+/// Marks an attribute, while files are loading, as a reference to the global
+/// attribute that follows it; settled like [`ATTRIBUTE_GROUP_REF`].
+const ATTRIBUTE_REF: &str = "\0attribute-ref:";
+
+/// The global attribute an attribute placeholder names, if it is one.
+fn attribute_ref(attribute: &AttributeDecl) -> Option<&str> {
+    attribute.name.strip_prefix(ATTRIBUTE_REF)
+}
+
+/// Whether an attribute is a placeholder for a reference of either kind.
+fn is_attribute_placeholder(attribute: &AttributeDecl) -> bool {
+    attribute_group_ref(attribute).is_some() || attribute_ref(attribute).is_some()
 }
 
 /// Reads the children of a named `<xs:attributeGroup>` up to and including
@@ -1878,6 +1925,8 @@ const MAX_ATTRIBUTE_GROUP_NESTING: usize = 32;
 struct Expansion<'a> {
     /// Named attribute groups, as written.
     attribute_groups: &'a HashMap<String, Vec<AttributeDecl>>,
+    /// Global attribute declarations.
+    global_attributes: &'a HashMap<String, AttributeDecl>,
     /// Attributes and particles that may still be copied.
     remaining: usize,
 }
@@ -1899,11 +1948,7 @@ impl<'a> Expansion<'a> {
     /// it holds. The recursion follows the nesting of the model, which the
     /// parser bounds.
     fn expand_complex_type(&mut self, complex_type: &mut ComplexType) {
-        if complex_type
-            .attributes
-            .iter()
-            .any(|attribute| attribute_group_ref(attribute).is_some())
-        {
+        if complex_type.attributes.iter().any(is_attribute_placeholder) {
             let attributes = std::mem::take(&mut complex_type.attributes);
             complex_type.attributes = self.expand_attributes(attributes);
         }
@@ -1931,6 +1976,38 @@ impl<'a> Expansion<'a> {
         }
     }
 
+    /// Appends the global attribute a reference names, with the `use`,
+    /// `default` and `fixed` the reference states, unless `seen` holds its
+    /// name, the attribute is not declared, or the budget is spent.
+    fn append_referenced(
+        &mut self,
+        reference: &AttributeDecl,
+        seen: &mut HashSet<String>,
+        expanded: &mut Vec<AttributeDecl>,
+    ) {
+        let Some(name) = attribute_ref(reference) else {
+            return;
+        };
+        let Some(global) = self.global_attributes.get(name) else {
+            return;
+        };
+        if self.remaining == 0 || seen.contains(&global.name) {
+            return;
+        }
+        self.remaining -= 1;
+        seen.insert(global.name.clone());
+        let mut attribute = global.clone();
+        attribute.referenced = true;
+        attribute.required = reference.required;
+        if reference.default.is_some() {
+            attribute.default.clone_from(&reference.default);
+        }
+        if reference.fixed.is_some() {
+            attribute.fixed.clone_from(&reference.fixed);
+        }
+        expanded.push(attribute);
+    }
+
     /// `attributes` with each group reference replaced by the group's
     /// attributes, nested groups included.
     ///
@@ -1939,17 +2016,18 @@ impl<'a> Expansion<'a> {
     fn expand_attributes(&mut self, attributes: Vec<AttributeDecl>) -> Vec<AttributeDecl> {
         let mut seen: HashSet<String> = attributes
             .iter()
-            .filter(|attribute| attribute_group_ref(attribute).is_none())
+            .filter(|attribute| !is_attribute_placeholder(attribute))
             .map(|attribute| attribute.name.clone())
             .collect();
         let mut expanded = Vec::with_capacity(attributes.len());
         let mut chain = Vec::new();
         for attribute in attributes {
-            match attribute_group_ref(&attribute) {
-                Some(group) => {
-                    self.append_attribute_group(group, &mut chain, &mut seen, &mut expanded);
-                }
-                None => expanded.push(attribute),
+            if let Some(group) = attribute_group_ref(&attribute) {
+                self.append_attribute_group(group, &mut chain, &mut seen, &mut expanded);
+            } else if attribute_ref(&attribute).is_some() {
+                self.append_referenced(&attribute, &mut seen, &mut expanded);
+            } else {
+                expanded.push(attribute);
             }
         }
         expanded
@@ -1974,13 +2052,18 @@ impl<'a> Expansion<'a> {
         for attribute in attributes {
             match attribute_group_ref(attribute) {
                 Some(inner) => self.append_attribute_group(inner, chain, seen, expanded),
+                None if attribute_ref(attribute).is_some() => {
+                    self.append_referenced(attribute, seen, expanded);
+                }
                 None => {
                     if self.remaining == 0 || seen.contains(&attribute.name) {
                         continue;
                     }
                     self.remaining -= 1;
                     seen.insert(attribute.name.clone());
-                    expanded.push(attribute.clone());
+                    let mut attribute = attribute.clone();
+                    attribute.referenced = true;
+                    expanded.push(attribute);
                 }
             }
         }
@@ -2012,6 +2095,7 @@ fn parse_attribute_decl(
         required,
         default,
         fixed,
+        referenced: false,
     })
 }
 
