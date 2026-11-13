@@ -61,7 +61,7 @@ DoGet sub/Upper.EML
 DoGet sub\Upper.EML
     InvalidArgument: Invalid path: <os error>
 DoGet notes.txt
-    Internal: Failed to parse email: Cannot detect email format for: <base>/root/notes.txt
+    Internal: Failed to parse email: Cannot detect email format for: notes.txt
 DoGet sub
     Internal: Failed to parse email: <os error>
 DoGet missing.eml

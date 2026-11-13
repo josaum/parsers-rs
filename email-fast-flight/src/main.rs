@@ -25,9 +25,9 @@ use clap::Parser;
 use email_fast_core::arrow::{emails_schema, emails_to_record_batch};
 use email_fast_core::{parse_email, ParseOptions};
 use flight_ipc_config::{
-    capability_json, do_put_unsupported, parse_writer_policies_for_process, FlightIpcDirection,
-    FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction, ParserRoute,
-    CAPABILITY_ACTION,
+    capability_json, do_put_unsupported, parse_writer_policies_for_process,
+    root_relative_error_text, FlightIpcDirection, FlightIpcObservationGuard,
+    FlightRequestAuthVerifier, FlightRpcAction, ParserRoute, CAPABILITY_ACTION,
 };
 use futures::StreamExt;
 use futures::{stream, Stream};
@@ -294,8 +294,14 @@ impl FlightService for EmailFlightService {
 
         let full_path = self.resolve_path(&path)?;
 
-        let email = parse_email(&full_path, self.options)
-            .map_err(|e| Status::internal(format!("Failed to parse email: {}", e)))?;
+        // The parser names the file by its path on the server; the answer
+        // names it by its path below the root.
+        let email = parse_email(&full_path, self.options).map_err(|e| {
+            Status::internal(root_relative_error_text(
+                &format!("Failed to parse email: {}", e),
+                &self.root,
+            ))
+        })?;
         let batch = emails_to_record_batch(std::slice::from_ref(&email))
             .map_err(|e| Status::internal(format!("Arrow encode: {}", e)))?;
         let schema = std::sync::Arc::new(emails_schema());
@@ -672,5 +678,10 @@ Hello from the wire test.\r\n";
         wire.list_actions(true).await;
 
         assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
     }
 }

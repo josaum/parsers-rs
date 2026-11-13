@@ -27,9 +27,10 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use flight_ipc_config::{
-    capability_json, do_put_unsupported, parse_writer_policies_for_process, split_query,
-    FlightIpcDirection, FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction,
-    ParserRoute, CAPABILITY_ACTION,
+    capability_json, do_put_unsupported, parse_writer_policies_for_process,
+    root_relative_error_text, root_relative_status, split_query, FlightIpcDirection,
+    FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction, ParserRoute,
+    CAPABILITY_ACTION,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -276,6 +277,7 @@ impl FlightService for XsdFlightService {
         let parse_opts = self.parse_options.clone();
 
         stream_schema_description(
+            &self.root,
             path,
             query,
             parse_opts,
@@ -324,6 +326,7 @@ impl FlightService for XsdFlightService {
         };
 
         stream_schema_description(
+            &self.root,
             path,
             query,
             self.parse_options.clone(),
@@ -377,7 +380,9 @@ impl FlightService for XsdFlightService {
                                 tx.blocking_send(Ok(arrow_flight::Result { body: bytes.into() }));
                         }
                         Err(e) => {
-                            let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
+                            let _ = tx.blocking_send(Err(Status::internal(
+                                root_relative_error_text(&e.to_string(), &root),
+                            )));
                         }
                     }
                 });
@@ -409,7 +414,9 @@ impl FlightService for XsdFlightService {
                                 tx.blocking_send(Ok(arrow_flight::Result { body: bytes.into() }));
                         }
                         Err(e) => {
-                            let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
+                            let _ = tx.blocking_send(Err(Status::internal(
+                                root_relative_error_text(&e.to_string(), &root),
+                            )));
                         }
                     }
                 });
@@ -456,6 +463,7 @@ impl FlightService for XsdFlightService {
 // ── Streaming helper ─────────────────────────────────────────────────────────
 
 fn stream_schema_description(
+    root: &Path,
     path: PathBuf,
     query: FlightQuery,
     parse_opts: ParseOptions,
@@ -498,8 +506,12 @@ fn stream_schema_description(
         .with_schema(schema)
         .with_options(write_options)
         .build(batch_stream);
+    // The parser names the file by its path on the server; the answer
+    // names it by its path below the root.
+    let root = root.to_path_buf();
     let output = flight_ipc_config::observe_flight_stream(
-        flight_stream.map(|res| res.map_err(to_status)),
+        flight_stream
+            .map(move |res| res.map_err(|err| root_relative_status(to_status(err), &root))),
         observation,
     );
     Ok(Response::new(output))
@@ -1036,5 +1048,10 @@ mod wire_parity_tests {
         wire.list_actions(true).await;
 
         assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
     }
 }

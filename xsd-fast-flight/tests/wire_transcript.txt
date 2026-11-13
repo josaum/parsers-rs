@@ -135,7 +135,7 @@ DoAction list_elements {"root":"../outside.xsd"}
 DoAction list_elements {"root":"link.xsd"}
     PermissionDenied: path escapes root
 DoAction list_elements 
-    ["Internal: mmap: <base>/root"]
+    ["Internal: mmap: ."]
 DoAction describe {"root":"order.xsd","element":"order"} without a bearer
     Unauthenticated: missing authorization metadata
 DoAction describe {"root":"order.xsd","element":"order"}

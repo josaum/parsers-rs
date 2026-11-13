@@ -25,8 +25,9 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::SchemaRef;
 use flight_ipc_config::{
-    capability_json, do_put_unsupported, FlightIpcDirection, FlightIpcObservationGuard,
-    FlightRequestAuthVerifier, FlightRpcAction, ParserRoute, CAPABILITY_ACTION,
+    capability_json, do_put_unsupported, root_relative_error_text, FlightIpcDirection,
+    FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction, ParserRoute,
+    CAPABILITY_ACTION,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -285,9 +286,17 @@ fn ticket_to_request(root: &Path, ticket: &Ticket) -> Result<(PathBuf, FlightQue
     resolve_path(root, Path::new(path_str)).map(|path| (path, query))
 }
 
-fn file_schema(path: &Path, options: &ArrowOptions) -> Result<SchemaRef, Status> {
-    let text = fs::read_to_string(path)
-        .map_err(|err| Status::internal(format!("read {}: {err}", path.display())))?;
+/// The answer for a file that could not be read. It names the file by its
+/// path below the root, never by where the root is on the server.
+fn read_error(root: &Path, path: &Path, err: &std::io::Error) -> Status {
+    Status::internal(root_relative_error_text(
+        &format!("read {}: {err}", path.display()),
+        root,
+    ))
+}
+
+fn file_schema(root: &Path, path: &Path, options: &ArrowOptions) -> Result<SchemaRef, Status> {
+    let text = fs::read_to_string(path).map_err(|err| read_error(root, path, &err))?;
     arrow::jsonl_schema(&text, options).map_err(|err| Status::internal(err.to_string()))
 }
 
@@ -345,7 +354,7 @@ impl FlightService for JsonFlightService {
                 let descriptor = FlightDescriptor::new_path(components);
                 let endpoint = FlightEndpoint::new().with_ticket(ticket);
 
-                let schema = match file_schema(&path, &options) {
+                let schema = match file_schema(&root_canon, &path, &options) {
                     Ok(schema) => schema,
                     Err(err) => {
                         let _ = tx.blocking_send(Err(err));
@@ -385,7 +394,7 @@ impl FlightService for JsonFlightService {
 
         let mut options = self.arrow_options.clone();
         apply_query_overrides(&query, &mut options);
-        let schema = file_schema(&path, &options)?;
+        let schema = file_schema(&self.root, &path, &options)?;
 
         let ticket = Ticket::new(path_to_ticket(&self.root, &path));
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
@@ -420,7 +429,7 @@ impl FlightService for JsonFlightService {
 
         let mut options = self.arrow_options.clone();
         apply_query_overrides(&query, &mut options);
-        let schema = file_schema(&path, &options)?;
+        let schema = file_schema(&self.root, &path, &options)?;
 
         let options = IpcWriteOptions::default();
         let schema_ipc = arrow_flight::SchemaAsIpc::new(schema.as_ref(), &options);
@@ -445,8 +454,7 @@ impl FlightService for JsonFlightService {
         let mut options = self.arrow_options.clone();
         apply_query_overrides(&query, &mut options);
 
-        let text = fs::read_to_string(&path)
-            .map_err(|err| Status::internal(format!("read {}: {err}", path.display())))?;
+        let text = fs::read_to_string(&path).map_err(|err| read_error(&self.root, &path, &err))?;
         let schema = arrow::jsonl_schema(&text, &options).map_err(to_status)?;
 
         let (tx, rx) =
@@ -671,5 +679,10 @@ mod wire_parity_tests {
         wire.list_actions(true).await;
 
         assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
     }
 }

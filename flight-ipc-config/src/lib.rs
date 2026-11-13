@@ -562,6 +562,94 @@ pub fn do_put_unsupported() -> Status {
     Status::unimplemented(DO_PUT_UNSUPPORTED)
 }
 
+/// Rewrites every mention of the served root in `message` as a root-relative path.
+///
+/// Parser errors name the file they failed on by its canonical path on the
+/// server. A caller only ever supplied a path below the root, so that is
+/// all an answer may name: `<root>/sub/a.txt` becomes `sub/a.txt` and the
+/// root itself becomes `.`. Both the root as configured and its canonical
+/// form are rewritten, because parsers report whichever one they opened.
+///
+/// A mention only counts when it ends at a path boundary, so a root of
+/// `/data` leaves `/data2/x` alone. A relative root, or a root with no
+/// name of its own such as `/`, cannot be told apart from ordinary text
+/// and is left as it is.
+pub fn root_relative_error_text(message: &str, root: &Path) -> String {
+    let mut needles: Vec<String> = Vec::with_capacity(2);
+    for candidate in [root.canonicalize().ok(), Some(root.to_path_buf())]
+        .into_iter()
+        .flatten()
+    {
+        if !candidate.is_absolute() || candidate.file_name().is_none() {
+            continue;
+        }
+        let text = candidate.to_string_lossy();
+        let text = text.trim_end_matches(std::path::MAIN_SEPARATOR);
+        if !text.is_empty() && !needles.iter().any(|known| known == text) {
+            needles.push(text.to_owned());
+        }
+    }
+    // Longest first, so a root that is a prefix of the other cannot leave
+    // the tail of the longer one behind.
+    needles.sort_by_key(|needle| std::cmp::Reverse(needle.len()));
+    let mut text = message.to_owned();
+    for needle in &needles {
+        text = strip_root_mentions(&text, needle);
+    }
+    text
+}
+
+/// One pass of [`root_relative_error_text`] for one spelling of the root.
+fn strip_root_mentions(message: &str, root: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(at) = rest.find(root) {
+        let after = &rest[at + root.len()..];
+        out.push_str(&rest[..at]);
+        let mut following = after.chars();
+        match following.next() {
+            Some(separator) if std::path::is_separator(separator) => {
+                // `<root>/` alone still means the root itself.
+                let names_a_child = following
+                    .next()
+                    .is_some_and(|next| !next.is_whitespace() && next != ':');
+                if !names_a_child {
+                    out.push('.');
+                }
+                rest = following_str(after, separator);
+            }
+            Some(next) if next.is_alphanumeric() || matches!(next, '_' | '-' | '.') => {
+                // A longer name that merely starts like the root.
+                out.push_str(root);
+                rest = after;
+            }
+            _ => {
+                out.push('.');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `text` without its leading `separator`.
+fn following_str(text: &str, separator: char) -> &str {
+    text.get(separator.len_utf8()..).unwrap_or("")
+}
+
+/// Returns `status` with the served root rewritten out of its message.
+///
+/// The code is kept. See [`root_relative_error_text`] for what is rewritten.
+pub fn root_relative_status(status: Status, root: &Path) -> Status {
+    let text = root_relative_error_text(status.message(), root);
+    if text == status.message() {
+        status
+    } else {
+        Status::new(status.code(), text)
+    }
+}
+
 /// Parsed query-string overrides shared by the read-only parser Flight
 /// servers: `table` selection plus batch-size and inflate-limit tuning.
 #[derive(Default, Debug, Clone)]
@@ -682,6 +770,61 @@ pub fn parse_query(query: &str) -> Result<FlightQuery, Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_text_names_files_relative_to_the_root() {
+        let base = std::env::temp_dir().join(format!(
+            "flight-ipc-config-root-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let root = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        let canon = root.canonicalize().unwrap();
+        let shown = canon.display();
+        let sibling = format!("{shown}2/x");
+
+        for (message, expected) in [
+            (
+                format!("open: {shown}/sub/a.xsd: denied"),
+                "open: sub/a.xsd: denied".to_owned(),
+            ),
+            (format!("mmap: {shown}"), "mmap: .".to_owned()),
+            (
+                format!("read {shown}: is a directory"),
+                "read .: is a directory".to_owned(),
+            ),
+            (
+                format!("read {shown}/: is a directory"),
+                "read .: is a directory".to_owned(),
+            ),
+            (format!("{shown}/a and {shown}/b"), "a and b".to_owned()),
+            (
+                format!("open: {}/a.xsd", root.display()),
+                "open: a.xsd".to_owned(),
+            ),
+            (format!("open: {sibling}"), format!("open: {sibling}")),
+            ("no path here".to_owned(), "no path here".to_owned()),
+        ] {
+            assert_eq!(
+                root_relative_error_text(&message, &root),
+                expected,
+                "{message}"
+            );
+        }
+
+        // Roots that cannot be recognised in running text are left alone.
+        assert_eq!(root_relative_error_text("a/b: c", Path::new("/")), "a/b: c");
+        assert_eq!(
+            root_relative_error_text("see ./a.b", Path::new(".")).len(),
+            9
+        );
+
+        let status = root_relative_status(Status::internal(format!("mmap: {shown}")), &root);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.message(), "mmap: .");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn absent_values_are_none_and_non_none_is_rejected_before_io() {

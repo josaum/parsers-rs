@@ -40,7 +40,7 @@ GetFlightInfo notes.txt
 	not json
 	...^....
 GetFlightInfo sub
-    Internal: read <base>/root/sub: <os error>
+    Internal: read sub: <os error>
 GetFlightInfo missing.jsonl
     NotFound: file not found
 GetFlightInfo missing.jsonl?batch=1
@@ -104,7 +104,7 @@ DoGet notes.txt
 	not json
 	...^....
 DoGet sub
-    Internal: read <base>/root/sub: <os error>
+    Internal: read sub: <os error>
 DoGet missing.jsonl
     NotFound: file not found
 DoGet ../outside.jsonl
@@ -116,7 +116,7 @@ DoGet link.jsonl
 DoGet <base>/outside.jsonl
     PermissionDenied: path escapes root
 DoGet 
-    Internal: read <base>/root: <os error>
+    Internal: read .: <os error>
 DoGet �
     InvalidArgument: ticket must be utf-8 path
 DoPut without a bearer

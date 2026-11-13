@@ -28,9 +28,9 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
     capability_json, descriptor_path_and_query, do_put_unsupported, parse_query,
-    parse_writer_policies_for_process, resolve_path, ticket_path_and_query, FlightIpcDirection,
-    FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction, ParserRoute,
-    CAPABILITY_ACTION,
+    parse_writer_policies_for_process, resolve_path, root_relative_status, ticket_path_and_query,
+    FlightIpcDirection, FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction,
+    ParserRoute, CAPABILITY_ACTION,
 };
 
 /// Everything that differs between two servers built on [`TableFlightService`].
@@ -212,8 +212,12 @@ impl<P: TableParser> TableFlightService<P> {
             .with_options(write_options)
             .build(batch_stream);
 
+        // A parser names the file by its path on the server; the caller
+        // only ever sees it the way the ticket spelled it.
+        let root = self.root.clone();
         let output = crate::observe_flight_stream(
-            flight_stream.map(|res| res.map_err(to_status)),
+            flight_stream
+                .map(move |res| res.map_err(|err| root_relative_status(to_status(err), &root))),
             observation,
         );
         Ok(Response::new(output))

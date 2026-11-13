@@ -100,6 +100,8 @@ DoGet
     Internal: External error: <os error>
 DoGet �
     InvalidArgument: ticket must be utf-8 path
+DoGet sub
+    Internal: External error: <os error>
 DoPut without a bearer
     Unauthenticated: missing authorization metadata
 DoPut

@@ -27,6 +27,9 @@ pub struct Wire {
     placeholders: Vec<(String, &'static str)>,
     /// The transcript so far.
     pub seen: String,
+    /// Every answer that named a directory on the server, as `call: answer`.
+    /// A server must describe a file the way the caller asked for it.
+    pub answers_naming_server_paths: Vec<String>,
 }
 
 fn fnv1a(parts: &[&[u8]]) -> u64 {
@@ -159,11 +162,20 @@ impl Wire {
             client: FlightServiceClient::new(channel),
             placeholders,
             seen: String::new(),
+            answers_naming_server_paths: Vec::new(),
         }
     }
 
     fn record(&mut self, call: &str, bearer: bool, answer: String) {
         let suffix = if bearer { "" } else { " without a bearer" };
+        if self
+            .placeholders
+            .iter()
+            .any(|(path, _)| answer.contains(path.as_str()))
+        {
+            self.answers_naming_server_paths
+                .push(format!("{call}{suffix}: {answer}"));
+        }
         let mut text = format!("{call}{suffix}\n    {answer}");
         for (path, placeholder) in &self.placeholders {
             text = text.replace(path.as_str(), placeholder);

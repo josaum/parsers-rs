@@ -864,6 +864,33 @@ mod wire_parity_tests {
     }
 
     #[tokio::test]
+    async fn a_file_that_cannot_be_opened_is_named_as_the_caller_named_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).expect("directories");
+        let locked = root.join("locked.xlsx");
+        std::fs::write(&locked, fixture()).expect("fixture");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("permissions");
+        if std::fs::File::open(&locked).is_ok() {
+            // A superuser opens the file anyway, so there is no error to read.
+            return;
+        }
+
+        let mut wire = Wire::start(service(&root), base.path()).await;
+        wire.do_get(b"locked.xlsx", true).await;
+
+        assert!(wire.seen.contains("locked.xlsx"), "{}", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
+    }
+
+    #[tokio::test]
     async fn every_rpc_answers_as_it_did_before_the_shared_server() {
         let base = tempfile::tempdir().expect("tempdir");
         let root = base.path().join("root");
@@ -944,6 +971,7 @@ mod wire_parity_tests {
             wire.do_get(ticket.as_bytes(), true).await;
         }
         wire.do_get(b"\xff", true).await;
+        wire.do_get(b"sub", true).await;
 
         wire.do_put(false).await;
         wire.do_put(true).await;
@@ -965,5 +993,10 @@ mod wire_parity_tests {
         wire.list_actions(true).await;
 
         assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
     }
 }
