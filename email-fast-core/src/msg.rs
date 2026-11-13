@@ -177,24 +177,33 @@ pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Ema
 
     // The recipient storages carry each recipient's type, name and address.
     // The display strings are names only, so they are read just for a
-    // message that has no recipient storages.
-    let (to, cc, bcc) = if recipient_storages.is_empty() {
-        (parse_addr_list(to_raw), parse_addr_list(cc_raw), Vec::new())
-    } else {
-        let (mut to, mut cc, mut bcc) = (Vec::new(), Vec::new(), Vec::new());
-        for recipient in &recipient_storages {
-            let Some((kind, address)) = recipient_address(recipient, string_encoding) else {
-                continue;
-            };
-            match kind {
-                RECIPIENT_TYPE_ORIGINATOR => {}
-                RECIPIENT_TYPE_CC => cc.push(address),
-                RECIPIENT_TYPE_BCC => bcc.push(address),
-                _ => to.push(address),
-            }
+    // message whose storages name nobody.
+    let (mut to, mut cc, mut bcc) = (Vec::new(), Vec::new(), Vec::new());
+    for recipient in &recipient_storages {
+        let Some((kind, address)) = recipient_address(recipient, string_encoding) else {
+            continue;
+        };
+        let list = match kind {
+            RECIPIENT_TYPE_ORIGINATOR => continue,
+            RECIPIENT_TYPE_CC => &mut cc,
+            RECIPIENT_TYPE_BCC => &mut bcc,
+            _ => &mut to,
+        };
+        // Writers list a recipient again with status flags set on its type;
+        // one entry per name and address is kept, the first.
+        let listed = list.iter().any(|known: &EmailAddress| {
+            known.name == address.name && known.address == address.address
+        });
+        if !listed {
+            list.push(address);
         }
-        (to, cc, bcc)
-    };
+    }
+    // No storages, or storages that name nobody: the display strings are
+    // all there is.
+    if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+        to = parse_addr_list(to_raw);
+        cc = parse_addr_list(cc_raw);
+    }
     let date = property_stream.and_then(|props| {
         [PROP_CLIENT_SUBMIT_TIME, PROP_MESSAGE_DELIVERY_TIME]
             .into_iter()
@@ -942,14 +951,20 @@ fn fixed_u64_property(property_stream: &[u8], header_len: usize, tag: u32) -> Op
 /// Converts a PtypTime value (a FILETIME) to a UTC timestamp.
 ///
 /// The result is cut to whole seconds, which is the precision of the `Date`
-/// header the EML path reads. Zero is how writers leave the property unset
-/// and gives `None`, as would a value `chrono` cannot represent.
+/// header the EML path reads. A time before 1970 or after 2200 is not when
+/// a message was sent: zero is how writers leave the property unset, and
+/// other such values are uninitialized or damaged. They give `None`.
 fn filetime_to_utc(ticks: u64) -> Option<chrono::DateTime<chrono::Utc>> {
-    if ticks == 0 {
+    /// 2200-01-01 00:00:00 UTC in Unix seconds.
+    const LATEST_PLAUSIBLE_UNIX_SECONDS: i64 = 7_258_118_400;
+
+    let seconds = i64::try_from(ticks / FILETIME_TICKS_PER_SECOND)
+        .ok()?
+        .checked_sub(FILETIME_UNIX_EPOCH_SECONDS)?;
+    if !(0..LATEST_PLAUSIBLE_UNIX_SECONDS).contains(&seconds) {
         return None;
     }
-    let seconds = i64::try_from(ticks / FILETIME_TICKS_PER_SECOND).ok()?;
-    chrono::DateTime::from_timestamp(seconds.checked_sub(FILETIME_UNIX_EPOCH_SECONDS)?, 0)
+    chrono::DateTime::from_timestamp(seconds, 0)
 }
 
 /// Reads one recipient storage: its `PidTagRecipientType` and its address.
@@ -1824,22 +1839,95 @@ mod cfb_hardening_tests {
     }
 
     #[test]
-    fn an_unset_time_is_no_date_and_the_largest_one_is_not_a_panic() {
-        let parse = |ticks: u64| {
+    fn a_time_outside_the_plausible_range_is_no_date() {
+        let parse = |submit: u64, delivery: u64| {
             parse_fixture(&[
                 (
                     "__properties_version1.0",
                     property_stream_u64(
                         TOP_LEVEL_PROPERTY_HEADER_LEN,
-                        &[(PROP_CLIENT_SUBMIT_TIME, ticks)],
+                        &[
+                            (PROP_CLIENT_SUBMIT_TIME, submit),
+                            (PROP_MESSAGE_DELIVERY_TIME, delivery),
+                        ],
                     ),
                 ),
                 ("__substg1.0_0037001F", utf16_le("s")),
             ])
+            .date
         };
-        assert_eq!(parse(0).date, None);
-        // Far in the future, but a date `chrono` holds; it must not overflow.
-        assert!(parse(u64::MAX).date.is_some());
+        // Unset, before 1970 (here 1601 and 1969), and far in the future.
+        let year_1969 = (FILETIME_UNIX_EPOCH_SECONDS as u64 - 1) * FILETIME_TICKS_PER_SECOND;
+        for ticks in [0, 1, year_1969, u64::MAX, u64::MAX / 2] {
+            assert_eq!(parse(ticks, 0), None, "{ticks}");
+            // The delivery time stands in for an unusable submit time.
+            assert_eq!(
+                parse(ticks, SAMPLE_FILETIME),
+                Some(utc("2024-01-15T14:30:00Z")),
+                "{ticks}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recipient_listed_twice_appears_once() {
+        let mut streams = vec![("__substg1.0_0037001F", utf16_le("s"))];
+        // The same recipient as a plain one and as a flagged copy, then
+        // another one, then the first again.
+        let names = [
+            "__recip_version1.0_#00000000",
+            "__recip_version1.0_#00000001",
+            "__recip_version1.0_#00000002",
+            "__recip_version1.0_#00000003",
+        ];
+        let paths: Vec<(String, String, String)> = names
+            .iter()
+            .map(|storage| {
+                (
+                    format!("{storage}/__properties_version1.0"),
+                    format!("{storage}/__substg1.0_3001001F"),
+                    format!("{storage}/__substg1.0_39FE001F"),
+                )
+            })
+            .collect();
+        let who = [
+            (1, "Maria", "maria@example.com"),
+            (0x1000_0001, "Maria", "maria@example.com"),
+            (1, "Ana", "ana@example.com"),
+            (1, "Maria", "maria@example.com"),
+        ];
+        for ((properties, name, address), (kind, display, smtp)) in paths.iter().zip(who) {
+            streams.push((properties.as_str(), recipient_type(kind)));
+            streams.push((name.as_str(), utf16_le(display)));
+            streams.push((address.as_str(), utf16_le(smtp)));
+        }
+        let email = parse_fixture(&streams);
+        assert_eq!(
+            pairs(&email.to),
+            [
+                (Some("Maria"), "maria@example.com"),
+                (Some("Ana"), "ana@example.com"),
+            ]
+        );
+    }
+
+    #[test]
+    fn display_strings_stand_in_when_no_recipient_storage_names_anyone() {
+        let email = parse_fixture(&[
+            ("__substg1.0_0037001F", utf16_le("s")),
+            ("__substg1.0_0E04001F", utf16_le("Maria Souza")),
+            ("__substg1.0_0E03001F", utf16_le("Carlos")),
+            (
+                "__recip_version1.0_#00000000/__properties_version1.0",
+                recipient_type(1),
+            ),
+            (
+                "__recip_version1.0_#00000001/__substg1.0_0FFF0102",
+                vec![1, 2, 3],
+            ),
+        ]);
+        assert_eq!(pairs(&email.to), [(None, "Maria Souza")]);
+        assert_eq!(pairs(&email.cc), [(None, "Carlos")]);
     }
 
     /// The display name and address of each entry, for comparison.
