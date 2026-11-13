@@ -22,6 +22,19 @@ request.
   parse raises an error naming its URI. References to the JSON Schema
   meta-schemas (`json_fast_core::schema::WELL_KNOWN_META_SCHEMAS`) stay a
   warning and are skipped.
+- **pdf (CCITT images):** image extraction decodes CCITTFax with
+  hayro-ccitt 0.5. Several changes follow from it:
+  - A row that truncated or damaged data cuts off partway is padded instead
+    of keeping its partial pixels.
+  - A damaged Group 3 row with end-of-line markers no longer borrows codes
+    from the other colour. It is padded, and decoding resumes at the next
+    row instead of stopping.
+  - Under `/BlackIs1 true`, columns past `/Columns` and rows the stream does
+    not code are padded with coded white (sample 0), not 0xFF, which is a
+    coded black sample there.
+
+  On 487 real CCITT images (Group 4 and Group 3 1D, none with `/BlackIs1
+  true`) the output is identical.
 - **json:** an `$id` or anchor inside `enum`, `const`, `default`,
   `examples` or an unknown keyword no longer identifies a schema. Two
   resources with one URI: the first in document order is used, with a
