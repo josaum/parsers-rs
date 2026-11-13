@@ -6,7 +6,7 @@
 
 use ontology_fast_core::{
     declared_prefixes, parse_turtle, parse_turtle_terms, OntologyError, OntologyLimits,
-    MAX_NESTING_DEPTH,
+    MAX_NESTING_DEPTH, TERM_BYTES_FLOOR, TERM_BYTES_PER_SOURCE_BYTE,
 };
 
 type Entry = fn(&[u8], OntologyLimits) -> Result<usize, OntologyError>;
@@ -222,4 +222,96 @@ fn nesting_passes_at_the_limit_and_refuses_one_level_more() {
             );
         }
     }
+}
+
+/// Whether `outcome` is the expanded-text refusal for a source of `source_bytes`.
+fn refuses_term_bytes(outcome: &Result<usize, OntologyError>, source_bytes: usize) -> bool {
+    let budget = TERM_BYTES_FLOOR.max(source_bytes * TERM_BYTES_PER_SOURCE_BYTE);
+    matches!(
+        outcome,
+        Err(OntologyError::ResourceLimit { resource: "term_bytes", limit, observed })
+            if *limit == budget && *observed > budget
+    )
+}
+
+#[test]
+fn text_expanded_far_beyond_the_source_is_refused_by_every_entry_point() {
+    // One megabyte of namespace, written once, is copied into every term that
+    // uses it: about a megabyte of source expands to several hundred.
+    let long = "x".repeat(1024 * 1024);
+    let mut distinct = format!("@prefix p: <a:{long}> .\n");
+    let mut repeated = distinct.clone();
+    for n in 0..120 {
+        distinct.push_str(&format!("p:s{n} p:p{n} p:o{n} .\n"));
+        // The same statement every time: nothing is retained, yet every copy
+        // is still made, so duplicates count.
+        repeated.push_str("p:a p:a p:a .\n");
+    }
+    // No prefix at all: one long subject, repeated by the object list.
+    let mut listed = format!("<a:{long}> <a:p> 0");
+    for n in 1..400 {
+        listed.push_str(&format!(",{n}"));
+    }
+    listed.push_str(" .");
+    // A long base, resolved into every relative IRI.
+    let mut based = format!("@base <a:{long}/> .\n");
+    for n in 0..120 {
+        based.push_str(&format!("<s{n}> <p{n}> <o{n}> .\n"));
+    }
+    for (shape, text) in [
+        ("distinct", distinct),
+        ("repeated", repeated),
+        ("listed", listed),
+        ("based", based),
+    ] {
+        for (name, entry) in ENTRIES {
+            let outcome = entry(text.as_bytes(), OntologyLimits::default());
+            assert!(
+                refuses_term_bytes(&outcome, text.len()),
+                "{name} on the {shape} document: {:?}",
+                outcome.map_err(|error| error.to_string())
+            );
+        }
+    }
+}
+
+#[test]
+fn text_expanded_within_the_allowance_still_reads() {
+    // The same shape, held under the floor: 60 statements of three terms of
+    // one megabyte each is 180 MiB.
+    let long = "x".repeat(1024 * 1024);
+    let mut text = format!("@prefix p: <a:{long}> .\n");
+    for n in 0..60 {
+        text.push_str(&format!("p:s{n} p:p{n} p:o{n} .\n"));
+    }
+    for (name, entry) in ENTRIES {
+        let expected = if name == "declared_prefixes" { 1 } else { 60 };
+        assert_eq!(
+            entry(text.as_bytes(), OntologyLimits::default()),
+            Ok(expected),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_long_prefix_name_cannot_expand_the_rendered_text_past_the_allowance() {
+    // The other direction: a short IRI rendered through a prefix whose name
+    // is a megabyte long. The terms are small; the text form is not.
+    let long = "x".repeat(1024 * 1024);
+    let mut text = format!("@prefix {long}: <a:> .\n");
+    for n in 0..120 {
+        text.push_str(&format!("<a:s{n}> <a:p{n}> <a:o{n}> .\n"));
+    }
+    let outcome =
+        parse_turtle(text.as_bytes(), OntologyLimits::default()).map(|read| read.triples().len());
+    assert!(
+        refuses_term_bytes(&outcome, text.len()),
+        "{:?}",
+        outcome.map_err(|error| error.to_string())
+    );
+    assert_eq!(
+        parse_turtle_terms(text.as_bytes(), OntologyLimits::default()).map(|read| read.len()),
+        Ok(120)
+    );
 }

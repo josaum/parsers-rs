@@ -64,6 +64,38 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// `nesting_depth`, by every entry point, before it is parsed.
 pub const MAX_NESTING_DEPTH: usize = 10_000;
 
+/// Least text one document's terms may expand to, whatever its size: 256 MiB.
+///
+/// See [`TERM_BYTES_PER_SOURCE_BYTE`] for the budget this is the floor of.
+/// One million collection items, the most the default statement budget
+/// admits, expand to about 230 MiB, so the floor leaves the statement budget
+/// to refuse that document as it always has.
+pub const TERM_BYTES_FLOOR: usize = 256 * 1024 * 1024;
+
+/// Expanded term bytes allowed per source byte, above [`TERM_BYTES_FLOOR`].
+///
+/// A prefixed name or a relative IRI is a few source bytes that the parser
+/// expands to the whole namespace or base, and every statement owns its copy.
+/// A megabyte-long namespace used by a few hundred thousand three-byte names
+/// therefore asks for hundreds of gigabytes of copying from a few megabytes of
+/// source. So the text of every term the parser emits is counted: subject,
+/// predicate and object of each statement, including a literal's datatype IRI
+/// and language tag and the terms inside an RDF 1.2 triple term, and
+/// including statements that repeat an earlier one. A document may expand to
+///
+/// ```text
+/// max(TERM_BYTES_FLOOR, source bytes * TERM_BYTES_PER_SOURCE_BYTE)
+/// ```
+///
+/// bytes; the statement that passes it is refused with
+/// [`OntologyError::ResourceLimit`] naming `term_bytes`, by every entry point.
+/// [`parse_turtle`] holds the text it renders to the same budget, since a
+/// long prefix name expands a short IRI just as a long namespace expands a
+/// short name. Authored ontologies expand five to ten times (the 50 MB
+/// benchmark document: about six), and a document under 8 MiB is held by the
+/// floor alone.
+pub const TERM_BYTES_PER_SOURCE_BYTE: usize = 32;
+
 /// Fail-closed resource budget for one parse.
 #[derive(Clone, Copy, Debug)]
 pub struct OntologyLimits {
@@ -454,7 +486,8 @@ pub fn parse_turtle(
     // term is mapped to the first term with its text, and the rows are
     // deduplicated again only when such a pair exists.
     let abbreviator = Abbreviator::new(&prefixes);
-    let rendered = terms.render(&abbreviator);
+    let term_budget = term_byte_budget(source.len());
+    let rendered = terms.render(&abbreviator, term_budget)?;
     let mut first_with_text: HashMap<&str, u32> = HashMap::with_capacity(rendered.len());
     let mut folded = false;
     let canonical: Vec<u32> = (0_u32..)
@@ -482,6 +515,14 @@ pub fn parse_turtle(
             limit: u32::MAX as usize,
             observed: rows.len(),
         });
+    }
+    // Every row owns its text, so the rendered text is held to the budget of
+    // the expanded terms before it is copied out.
+    let text_of = |number: &u32| rendered[*number as usize].len();
+    let mut row_bytes = 0_usize;
+    for row in &rows {
+        row_bytes = row_bytes.saturating_add(row.iter().map(text_of).sum());
+        enforce_term_budget(row_bytes, term_budget)?;
     }
     let triples: Vec<TripleText> = rows
         .iter()
@@ -631,15 +672,20 @@ fn read_default_graph(
         });
     }
     let mut blank_labels = BlankLabels::for_document(source);
+    let term_budget = term_byte_budget(source.len());
+    let mut term_bytes = 0_usize;
     let mut parser = TurtleParser::new().for_slice(source);
     // `by_ref`: the parser is read again after the last triple, for the
     // prefixes it saw.
     for triple in parser.by_ref() {
+        let triple = triple.map_err(|error| OntologyError::Syntax(error.to_string()))?;
+        // Counted before the statement is looked at: a repeated statement is
+        // retained nowhere, but the parser has still made its copies.
+        term_bytes = term_bytes.saturating_add(triple_term_bytes(&triple));
+        enforce_term_budget(term_bytes, term_budget)?;
         // Turtle has no graph syntax, so every statement is in the default
         // graph; `OntologyError::NamedGraph` stays for a future quad format.
-        let quad = triple
-            .map_err(|error| OntologyError::Syntax(error.to_string()))?
-            .in_graph(GraphName::DefaultGraph);
+        let quad = triple.in_graph(GraphName::DefaultGraph);
         visit(&quad, &mut blank_labels)?;
     }
     Ok(parser
@@ -735,6 +781,47 @@ fn end_of_string(source: &[u8], mut at: usize, quote: u8) -> usize {
     at
 }
 
+/// The expanded term bytes a source of `source_bytes` bytes may ask for.
+///
+/// See [`TERM_BYTES_PER_SOURCE_BYTE`].
+fn term_byte_budget(source_bytes: usize) -> usize {
+    TERM_BYTES_FLOOR.max(source_bytes.saturating_mul(TERM_BYTES_PER_SOURCE_BYTE))
+}
+
+/// Refuse once `observed` expanded term bytes pass `budget`.
+fn enforce_term_budget(observed: usize, budget: usize) -> Result<(), OntologyError> {
+    if observed > budget {
+        return Err(OntologyError::ResourceLimit {
+            resource: "term_bytes",
+            limit: budget,
+            observed,
+        });
+    }
+    Ok(())
+}
+
+/// The text bytes of every term of `triple`, as the parser expanded them.
+fn triple_term_bytes(triple: &oxrdf::Triple) -> usize {
+    let subject = match &triple.subject {
+        NamedOrBlankNode::NamedNode(node) => node.as_str().len(),
+        NamedOrBlankNode::BlankNode(node) => node.as_str().len(),
+    };
+    let object = match &triple.object {
+        Term::NamedNode(node) => node.as_str().len(),
+        Term::BlankNode(node) => node.as_str().len(),
+        Term::Literal(literal) => literal
+            .value()
+            .len()
+            .saturating_add(literal.datatype().as_str().len())
+            .saturating_add(literal.language().map_or(0, str::len)),
+        // Nested no deeper than `MAX_NESTING_DEPTH`: each level is a `<<`.
+        Term::Triple(inner) => triple_term_bytes(inner),
+    };
+    subject
+        .saturating_add(triple.predicate.as_str().len())
+        .saturating_add(object)
+}
+
 /// Refuse the first distinct statement beyond `limits.max_statements`.
 fn enforce_statement_budget(observed: usize, limits: OntologyLimits) -> Result<(), OntologyError> {
     if observed > limits.max_statements {
@@ -783,25 +870,39 @@ impl StagedTerms {
     }
 
     /// The text form of every term, at the index of its number.
-    fn render(self, abbreviator: &Abbreviator<'_>) -> Vec<String> {
+    ///
+    /// Refuses once the rendered text passes `budget` bytes: a prefix name
+    /// can be far longer than the namespace it stands for.
+    fn render(
+        self,
+        abbreviator: &Abbreviator<'_>,
+        budget: usize,
+    ) -> Result<Vec<String>, OntologyError> {
         let mut rendered = vec![String::new(); self.count as usize];
+        let mut bytes = 0_usize;
+        let mut place = |number: u32, text: String| {
+            bytes = bytes.saturating_add(text.len());
+            rendered[number as usize] = text;
+            enforce_term_budget(bytes, budget)
+        };
         let [iris, verbatim, predicates] = self.by_kind;
         // The tables are walked in hash order, but every text lands in the
         // slot of its own number, so the result does not depend on that order.
         for (iri, number) in iris {
-            rendered[number as usize] = abbreviator.abbreviate(&iri);
+            place(number, abbreviator.abbreviate(&iri))?;
         }
         for (text, number) in verbatim {
-            rendered[number as usize] = text;
+            place(number, text)?;
         }
         for (iri, number) in predicates {
-            rendered[number as usize] = if iri == RDF_TYPE {
+            let text = if iri == RDF_TYPE {
                 "a".to_owned()
             } else {
                 abbreviator.abbreviate(&iri)
             };
+            place(number, text)?;
         }
-        rendered
+        Ok(rendered)
     }
 }
 
@@ -1319,6 +1420,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_term_budget_scales_with_the_source_above_its_floor() {
+        let floor_covers = TERM_BYTES_FLOOR / TERM_BYTES_PER_SOURCE_BYTE;
+        assert_eq!(term_byte_budget(0), TERM_BYTES_FLOOR);
+        assert_eq!(term_byte_budget(floor_covers), TERM_BYTES_FLOOR);
+        assert_eq!(
+            term_byte_budget(floor_covers + 1),
+            TERM_BYTES_FLOOR + TERM_BYTES_PER_SOURCE_BYTE
+        );
+        assert_eq!(term_byte_budget(usize::MAX), usize::MAX);
+        assert_eq!(enforce_term_budget(7, 7), Ok(()));
+        assert_eq!(
+            enforce_term_budget(8, 7),
+            Err(OntologyError::ResourceLimit {
+                resource: "term_bytes",
+                limit: 7,
+                observed: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn term_bytes_count_every_part_of_a_statement() {
+        let count = |text: &str| -> usize {
+            TurtleParser::new()
+                .for_slice(text.as_bytes())
+                .map(|triple| triple_term_bytes(&triple.expect("parses")))
+                .sum()
+        };
+        // 3 + 3 + 3 bytes of IRI.
+        assert_eq!(count("<a:s> <a:p> <a:o> ."), 9);
+        // Lexical form, language tag, and the `rdf:langString` datatype IRI.
+        assert_eq!(count("<a:s> <a:p> 'xy'@en ."), 6 + 2 + 2 + 53);
+        // Lexical form and datatype IRI.
+        assert_eq!(count("<a:s> <a:p> 'xy'^^<a:dt> ."), 6 + 2 + 4);
+        // A triple term's own three terms.
+        assert_eq!(count("<a:s> <a:p> <<( <a:x> <a:y> <a:z> )>> ."), 6 + 9);
     }
 
     #[test]
