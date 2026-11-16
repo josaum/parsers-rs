@@ -1,7 +1,7 @@
 //! Offline JSON-LD to RDF and HTML evidence projection.
 use crate::graph::{GraphBuilder, GraphError, Term};
+use oxjsonld::{JsonLdParser, JsonLdRemoteDocument};
 use oxrdf::{GraphName, NamedOrBlankNode};
-use oxrdfio::{JsonLdProfile, JsonLdProfileSet, LoadedDocument, RdfFormat, RdfParser};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -289,41 +289,36 @@ pub fn extract_semantics(
         let calls = AtomicUsize::new(0);
         let max_calls = options.max_context_loads;
         let max_context_bytes = options.max_context_bytes;
-        let parser = RdfParser::from_format(RdfFormat::JsonLd {
-            profile: JsonLdProfileSet::empty(),
-        })
-        .with_base_iri(document.base_url.as_deref().unwrap_or(source_url))
-        .map_err(|_| GraphError::Invalid("JSON-LD base"))?
-        .for_slice(&bytes)
-        .with_document_loader(move |url| {
-            if calls.fetch_add(1, Ordering::Relaxed) >= max_calls {
-                return Err("context load limit".into());
-            }
-            let content = if let Some(bytes) = contexts.get(url) {
-                bytes.clone()
-            } else if matches!(
-                url,
-                "http://schema.org"
-                    | "http://schema.org/"
-                    | "https://schema.org"
-                    | "https://schema.org/"
-                    | "https://schema.org/docs/jsonldcontext.jsonld"
-            ) {
-                include_bytes!("../contexts/schema.org.jsonld").to_vec()
-            } else {
-                return Err("unregistered offline context".into());
-            };
-            if content.len() > max_context_bytes {
-                return Err("context byte limit".into());
-            }
-            Ok(LoadedDocument {
-                url: url.into(),
-                content,
-                format: RdfFormat::JsonLd {
-                    profile: JsonLdProfile::Context.into(),
-                },
-            })
-        });
+        let parser = JsonLdParser::new()
+            .with_base_iri(document.base_url.as_deref().unwrap_or(source_url))
+            .map_err(|_| GraphError::Invalid("JSON-LD base"))?
+            .for_slice(&bytes)
+            .with_load_document_callback(move |url, _| {
+                if calls.fetch_add(1, Ordering::Relaxed) >= max_calls {
+                    return Err("context load limit".into());
+                }
+                let content = if let Some(bytes) = contexts.get(url) {
+                    bytes.clone()
+                } else if matches!(
+                    url,
+                    "http://schema.org"
+                        | "http://schema.org/"
+                        | "https://schema.org"
+                        | "https://schema.org/"
+                        | "https://schema.org/docs/jsonldcontext.jsonld"
+                ) {
+                    include_bytes!("../contexts/schema.org.jsonld").to_vec()
+                } else {
+                    return Err("unregistered offline context".into());
+                };
+                if content.len() > max_context_bytes {
+                    return Err("context byte limit".into());
+                }
+                Ok(JsonLdRemoteDocument {
+                    document_url: url.into(),
+                    document: content,
+                })
+            });
         let mut blanks = HashMap::new();
         let blank_scope = format!("d{scope}s{script_index}");
         let mut statements = Vec::new();

@@ -255,6 +255,9 @@ python3 vendor/parsers-rs/src/scripts/consumer_surface_check.py --dist dist --co
 attribution and terms. This applies to the context data; the Rust source remains
 MIT OR Apache-2.0. `deny.toml` scopes this data-license exception to the crawler.
 
+The TLS verifier uses Mozilla root certificate data from `webpki-root-certs`
+under CDLA-Permissive-2.0. Its agreement is included in
+[LICENSE-CDLA-Permissive-2.0](LICENSE-CDLA-Permissive-2.0).
 
 `web-fast-core` links four crates under the Mozilla Public License 2.0, through
 its HTML parser `scraper`: `cssparser`, `cssparser-macros`, `selectors` and

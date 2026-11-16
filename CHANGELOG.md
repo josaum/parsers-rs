@@ -25,6 +25,9 @@ and CLI built from source; it has no Python or Node binding artifact.
 
 ### Correctness and compatibility
 
+- Sitemap parsing uses quick-xml 0.42; JSON-LD uses oxjsonld directly, removing
+  unused RDF/XML dependencies affected by RUSTSEC-2026-0194 and -0195.
+
 - JSON protocol envelopes retain explicit nulls and reject malformed member
   shapes. JSON Schema pointers reject malformed escapes and array indices;
   unresolved references remain errors under the upstream fail-closed policy.

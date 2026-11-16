@@ -55,6 +55,9 @@ allow = [
   # zerovec, yoke, litemap, tinystr, writeable, potential_utf). Permissive,
   # notice required.
   "Unicode-3.0",
+  # Mozilla root certificate data used by rustls-platform-verifier.
+  # Permissive data licence; preserve its agreement with redistributed data.
+  "CDLA-Permissive-2.0",
 ]
 # How sure the licence-text matcher must be before it names a licence.
 confidence-threshold = 0.93

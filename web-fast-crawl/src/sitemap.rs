@@ -6,7 +6,8 @@ pub(crate) fn parse(
     max_urls: usize,
     max_url_bytes: usize,
 ) -> Result<(Kind, Vec<Url>), &'static str> {
-    let mut reader = Reader::from_reader(bytes);
+    let mut reader =
+        Reader::from_str(std::str::from_utf8(bytes).map_err(|_| "invalid_sitemap_encoding")?);
     let mut root = None;
     let mut depth: usize = 0;
     let mut urls = Vec::new();
@@ -22,12 +23,12 @@ pub(crate) fn parse(
                 }
                 if root.is_none() {
                     root = match tag.local_name().as_ref() {
-                        b"urlset" => Some(Kind::Page),
-                        b"sitemapindex" => Some(Kind::Sitemap),
+                        "urlset" => Some(Kind::Page),
+                        "sitemapindex" => Some(Kind::Sitemap),
                         _ => return Err("invalid_sitemap_root"),
                     };
                 }
-                if tag.local_name().as_ref() == b"loc" {
+                if tag.local_name().as_ref() == "loc" {
                     let value = reader
                         .read_text(tag.name())
                         .map_err(|_| "invalid_sitemap_location")?;
@@ -44,8 +45,8 @@ pub(crate) fn parse(
             }
             Event::Empty(tag) if root.is_none() => {
                 root = match tag.local_name().as_ref() {
-                    b"urlset" => Some(Kind::Page),
-                    b"sitemapindex" => Some(Kind::Sitemap),
+                    "urlset" => Some(Kind::Page),
+                    "sitemapindex" => Some(Kind::Sitemap),
                     _ => return Err("invalid_sitemap_root"),
                 };
             }
@@ -69,6 +70,21 @@ pub(crate) fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn utf8_locations_and_xml_entities_survive_parser_upgrade() {
+        let (_, urls) = parse(
+            "<urlset><url><loc>https://e.test/café?a=1&amp;b=2</loc></url></urlset>".as_bytes(),
+            10,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(urls[0].as_str(), "https://e.test/caf%C3%A9?a=1&b=2");
+        assert_eq!(
+            parse(b"<urlset>\xff</urlset>", 10, 1024),
+            Err("invalid_sitemap_encoding")
+        );
+    }
+
     #[test]
     fn malformed_sitemaps_are_rejected_without_external_entities() {
         for bytes in [
