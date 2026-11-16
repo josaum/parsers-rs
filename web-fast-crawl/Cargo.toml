@@ -34,4 +34,5 @@ name = "graph_paths"
 harness = false
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 flate2 = "1"

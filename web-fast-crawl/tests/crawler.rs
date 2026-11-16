@@ -136,7 +136,7 @@ async fn noindex_drops_content_and_header_nofollow_stops_discovery() {
     assert!(!serde_json::to_string(&report).unwrap().contains("Secret"));
 }
 #[tokio::test]
-async fn concurrency_and_pacing_bound_real_request_starts() {
+async fn per_origin_concurrency_bounds_real_in_flight_requests() {
     let server = Server::start(|path, _, _| {
         if path == "/robots.txt" {
             Response::status(404)
@@ -163,10 +163,8 @@ async fn concurrency_and_pacing_bound_real_request_starts() {
     assert_eq!(report.pages.len(), 4);
     assert_eq!(server.count("/robots.txt"), 1);
     assert_eq!(server.max_active.load(Ordering::SeqCst), 2);
-    let hits = server.hits.lock().unwrap();
-    for pair in hits.windows(2) {
-        assert!(pair[1].1.duration_since(pair[0].1).as_millis() >= 15);
-    }
+    // Receive times can bunch up when the server is descheduled. Pacing is
+    // checked at the client gate with a paused clock in http::tests.
 }
 #[tokio::test]
 async fn retries_obey_retry_after_and_attempt_budget() {

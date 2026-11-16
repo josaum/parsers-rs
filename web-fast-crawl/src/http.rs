@@ -160,6 +160,13 @@ struct OriginState {
     next_start: AsyncMutex<Instant>,
     robots: OnceCell<Arc<RobotsPolicy>>,
 }
+impl OriginState {
+    async fn wait_start(&self, interval: Duration) {
+        let mut next = self.next_start.lock().await;
+        tokio::time::sleep_until(*next).await;
+        *next = Instant::now() + interval;
+    }
+}
 #[derive(Debug)]
 pub(crate) struct RobotsPolicy {
     body: String,
@@ -423,11 +430,9 @@ impl Network {
                 .acquire_owned()
                 .await
                 .map_err(|_| FetchError::Transport)?;
-            {
-                let mut next = state.next_start.lock().await;
-                tokio::time::sleep_until(*next).await;
-                *next = Instant::now() + Duration::from_millis(self.options.min_origin_interval_ms);
-            }
+            state
+                .wait_start(Duration::from_millis(self.options.min_origin_interval_ms))
+                .await;
             self.requests
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value
@@ -632,6 +637,33 @@ fn retry_after(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn origin_pacing_spaces_concurrent_starts_without_catch_up_bursts() {
+        let begin = Instant::now();
+        let interval = Duration::from_millis(20);
+        let state = OriginState {
+            permits: Arc::new(Semaphore::new(3)),
+            next_start: AsyncMutex::new(begin + Duration::from_millis(100)),
+            robots: OnceCell::new(),
+        };
+        let start = || async {
+            state.wait_start(interval).await;
+            Instant::now()
+        };
+        let (a, b, c) = tokio::join!(start(), start(), start());
+        let mut starts = [a, b, c];
+        starts.sort();
+        assert!(starts[0].duration_since(begin) >= Duration::from_millis(100));
+        for pair in starts.windows(2) {
+            assert!(pair[1].duration_since(pair[0]) >= interval);
+        }
+        // A stalled runtime must not accumulate credits for a burst.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let first = start().await;
+        let second = start().await;
+        assert!(second.duration_since(first) >= interval);
+    }
+
     #[test]
     fn network_ranges_and_url_identity() {
         for ip in [
