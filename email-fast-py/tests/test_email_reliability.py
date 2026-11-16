@@ -60,7 +60,7 @@ def test_mbox_encoding_and_failures(tmp_path):
         prefix + b"Content-Type: text/plain; charset=iso-8859-1\n\ncaf\xe9\n"
     )
     assert email_fast.parse_mbox_ndjson(str(source), str(output)) == 1
-    assert json.loads(output.read_text())["body"]["text"].strip() == "café"
+    assert json.loads(output.read_text(encoding="utf-8"))["body"]["text"].strip() == "café"
     source.write_bytes(prefix + ATTACHMENT)
     with pytest.raises(RuntimeError, match="offset"):
         email_fast.parse_mbox_ndjson(
