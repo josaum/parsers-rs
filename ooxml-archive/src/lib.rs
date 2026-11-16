@@ -10,7 +10,9 @@ use flate2::read::DeflateDecoder;
 use memmap2::Mmap;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use rawzip::{CompressionMethod, ZipArchive, ZipArchiveEntryWayfinder, ZipSliceArchive};
+use rawzip::{
+    CompressionMethod, ZipArchive, ZipArchiveEntryWayfinder, ZipSliceArchive, ZipVerification,
+};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read};
@@ -140,6 +142,14 @@ impl OoxmlArchive {
         self.entries.contains_key(name)
     }
 
+    /// Borrow the original ZIP bytes, including compressed parts.
+    ///
+    /// This does not inflate or validate parts; use [`Self::read_part`] before
+    /// handing a package to a format-specific secondary reader.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.archive.as_bytes()
+    }
+
     /// Central-directory part names, in hash order.
     pub fn part_names(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
@@ -147,20 +157,34 @@ impl OoxmlArchive {
 
     /// Read a part, borrowing stored bytes and owning inflated bytes.
     ///
-    /// Fails when the uncompressed size exceeds `max_inflate`.
+    /// Validates the ZIP uncompressed size and CRC32 before returning bytes.
+    /// Fails when the aggregate uncompressed size exceeds `max_inflate`.
     pub fn read_part(&self, name: &str, max_inflate: usize) -> Result<PartBytes<'_>> {
-        let (meta, data) = self.part_data(name)?;
-        self.with_inflate_budget(name, max_inflate, |remaining| match meta.compression {
-            CompressionMethod::Store => {
-                ensure_within_max(name, data.len(), remaining)?;
-                Ok((PartBytes::Borrowed(data), data.len()))
+        let (meta, data, expected) = self.part_data(name)?;
+        self.with_inflate_budget(name, max_inflate, |remaining| {
+            if expected.size() > remaining as u64 {
+                return Err(oversize_error(name, max_inflate));
             }
-            CompressionMethod::Deflate => {
-                let inflated = inflate_capped(name, data, remaining)?;
-                let inflated_len = inflated.len();
-                Ok((PartBytes::Owned(inflated), inflated_len))
+            let part = match meta.compression {
+                CompressionMethod::Store => {
+                    ensure_within_max(name, data.len(), remaining)?;
+                    PartBytes::Borrowed(data)
+                }
+                CompressionMethod::Deflate => {
+                    PartBytes::Owned(inflate_capped(name, data, remaining)?)
+                }
+                _ => return Err(anyhow!("unsupported compression for part: {name}")),
+            };
+            // A zero CRC is a legitimate checksum, not a sentinel for skipping
+            // verification. rawzip's generic verifier allows that sentinel.
+            if part.len() as u64 != expected.size() {
+                return Err(anyhow!("uncompressed size mismatch for part: {name}"));
             }
-            _ => Err(anyhow!("unsupported compression for part: {name}")),
+            if rawzip::crc32(part.as_slice()) != expected.crc() {
+                return Err(anyhow!("CRC32 mismatch for part: {name}"));
+            }
+            let len = part.len();
+            Ok((part, len))
         })
     }
 
@@ -175,18 +199,9 @@ impl OoxmlArchive {
         max_inflate: usize,
         _stream_oversize: bool,
     ) -> Result<PartReader<'_>> {
-        let (meta, data) = self.part_data(name)?;
-        self.with_inflate_budget(name, max_inflate, |remaining| match meta.compression {
-            CompressionMethod::Store => {
-                ensure_within_max(name, data.len(), remaining)?;
-                Ok((PartReader::Stored(Cursor::new(data)), data.len()))
-            }
-            CompressionMethod::Deflate => {
-                let inflated = inflate_capped(name, data, remaining)?;
-                let inflated_len = inflated.len();
-                Ok((PartReader::Owned(Cursor::new(inflated)), inflated_len))
-            }
-            _ => Err(anyhow!("unsupported compression for part: {name}")),
+        self.read_part(name, max_inflate).map(|part| match part {
+            PartBytes::Borrowed(data) => PartReader::Stored(Cursor::new(data)),
+            PartBytes::Owned(data) => PartReader::Owned(Cursor::new(data)),
         })
     }
 
@@ -208,7 +223,7 @@ impl OoxmlArchive {
         ))
     }
 
-    fn part_data(&self, name: &str) -> Result<(EntryMeta, &[u8])> {
+    fn part_data(&self, name: &str) -> Result<(EntryMeta, &[u8], ZipVerification)> {
         let meta = *self
             .entries
             .get(name)
@@ -217,7 +232,7 @@ impl OoxmlArchive {
             .archive
             .get_entry(meta.wayfinder)
             .with_context(|| format!("open part: {name}"))?;
-        Ok((meta, entry.data()))
+        Ok((meta, entry.data(), entry.claim_verifier()))
     }
 
     fn with_inflate_budget<T>(
@@ -532,7 +547,14 @@ fn build_index(archive: &ZipSliceArchive<ArchiveStorage>) -> Result<HashMap<Stri
             wayfinder: entry.wayfinder(),
             compression: entry.compression_method(),
         };
-        map.insert(path, meta);
+        match map.entry(path) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(meta);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                return Err(anyhow!("duplicate ZIP part name: {}", entry.key()));
+            }
+        }
     }
     Ok(map)
 }

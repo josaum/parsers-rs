@@ -4,7 +4,7 @@
 //! and the standard GeoJSON wire format.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map as JsonMap, Value};
+use serde_json::{json, Value};
 
 use crate::error::GeoError;
 use crate::types::{Coordinate, GeoFeature, Geometry};
@@ -77,16 +77,20 @@ pub fn parse_geojson_str(s: &str) -> Result<Vec<GeoFeature>, GeoError> {
 
 fn feature_to_geojson_value(feature: &GeoFeature) -> Result<Value, GeoError> {
     let geometry = geometry_to_value(&feature.geometry)?;
-    let id: Value = match &feature.id {
-        Some(s) => Value::String(s.clone()),
-        None => Value::Null,
-    };
-    Ok(json!({
+    if !(feature.properties.is_object() || feature.properties.is_null()) {
+        return Err(GeoError::InvalidFormat(
+            "Feature properties must be an object or null".into(),
+        ));
+    }
+    let mut value = json!({
         "type": "Feature",
-        "id": id,
         "geometry": geometry,
         "properties": feature.properties
-    }))
+    });
+    if let Some(id) = &feature.id {
+        value["id"] = Value::String(id.clone());
+    }
+    Ok(value)
 }
 
 fn geometry_to_value(geom: &Geometry) -> Result<Value, GeoError> {
@@ -161,18 +165,28 @@ fn geometry_to_value(geom: &Geometry) -> Result<Value, GeoError> {
 }
 
 fn parse_feature(v: &Value) -> Result<GeoFeature, GeoError> {
-    let id = v.get("id").and_then(|i| {
-        if i.is_null() {
-            None
-        } else {
-            Some(i.to_string().trim_matches('"').to_string())
+    if v.get("type").and_then(Value::as_str) != Some("Feature") {
+        return Err(GeoError::InvalidFormat(
+            "FeatureCollection members must be Features".into(),
+        ));
+    }
+    let id = match v.get("id") {
+        None => None,
+        Some(Value::String(id)) => Some(id.clone()),
+        Some(Value::Number(id)) => Some(id.to_string()),
+        _ => {
+            return Err(GeoError::InvalidFormat(
+                "Feature id must be a string or number".into(),
+            ))
         }
-    });
-
+    };
     let props = v
         .get("properties")
-        .cloned()
-        .unwrap_or(Value::Object(JsonMap::new()));
+        .filter(|value| value.is_object() || value.is_null())
+        .ok_or_else(|| {
+            GeoError::InvalidFormat("Feature requires object or null properties".into())
+        })?
+        .clone();
 
     let geom_val = v
         .get("geometry")
@@ -215,7 +229,7 @@ fn parse_geometry(v: &Value) -> Result<Geometry, GeoError> {
             Ok(Geometry::MultiPoint(pts))
         }
         "LineString" => {
-            let ring = parse_ring(coords)?;
+            let ring = parse_line(coords)?;
             Ok(Geometry::Polyline(vec![ring]))
         }
         "MultiLineString" => {
@@ -225,7 +239,7 @@ fn parse_geometry(v: &Value) -> Result<Geometry, GeoError> {
                     GeoError::InvalidFormat("MultiLineString coordinates must be array".into())
                 })?
                 .iter()
-                .map(parse_ring)
+                .map(parse_line)
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Geometry::Polyline(parts))
         }
@@ -273,6 +287,14 @@ fn parse_coord_pair(v: &Value) -> Result<Coordinate, GeoError> {
             "Coordinate array must have at least 2 elements".into(),
         ));
     }
+    if arr
+        .iter()
+        .any(|value| !value.as_f64().is_some_and(f64::is_finite))
+    {
+        return Err(GeoError::InvalidFormat(
+            "Every coordinate component must be a finite number".into(),
+        ));
+    }
     let lon = arr[0]
         .as_f64()
         .ok_or_else(|| GeoError::InvalidFormat("Longitude must be number".into()))?;
@@ -287,12 +309,45 @@ fn parse_coord_pair(v: &Value) -> Result<Coordinate, GeoError> {
     Ok(Coordinate::new(lon, lat))
 }
 
-fn parse_ring(v: &Value) -> Result<Vec<Coordinate>, GeoError> {
+fn parse_positions(v: &Value) -> Result<Vec<Coordinate>, GeoError> {
     v.as_array()
-        .ok_or_else(|| GeoError::InvalidFormat("Ring must be array".into()))?
+        .ok_or_else(|| GeoError::InvalidFormat("Coordinates must be an array".into()))?
         .iter()
         .map(parse_coord_pair)
         .collect()
+}
+
+fn parse_line(v: &Value) -> Result<Vec<Coordinate>, GeoError> {
+    let line = parse_positions(v)?;
+    if line.len() < 2 {
+        return Err(GeoError::InvalidFormat(
+            "LineString requires at least two positions".into(),
+        ));
+    }
+    Ok(line)
+}
+
+fn parse_ring(v: &Value) -> Result<Vec<Coordinate>, GeoError> {
+    let ring = parse_positions(v)?;
+    let positions = v.as_array().expect("parse_positions checked the array");
+    // Compare every ordinate (including altitude) before the 2D projection.
+    let closed = positions
+        .first()
+        .and_then(Value::as_array)
+        .zip(positions.last().and_then(Value::as_array))
+        .is_some_and(|(first, last)| {
+            first.len() == last.len()
+                && first
+                    .iter()
+                    .zip(last)
+                    .all(|(a, b)| a.as_f64() == b.as_f64())
+        });
+    if ring.len() < 4 || !closed {
+        return Err(GeoError::InvalidFormat(
+            "Polygon rings require at least four positions and identical endpoints".into(),
+        ));
+    }
+    Ok(ring)
 }
 
 #[cfg(test)]

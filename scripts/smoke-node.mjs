@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Load-and-parse smoke for the Node bindings. Each fixture is generated here,
-// as a STORE-only OOXML zip or a plain EML, so the check needs no committed
-// binary and survives a fresh checkout. Exits non-zero on the first failure.
+// as a STORE-only OOXML zip or plain text, with licensed XLS/XLSB fixtures
+// under xlsx-fast-core/tests/fixtures. Exits non-zero on the first failure.
 //
 // Usage: node scripts/smoke-node.mjs [docx|xlsx|pptx|email ...]
 import { createRequire } from 'node:module';
+import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -108,6 +109,19 @@ const checks = {
     return `${doc.blocks.length} blocks, ${readdirSync(ipcDir).length} arrow tables`;
   },
   xlsx(m, file, dir) {
+    for (const name of ['date.xls', 'date.xlsb', 'date_1904.xls', 'date_1904.xlsb']) {
+      const source = path.join(root, 'xlsx-fast-core/tests/fixtures', name);
+      const workbook = m.parseExcel(source);
+      assert.deepEqual(workbook, m.parseXlsx(source));
+      assert.equal(workbook.sheets[0].cells[0].value.iso, '2021-01-01T00:00:00');
+      const out = path.join(dir, `${name}.ndjson`);
+      m.parseExcelNdjson(source, out);
+      assert.equal(readFileSync(out, 'utf8').trim().split('\n').length, 7);
+      const ipc = path.join(dir, `${name}.arrow`);
+      m.parseExcelArrowIpc(source, ipc, { batchSize: 2 });
+      assert.ok(statSync(ipc).size > 0);
+      assert.throws(() => m.parseExcel(source, { maxInflate: 16 }), /max_inflate/);
+    }
     const wb = m.parseXlsx(file);
     const cells = wb.sheets[0].cells;
     if (!JSON.stringify(cells).includes('Hello XLSX')) throw new Error('shared string missing');
@@ -134,7 +148,23 @@ const checks = {
     m.parseEmailNdjson(file, path.join(dir, 'out.ndjson'), { includeRawHeaders: true, maxAttachmentSize: 1024 });
     if (!m.parseEmail(file, { include_raw_headers: true }).headers) throw new Error('raw headers option not forwarded');
     if (m.extractAttachments(file, path.join(dir, 'att'), 1024).length !== 0) throw new Error('unexpected attachments');
-    return `subject=${e.subject}`;
+    for (const option of ['maxInflate', 'maxHeaderBytes', 'maxMimeParts', 'maxMimeDepth']) {
+      assert.throws(() => m.parseEmail(file, { [option]: 0 }));
+    }
+    const attachment = path.join(dir, 'attachment.eml');
+    writeFileSync(attachment, 'Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename="../payload.bin"\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n');
+    assert.throws(() => m.parseEmail(attachment, { maxTotalAttachmentBytes: 1 }), /budget/);
+    assert.throws(() => m.extractAttachments(attachment, path.join(dir, 'limited'), { maxTotalAttachmentBytes: 1 }), /budget/);
+    const extracted = m.extractAttachments(attachment, path.join(dir, 'safe'));
+    assert.equal(extracted.length, 1);
+    assert.equal(path.dirname(extracted[0]), path.join(dir, 'safe'));
+    assert.equal(readFileSync(extracted[0], 'utf8'), 'hello');
+    const duplicate = m.extractAttachments(attachment, path.join(dir, 'safe'));
+    assert.notEqual(extracted[0], duplicate[0]);
+    const mailbox = path.join(dir, 'mail.mbox');
+    writeFileSync(mailbox, Buffer.concat([Buffer.from('From a@example.com Mon Jan 1 00:00:00 2024\n'), readFileSync(attachment)]));
+    assert.throws(() => m.parseMboxNdjson(mailbox, path.join(dir, 'failed.ndjson'), { maxTotalAttachmentBytes: 1 }), /offset/);
+    return `subject=${e.subject}; resource limits and safe extraction verified`;
   },
   json(m, file, dir) {
     const text = readFileSync(file, 'utf8');
@@ -145,6 +175,16 @@ const checks = {
     if (rows.length !== 2) throw new Error('jsonl parse count mismatch');
     const count = m.countLines(text);
     if (count !== 2) throw new Error(`count lines mismatch: ${count}`);
+    assert.deepEqual(m.jsonApiDocument('{"data":null}'), { data: null });
+    assert.deepEqual(m.jsonRpcResponse('{"jsonrpc":"2.0","result":null,"id":null}'),
+      { jsonrpc: '2.0', result: null, id: null });
+    assert.deepEqual(m.jsonRpcRequest('{"jsonrpc":"2.0","method":"m","id":null}'),
+      { jsonrpc: '2.0', method: 'm', id: null });
+    assert.equal(Object.hasOwn(m.jsonRpcRequest('{"jsonrpc":"2.0","method":"m"}'), 'id'), false);
+    assert.throws(() => m.jsonApiDocument('{"data":null,"errors":[]}'));
+    assert.throws(() => m.jsonRpcResponse('{"jsonrpc":"2.0","result":1}'));
+    assert.throws(() => m.jsonRpcRequest('{"jsonrpc":"2.0","method":"m","params":null}'));
+    assert.throws(() => m.parseJsonl('\u00a01\n'));
     return `version=${m.version()}, lines=${count}`;
   },
 };

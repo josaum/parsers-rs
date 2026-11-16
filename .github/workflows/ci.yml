@@ -31,6 +31,21 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --locked --features ${{ env.ARROW_FEATURES }}
 
+  browser-crawler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: web-fast-crawl/browser/package-lock.json
+      - run: npm ci --ignore-scripts --prefix web-fast-crawl/browser
+      - run: npm exec --prefix web-fast-crawl/browser -- playwright install --with-deps chromium
+      - run: cargo test -p web-fast-crawl --test browser_e2e --locked -- --ignored
+
   release-tooling:
     # The manifest and SBOM scripts are part of the release contract; they are
     # tested like code because a release that lies about its bytes is worse

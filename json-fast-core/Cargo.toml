@@ -12,6 +12,10 @@ rust-version.workspace = true
 [lib]
 name = "json_fast_core"
 
+[[bench]]
+name = "parse_paths"
+harness = false
+
 [features]
 default = []
 # Columnar output: parse JSONL into Apache Arrow RecordBatches / IPC streams.

@@ -9,8 +9,13 @@
 //! source digest and stable document-order evidence suitable for downstream
 //! provenance and Arrow pipelines.
 
-use encoding_rs::{Encoding, UTF_8};
-use scraper::{node::Node, ElementRef, Html, Selector};
+use scraper::{ElementRef, Html};
+use std::collections::HashMap;
+use std::io::Read;
+
+mod decoding;
+mod dom;
+use dom::{DomIndex, TextMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -36,6 +41,9 @@ pub enum WebParseError {
     /// The extracted document exceeded the configured node limit.
     #[error("HTML document exceeds the configured node limit")]
     NodeLimitExceeded,
+    /// The parsed DOM exceeded the configured nesting limit.
+    #[error("HTML document exceeds the configured depth limit")]
+    DepthLimitExceeded,
     /// Extracted text exceeded the configured byte limit.
     #[error("HTML text exceeds the configured byte limit")]
     TextLimitExceeded,
@@ -53,11 +61,16 @@ pub enum WebParseError {
 pub struct ParseOptions {
     /// Maximum accepted source size in bytes.
     pub max_input_bytes: usize,
-    /// Maximum number of emitted blocks, links, images, tables, and JSON-LD values.
+    /// Maximum emitted blocks, links, images, tables, rows, cells, and JSON-LD values.
     pub max_nodes: usize,
-    /// Maximum UTF-8 byte size of all emitted text combined.
+    /// Maximum parsed DOM nodes, including text, comments, and hidden content.
+    pub max_dom_nodes: usize,
+    /// Maximum element nesting depth, including implicit HTML/body elements.
+    pub max_dom_depth: usize,
+    /// Maximum UTF-8 bytes retained in dynamic output strings and JSON-LD source.
     pub max_text_bytes: usize,
-    /// Optional WHATWG encoding label. UTF-8 is required when absent.
+    /// Optional strict WHATWG encoding override; conflicting BOMs are rejected.
+    /// Otherwise use BOM, an early meta declaration, then strict UTF-8.
     pub encoding_label: Option<String>,
 }
 
@@ -66,6 +79,8 @@ impl Default for ParseOptions {
         Self {
             max_input_bytes: 32 * 1024 * 1024,
             max_nodes: 250_000,
+            max_dom_nodes: 1_000_000,
+            max_dom_depth: 256,
             max_text_bytes: 32 * 1024 * 1024,
             encoding_label: None,
         }
@@ -162,6 +177,30 @@ pub struct WebTable {
     pub rows: Vec<Vec<String>>,
 }
 
+/// One named HTML metadata declaration, retaining repeated values in DOM order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebMeta {
+    /// Attribute identifying the declaration: `name`, `property`, or `http-equiv`.
+    pub kind: String,
+    /// Original metadata name or property.
+    pub name: String,
+    /// Original content value.
+    pub content: String,
+}
+
+/// Strict JSON embedded in a data script or a recognized state assignment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebJson {
+    /// `application_json`, `next_data`, `nuxt_data`, or `initial_state`.
+    pub kind: String,
+    /// Script element ID when present.
+    pub id: Option<String>,
+    /// Source script path.
+    pub dom_path: String,
+    /// Parsed JSON. JavaScript expressions are never evaluated by the parser.
+    pub value: serde_json::Value,
+}
+
 /// Parsed static HTML with content-derived identity and deterministic ordering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebDocument {
@@ -177,7 +216,7 @@ pub struct WebDocument {
     pub canonical_url: Option<String>,
     /// Metadata description.
     pub description: Option<String>,
-    /// Normalized document text assembled from blocks.
+    /// Visible body text in document order, without duplicating nested blocks.
     pub text: String,
     /// Document-order semantic blocks.
     pub blocks: Vec<WebBlock>,
@@ -189,6 +228,15 @@ pub struct WebDocument {
     pub tables: Vec<WebTable>,
     /// Valid embedded `application/ld+json` values.
     pub json_ld: Vec<serde_json::Value>,
+    /// Embedded application JSON and hydration state.
+    #[serde(default)]
+    pub json_data: Vec<WebJson>,
+    /// Head-declared next-page and alternate JSON links.
+    #[serde(default)]
+    pub discovery_links: Vec<WebLink>,
+    /// Named metadata, including Open Graph, Twitter, and robots directives.
+    #[serde(default)]
+    pub metadata: Vec<WebMeta>,
     /// Deterministic, payload-free parse diagnostics.
     pub diagnostics: Vec<String>,
 }
@@ -203,7 +251,10 @@ pub fn parse_html_file(
     if metadata.len() > options.max_input_bytes as u64 {
         return Err(WebParseError::InputTooLarge);
     }
-    let bytes = fs::read(path)?;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take((options.max_input_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
     parse_html_bytes(&bytes, base_url, options)
 }
 
@@ -216,7 +267,8 @@ pub fn parse_html_bytes(
     if bytes.len() > options.max_input_bytes {
         return Err(WebParseError::InputTooLarge);
     }
-    let (encoding, bom_bytes) = resolve_encoding(bytes, options.encoding_label.as_deref())?;
+    let (encoding, bom_bytes) =
+        decoding::resolve_encoding(bytes, options.encoding_label.as_deref())?;
     let (decoded, had_errors) = encoding.decode_without_bom_handling(&bytes[bom_bytes..]);
     if had_errors {
         return Err(WebParseError::InvalidEncoding);
@@ -236,88 +288,6 @@ pub fn parse_html(
     parse_html_inner(html, html.as_bytes(), base_url, &options)
 }
 
-fn resolve_encoding(
-    bytes: &[u8],
-    explicit_label: Option<&str>,
-) -> Result<(&'static Encoding, usize), WebParseError> {
-    if let Some(label) = explicit_label {
-        let encoding =
-            Encoding::for_label(label.trim().as_bytes()).ok_or(WebParseError::InvalidEncoding)?;
-        return Ok((encoding, matching_bom_len(bytes, encoding)));
-    }
-    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-        return Ok((UTF_8, 3));
-    }
-    if bytes.starts_with(&[0xff, 0xfe]) {
-        return Ok((encoding_rs::UTF_16LE, 2));
-    }
-    if bytes.starts_with(&[0xfe, 0xff]) {
-        return Ok((encoding_rs::UTF_16BE, 2));
-    }
-    if let Some(label) = meta_charset_label(bytes) {
-        if let Some(encoding) = Encoding::for_label(label.as_bytes()) {
-            return Ok((encoding, 0));
-        }
-    }
-    Ok((UTF_8, 0))
-}
-
-fn matching_bom_len(bytes: &[u8], encoding: &'static Encoding) -> usize {
-    if encoding == UTF_8 && bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-        3
-    } else if (encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE)
-        && (bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]))
-    {
-        2
-    } else {
-        0
-    }
-}
-
-fn meta_charset_label(bytes: &[u8]) -> Option<String> {
-    let prefix = &bytes[..bytes.len().min(1024)];
-    let lower = prefix
-        .iter()
-        .map(u8::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    let needle = b"charset";
-    let charset_start = lower
-        .windows(needle.len())
-        .position(|window| window == needle)?;
-    let meta_start = lower[..charset_start]
-        .windows(5)
-        .rposition(|window| window == b"<meta")?;
-    if lower[meta_start..charset_start].contains(&b'>') {
-        return None;
-    }
-    let mut cursor = charset_start + needle.len();
-    while lower
-        .get(cursor)
-        .is_some_and(|byte| byte.is_ascii_whitespace())
-    {
-        cursor += 1;
-    }
-    if lower.get(cursor) == Some(&b'=') {
-        cursor += 1;
-    }
-    while lower
-        .get(cursor)
-        .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'\'' | b'\"'))
-    {
-        cursor += 1;
-    }
-    let end = (cursor..lower.len())
-        .find(|index| {
-            !lower[*index].is_ascii_alphanumeric() && !matches!(lower[*index], b'-' | b'_' | b'.')
-        })
-        .unwrap_or(lower.len());
-    (end > cursor).then(|| String::from_utf8_lossy(&lower[cursor..end]).into_owned())
-}
-
-fn selector(value: &str) -> Result<Selector, WebParseError> {
-    Selector::parse(value).map_err(|_| WebParseError::InvalidSelector)
-}
-
 fn parse_html_inner(
     html: &str,
     source_bytes: &[u8],
@@ -325,168 +295,298 @@ fn parse_html_inner(
     options: &ParseOptions,
 ) -> Result<WebDocument, WebParseError> {
     let document = Html::parse_document(html);
+    let index = DomIndex::new(&document, options)?;
     let mut budget = Budget::new(options.max_nodes, options.max_text_bytes);
-
+    if supplied_base_url.is_some_and(|value| value.len() > options.max_text_bytes) {
+        return Err(WebParseError::TextLimitExceeded);
+    }
     let supplied_base = supplied_base_url.and_then(|value| Url::parse(value).ok());
-    let base_selector = selector("base[href]")?;
-    let declared_base = document
-        .select(&base_selector)
-        .next()
+    let declared_base = index
+        .elements
+        .iter()
+        .find(|element| {
+            !index.info[&element.id()].inert
+                && element.value().name() == "base"
+                && element.value().attr("href").is_some()
+        })
         .and_then(|element| element.value().attr("href"));
     let effective_base = resolve_url(supplied_base.as_ref(), declared_base)
         .and_then(|value| Url::parse(&value).ok())
+        .filter(|url| !matches!(url.scheme(), "data" | "javascript"))
         .or(supplied_base);
+    let base_url = effective_base.as_ref().map(ToString::to_string);
+    budget.optional_text(base_url.as_deref())?;
 
-    let title = first_text(&document, "title", &mut budget)?;
-    let language = first_attr(&document, "html[lang]", "lang");
-    let description = first_attr(&document, "meta[name='description'][content]", "content");
-    let canonical_url = first_attr(&document, "link[rel~='canonical'][href]", "href")
-        .and_then(|value| resolve_url(effective_base.as_ref(), Some(&value)));
-
-    let block_selector = selector("h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,figcaption,dt,dd,th,td")?;
+    let mut metadata = Vec::new();
+    let mut title = None;
+    let mut language = None;
+    let mut description = None;
+    let mut canonical_url = None;
     let mut blocks = Vec::new();
-    for element in document.select(&block_selector) {
-        if element_is_hidden(element) {
-            continue;
-        }
-        let tag = element.value().name();
-        let Some(kind) = block_kind(tag) else {
-            continue;
-        };
-        let text = normalized_text(element);
-        if text.is_empty() {
-            continue;
-        }
-        budget.add_node()?;
-        budget.add_text(&text)?;
-        blocks.push(WebBlock {
-            ordinal: ordinal(blocks.len())?,
-            kind,
-            dom_path: structural_path(element),
-            text,
-            heading_level: tag
-                .strip_prefix('h')
-                .and_then(|value| value.parse::<u8>().ok())
-                .filter(|level| (1..=6).contains(level)),
-        });
-    }
-
     let mut links = Vec::new();
-    let link_selector = selector("a[href],area[href]")?;
-    for element in document.select(&link_selector) {
-        let Some(href) = element.value().attr("href").map(str::trim) else {
-            continue;
-        };
-        if href.is_empty() {
-            continue;
-        }
-        budget.add_node()?;
-        let text = normalized_text(element);
-        budget.add_text(&text)?;
-        links.push(WebLink {
-            ordinal: ordinal(links.len())?,
-            dom_path: structural_path(element),
-            text,
-            href: href.to_owned(),
-            resolved_url: resolve_url(effective_base.as_ref(), Some(href)),
-            rel: element.value().attr("rel").map(str::to_owned),
-        });
-    }
-
     let mut images = Vec::new();
-    let image_selector = selector("img[src]")?;
-    for element in document.select(&image_selector) {
-        let Some(src) = element.value().attr("src").map(str::trim) else {
-            continue;
-        };
-        if src.is_empty() {
-            continue;
-        }
-        budget.add_node()?;
-        images.push(WebImage {
-            ordinal: ordinal(images.len())?,
-            dom_path: structural_path(element),
-            src: src.to_owned(),
-            resolved_url: resolve_url(effective_base.as_ref(), Some(src)),
-            alt: element.value().attr("alt").map(str::to_owned),
-            width: element.value().attr("width").map(str::to_owned),
-            height: element.value().attr("height").map(str::to_owned),
-        });
-    }
-
-    let row_selector = selector("tr")?;
-    let cell_selector = selector("th,td")?;
-    let caption_selector = selector("caption")?;
-    let table_selector = selector("table")?;
-    let mut tables = Vec::new();
-    for table in document.select(&table_selector) {
-        budget.add_node()?;
-        let caption = table
-            .select(&caption_selector)
-            .next()
-            .map(normalized_text)
-            .filter(|value| !value.is_empty());
-        if let Some(value) = &caption {
-            budget.add_text(value)?;
-        }
-        let mut rows = Vec::new();
-        for row in table.select(&row_selector) {
-            let cells = row
-                .select(&cell_selector)
-                .map(normalized_text)
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>();
-            for cell in &cells {
-                budget.add_text(cell)?;
-            }
-            if !cells.is_empty() {
-                rows.push(cells);
-            }
-        }
-        tables.push(WebTable {
-            ordinal: ordinal(tables.len())?,
-            dom_path: structural_path(table),
-            caption,
-            rows,
-        });
-    }
-
-    let json_ld_selector = selector("script[type='application/ld+json']")?;
+    let mut tables: Vec<WebTable> = Vec::new();
+    let mut table_indices = HashMap::new();
+    let mut row_indices = HashMap::new();
     let mut json_ld = Vec::new();
+    let mut json_data = Vec::new();
+    let mut discovery_links = Vec::new();
+    let mut invalid_json_data = 0usize;
     let mut invalid_json_ld = 0usize;
-    for element in document.select(&json_ld_selector) {
-        let raw = element.text().collect::<String>();
-        if raw.trim().is_empty() {
+    let mut body = None;
+    for &element in &index.elements {
+        let tag = element.value().name();
+        let info = &index.info[&element.id()];
+        if info.inert {
             continue;
         }
-        budget.add_node()?;
-        budget.add_text(&raw)?;
-        match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(value) => json_ld.push(value),
-            Err(_) => invalid_json_ld += 1,
+        if tag == "meta" {
+            if let Some(content) = element.value().attr("content") {
+                for kind in ["name", "property", "http-equiv"] {
+                    if let Some(name) = element.value().attr(kind) {
+                        budget.add_node()?;
+                        budget.add_text(kind)?;
+                        budget.add_text(name)?;
+                        budget.add_text(content)?;
+                        metadata.push(WebMeta {
+                            kind: kind.into(),
+                            name: name.into(),
+                            content: content.into(),
+                        });
+                    }
+                }
+            }
+        }
+        match tag {
+            "title" if title.is_none() && !info.hidden => {
+                let value = index.text(element, TextMode::Normalized, false, &mut budget)?;
+                if !value.is_empty() {
+                    title = Some(value);
+                }
+            }
+            "html" if language.is_none() => {
+                language = owned_attr(element, "lang", &mut budget)?;
+            }
+            "meta" if description.is_none() && attr_eq(element, "name", "description") => {
+                description = owned_attr(element, "content", &mut budget)?;
+            }
+            "link"
+                if canonical_url.is_none()
+                    && element.value().attr("rel").is_some_and(|value| {
+                        value
+                            .split_ascii_whitespace()
+                            .any(|part| part.eq_ignore_ascii_case("canonical"))
+                    }) =>
+            {
+                canonical_url = resolve_url(effective_base.as_ref(), element.value().attr("href"));
+                budget.optional_text(canonical_url.as_deref())?;
+            }
+            "script"
+                if element
+                    .value()
+                    .attr("type")
+                    .and_then(|value| value.split(';').next())
+                    .is_some_and(|value| {
+                        value
+                            .trim_matches(decoding::ascii_space)
+                            .eq_ignore_ascii_case("application/ld+json")
+                    })
+                    && !element
+                        .ancestors()
+                        .filter_map(ElementRef::wrap)
+                        .any(|ancestor| index.info[&ancestor.id()].hidden) =>
+            {
+                let mut raw = String::new();
+                for part in element.text() {
+                    budget.add_text(part)?;
+                    raw.push_str(part);
+                }
+                if !raw.trim().is_empty() {
+                    budget.add_node()?;
+                    match serde_json::from_str::<serde_json::Value>(&raw) {
+                        Ok(value) => json_ld.push(value),
+                        Err(_) => invalid_json_ld += 1,
+                    }
+                }
+            }
+            "body" if body.is_none() => {
+                body = Some(element);
+            }
+            _ => {}
+        }
+        if tag == "script"
+            && !element
+                .ancestors()
+                .filter_map(ElementRef::wrap)
+                .any(|ancestor| index.info[&ancestor.id()].hidden)
+        {
+            if let Some((kind, assignment)) = embedded_kind(element) {
+                let mut raw = String::new();
+                for part in element.text() {
+                    budget.add_text(part)?;
+                    raw.push_str(part);
+                }
+                budget.add_node()?;
+                let value = if let Some(prefix) = assignment {
+                    parse_assigned_json(&raw, prefix)
+                } else {
+                    serde_json::from_str(&raw).ok()
+                };
+                if let Some(value) = value {
+                    json_data.push(WebJson {
+                        kind: kind.into(),
+                        id: owned_attr(element, "id", &mut budget)?,
+                        dom_path: index.path(element, &mut budget)?,
+                        value,
+                    });
+                } else {
+                    invalid_json_data += 1;
+                }
+            }
+        }
+        if tag == "link" && element.value().attr("href").is_some() {
+            let rel = element.value().attr("rel").unwrap_or("");
+            let has_rel = |name: &str| {
+                rel.split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case(name))
+            };
+            let json_alternate = has_rel("alternate")
+                && element.value().attr("type").is_some_and(|value| {
+                    value.split(';').next().is_some_and(|kind| {
+                        kind.trim().eq_ignore_ascii_case("application/json")
+                            || kind.trim().to_ascii_lowercase().ends_with("+json")
+                    })
+                });
+            if has_rel("next") || json_alternate {
+                budget.add_node()?;
+                let href = owned_attr(element, "href", &mut budget)?.unwrap();
+                let resolved_url = resolve_url(effective_base.as_ref(), Some(&href));
+                budget.optional_text(resolved_url.as_deref())?;
+                discovery_links.push(WebLink {
+                    ordinal: ordinal(discovery_links.len())?,
+                    dom_path: index.path(element, &mut budget)?,
+                    text: String::new(),
+                    href,
+                    resolved_url,
+                    rel: owned_attr(element, "rel", &mut budget)?,
+                });
+            }
+        }
+        if info.hidden {
+            continue;
+        }
+        if let Some(kind) = block_kind(tag) {
+            let mode = if tag == "pre" {
+                TextMode::Preformatted
+            } else {
+                TextMode::Normalized
+            };
+            let text = index.text(element, mode, matches!(tag, "td" | "th"), &mut budget)?;
+            if !text.is_empty() {
+                budget.add_node()?;
+                blocks.push(WebBlock {
+                    ordinal: ordinal(blocks.len())?,
+                    kind,
+                    dom_path: index.path(element, &mut budget)?,
+                    text,
+                    heading_level: tag
+                        .strip_prefix('h')
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .filter(|level| (1..=6).contains(level)),
+                });
+            }
+        }
+        match tag {
+            "a" | "area" if element.value().attr("href").is_some() => {
+                budget.add_node()?;
+                let href = owned_attr(element, "href", &mut budget)?.unwrap();
+                let resolved_url = resolve_url(effective_base.as_ref(), Some(&href));
+                budget.optional_text(resolved_url.as_deref())?;
+                links.push(WebLink {
+                    ordinal: ordinal(links.len())?,
+                    dom_path: index.path(element, &mut budget)?,
+                    text: index.text(element, TextMode::Normalized, false, &mut budget)?,
+                    href,
+                    resolved_url,
+                    rel: owned_attr(element, "rel", &mut budget)?,
+                });
+            }
+            "img"
+                if element
+                    .value()
+                    .attr("src")
+                    .is_some_and(|value| !value.trim().is_empty()) =>
+            {
+                budget.add_node()?;
+                let src = owned_attr(element, "src", &mut budget)?.unwrap();
+                let resolved_url = resolve_url(effective_base.as_ref(), Some(&src));
+                budget.optional_text(resolved_url.as_deref())?;
+                images.push(WebImage {
+                    ordinal: ordinal(images.len())?,
+                    dom_path: index.path(element, &mut budget)?,
+                    src,
+                    resolved_url,
+                    alt: owned_attr(element, "alt", &mut budget)?,
+                    width: owned_attr(element, "width", &mut budget)?,
+                    height: owned_attr(element, "height", &mut budget)?,
+                });
+            }
+            "table" => {
+                budget.add_node()?;
+                table_indices.insert(element.id(), tables.len());
+                tables.push(WebTable {
+                    ordinal: ordinal(tables.len())?,
+                    dom_path: index.path(element, &mut budget)?,
+                    caption: None,
+                    rows: Vec::new(),
+                });
+            }
+            "caption" => {
+                if let Some(&table) = info.table.and_then(|id| table_indices.get(&id)) {
+                    if tables[table].caption.is_none() {
+                        let value = index.text(element, TextMode::Normalized, true, &mut budget)?;
+                        if !value.is_empty() {
+                            tables[table].caption = Some(value);
+                        }
+                    }
+                }
+            }
+            "tr" => {
+                if let Some(&table) = info.table.and_then(|id| table_indices.get(&id)) {
+                    budget.add_node()?;
+                    row_indices.insert(element.id(), (table, tables[table].rows.len()));
+                    tables[table].rows.push(Vec::new());
+                }
+            }
+            "td" | "th" => {
+                if let Some(&(table, row)) = info.row.and_then(|id| row_indices.get(&id)) {
+                    budget.add_node()?;
+                    tables[table].rows[row].push(index.text(
+                        element,
+                        TextMode::Normalized,
+                        true,
+                        &mut budget,
+                    )?);
+                }
+            }
+            _ => {}
         }
     }
-
-    let text = if blocks.is_empty() {
-        let fallback = fallback_text(&document);
-        budget.add_text(&fallback)?;
-        fallback
-    } else {
-        blocks
-            .iter()
-            .map(|block| block.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+    let text = match body {
+        Some(body) => index.text(body, TextMode::Document, false, &mut budget)?,
+        None => String::new(),
     };
-    let diagnostics = if invalid_json_ld == 0 {
+    let mut diagnostics = if invalid_json_ld == 0 {
         Vec::new()
     } else {
         vec![format!("invalid_json_ld:{invalid_json_ld}")]
     };
-
+    if invalid_json_data > 0 {
+        diagnostics.push(format!("invalid_embedded_json:{invalid_json_data}"));
+    }
     Ok(WebDocument {
         source_sha256: format!("{:x}", Sha256::digest(source_bytes)),
-        base_url: effective_base.map(Into::into),
+        base_url,
         title,
         language,
         canonical_url,
@@ -497,36 +597,84 @@ fn parse_html_inner(
         images,
         tables,
         json_ld,
+        metadata,
+        json_data,
+        discovery_links,
         diagnostics,
     })
 }
 
-fn first_text(
-    document: &Html,
-    query: &str,
-    budget: &mut Budget,
-) -> Result<Option<String>, WebParseError> {
-    let selector = selector(query)?;
-    let value = document
-        .select(&selector)
-        .next()
-        .map(normalized_text)
-        .filter(|value| !value.is_empty());
-    if let Some(value) = &value {
-        budget.add_text(value)?;
-    }
-    Ok(value)
+fn parse_assigned_json(raw: &str, prefix: &str) -> Option<serde_json::Value> {
+    let rest = raw
+        .trim_start()
+        .strip_prefix(prefix)?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim_start();
+    let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
+    let value = stream.next()?.ok()?;
+    let suffix = rest[stream.byte_offset()..].trim_start();
+    (suffix.is_empty() || suffix.starts_with(';')).then_some(value)
 }
 
-fn first_attr(document: &Html, query: &str, attribute: &str) -> Option<String> {
-    let selector = Selector::parse(query).ok()?;
-    document
-        .select(&selector)
+fn embedded_kind(element: ElementRef<'_>) -> Option<(&'static str, Option<&'static str>)> {
+    let media = element
+        .value()
+        .attr("type")
+        .unwrap_or("")
+        .split(';')
         .next()
-        .and_then(|element| element.value().attr(attribute))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+        .unwrap_or("")
+        .trim();
+    if media.eq_ignore_ascii_case("application/json") {
+        let kind = match element.value().attr("id") {
+            Some("__NEXT_DATA__") => "next_data",
+            Some("__NUXT_DATA__") => "nuxt_data",
+            _ => "application_json",
+        };
+        return Some((kind, None));
+    }
+    if !media.is_empty()
+        && !media.eq_ignore_ascii_case("text/javascript")
+        && !media.eq_ignore_ascii_case("application/javascript")
+    {
+        return None;
+    }
+    let first = element.text().next()?.trim_start();
+    for prefix in [
+        "window.__INITIAL_STATE__",
+        "window.__PRELOADED_STATE__",
+        "window.__APOLLO_STATE__",
+        "window.__NEXT_DATA__",
+        "window.__NUXT__",
+        "var __INITIAL_STATE__",
+        "var __PRELOADED_STATE__",
+    ] {
+        if first
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+        {
+            return Some(("initial_state", Some(prefix)));
+        }
+    }
+    None
+}
+
+fn attr_eq(element: ElementRef<'_>, name: &str, expected: &str) -> bool {
+    element
+        .value()
+        .attr(name)
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+fn owned_attr(
+    element: ElementRef<'_>,
+    name: &str,
+    budget: &mut Budget,
+) -> Result<Option<String>, WebParseError> {
+    let value = element.value().attr(name);
+    budget.optional_text(value)?;
+    Ok(value.map(str::to_owned))
 }
 
 fn block_kind(tag: &str) -> Option<BlockKind> {
@@ -545,79 +693,8 @@ fn block_kind(tag: &str) -> Option<BlockKind> {
     }
 }
 
-fn normalized_text(element: ElementRef<'_>) -> String {
-    element
-        .text()
-        .flat_map(str::split_whitespace)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn fallback_text(document: &Html) -> String {
-    let mut words = Vec::new();
-    for node in document.tree.root().descendants() {
-        let Node::Text(text) = node.value() else {
-            continue;
-        };
-        let ancestors = node
-            .ancestors()
-            .filter_map(ElementRef::wrap)
-            .collect::<Vec<_>>();
-        if !ancestors
-            .iter()
-            .any(|element| element.value().name() == "body")
-            || ancestors.iter().copied().any(is_hidden_element)
-        {
-            continue;
-        }
-        words.extend(text.split_whitespace().map(str::to_owned));
-    }
-    words.join(" ")
-}
-
-fn element_is_hidden(element: ElementRef<'_>) -> bool {
-    is_hidden_element(element)
-        || element
-            .ancestors()
-            .filter_map(ElementRef::wrap)
-            .any(is_hidden_element)
-}
-
-fn is_hidden_element(element: ElementRef<'_>) -> bool {
-    element.value().attr("hidden").is_some()
-        || element
-            .value()
-            .attr("aria-hidden")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-        || matches!(
-            element.value().name(),
-            "script" | "style" | "noscript" | "template" | "svg" | "canvas"
-        )
-}
-
-fn structural_path(element: ElementRef<'_>) -> String {
-    let mut parts = std::iter::once(element)
-        .chain(element.ancestors().filter_map(ElementRef::wrap))
-        .map(|ancestor| {
-            let name = ancestor.value().name();
-            let position = ancestor
-                .prev_siblings()
-                .filter_map(ElementRef::wrap)
-                .filter(|sibling| sibling.value().name() == name)
-                .count()
-                + 1;
-            format!("{name}[{position}]")
-        })
-        .collect::<Vec<_>>();
-    parts.reverse();
-    format!("/{}", parts.join("/"))
-}
-
 fn resolve_url(base: Option<&Url>, raw: Option<&str>) -> Option<String> {
-    let raw = raw?.trim();
-    if raw.is_empty() {
-        return None;
-    }
+    let raw = raw?;
     Url::parse(raw)
         .or_else(|_| {
             base.ok_or(url::ParseError::RelativeUrlWithoutBase)?
@@ -655,6 +732,13 @@ impl Budget {
             .ok_or(WebParseError::NodeLimitExceeded)?;
         if self.nodes > self.max_nodes {
             return Err(WebParseError::NodeLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn optional_text(&mut self, text: Option<&str>) -> Result<(), WebParseError> {
+        if let Some(text) = text {
+            self.add_text(text)?;
         }
         Ok(())
     }

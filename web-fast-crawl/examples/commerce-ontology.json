@@ -1,0 +1,14 @@
+{
+  "name": "Example commerce taxonomy (not GS1 certification)",
+  "concepts": [
+    {"curie":"shop:Product","label":"Product","parents":[],"synonyms":[]},
+    {"curie":"shop:Electronics","label":"Electronics","parents":["shop:Product"],"synonyms":["electronic device"],"disjoint_with":["shop:KitchenAppliance"]},
+    {"curie":"shop:ChargingAccessory","label":"Charging accessory","parents":["shop:Electronics"],"synonyms":["charger","charging","carregador"]},
+    {"curie":"shop:WirelessChargingStation","label":"Wireless charging station","parents":["shop:ChargingAccessory"],"synonyms":["wireless charger","charging stand","charging dock","3 in 1","carregador sem fio"],"disjoint_with":["shop:WiredCharger","shop:Smartphone"]},
+    {"curie":"shop:WiredCharger","label":"Wired power adapter","parents":["shop:ChargingAccessory"],"synonyms":["wall adapter","power brick","gan charger"]},
+    {"curie":"shop:Smartphone","label":"Smartphone","parents":["shop:Electronics"],"synonyms":["celular","mobile phone","telefone"]},
+    {"curie":"shop:Wearable","label":"Smartwatch","parents":["shop:Electronics"],"synonyms":["smart watch","wearable","relógio"]},
+    {"curie":"shop:KitchenAppliance","label":"Kitchen appliance","parents":["shop:Product"],"synonyms":["kitchen appliance"]},
+    {"curie":"shop:CoffeeMaker","label":"Coffee maker","parents":["shop:KitchenAppliance"],"synonyms":["cafeteira","espresso machine","brewer"]}
+  ]
+}

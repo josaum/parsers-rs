@@ -12,7 +12,7 @@
 //! # Query with any Arrow Flight client
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::{
@@ -70,6 +70,21 @@ struct Args {
     /// Max attachment size in MB
     #[arg(long, default_value = "100")]
     max_attachment_size: usize,
+    /// Maximum input/decoded message size in MiB.
+    #[arg(long, default_value_t = 128)]
+    max_message_size: usize,
+    /// Maximum total attachment bytes in MiB (defaults to max-attachment-size).
+    #[arg(long)]
+    max_total_attachment_size: Option<usize>,
+    /// Maximum MIME/MSG nesting depth.
+    #[arg(long, default_value_t = 64)]
+    max_mime_depth: usize,
+    /// Maximum MIME parts or MSG directory entries.
+    #[arg(long, default_value_t = 10_000)]
+    max_mime_parts: usize,
+    /// Maximum bytes in a MIME part's headers.
+    #[arg(long, default_value_t = 262_144)]
+    max_header_bytes: usize,
 }
 
 struct EmailFlightService {
@@ -377,9 +392,22 @@ async fn main() -> Result<()> {
     // against the operator's flag, so raising --max-attachment-size is not silently
     // undone by a 100 MB total budget the operator never chose.
     let options = ParseOptions {
-        max_inflate: 128 * 1024 * 1024,
-        max_attachment_size: args.max_attachment_size * 1024 * 1024,
-        max_total_attachment_bytes: args.max_attachment_size * 1024 * 1024,
+        max_mime_depth: args.max_mime_depth,
+        max_mime_parts: args.max_mime_parts,
+        max_header_bytes: args.max_header_bytes,
+        max_inflate: args
+            .max_message_size
+            .checked_mul(1024 * 1024)
+            .context("max-message-size overflow")?,
+        max_attachment_size: args
+            .max_attachment_size
+            .checked_mul(1024 * 1024)
+            .context("max-attachment-size overflow")?,
+        max_total_attachment_bytes: args
+            .max_total_attachment_size
+            .unwrap_or(args.max_attachment_size)
+            .checked_mul(1024 * 1024)
+            .context("max-total-attachment-size overflow")?,
         include_raw_headers: false,
         html_to_text: false,
         extract_attachment_content: false,

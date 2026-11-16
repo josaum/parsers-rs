@@ -3,7 +3,7 @@ name = "xlsx-fast-core"
 version = "0.2.6"
 edition.workspace = true
 authors.workspace = true
-description = "High-performance Excel (.xlsx) parser with SIMD optimizations"
+description = "Excel XLSX, XLS and XLSB parser with shared JSON and Arrow output"
 license.workspace = true
 keywords = ["xlsx", "excel", "ooxml", "parser", "office", "spreadsheet"]
 categories = ["parser-implementations", "encoding"]
@@ -22,6 +22,8 @@ arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc"]
 
 [dependencies]
 anyhow = "1.0"
+calamine = { version = "=0.38.0", features = ["dates"] }
+cfb = "0.16"
 arrow-array = { workspace = true, optional = true }
 arrow-ipc = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
@@ -33,6 +35,5 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-calamine = "0.22"
 tempfile = "3.10"
 zip = "0.6"

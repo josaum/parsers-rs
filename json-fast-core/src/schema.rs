@@ -35,8 +35,8 @@
 //!
 //! # Performance profile
 //!
-//! The document and schema are borrowed, never copied. `validate` allocates
-//! nothing on the happy path: the JSON pointer is carried as a reused working
+//! The document and schema are borrowed, never copied. The JSON pointer is
+//! carried as a reused working
 //! buffer (a finding materializes its own `String` only when one exists),
 //! patterns are compiled once and cached, `propertyNames` reuses one scratch
 //! `Value`, `uniqueItems` runs in O(n) with a hash prefilter plus exact
@@ -48,8 +48,8 @@
 //! feature adds zero-cpu-copy file entry points ([`crate::parse_file`],
 //! [`crate::validate_file`]).
 //!
-//! `validate` never panics and never allocates outside the findings list and
-//! the evaluation tracker.
+//! Validation also allocates scratch storage for anchor indexing, pattern
+//! caching, applicator branches, and uniqueness checks.
 
 use std::collections::{HashMap, HashSet};
 
@@ -215,8 +215,8 @@ struct Applied<'v> {
 
 struct Ctx<'a> {
     root: &'a Value,
-    /// `$anchor`/plain-name fragment name -> JSON pointers that define it.
-    anchors: HashMap<String, Vec<String>>,
+    /// `$anchor`/plain-name fragment name -> borrowed schema node.
+    anchors: HashMap<&'a str, &'a Value>,
     /// `$ref` hops taken so far; caps recursive schemas.
     ref_depth: usize,
     /// Compiled patterns, keyed by pattern text, so rows never recompile.
@@ -803,14 +803,21 @@ fn hash_value(value: &Value) -> u64 {
             }
             Value::Object(map) => {
                 mix_u64(h, 0x06);
+                // preserve_order makes map iteration insertion-ordered, but
+                // JSON Schema object equality ignores member order. Combine
+                // per-member hashes commutatively without sorting/allocating.
+                let mut members = 0u64;
                 for (key, entry) in map {
+                    let mut member = FNV_OFFSET;
                     for &b in key.as_bytes() {
-                        mix_u64(h, b);
+                        mix_u64(&mut member, b);
                     }
-                    mix_u64(h, 0xfd);
-                    walk(h, entry);
-                    mix_u64(h, 0xfc);
+                    mix_u64(&mut member, 0xfd);
+                    walk(&mut member, entry);
+                    members = members.wrapping_add(member);
                 }
+                mix(h, map.len() as u64);
+                mix(h, members);
             }
         }
     }
@@ -1295,7 +1302,27 @@ fn numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
     if let (Some(x), Some(y)) = (a.as_u64(), b.as_i64()) {
         return y >= 0 && x == y as u64;
     }
-    a.as_f64() == b.as_f64()
+    // Never round an integer to f64 for equality: distinct integers above
+    // 2^53 can collapse to the same float. Bounds are exclusive at 2^63/2^64
+    // because Rust float-to-integer casts saturate at those boundaries.
+    fn integer_float_equal(integer: &serde_json::Number, float: f64) -> bool {
+        if float.fract() != 0.0 {
+            return false;
+        }
+        if let Some(value) = integer.as_i64() {
+            return (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&float)
+                && float as i64 == value;
+        }
+        integer.as_u64().is_some_and(|value| {
+            (0.0..18_446_744_073_709_551_616.0).contains(&float) && float as u64 == value
+        })
+    }
+    match (a.is_f64(), b.is_f64()) {
+        (true, true) => a.as_f64() == b.as_f64(),
+        (false, true) => integer_float_equal(a, b.as_f64().unwrap()),
+        (true, false) => integer_float_equal(b, a.as_f64().unwrap()),
+        (false, false) => false,
+    }
 }
 
 fn type_matches(value: &Value, type_name: &str) -> bool {
@@ -1319,38 +1346,56 @@ fn type_matches(value: &Value, type_name: &str) -> bool {
 
 /// Walk the root schema and record every `$anchor` (and `$id` in plain-name
 /// fragment form) so `$ref: "#name"` resolves. Runs once per `validate`.
-fn collect_anchors(root: &Value) -> HashMap<String, Vec<String>> {
-    let mut anchors: HashMap<String, Vec<String>> = HashMap::new();
-    let mut stack: Vec<(&Value, String)> = vec![(root, String::new())];
-    while let Some((node, pointer)) = stack.pop() {
-        if let Some(obj) = node.as_object() {
-            if let Some(name) = obj
-                .get("$anchor")
-                .and_then(|a| a.as_str())
-                .filter(|a| !a.is_empty())
-            {
-                anchors
-                    .entry(name.to_string())
-                    .or_default()
-                    .push(pointer.clone());
-            }
-            if let Some(name) = obj
-                .get("$id")
-                .and_then(|i| i.as_str())
-                .and_then(|i| i.strip_prefix('#'))
-                .filter(|n| !n.is_empty())
-            {
-                anchors
-                    .entry(name.to_string())
-                    .or_default()
-                    .push(pointer.clone());
-            }
-            for (key, child) in obj {
-                let mut child_pointer = pointer.clone();
-                child_pointer.push('/');
-                child_pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
-                child_pointer.shrink_to_fit();
-                stack.push((child, child_pointer));
+fn collect_anchors(root: &Value) -> HashMap<&str, &Value> {
+    let mut anchors = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let Some(obj) = node.as_object() else {
+            continue;
+        };
+        for name in [
+            obj.get("$anchor").and_then(Value::as_str),
+            obj.get("$id")
+                .and_then(Value::as_str)
+                .and_then(|id| id.strip_prefix('#')),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|name| !name.is_empty())
+        {
+            anchors.entry(name).or_insert(node);
+        }
+        // Traverse schema locations only: annotation/instance data such as
+        // `const`, `enum`, `default` and `examples` cannot declare anchors.
+        for (keyword, child) in obj {
+            match keyword.as_str() {
+                "$defs" | "definitions" | "properties" | "patternProperties"
+                | "dependentSchemas" | "dependencies" => {
+                    if let Some(map) = child.as_object() {
+                        stack.extend(map.values());
+                    }
+                }
+                "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                    if let Some(array) = child.as_array() {
+                        stack.extend(array);
+                    }
+                }
+                "items" => match child {
+                    Value::Array(array) => stack.extend(array),
+                    _ => stack.push(child),
+                },
+                "additionalItems"
+                | "additionalProperties"
+                | "unevaluatedItems"
+                | "unevaluatedProperties"
+                | "contains"
+                | "propertyNames"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "contentSchema" => stack.push(child),
+                _ => {}
             }
         }
     }
@@ -1358,36 +1403,14 @@ fn collect_anchors(root: &Value) -> HashMap<String, Vec<String>> {
 }
 
 fn resolve_ref<'a>(reference: &str, ctx: &Ctx<'a>) -> Option<&'a Value> {
-    if reference == "#" {
-        return Some(ctx.root);
+    let fragment = reference.strip_prefix('#')?;
+    if fragment.is_empty() || fragment.starts_with('/') {
+        // Validate escapes before serde_json decodes them; its pointer API
+        // checks array index syntax but permits literal invalid '~' escapes.
+        validate_json_pointer(fragment).ok()?;
+        return ctx.root.pointer(fragment);
     }
-    if let Some(pointer) = reference.strip_prefix("#/") {
-        return pointer_get(ctx.root, pointer);
-    }
-    if let Some(name) = reference.strip_prefix('#') {
-        if let Some(pointers) = ctx.anchors.get(name) {
-            for pointer in pointers {
-                if let Some(target) = pointer_get(ctx.root, pointer) {
-                    return Some(target);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// RFC 6901 JSON-pointer get (document-local references only).
-fn pointer_get<'a>(root: &'a Value, pointer: &str) -> Option<&'a Value> {
-    let mut node = root;
-    for raw in pointer.split('/') {
-        let token = raw.replace("~1", "/").replace("~0", "~");
-        node = match node {
-            Value::Object(map) => map.get(&token)?,
-            Value::Array(arr) => arr.get(token.parse::<usize>().ok()?)?,
-            _ => return None,
-        };
-    }
-    Some(node)
+    ctx.anchors.get(fragment).copied()
 }
 
 /// Why a `format` check did not pass.

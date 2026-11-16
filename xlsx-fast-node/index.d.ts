@@ -1,5 +1,5 @@
 /**
- * xlsx-fast-node - High-performance Excel (.xlsx) parser
+ * xlsx-fast-node - Excel XLS, XLSB and XLSX parser
  * 
  * @example
  * ```typescript
@@ -24,7 +24,7 @@ export interface ParseOptions {
   includeFormulas?: boolean;
   /** Emit raw values for non-string cells (default: false) */
   rawValues?: boolean;
-  /** Max uncompressed part size in bytes (default: 134217728 = 128 MiB) */
+  /** Aggregate ZIP/input and binary workbook budget in bytes (default: 134217728 = 128 MiB) */
   maxInflate?: number;
   /** Cells per Arrow record batch when using parseXlsxArrowIpc (default: 16384) */
   batchSize?: number;
@@ -79,7 +79,7 @@ export interface Workbook {
 /**
  * Parse an Excel file into a Workbook object
  * 
- * @param path - Path to the .xlsx file
+ * @param path - Path to an XLS, XLSB or XLSX file
  * @param options - Parsing options
  * @returns The parsed workbook
  * @throws Error if the file cannot be parsed
@@ -100,10 +100,10 @@ export function parseXlsx(path: string, options?: ParseOptions): Workbook;
 /**
  * Parse an Excel file and stream output to NDJSON
  * 
- * This is memory-efficient for large files as it doesn't load everything
- * into memory at once.
+ * XLSX uses the XML streaming path. XLS/XLSB are materialized under
+ * the configured resource budget before writing.
  * 
- * @param path - Path to the .xlsx file
+ * @param path - Path to an XLS, XLSB or XLSX file
  * @param outPath - Path for the output .ndjson file
  * @param options - Parsing options
  * @throws Error if the file cannot be parsed or written
@@ -121,10 +121,17 @@ export function parseXlsx(path: string, options?: ParseOptions): Workbook;
 export function parseXlsxNdjson(path: string, outPath: string, options?: ParseOptions): void;
 
 /**
- * Parse an Excel file and write Arrow IPC (Feather v2) to `outPath`.
+ * Parse an Excel file and write an Arrow IPC stream to `outPath`.
  */
 export function parseXlsxArrowIpc(
   path: string,
   outPath: string,
   options?: ParseOptions
 ): void;
+
+/** Parse XLS, XLSB or XLSX, detected from workbook contents. */
+export const parseExcel: typeof parseXlsx;
+/** Export XLS, XLSB or XLSX cells to NDJSON. */
+export const parseExcelNdjson: typeof parseXlsxNdjson;
+/** Export XLS, XLSB or XLSX cells using the existing Arrow IPC schema. */
+export const parseExcelArrowIpc: typeof parseXlsxArrowIpc;

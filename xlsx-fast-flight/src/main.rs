@@ -545,7 +545,10 @@ fn is_xlsx_file(path: &Path) -> bool {
         Some(ext) => ext.to_ascii_lowercase(),
         None => return false,
     };
-    matches!(ext.as_str(), "xlsx" | "xlsm" | "xltx" | "xltm")
+    matches!(
+        ext.as_str(),
+        "xls" | "xlsb" | "xlsx" | "xlsm" | "xltx" | "xltm"
+    )
 }
 
 fn parse_query(query: &str) -> Result<FlightQuery, Status> {
@@ -1010,6 +1013,17 @@ mod symlink_listing_tests {
     use std::os::unix::fs::symlink as symlink_file;
     #[cfg(windows)]
     use std::os::windows::fs::symlink_file;
+
+    #[test]
+    fn lists_binary_and_xml_workbooks() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["book.XLS", "book.XLSB", "book.xlsx", "ignore.txt"] {
+            std::fs::write(root.path().join(name), b"fixture").unwrap();
+        }
+        let found = collect_xlsx_paths(root.path(), 100).unwrap();
+        assert_eq!(found.len(), 3);
+        assert!(found.iter().all(|path| is_xlsx_file(path)));
+    }
 
     #[test]
     fn collect_xlsx_paths_skips_symlinks() {

@@ -540,6 +540,7 @@ fn content_particles_mut(content: &mut ContentModel) -> Option<&mut Vec<Particle
 }
 
 /// A borrowed reference to a resolved schema type.
+#[derive(Clone, Copy)]
 pub enum SchemaTypeRef<'a> {
     /// Borrowed simple type reference.
     Simple(&'a SimpleTypeDef),

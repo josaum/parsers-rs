@@ -1,30 +1,61 @@
 # Email Fast
 
-`email-fast-py` is the Python binding for deterministic EML and MSG extraction,
-on top of the native `email-fast-core` parser.
+`email-fast-py` reads EML, Outlook MSG, and mbox through `email-fast-core`.
 
-## Contract
+```python
+import email_fast
 
-- **Input:** an EML or MSG path, or in-memory bytes with an explicit format;
-  callers may bound attachment size and opt into raw headers, HTML-to-text, or
-  attachment-content extraction.
-- **Output:** an in-memory Python dictionary containing parsed metadata and
-  permitted content. The binding sends no message and writes no attachment.
-- **Arrow boundary:** the current binding returns a structured Python object;
-  a consumer applies an explicit schema before Arrow IPC transport or any
-  downstream processing.
-- **Determinism:** parsing the same bytes always yields the same result.
-  Extraction does not verify identity, consent, source ownership, or delivery
-  authenticity; those remain the caller's responsibility.
+email = email_fast.parse_email_bytes(
+    upload_bytes, format="eml", max_inflate=32 * 1024 * 1024,
+    max_total_attachment_bytes=8 * 1024 * 1024,
+)
+paths = email_fast.extract_attachments("message.msg", "attachments")
+email_fast.parse_mbox_ndjson("archive.mbox", "archive.ndjson")
+```
 
-Invalid messages, unsupported structures, and attachment-budget violations
-fail loudly rather than producing a partial result. Callers should preserve
-source provenance when it matters downstream.
+## Limits and errors
+
+All entry points accept `max_inflate`, `max_mime_depth`, `max_mime_parts`, and
+`max_header_bytes` as keyword-only arguments, plus the existing per-attachment
+and aggregate attachment limits. The byte API forwards every limit to Rust.
+
+Defaults are 128 MiB input/decoded content, 100 MiB per attachment and in total,
+64 nesting levels, 10,000 MIME parts/MSG entries, and 256 KiB headers per MIME
+part. Input and decoded-content ceilings apply separately; these are not a
+process-wide memory cap. Attachment sizes count decoded payload bytes rather
+than MIME headers or Base64 overhead. Exceeded limits raise `RuntimeError`.
+
+Mbox preserves original MIME bytes and removes one level of mboxrd `>From`
+escaping. Parsing stops on the first invalid message with its index and byte
+offset; it no longer silently omits failed messages. NDJSON or previously
+completed extraction files may remain after an error.
+
+## Output and compatibility
+
+Parsing returns dictionaries; extraction writes attachments and returns their
+actual paths. Sender-supplied directories are discarded, unsafe filename
+characters are replaced, and collisions receive numeric suffixes. Existing
+files and symlinks are not overwritten. EML payloads stream through decoding
+into output files without an intermediate Base64 representation.
+
+MIME alternatives prefer later supported representations; related resources
+are distinguished from their root body. Address groups and quoted display names
+use structured parsing. `message_id` appears once in JSON.
+
+MSG reads recipient objects (To/CC/BCC), timestamps, threading, SMTP reply entry
+IDs, message codepages, and compressed RTF text. Embedded messages are exported
+as independently readable `.msg` attachments. See
+[compatibility and specification notes](../SPEC_COMPLIANCE.md) for limits.
+
+`parse_mbox_arrow` writes Arrow IPC files, splitting them by `batch_size` as
+before. Existing Arrow schemas are unchanged. A batch size of zero is an error.
 
 ## Verify
 
-```bash
-cargo test -p email-fast-py
+Build/install the wheel, then run:
+
+```sh
+python -m pytest email-fast-py/tests -q
 ```
 
 Licensed under MIT.

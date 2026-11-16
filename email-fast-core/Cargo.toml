@@ -30,14 +30,19 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 
 # Email parsing
-mailparse = "0.15"
-charset = "0.1"
-quoted_printable = "0.5"
+mailparse = "=0.18.0"
 base64 = "0.22"
 
-# MSG file parsing (OLE Compound File Binary — raw FAT/mini-FAT, no crate)
-encoding_rs = "0.8"
+# MSG compound files, codepages and RTF text projection
 regex = { workspace = true }
+cfb = "0.16"
+codepage = "0.1"
+rtf-parser = { version = "=0.5.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.10"
+compressed-rtf = "=1.0.1"
+
+[[bench]]
+name = "email_paths"
+harness = false

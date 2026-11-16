@@ -38,6 +38,7 @@ members = [
   "ontology-fast-core",
   "ontology-fast-py",
   "web-fast-core",
+  "web-fast-crawl",
   "geo-fast-core",
   "geo-fast-py",
   "geo-fast-node",

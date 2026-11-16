@@ -3,19 +3,21 @@
 //! Validates simple-type constraints: enumerations, string length, numeric range.
 //! Complex structure checks (required children, cardinality) are also included.
 //!
-//! Each [`TypeFrame`] on the stack owns a cloned `XsdType` so there are no
-//! lifetime conflicts between the immutable schema model reference and the
-//! mutable error accumulation.
+//! Element frames borrow resolved schema types; validation never clones the
+//! schema tree for each occurrence of an element.
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::parser::SchemaSet;
-use crate::schema::{ComplexType, ContentModel, ElementRef, SchemaModel, SimpleTypeDef, XsdType};
+use crate::schema::{
+    ContentModel, ElementRef, SchemaModel, SchemaTypeRef, SimpleTypeDef, SimpleTypeKind, XsdType,
+};
 
 /// Severity of a validation issue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +63,7 @@ impl Default for ValidateOptions {
 impl SchemaSet {
     /// Validate an XML document against this schema set.
     pub fn validate(&self, xml: &[u8], opts: ValidateOptions) -> Result<Vec<ValidationError>> {
+        ensure!(opts.max_errors > 0, "max_errors must be greater than zero");
         let mut ctx = ValidationContext {
             model: &self.model,
             errors: Vec::new(),
@@ -75,11 +78,11 @@ impl SchemaSet {
 
 // ── Type frame ────────────────────────────────────────────────────────────────
 
-struct TypeFrame {
+struct TypeFrame<'m> {
     /// Accumulated text content.
     text: String,
-    /// Owned clone of the resolved XSD type for this element.
-    xsd_type: Option<XsdType>,
+    /// Borrowed resolved schema type for this element.
+    xsd_type: Option<SchemaTypeRef<'m>>,
     /// Counts of child element occurrences.
     child_counts: HashMap<String, usize>,
 }
@@ -91,125 +94,156 @@ struct ValidationContext<'m> {
     errors: Vec<ValidationError>,
     opts: ValidateOptions,
     path: Vec<String>,
-    type_stack: Vec<TypeFrame>,
+    type_stack: Vec<TypeFrame<'m>>,
 }
 
 impl<'m> ValidationContext<'m> {
     fn validate_document(&mut self, xml: &[u8]) -> Result<()> {
         let mut reader = Reader::from_reader(xml);
-        reader.config_mut().trim_text(true);
-        let mut buf = Vec::with_capacity(4096);
-
+        reader.config_mut().trim_text(false);
+        reader.config_mut().expand_empty_elements = true;
+        let mut roots = 0usize;
         loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) => {
-                    let local = {
-                        let name_bytes = e.name();
-                        let raw = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("?");
-                        strip_prefix(raw).to_owned()
-                    };
-                    self.path.push(local.clone());
-
-                    let xsd_type = self.resolve_child_type(&local);
-
-                    if let Some(parent) = self.type_stack.last_mut() {
-                        *parent.child_counts.entry(local).or_insert(0) += 1;
+            match reader.read_event() {
+                Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                    // Expand empty elements into start/end events below via
+                    // the reader configuration, so both forms use one path.
+                    if self.type_stack.is_empty() {
+                        roots += 1;
+                        if roots > 1 {
+                            self.push_error(
+                                ValidationSeverity::Error,
+                                "XML has multiple root elements".into(),
+                            );
+                            break;
+                        }
                     }
-
+                    let name = e.name();
+                    let local = match std::str::from_utf8(name.as_ref()) {
+                        Ok(name) => strip_prefix(name),
+                        Err(error) => {
+                            self.push_error(
+                                ValidationSeverity::Error,
+                                format!("invalid XML name: {error}"),
+                            );
+                            break;
+                        }
+                    };
+                    let xsd_type = self.resolve_child_type(local);
+                    self.path.push(local.to_owned());
+                    if xsd_type.is_none() {
+                        self.push_error(
+                            ValidationSeverity::Error,
+                            format!("no schema type for element <{local}>"),
+                        );
+                    }
+                    if let Some(parent) = self.type_stack.last_mut() {
+                        *parent.child_counts.entry(local.to_owned()).or_insert(0) += 1;
+                    }
                     self.type_stack.push(TypeFrame {
                         text: String::new(),
                         xsd_type,
                         child_counts: HashMap::new(),
                     });
                 }
-                Ok(Event::Empty(ref e)) => {
-                    let local = {
-                        let name_bytes = e.name();
-                        let raw = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("?");
-                        strip_prefix(raw).to_owned()
-                    };
-                    self.path.push(local.clone());
-
-                    if let Some(parent) = self.type_stack.last_mut() {
-                        *parent.child_counts.entry(local.clone()).or_insert(0) += 1;
-                    }
-
-                    let xsd_type = self.resolve_child_type(&local);
-                    if self.opts.check_facets {
-                        if let Some(ref t) = xsd_type {
-                            self.check_text_for_type_val(t, "");
-                        }
-                    }
-
-                    self.path.pop();
-
-                    if self.errors.len() >= self.opts.max_errors {
-                        break;
-                    }
-                }
-                Ok(Event::Text(ref t)) => {
-                    if let Ok(text) = t.unescape() {
-                        if let Some(frame) = self.type_stack.last_mut() {
-                            frame.text.push_str(&text);
-                        }
-                    }
-                }
+                Ok(Event::Text(t)) => match t.unescape() {
+                    Ok(text) => self.append_text(&text, false),
+                    Err(error) => self.push_error(
+                        ValidationSeverity::Error,
+                        format!("XML text error: {error}"),
+                    ),
+                },
+                Ok(Event::CData(t)) => match reader.decoder().decode(t.as_ref()) {
+                    Ok(text) => self.append_text(&text, true),
+                    Err(error) => self.push_error(
+                        ValidationSeverity::Error,
+                        format!("XML CDATA error: {error}"),
+                    ),
+                },
                 Ok(Event::End(_)) => {
                     if let Some(frame) = self.type_stack.pop() {
-                        let text = frame.text.clone();
-                        let counts = frame.child_counts.clone();
-                        let xsd_type = frame.xsd_type.clone();
-
-                        if self.opts.check_facets {
-                            if let Some(ref t) = xsd_type {
-                                self.check_text_for_type_val(t, &text);
+                        if let Some(t) = frame.xsd_type {
+                            if self.opts.check_facets {
+                                self.check_text_for_type_val(t, &frame.text);
                             }
-                        }
-                        if self.opts.check_cardinality {
-                            if let Some(ref t) = xsd_type {
-                                self.check_cardinality_for_type(t, &counts);
+                            if self.opts.check_cardinality {
+                                self.check_cardinality_for_type(t, &frame.child_counts);
                             }
                         }
                     }
                     self.path.pop();
-
-                    if self.errors.len() >= self.opts.max_errors {
-                        break;
-                    }
                 }
-                Ok(Event::Eof) => break,
-                Err(e) => {
-                    self.push_error(ValidationSeverity::Error, format!("XML parse error: {e}"));
+                Ok(Event::Eof) => {
+                    if roots == 0 {
+                        self.push_error(
+                            ValidationSeverity::Error,
+                            "XML document has no root element".into(),
+                        );
+                    } else if !self.type_stack.is_empty() {
+                        self.push_error(
+                            ValidationSeverity::Error,
+                            "XML document ends before its elements are closed".into(),
+                        );
+                    }
+                    break;
+                }
+                Err(error) => {
+                    self.push_error(
+                        ValidationSeverity::Error,
+                        format!("XML parse error: {error}"),
+                    );
                     break;
                 }
                 _ => {}
             }
-            buf.clear();
+            if self.errors.len() >= self.opts.max_errors {
+                break;
+            }
         }
-
         Ok(())
     }
 
+    fn append_text(&mut self, text: &str, cdata: bool) {
+        if let Some(frame) = self.type_stack.last_mut() {
+            frame.text.push_str(text);
+        } else if cdata || !text.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n')) {
+            self.push_error(
+                ValidationSeverity::Error,
+                "XML content outside the root element".into(),
+            );
+        }
+    }
+
     /// Resolve the XSD type for a child element given the current type stack.
-    fn resolve_child_type(&self, child_local: &str) -> Option<XsdType> {
+    fn resolve_child_type(&self, child_local: &str) -> Option<SchemaTypeRef<'m>> {
         if let Some(parent) = self.type_stack.last() {
-            let parent_type = parent.xsd_type.as_ref()?;
+            let parent_type = parent.xsd_type?;
             return self.find_child_xsd_type(parent_type, child_local);
         }
         // Root element — global lookup.
         let decl = self.model.global_elements.get(child_local)?;
-        Some(self.resolve_xsd_type(&decl.type_def))
+        self.resolve_xsd_type(&decl.type_def)
     }
 
     /// Find the child element type inside a parent XsdType.
-    fn find_child_xsd_type(&self, parent: &XsdType, child_name: &str) -> Option<XsdType> {
-        let ct = self.as_complex_type(parent)?;
+    fn find_child_xsd_type(
+        &self,
+        parent: SchemaTypeRef<'m>,
+        child_name: &str,
+    ) -> Option<SchemaTypeRef<'m>> {
+        let SchemaTypeRef::Complex(ct) = parent else {
+            return None;
+        };
         self.find_child_in_content(&ct.content, child_name)
     }
 
     /// Find a child element type within a content model, descending into nested
     /// model groups (e.g. an `xs:choice` inside an `xs:sequence`).
-    fn find_child_in_content(&self, content: &ContentModel, child_name: &str) -> Option<XsdType> {
+    fn find_child_in_content(
+        &self,
+        content: &'m ContentModel,
+        child_name: &str,
+    ) -> Option<SchemaTypeRef<'m>> {
         let particles = match content {
             ContentModel::Sequence(p) | ContentModel::All(p) | ContentModel::Choice(p) => p,
             _ => return None,
@@ -217,11 +251,11 @@ impl<'m> ValidationContext<'m> {
         for particle in particles {
             match &particle.element {
                 ElementRef::Inline(decl) if decl.name.local == child_name => {
-                    return Some(self.resolve_xsd_type(&decl.as_ref().type_def));
+                    return self.resolve_xsd_type(&decl.as_ref().type_def);
                 }
                 ElementRef::Ref(qn) if qn.local == child_name => {
                     if let Some(decl) = self.model.global_elements.get(&qn.local) {
-                        return Some(self.resolve_xsd_type(&decl.type_def));
+                        return self.resolve_xsd_type(&decl.type_def);
                     }
                 }
                 ElementRef::Group(group) => {
@@ -235,47 +269,28 @@ impl<'m> ValidationContext<'m> {
         None
     }
 
-    /// Resolve a Ref to its concrete type; return the type unchanged otherwise.
-    fn resolve_xsd_type(&self, xsd: &XsdType) -> XsdType {
+    fn resolve_xsd_type(&self, xsd: &'m XsdType) -> Option<SchemaTypeRef<'m>> {
         match xsd {
-            XsdType::Ref(qn) => {
-                if let Some(ct) = self.model.complex_types.get(&qn.local) {
-                    return XsdType::Complex(ct.clone());
-                }
-                if let Some(st) = self.model.simple_types.get(&qn.local) {
-                    return XsdType::Simple(st.clone());
-                }
-                xsd.clone()
-            }
-            other => other.clone(),
+            XsdType::Ref(qn) => self.model.resolve_type(&qn.local),
+            XsdType::Simple(st) => Some(SchemaTypeRef::Simple(st)),
+            XsdType::Complex(ct) => Some(SchemaTypeRef::Complex(ct)),
         }
     }
 
-    /// Return a reference to the complex type inside an XsdType if resolvable.
-    fn as_complex_type<'a>(&'a self, xsd: &'a XsdType) -> Option<&'a ComplexType> {
-        match xsd {
-            XsdType::Complex(ct) => Some(ct),
-            XsdType::Ref(qn) => self.model.complex_types.get(&qn.local),
-            _ => None,
-        }
-    }
-
-    fn check_text_for_type_val(&mut self, xsd: &XsdType, text: &str) {
+    fn check_text_for_type_val(&mut self, xsd: SchemaTypeRef<'m>, text: &str) {
         let st: Option<&SimpleTypeDef> = match xsd {
-            XsdType::Simple(st) => Some(st),
-            XsdType::Ref(qn) => self.model.simple_types.get(&qn.local),
-            XsdType::Complex(ct) => {
-                if let ContentModel::SimpleContent(st) = &ct.content {
-                    Some(st.as_ref())
-                } else {
-                    None
-                }
-            }
+            SchemaTypeRef::Simple(st) => Some(st),
+            SchemaTypeRef::Complex(ct) => match &ct.content {
+                ContentModel::SimpleContent(st) => Some(st),
+                _ => None,
+            },
         };
         let st = match st {
             Some(s) => s,
             None => return,
         };
+        let normalized = normalize_whitespace(text, &st.kind);
+        let text = normalized.as_ref();
         let facets = &st.facets;
         let kind = &st.kind;
 
@@ -344,12 +359,14 @@ impl<'m> ValidationContext<'m> {
         }
     }
 
-    fn check_cardinality_for_type(&mut self, xsd: &XsdType, child_counts: &HashMap<String, usize>) {
-        let content = match self.as_complex_type(xsd) {
-            Some(ct) => ct.content.clone(),
-            None => return,
-        };
-        self.check_cardinality_for_content(&content, child_counts);
+    fn check_cardinality_for_type(
+        &mut self,
+        xsd: SchemaTypeRef<'m>,
+        child_counts: &HashMap<String, usize>,
+    ) {
+        if let SchemaTypeRef::Complex(ct) = xsd {
+            self.check_cardinality_for_content(&ct.content, child_counts);
+        }
     }
 
     /// Validate occurrence constraints for one content model.
@@ -375,8 +392,8 @@ impl<'m> ValidationContext<'m> {
             // A nested model group (typically a choice) is handled as a union:
             // its branches count toward the parent only as the group's own.
             let (child_name, occ) = match &particle.element {
-                ElementRef::Inline(decl) => (decl.name.local.clone(), decl.occurrence),
-                ElementRef::Ref(qn) => (qn.local.clone(), particle.occurrence),
+                ElementRef::Inline(decl) => (decl.name.local.as_str(), decl.occurrence),
+                ElementRef::Ref(qn) => (qn.local.as_str(), particle.occurrence),
                 ElementRef::Group(group) => {
                     let selected = group_branch_count(group, child_counts);
                     branch_total += selected;
@@ -391,14 +408,17 @@ impl<'m> ValidationContext<'m> {
                 }
             };
 
-            let count = child_counts.get(&child_name).copied().unwrap_or(0);
+            let count = child_counts.get(child_name).copied().unwrap_or(0);
             branch_total += count;
             // In a choice, no single branch is individually required — only the
             // union is. Skip the per-branch required check there.
-            if !is_choice && occ.min >= 1 && count == 0 {
+            if !is_choice && count < occ.min as usize {
                 self.push_error(
                     ValidationSeverity::Error,
-                    format!("required child <{child_name}> is missing"),
+                    format!(
+                        "child <{child_name}> appears {count} times, min is {}",
+                        occ.min
+                    ),
                 );
             }
             if let Some(m) = occ.max {
@@ -421,6 +441,9 @@ impl<'m> ValidationContext<'m> {
     }
 
     fn push_error(&mut self, severity: ValidationSeverity, message: String) {
+        if self.errors.len() >= self.opts.max_errors {
+            return;
+        }
         self.errors.push(ValidationError {
             severity,
             path: self.current_path(),
@@ -464,4 +487,29 @@ fn group_branch_count(content: &ContentModel, child_counts: &HashMap<String, usi
             ElementRef::Group(inner) => group_branch_count(inner, child_counts),
         })
         .sum()
+}
+
+// XSD built-in whitespace normalization uses XML whitespace, not Unicode trim.
+fn normalize_whitespace<'a>(text: &'a str, kind: &SimpleTypeKind) -> Cow<'a, str> {
+    if matches!(kind, SimpleTypeKind::String | SimpleTypeKind::Other(_)) {
+        return Cow::Borrowed(text);
+    }
+    if matches!(kind, SimpleTypeKind::NormalizedString) {
+        return if text.contains(['\t', '\r', '\n']) {
+            Cow::Owned(text.replace(['\t', '\r', '\n'], " "))
+        } else {
+            Cow::Borrowed(text)
+        };
+    }
+    let trimmed = text.trim_matches([' ', '\t', '\r', '\n']);
+    if !trimmed.contains(['\t', '\r', '\n']) && !trimmed.contains("  ") {
+        return Cow::Borrowed(trimmed);
+    }
+    Cow::Owned(
+        trimmed
+            .split([' ', '\t', '\r', '\n'])
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }

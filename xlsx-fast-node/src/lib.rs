@@ -57,17 +57,17 @@ fn to_arrow_options(opts: Option<ArrowOptionsJs>) -> ArrowOptions {
 
 /// Convert a core error into a JavaScript error carrying its message.
 fn js_error(err: impl std::fmt::Display) -> Error {
-    Error::from_reason(err.to_string())
+    Error::from_reason(format!("{err:#}"))
 }
 
-/// Parse an XLSX workbook and return every sheet and cell as a JSON value.
+/// Parse an XLS, XLSB or XLSX workbook and return every sheet and cell as a JSON value.
 #[napi]
 pub fn parse_xlsx_js(path: String, options: Option<ParseOptionsJs>) -> Result<serde_json::Value> {
     let workbook = parse_xlsx(path, to_parse_options(options)).map_err(js_error)?;
     serde_json::to_value(&workbook).map_err(js_error)
 }
 
-/// Parse an XLSX workbook and write one NDJSON record per cell to `out_path`.
+/// Parse an XLS, XLSB or XLSX workbook and write one NDJSON record per cell to `out_path`.
 #[napi]
 pub fn parse_xlsx_ndjson_js(
     path: String,
@@ -77,7 +77,7 @@ pub fn parse_xlsx_ndjson_js(
     parse_xlsx_to_ndjson(path, out_path, to_parse_options(options)).map_err(js_error)
 }
 
-/// Parse an XLSX workbook and write an Arrow IPC file to `out_path`.
+/// Parse an XLS, XLSB or XLSX workbook and write an Arrow IPC file to `out_path`.
 #[napi]
 pub fn parse_xlsx_arrow_ipc_js(
     path: String,

@@ -30,3 +30,6 @@ __pycache__/
 /.leio-code/exports/
 /.leio-code/*.lock
 /.leio-code/sessions/
+
+# Optional JavaScript rendering sidecar dependencies.
+/web-fast-crawl/browser/node_modules/

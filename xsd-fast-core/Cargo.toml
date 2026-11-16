@@ -12,6 +12,10 @@ rust-version.workspace = true
 [lib]
 name = "xsd_fast_core"
 
+[[bench]]
+name = "validate"
+harness = false
+
 [features]
 default = []
 arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc"]

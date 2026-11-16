@@ -18,6 +18,22 @@
  * Options for parsing email files
  */
 export interface ParseOptions {
+  /** Resource limit; same meaning as Rust max_inflate. */
+  maxInflate?: number;
+  max_inflate?: number;
+  /** Resource limit; same meaning as Rust max_mime_depth. */
+  maxMimeDepth?: number;
+  max_mime_depth?: number;
+  /** Resource limit; same meaning as Rust max_mime_parts. */
+  maxMimeParts?: number;
+  max_mime_parts?: number;
+  /** Resource limit; same meaning as Rust max_header_bytes. */
+  maxHeaderBytes?: number;
+  max_header_bytes?: number;
+  /** Resource limit; same meaning as Rust max_total_attachment_bytes. */
+  maxTotalAttachmentBytes?: number;
+  max_total_attachment_bytes?: number;
+
   /** Max attachment size to process in bytes (default: 104857600 = 100 MB) */
   maxAttachmentSize?: number;
   /** Max attachment size (snake_case alias) */
@@ -159,4 +175,4 @@ export function parseMboxArrow(path: string, outPath: string, options?: ParseOpt
  * @returns Array of paths to extracted files
  * @throws Error if the file cannot be parsed or attachments cannot be extracted
  */
-export function extractAttachments(path: string, outDir: string, maxAttachmentSize?: number): string[];
+export function extractAttachments(path: string, outDir: string, maxAttachmentSize?: number | ParseOptions, options?: ParseOptions): string[];

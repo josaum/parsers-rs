@@ -1,7 +1,7 @@
 {
   "name": "xlsx-fast-node",
   "version": "0.2.6",
-  "description": "High-performance Excel (.xlsx) parser with native Rust core",
+  "description": "Excel (.xlsx, .xls, .xlsb) parser with native Rust core",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",

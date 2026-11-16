@@ -1,3 +1,7 @@
+#![allow(
+    clippy::too_many_arguments,
+    reason = "Python keyword options preserve the released calling convention"
+)]
 use email_fast_core::arrow::{parse_mbox_to_arrow_ipc, ArrowOptions};
 use email_fast_core::{
     extract_attachments, parse_email, parse_email_bytes, parse_email_to_ndjson, parse_eml,
@@ -8,7 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 #[pyfunction]
-#[pyo3(signature = (path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None))]
+#[pyo3(signature = (path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None, *, max_inflate=None, max_mime_depth=None, max_mime_parts=None, max_header_bytes=None))]
 fn parse_email_json_py(
     path: &str,
     max_attachment_size: Option<usize>,
@@ -16,9 +20,16 @@ fn parse_email_json_py(
     html_to_text: Option<bool>,
     extract_attachment_content: Option<bool>,
     max_total_attachment_bytes: Option<usize>,
+    max_inflate: Option<usize>,
+    max_mime_depth: Option<usize>,
+    max_mime_parts: Option<usize>,
+    max_header_bytes: Option<usize>,
 ) -> PyResult<String> {
     let options = ParseOptions {
-        max_inflate: 128 * 1024 * 1024,
+        max_mime_depth: max_mime_depth.unwrap_or(64),
+        max_mime_parts: max_mime_parts.unwrap_or(10_000),
+        max_header_bytes: max_header_bytes.unwrap_or(256 * 1024),
+        max_inflate: max_inflate.unwrap_or(128 * 1024 * 1024),
         max_attachment_size: max_attachment_size.unwrap_or(100 * 1024 * 1024),
         max_total_attachment_bytes: max_total_attachment_bytes.unwrap_or(100 * 1024 * 1024),
         include_raw_headers: include_raw_headers.unwrap_or(false),
@@ -27,13 +38,13 @@ fn parse_email_json_py(
     };
 
     let email =
-        parse_email(path, options).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        parse_email(path, options).map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))?;
 
-    serde_json::to_string(&email).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    serde_json::to_string(&email).map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None))]
+#[pyo3(signature = (path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None, *, max_inflate=None, max_mime_depth=None, max_mime_parts=None, max_header_bytes=None))]
 fn parse_eml_json_py(
     path: &str,
     max_attachment_size: Option<usize>,
@@ -41,9 +52,16 @@ fn parse_eml_json_py(
     html_to_text: Option<bool>,
     extract_attachment_content: Option<bool>,
     max_total_attachment_bytes: Option<usize>,
+    max_inflate: Option<usize>,
+    max_mime_depth: Option<usize>,
+    max_mime_parts: Option<usize>,
+    max_header_bytes: Option<usize>,
 ) -> PyResult<String> {
     let options = ParseOptions {
-        max_inflate: 128 * 1024 * 1024,
+        max_mime_depth: max_mime_depth.unwrap_or(64),
+        max_mime_parts: max_mime_parts.unwrap_or(10_000),
+        max_header_bytes: max_header_bytes.unwrap_or(256 * 1024),
+        max_inflate: max_inflate.unwrap_or(128 * 1024 * 1024),
         max_attachment_size: max_attachment_size.unwrap_or(100 * 1024 * 1024),
         max_total_attachment_bytes: max_total_attachment_bytes.unwrap_or(100 * 1024 * 1024),
         include_raw_headers: include_raw_headers.unwrap_or(false),
@@ -51,13 +69,14 @@ fn parse_eml_json_py(
         extract_attachment_content: extract_attachment_content.unwrap_or(false),
     };
 
-    let email = parse_eml(path, options).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    let email =
+        parse_eml(path, options).map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))?;
 
-    serde_json::to_string(&email).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    serde_json::to_string(&email).map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, out_path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None))]
+#[pyo3(signature = (path, out_path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None, *, max_inflate=None, max_mime_depth=None, max_mime_parts=None, max_header_bytes=None))]
 fn parse_email_ndjson_py(
     path: &str,
     out_path: &str,
@@ -66,9 +85,16 @@ fn parse_email_ndjson_py(
     html_to_text: Option<bool>,
     extract_attachment_content: Option<bool>,
     max_total_attachment_bytes: Option<usize>,
+    max_inflate: Option<usize>,
+    max_mime_depth: Option<usize>,
+    max_mime_parts: Option<usize>,
+    max_header_bytes: Option<usize>,
 ) -> PyResult<()> {
     let options = ParseOptions {
-        max_inflate: 128 * 1024 * 1024,
+        max_mime_depth: max_mime_depth.unwrap_or(64),
+        max_mime_parts: max_mime_parts.unwrap_or(10_000),
+        max_header_bytes: max_header_bytes.unwrap_or(256 * 1024),
+        max_inflate: max_inflate.unwrap_or(128 * 1024 * 1024),
         max_attachment_size: max_attachment_size.unwrap_or(100 * 1024 * 1024),
         max_total_attachment_bytes: max_total_attachment_bytes.unwrap_or(100 * 1024 * 1024),
         include_raw_headers: include_raw_headers.unwrap_or(false),
@@ -77,11 +103,11 @@ fn parse_email_ndjson_py(
     };
 
     parse_email_to_ndjson(path, out_path, options)
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+        .map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, out_path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None))]
+#[pyo3(signature = (path, out_path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None, *, max_inflate=None, max_mime_depth=None, max_mime_parts=None, max_header_bytes=None))]
 fn parse_mbox_ndjson_py(
     path: &str,
     out_path: &str,
@@ -90,9 +116,16 @@ fn parse_mbox_ndjson_py(
     html_to_text: Option<bool>,
     extract_attachment_content: Option<bool>,
     max_total_attachment_bytes: Option<usize>,
+    max_inflate: Option<usize>,
+    max_mime_depth: Option<usize>,
+    max_mime_parts: Option<usize>,
+    max_header_bytes: Option<usize>,
 ) -> PyResult<usize> {
     let options = ParseOptions {
-        max_inflate: 128 * 1024 * 1024,
+        max_mime_depth: max_mime_depth.unwrap_or(64),
+        max_mime_parts: max_mime_parts.unwrap_or(10_000),
+        max_header_bytes: max_header_bytes.unwrap_or(256 * 1024),
+        max_inflate: max_inflate.unwrap_or(128 * 1024 * 1024),
         max_attachment_size: max_attachment_size.unwrap_or(100 * 1024 * 1024),
         max_total_attachment_bytes: max_total_attachment_bytes.unwrap_or(100 * 1024 * 1024),
         include_raw_headers: include_raw_headers.unwrap_or(false),
@@ -101,17 +134,13 @@ fn parse_mbox_ndjson_py(
     };
 
     parse_mbox_to_ndjson(path, out_path, options)
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+        .map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
 }
 
 #[pyfunction]
 // The eight parameters are the released Python signature; collapsing them into
 // an options struct would change the wheel surface, not the code quality.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors the released Python signature"
-)]
-#[pyo3(signature = (path, out_path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None, batch_size=None))]
+#[pyo3(signature = (path, out_path, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None, batch_size=None, *, max_inflate=None, max_mime_depth=None, max_mime_parts=None, max_header_bytes=None))]
 fn parse_mbox_arrow_py(
     path: &str,
     out_path: &str,
@@ -121,9 +150,16 @@ fn parse_mbox_arrow_py(
     extract_attachment_content: Option<bool>,
     max_total_attachment_bytes: Option<usize>,
     batch_size: Option<usize>,
+    max_inflate: Option<usize>,
+    max_mime_depth: Option<usize>,
+    max_mime_parts: Option<usize>,
+    max_header_bytes: Option<usize>,
 ) -> PyResult<usize> {
     let options = ParseOptions {
-        max_inflate: 128 * 1024 * 1024,
+        max_mime_depth: max_mime_depth.unwrap_or(64),
+        max_mime_parts: max_mime_parts.unwrap_or(10_000),
+        max_header_bytes: max_header_bytes.unwrap_or(256 * 1024),
+        max_inflate: max_inflate.unwrap_or(128 * 1024 * 1024),
         max_attachment_size: max_attachment_size.unwrap_or(100 * 1024 * 1024),
         max_total_attachment_bytes: max_total_attachment_bytes.unwrap_or(100 * 1024 * 1024),
         include_raw_headers: include_raw_headers.unwrap_or(false),
@@ -136,19 +172,26 @@ fn parse_mbox_arrow_py(
     };
 
     parse_mbox_to_arrow_ipc(path, out_path, options, arrow_options)
-        .map_err(|err: anyhow::Error| PyRuntimeError::new_err(err.to_string()))
+        .map_err(|err: anyhow::Error| PyRuntimeError::new_err(format!("{err:#}")))
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, out_dir, max_attachment_size=None, max_total_attachment_bytes=None))]
+#[pyo3(signature = (path, out_dir, max_attachment_size=None, max_total_attachment_bytes=None, *, max_inflate=None, max_mime_depth=None, max_mime_parts=None, max_header_bytes=None))]
 fn extract_attachments_py(
     path: &str,
     out_dir: &str,
     max_attachment_size: Option<usize>,
     max_total_attachment_bytes: Option<usize>,
+    max_inflate: Option<usize>,
+    max_mime_depth: Option<usize>,
+    max_mime_parts: Option<usize>,
+    max_header_bytes: Option<usize>,
 ) -> PyResult<Vec<String>> {
     let options = ParseOptions {
-        max_inflate: 128 * 1024 * 1024,
+        max_mime_depth: max_mime_depth.unwrap_or(64),
+        max_mime_parts: max_mime_parts.unwrap_or(10_000),
+        max_header_bytes: max_header_bytes.unwrap_or(256 * 1024),
+        max_inflate: max_inflate.unwrap_or(128 * 1024 * 1024),
         max_attachment_size: max_attachment_size.unwrap_or(100 * 1024 * 1024),
         max_total_attachment_bytes: max_total_attachment_bytes.unwrap_or(100 * 1024 * 1024),
         include_raw_headers: false,
@@ -157,7 +200,7 @@ fn extract_attachments_py(
     };
 
     let paths = extract_attachments(path, out_dir, options)
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        .map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))?;
 
     Ok(paths
         .into_iter()
@@ -170,7 +213,7 @@ fn extract_attachments_py(
 /// A caller with an uploaded document must not have to write it to disk first;
 /// this is the byte entry point for the `.eml` / `.msg` upload path.
 #[pyfunction]
-#[pyo3(signature = (source, format, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None))]
+#[pyo3(signature = (source, format, max_attachment_size=None, include_raw_headers=None, html_to_text=None, extract_attachment_content=None, max_total_attachment_bytes=None, *, max_inflate=None, max_mime_depth=None, max_mime_parts=None, max_header_bytes=None))]
 fn parse_email_bytes_json_py(
     source: &Bound<'_, PyBytes>,
     format: &str,
@@ -179,6 +222,10 @@ fn parse_email_bytes_json_py(
     html_to_text: Option<bool>,
     extract_attachment_content: Option<bool>,
     max_total_attachment_bytes: Option<usize>,
+    max_inflate: Option<usize>,
+    max_mime_depth: Option<usize>,
+    max_mime_parts: Option<usize>,
+    max_header_bytes: Option<usize>,
 ) -> PyResult<String> {
     let format = match format {
         "eml" => EmailFormat::Eml,
@@ -190,7 +237,10 @@ fn parse_email_bytes_json_py(
         }
     };
     let options = ParseOptions {
-        max_inflate: 128 * 1024 * 1024,
+        max_mime_depth: max_mime_depth.unwrap_or(64),
+        max_mime_parts: max_mime_parts.unwrap_or(10_000),
+        max_header_bytes: max_header_bytes.unwrap_or(256 * 1024),
+        max_inflate: max_inflate.unwrap_or(128 * 1024 * 1024),
         max_attachment_size: max_attachment_size.unwrap_or(100 * 1024 * 1024),
         max_total_attachment_bytes: max_total_attachment_bytes.unwrap_or(100 * 1024 * 1024),
         include_raw_headers: include_raw_headers.unwrap_or(false),
@@ -198,8 +248,8 @@ fn parse_email_bytes_json_py(
         extract_attachment_content: extract_attachment_content.unwrap_or(false),
     };
     let email = parse_email_bytes(source.as_bytes(), format, options)
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    serde_json::to_string(&email).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+        .map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))?;
+    serde_json::to_string(&email).map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
 }
 
 #[pymodule]

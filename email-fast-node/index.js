@@ -4,6 +4,11 @@ function parseEmail(path, options = undefined) {
   let opts = undefined;
   if (options) {
     opts = {
+      maxInflate: options.maxInflate ?? options.max_inflate,
+      maxMimeDepth: options.maxMimeDepth ?? options.max_mime_depth,
+      maxMimeParts: options.maxMimeParts ?? options.max_mime_parts,
+      maxHeaderBytes: options.maxHeaderBytes ?? options.max_header_bytes,
+      maxTotalAttachmentBytes: options.maxTotalAttachmentBytes ?? options.max_total_attachment_bytes,
       maxAttachmentSize: options.maxAttachmentSize ?? options.max_attachment_size,
       includeRawHeaders: options.includeRawHeaders ?? options.include_raw_headers,
       htmlToText: options.htmlToText ?? options.html_to_text,
@@ -17,6 +22,11 @@ function parseEml(path, options = undefined) {
   let opts = undefined;
   if (options) {
     opts = {
+      maxInflate: options.maxInflate ?? options.max_inflate,
+      maxMimeDepth: options.maxMimeDepth ?? options.max_mime_depth,
+      maxMimeParts: options.maxMimeParts ?? options.max_mime_parts,
+      maxHeaderBytes: options.maxHeaderBytes ?? options.max_header_bytes,
+      maxTotalAttachmentBytes: options.maxTotalAttachmentBytes ?? options.max_total_attachment_bytes,
       maxAttachmentSize: options.maxAttachmentSize ?? options.max_attachment_size,
       includeRawHeaders: options.includeRawHeaders ?? options.include_raw_headers,
       htmlToText: options.htmlToText ?? options.html_to_text,
@@ -30,6 +40,11 @@ function parseEmailNdjson(path, outPath, options = undefined) {
   let opts = undefined;
   if (options) {
     opts = {
+      maxInflate: options.maxInflate ?? options.max_inflate,
+      maxMimeDepth: options.maxMimeDepth ?? options.max_mime_depth,
+      maxMimeParts: options.maxMimeParts ?? options.max_mime_parts,
+      maxHeaderBytes: options.maxHeaderBytes ?? options.max_header_bytes,
+      maxTotalAttachmentBytes: options.maxTotalAttachmentBytes ?? options.max_total_attachment_bytes,
       maxAttachmentSize: options.maxAttachmentSize ?? options.max_attachment_size,
       includeRawHeaders: options.includeRawHeaders ?? options.include_raw_headers,
       htmlToText: options.htmlToText ?? options.html_to_text,
@@ -43,6 +58,11 @@ function parseMboxNdjson(path, outPath, options = undefined) {
   let opts = undefined;
   if (options) {
     opts = {
+      maxInflate: options.maxInflate ?? options.max_inflate,
+      maxMimeDepth: options.maxMimeDepth ?? options.max_mime_depth,
+      maxMimeParts: options.maxMimeParts ?? options.max_mime_parts,
+      maxHeaderBytes: options.maxHeaderBytes ?? options.max_header_bytes,
+      maxTotalAttachmentBytes: options.maxTotalAttachmentBytes ?? options.max_total_attachment_bytes,
       maxAttachmentSize: options.maxAttachmentSize ?? options.max_attachment_size,
       includeRawHeaders: options.includeRawHeaders ?? options.include_raw_headers,
       htmlToText: options.htmlToText ?? options.html_to_text,
@@ -57,6 +77,11 @@ function parseMboxArrow(path, outPath, options = undefined) {
   let arrowOpts = undefined;
   if (options) {
     opts = {
+      maxInflate: options.maxInflate ?? options.max_inflate,
+      maxMimeDepth: options.maxMimeDepth ?? options.max_mime_depth,
+      maxMimeParts: options.maxMimeParts ?? options.max_mime_parts,
+      maxHeaderBytes: options.maxHeaderBytes ?? options.max_header_bytes,
+      maxTotalAttachmentBytes: options.maxTotalAttachmentBytes ?? options.max_total_attachment_bytes,
       maxAttachmentSize: options.maxAttachmentSize ?? options.max_attachment_size,
       includeRawHeaders: options.includeRawHeaders ?? options.include_raw_headers,
       htmlToText: options.htmlToText ?? options.html_to_text,
@@ -69,8 +94,19 @@ function parseMboxArrow(path, outPath, options = undefined) {
   return native.parseMboxArrowJs(path, outPath, opts, arrowOpts);
 }
 
-function extractAttachments(path, outDir, maxAttachmentSize = undefined) {
-  return native.extractAttachmentsJs(path, outDir, maxAttachmentSize);
+function extractAttachments(path, outDir, maxAttachmentSize = undefined, options = undefined) {
+  if (typeof maxAttachmentSize === 'object' && maxAttachmentSize !== null) {
+    options = maxAttachmentSize;
+    maxAttachmentSize = options.maxAttachmentSize ?? options.max_attachment_size;
+  }
+  const opts = options && {
+    maxInflate: options.maxInflate ?? options.max_inflate,
+    maxMimeDepth: options.maxMimeDepth ?? options.max_mime_depth,
+    maxMimeParts: options.maxMimeParts ?? options.max_mime_parts,
+    maxHeaderBytes: options.maxHeaderBytes ?? options.max_header_bytes,
+    maxTotalAttachmentBytes: options.maxTotalAttachmentBytes ?? options.max_total_attachment_bytes,
+  };
+  return native.extractAttachmentsJs(path, outDir, maxAttachmentSize, opts);
 }
 
 module.exports = {

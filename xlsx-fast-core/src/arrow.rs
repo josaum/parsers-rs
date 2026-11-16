@@ -1,8 +1,8 @@
 use crate::{
-    open_archive, open_archive_with_budget, open_optional_part_reader, open_part_reader,
-    parse_relationships, parse_shared_strings_reader, parse_sheet_reader_with, parse_styles,
-    parse_workbook, part_dir, read_optional_part_bytes, rels_path_for_part, resolve_part,
-    CellPartsRef, CellValueRef, ParseOptions, StringTable, Styles, REL_SHARED_STRINGS, REL_STYLES,
+    open_archive_with_budget, open_optional_part_reader, open_part_reader, parse_relationships,
+    parse_shared_strings_reader, parse_sheet_reader_with, parse_styles, parse_workbook, part_dir,
+    read_optional_part_bytes, rels_path_for_part, resolve_part, CellPartsRef, CellValueRef,
+    ParseOptions, StringTable, Styles, REL_SHARED_STRINGS, REL_STYLES,
 };
 use anyhow::{anyhow, Context, Result};
 use arrow_array::builder::{
@@ -23,6 +23,13 @@ const TYPE_STRING: u8 = 3;
 const TYPE_ERROR: u8 = 4;
 const TYPE_DATE: u8 = 5;
 const TYPE_RAW: u8 = 6;
+
+/// Stream batches from XLS, XLSB or XLSX using the common cell schema.
+pub use parse_xlsx_to_arrow_batches as parse_excel_to_arrow_batches;
+/// Write an XLS, XLSB or XLSX workbook as Arrow IPC.
+pub use parse_xlsx_to_arrow_ipc as parse_excel_to_arrow_ipc;
+/// Return Arrow IPC bytes for an XLS, XLSB or XLSX workbook.
+pub use parse_xlsx_to_arrow_ipc_bytes as parse_excel_to_arrow_ipc_bytes;
 
 pub use crate::RangeFilter;
 
@@ -90,7 +97,7 @@ pub fn schema() -> SchemaRef {
     ]))
 }
 
-/// Parse an `.xlsx` file and encode its cell batches as an in-memory Arrow IPC
+/// Parse an XLS, XLSB or XLSX file and encode its cell batches as an in-memory Arrow IPC
 /// stream.
 ///
 /// Use this when the caller wants the bytes — a Flight response, an in-process
@@ -114,11 +121,12 @@ pub fn parse_xlsx_to_arrow_ipc_bytes(
     Ok(ipc)
 }
 
-/// Parse an `.xlsx` file and stream its cell batches to `out_path` as Arrow
-/// IPC (Feather v2), returning the number of bytes written.
+/// Parse an XLS, XLSB or XLSX file and stream its cell batches to `out_path` as Arrow
+/// IPC stream, returning the number of bytes written.
 ///
-/// Batches follow [`schema()`] and are emitted as they fill, so peak memory is
-/// bounded by [`ArrowOptions::batch_size`] rather than by the workbook. The
+/// Batches follow [`schema()`] and are emitted as they fill. XLSX parses sheet
+/// XML incrementally after bounded part inflation. XLS/XLSB materialize a
+/// budgeted workbook first; batch size only bounds their output batches. The
 /// stream is fed through a [`BufWriter`], so a failure mid-parse leaves a
 /// partial file: a caller that needs all-or-nothing output should write to a
 /// temporary path and rename.
@@ -180,7 +188,36 @@ where
     F: FnMut(RecordBatch) -> Result<()>,
 {
     let path = path.as_ref();
-    let archive = open_archive(path)?;
+    let archive = match crate::open_workbook_source(path, options)? {
+        crate::WorkbookSource::Xml(archive) => archive,
+        crate::WorkbookSource::Binary(workbook) => {
+            let schema = schema();
+            let mut builder = ArrowBatchBuilder::new(
+                arrow_options.batch_size.max(1),
+                arrow_options.include_sheet_names,
+                arrow_options.range_filter.clone(),
+            );
+            for sheet in workbook.sheets {
+                if arrow_options
+                    .sheet_filter
+                    .as_ref()
+                    .is_some_and(|names| !names.contains(&sheet.name))
+                {
+                    continue;
+                }
+                for cell in &sheet.cells {
+                    builder.push(sheet.id, &sheet.name, cell.as_parts());
+                    if builder.len() >= builder.capacity {
+                        emit(builder.finish(&schema)?)?;
+                    }
+                }
+            }
+            if builder.len() > 0 {
+                emit(builder.finish(&schema)?)?;
+            }
+            return Ok(());
+        }
+    };
     let schema = schema();
 
     let root_rels = read_optional_part_bytes(&archive, "_rels/.rels", options.max_inflate)?;

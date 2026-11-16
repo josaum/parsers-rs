@@ -1,6 +1,11 @@
 # xlsx-fast-flight
 
-Arrow Flight server for streaming XLSX cells as Arrow IPC.
+Arrow Flight server for serving XLSX, XLS and XLSB cells as Arrow IPC.
+
+All formats share the existing Arrow schema and query filters. Directory listings
+include `.xls` and `.xlsb`. Binary workbooks are materialized under resource
+budgets before batches are emitted; `--threads` parallelizes XLSX sheets only.
+Encrypted workbooks are unsupported.
 
 ## Run server
 

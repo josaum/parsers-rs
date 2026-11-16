@@ -1,953 +1,593 @@
-// Rust guideline compliant 2026-02-21
-//! Outlook MSG via a zero-copy OLE Compound File Binary reader.
-//!
-//! No CFB crate: we walk the on-disk FAT / mini-FAT / directory ourselves
-//! (MS-CFB + MS-OXMSG). That keeps the hot path as slice indexing plus
-//! explicit bounds checks, and it cannot return the whole OLE file as a body.
-
-use crate::{
-    html_to_text, parse_email_address, Attachment, Email, EmailAddress, EmailBody, ParseOptions,
-    ThreadInfo,
-};
-use anyhow::{anyhow, Result};
+//! MS-OXMSG property/recipient/attachment projection over the shared CFB reader.
+use crate::{mime, Attachment, Email, EmailAddress, EmailBody, ParseOptions, ThreadInfo};
+use anyhow::{anyhow, ensure, Context, Result};
 use base64::Engine;
+use cfb::CompoundFile;
+use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
-const OLE_SIGNATURE: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
-const FREESECT: u32 = 0xFFFF_FFFF;
-const ENDOFCHAIN: u32 = 0xFFFF_FFFE;
-const FATSECT: u32 = 0xFFFF_FFFD;
-const DIFSECT: u32 = 0xFFFF_FFFC;
-const NOSTREAM: u32 = 0xFFFF_FFFF;
-const DIR_ENTRY_SIZE: usize = 128;
-const HEADER_SIZE: usize = 512;
-const MAX_CHAIN: usize = 1 << 20;
+mod rtf;
 
-const TYPE_STORAGE: u8 = 1;
-const TYPE_STREAM: u8 = 2;
-const TYPE_ROOT: u8 = 5;
-
-const TAG_SUBJECT: &str = "0037";
-const TAG_SENDER_EMAIL: &str = "0C1F";
-const TAG_SENDER_NAME: &str = "0C1A";
-const TAG_SENT_REPRESENTING_EMAIL: &str = "0065";
-const TAG_DISPLAY_CC: &str = "0E03";
-const TAG_DISPLAY_TO: &str = "0E04";
-const TAG_BODY: &str = "1000";
-const TAG_BODY_HTML: &str = "1013";
-const TAG_INTERNET_MESSAGE_ID: &str = "1035";
-const TAG_DISPLAY_NAME: &str = "3001";
-const TAG_ATTACH_DATA_BIN: &str = "3701";
-const TAG_ATTACH_FILENAME: &str = "3704";
-const TAG_ATTACH_LONG_FILENAME: &str = "3707";
-const TAG_ATTACH_MIME_TAG: &str = "370E";
-const TAG_ATTACH_CONTENT_ID: &str = "3712";
+type File<'a> = CompoundFile<Cursor<&'a [u8]>>;
 
 pub(crate) fn parse_msg_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
-    if bytes.len() < HEADER_SIZE || bytes[..8] != OLE_SIGNATURE {
-        return Err(anyhow!("Not a valid MSG file"));
-    }
-    let file = CfbFile::parse(bytes)?;
-    let (streams, attach_storages) = file.root_streams_and_attachments()?;
-    if streams.is_empty() {
-        return Err(anyhow!(
-            "MSG file has no root __substg1.0_ property streams (not a message object)"
-        ));
-    }
+    parse_with_sink(bytes, options, None)
+}
 
-    let subject = first_string(&streams, TAG_SUBJECT);
-    let from_addr = first_string(&streams, TAG_SENDER_EMAIL)
-        .or_else(|| first_string(&streams, TAG_SENT_REPRESENTING_EMAIL));
-    let from_name = first_string(&streams, TAG_SENDER_NAME);
-    let to_raw = first_string(&streams, TAG_DISPLAY_TO);
-    let cc_raw = first_string(&streams, TAG_DISPLAY_CC);
-    let mut body_text = first_string(&streams, TAG_BODY);
-    let body_html = first_string(&streams, TAG_BODY_HTML).or_else(|| {
-        first_binary(&streams, TAG_BODY_HTML)
-            .map(|b| {
-                String::from_utf8_lossy(b)
-                    .trim_matches('\0')
-                    .trim()
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty())
-    });
-    if options.html_to_text && body_text.is_none() {
-        if let Some(html) = &body_html {
-            body_text = Some(html_to_text(html));
+pub(crate) fn parse_with_sink(
+    bytes: &[u8],
+    options: ParseOptions,
+    mut sink: Option<&mut mime::AttachmentSink<'_>>,
+) -> Result<Email> {
+    ensure!(
+        bytes.len() <= options.max_inflate,
+        "MSG input exceeds max_inflate"
+    );
+    let mut file = CompoundFile::open(Cursor::new(bytes)).context("read MSG CFB compound file")?;
+    let entries: Vec<_> = file.walk().collect();
+    ensure!(
+        entries.len() <= options.max_mime_parts,
+        "MSG exceeds max_mime_parts"
+    );
+    let mut retained = 0u64;
+    for entry in &entries {
+        ensure!(
+            entry.path().components().count() <= options.max_mime_depth.saturating_add(1),
+            "MSG exceeds max_mime_depth"
+        );
+        retained = retained
+            .checked_add(entry.len())
+            .ok_or_else(|| anyhow!("MSG stream size overflow"))?;
+        ensure!(
+            retained <= options.max_inflate as u64,
+            "MSG property streams exceed max_inflate"
+        );
+    }
+    let root = Path::new("/");
+    let props = properties(&mut file, root, 32, 1252)?;
+    ensure!(!props.values.is_empty(), "MSG has no message properties");
+    let headers = props.string(0x007D)?;
+    let transport = if let Some(headers) = &headers {
+        let mut raw = headers.as_bytes().to_vec();
+        raw.extend_from_slice(b"\r\n\r\n");
+        let options = ParseOptions {
+            extract_attachment_content: false,
+            ..options
+        };
+        Some(crate::parse_eml_bytes(&raw, options)?)
+    } else {
+        None
+    };
+    let subject = props
+        .string(0x0037)?
+        .or_else(|| transport.as_ref().and_then(|e| e.subject.clone()));
+    let from = EmailAddress {
+        address: props
+            .string(0x5D01)?
+            .or(props.string(0x0C1F)?)
+            .or(props.string(0x0065)?)
+            .unwrap_or_else(|| {
+                transport
+                    .as_ref()
+                    .map(|e| e.from.address.clone())
+                    .unwrap_or_default()
+            }),
+        name: props
+            .string(0x0C1A)?
+            .or_else(|| transport.as_ref().and_then(|e| e.from.name.clone())),
+    };
+    let mut to = Vec::new();
+    let mut cc = Vec::new();
+    let mut bcc = Vec::new();
+    let mut recipient_count = 0;
+    for entry in entries.iter().filter(|entry| {
+        entry.is_storage()
+            && entry.path().parent() == Some(root)
+            && entry.name().starts_with("__recip_version1.0_")
+    }) {
+        recipient_count += 1;
+        let recipient = properties(&mut file, entry.path(), 8, props.codepage())?;
+        let address = EmailAddress {
+            name: recipient.string(0x3001)?,
+            address: recipient
+                .string(0x39FE)?
+                .or(recipient.string(0x3003)?)
+                .unwrap_or_default(),
+        };
+        match recipient.integer(0x0C15).unwrap_or(1) {
+            1 => to.push(address),
+            2 => cc.push(address),
+            3 => bcc.push(address),
+            _ => {}
         }
     }
-    let message_id = first_string(&streams, TAG_INTERNET_MESSAGE_ID);
-
-    let from = match (from_addr, from_name) {
-        (Some(address), name) => EmailAddress { name, address },
-        (None, Some(name)) => EmailAddress {
-            name: Some(name),
-            address: String::new(),
-        },
-        (None, None) => EmailAddress::default(),
+    if recipient_count == 0 {
+        to = transport.as_ref().map(|e| e.to.clone()).unwrap_or_default();
+        cc = transport.as_ref().map(|e| e.cc.clone()).unwrap_or_default();
+        bcc = transport
+            .as_ref()
+            .map(|e| e.bcc.clone())
+            .unwrap_or_default();
+        // DisplayTo/DisplayCc are labels, not reliable email addresses. Preserve
+        // them as names only when recipient objects/transport headers are absent.
+        if to.is_empty() {
+            to = display_recipients(props.string(0x0E04)?);
+        }
+        if cc.is_empty() {
+            cc = display_recipients(props.string(0x0E03)?);
+        }
+        if bcc.is_empty() {
+            bcc = display_recipients(props.string(0x0E02)?);
+        }
+    }
+    let mut body = EmailBody {
+        text: props.string(0x1000)?,
+        html: props.string(0x1013)?,
     };
-
-    let parse_addr_list = |raw_opt: Option<String>| -> Vec<EmailAddress> {
-        raw_opt
-            .map(|raw| {
-                raw.split(';')
-                    .map(str::trim)
-                    .filter(|part| !part.is_empty())
-                    .map(|part| {
-                        parse_email_address(part).unwrap_or(EmailAddress {
-                            name: None,
-                            address: part.to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-
-    let to = parse_addr_list(to_raw);
-    let cc = parse_addr_list(cc_raw);
-
+    if body.html.is_none() {
+        if let Some(raw) = props.binary(0x1013) {
+            body.html = Some(props.decode_with_codepage(
+                raw,
+                props.integer(0x3FDE).unwrap_or_else(|| props.codepage()),
+            )?);
+        }
+    }
+    if body.text.is_none() {
+        if let Some(compressed) = props.binary(0x1009) {
+            body.text = Some(rtf::text(
+                compressed,
+                options.max_inflate,
+                options.max_mime_depth,
+            )?);
+        }
+    }
+    if options.html_to_text && body.text.is_none() {
+        body.text = body.html.as_deref().map(crate::html_to_text);
+    }
+    let mut total = body
+        .text
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(body.html.as_ref().map_or(0, String::len));
+    ensure!(
+        total <= options.max_inflate,
+        "MSG decoded body exceeds max_inflate"
+    );
+    let mut attachment_total = 0usize;
     let mut attachments = Vec::new();
-    let mut total_attachment_bytes = 0usize;
-    for (idx, att_streams) in attach_storages.into_iter().enumerate() {
-        let Some(raw_bytes) = first_binary(&att_streams, TAG_ATTACH_DATA_BIN) else {
-            continue;
-        };
-        let size = raw_bytes.len();
-        if size > options.max_attachment_size {
-            continue;
-        }
-        let filename = first_string(&att_streams, TAG_ATTACH_LONG_FILENAME)
-            .or_else(|| first_string(&att_streams, TAG_ATTACH_FILENAME))
-            .or_else(|| first_string(&att_streams, TAG_DISPLAY_NAME))
-            .unwrap_or_else(|| format!("attachment_{idx}.bin"));
-        let content_type = first_string(&att_streams, TAG_ATTACH_MIME_TAG)
-            .unwrap_or_else(|| infer_mime_type(&filename, raw_bytes));
-        let content_id = first_string(&att_streams, TAG_ATTACH_CONTENT_ID);
-        let is_inline = content_id.is_some();
-
-        let content = if options.extract_attachment_content
-            && total_attachment_bytes.saturating_add(size) <= options.max_total_attachment_bytes
-        {
-            total_attachment_bytes += size;
-            Some(base64::engine::general_purpose::STANDARD.encode(raw_bytes))
-        } else {
-            None
-        };
-
-        attachments.push(Attachment {
-            filename,
-            content_type,
-            size,
+    for (index, entry) in entries
+        .iter()
+        .filter(|entry| {
+            entry.is_storage()
+                && entry.path().parent() == Some(root)
+                && entry.name().starts_with("__attach_version1.0_")
+        })
+        .enumerate()
+    {
+        let p = properties(&mut file, entry.path(), 8, props.codepage())?;
+        let embedded = entry.path().join("__substg1.0_3701000D");
+        let data_path = entry.path().join("__substg1.0_37010102");
+        let is_embedded = file.is_storage(&embedded);
+        let limit = options
+            .max_attachment_size
+            .min(
+                options
+                    .max_total_attachment_bytes
+                    .saturating_sub(attachment_total),
+            )
+            .min(options.max_inflate.saturating_sub(total));
+        let content_id = p.string(0x3712)?;
+        let mut attachment = Attachment {
+            filename: p
+                .string(0x3707)?
+                .or(p.string(0x3704)?)
+                .or(p.string(0x3001)?)
+                .unwrap_or_else(|| {
+                    format!(
+                        "attachment_{index}.{}",
+                        if is_embedded { "msg" } else { "bin" }
+                    )
+                }),
+            content_type: p.string(0x370E)?.unwrap_or_else(|| {
+                if is_embedded {
+                    "application/vnd.ms-outlook"
+                } else {
+                    "application/octet-stream"
+                }
+                .into()
+            }),
+            size: 0,
+            is_inline: content_id.is_some(),
             content_id,
-            is_inline,
-            content,
-        });
+            content: None,
+        };
+        let embedded_bytes;
+        let mut reader: Box<dyn Read> = if is_embedded {
+            embedded_bytes = copy_embedded(&mut file, &embedded, limit)?;
+            Box::new(Cursor::new(embedded_bytes))
+        } else if file.is_stream(&data_path) {
+            ensure!(
+                file.entry(&data_path)?.len() <= limit as u64,
+                "MSG attachment exceeds configured budget"
+            );
+            Box::new(file.open_stream(&data_path)?)
+        } else {
+            continue;
+        };
+        let size = if let Some(sink) = &mut sink {
+            sink(&attachment, &mut reader, limit)?
+        } else if options.extract_attachment_content {
+            let mut bytes = Vec::new();
+            let n = mime::copy_limited(&mut reader, &mut bytes, limit)?;
+            attachment.content = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+            n
+        } else {
+            mime::copy_limited(&mut reader, &mut std::io::sink(), limit)?
+        };
+        attachment.size = size;
+        total += size;
+        attachment_total += size;
+        attachments.push(attachment);
     }
-
+    let message_id = props
+        .string(0x1035)?
+        .or_else(|| transport.as_ref().and_then(|e| e.message_id.clone()));
+    let in_reply_to = props.string(0x1042)?.or_else(|| {
+        transport
+            .as_ref()
+            .and_then(|e| e.thread_info.in_reply_to.clone())
+    });
+    let references = props
+        .string(0x1039)?
+        .map(|s| s.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_else(|| {
+            transport
+                .as_ref()
+                .map(|e| e.thread_info.references.clone())
+                .unwrap_or_default()
+        });
+    let reply_to = props
+        .binary(0x004F)
+        .map(|bytes| reply_recipient(bytes, &props))
+        .transpose()?
+        .flatten()
+        .or_else(|| transport.as_ref().and_then(|e| e.reply_to.clone()))
+        .or_else(|| {
+            props
+                .string(0x0050)
+                .ok()
+                .flatten()
+                .and_then(|raw| display_recipients(Some(raw)).into_iter().next())
+        });
+    let date = props
+        .timestamp(0x0039)?
+        .or(props.timestamp(0x0E06)?)
+        .or_else(|| transport.as_ref().and_then(|e| e.date));
     Ok(Email {
-        message_id,
+        message_id: message_id.clone(),
         from,
-        reply_to: None,
+        reply_to,
         to,
         cc,
-        bcc: vec![],
+        bcc,
         subject,
-        date: None,
-        body: EmailBody {
-            text: body_text,
-            html: body_html,
-        },
+        date,
+        body,
         attachments,
-        thread_info: ThreadInfo::default(),
-        priority: None,
-        headers: None,
+        thread_info: ThreadInfo {
+            message_id,
+            in_reply_to,
+            references,
+        },
+        priority: props.integer(0x0017).and_then(|n| match n {
+            0 => Some(5),
+            1 => Some(3),
+            2 => Some(1),
+            _ => None,
+        }),
+        headers: transport.and_then(|e| e.headers),
     })
 }
 
-fn infer_mime_type(filename: &str, bytes: &[u8]) -> String {
-    let lower = filename.to_ascii_lowercase();
-    if lower.ends_with(".pdf") || bytes.starts_with(b"%PDF") {
-        "application/pdf".to_string()
-    } else if lower.ends_with(".png") || bytes.starts_with(b"\x89PNG") {
-        "image/png".to_string()
-    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        "image/jpeg".to_string()
-    } else if lower.ends_with(".docx") {
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string()
-    } else if lower.ends_with(".xlsx") {
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()
-    } else if lower.ends_with(".csv") {
-        "text/csv".to_string()
-    } else {
-        "application/octet-stream".to_string()
-    }
-}
-
-struct CfbFile<'a> {
-    data: &'a [u8],
-    sector_size: usize,
-    mini_sector_size: usize,
-    mini_cutoff: u64,
-    fat: Vec<u32>,
-    mini_fat: Vec<u32>,
-    directory: Vec<DirEntry>,
-    mini_stream: Vec<u8>,
-}
-
-struct DirEntry {
-    name: String,
-    obj_type: u8,
-    left: u32,
-    right: u32,
-    child: u32,
-    start_sector: u32,
-    stream_size: u64,
-}
-
-struct PropStream {
-    tag: String,
-    kind: PropKind,
-    bytes: Vec<u8>,
-}
-
-enum PropKind {
-    Unicode,
-    Ansi,
-    Binary,
-}
-
-impl<'a> CfbFile<'a> {
-    fn parse(data: &'a [u8]) -> Result<Self> {
-        if u16_le(data, 0x1C)? != 0xFFFE {
-            return Err(anyhow!("MSG CFB: unexpected byte order"));
-        }
-        let sector_shift = u16_le(data, 0x1E)? as u32;
-        let mini_shift = u16_le(data, 0x20)? as u32;
-        if !(9..=12).contains(&sector_shift) || mini_shift == 0 || mini_shift >= sector_shift {
-            return Err(anyhow!("MSG CFB: invalid sector shift"));
-        }
-        let sector_size = 1usize << sector_shift;
-        let mini_sector_size = 1usize << mini_shift;
-        let mini_cutoff = u32_le(data, 0x38)? as u64;
-        let first_dir = u32_le(data, 0x30)?;
-        let first_mini_fat = u32_le(data, 0x3C)?;
-        let first_difat = u32_le(data, 0x44)?;
-        let num_difat = u32_le(data, 0x48)? as usize;
-
-        let fat = load_fat(data, sector_size, first_difat, num_difat)?;
-        let directory = load_directory(data, sector_size, &fat, first_dir)?;
-        let mini_fat = if first_mini_fat == ENDOFCHAIN || first_mini_fat == FREESECT {
-            Vec::new()
-        } else {
-            let raw = read_fat_chain(data, sector_size, &fat, first_mini_fat)?;
-            parse_u32_le_table(&raw)
-        };
-        let mini_stream = if let Some(root) = directory.first() {
-            if root.stream_size == 0 || root.start_sector == ENDOFCHAIN {
-                Vec::new()
-            } else {
-                read_fat_chain_len(
-                    data,
-                    sector_size,
-                    &fat,
-                    root.start_sector,
-                    root.stream_size as usize,
-                )?
-            }
-        } else {
-            Vec::new()
-        };
-
-        Ok(Self {
-            data,
-            sector_size,
-            mini_sector_size,
-            mini_cutoff,
-            fat,
-            mini_fat,
-            directory,
-            mini_stream,
+fn display_recipients(raw: Option<String>) -> Vec<EmailAddress> {
+    raw.into_iter()
+        .flat_map(|raw| {
+            raw.split(';')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    mailparse::addrparse(s)
+                        .ok()
+                        .and_then(|list| crate::flatten_addresses(&list).into_iter().next())
+                        .unwrap_or(EmailAddress {
+                            name: Some(s.trim().into()),
+                            address: String::new(),
+                        })
+                })
+                .collect::<Vec<_>>()
         })
-    }
-
-    #[cfg(test)]
-    fn root_substg_streams(&self) -> Result<Vec<PropStream>> {
-        self.root_streams_and_attachments().map(|(s, _)| s)
-    }
-
-    fn root_streams_and_attachments(&self) -> Result<(Vec<PropStream>, Vec<Vec<PropStream>>)> {
-        let Some(root) = self.directory.first() else {
-            return Err(anyhow!("MSG CFB: empty directory"));
-        };
-        let mut out = Vec::new();
-        let mut attachments = Vec::new();
-        // A malformed CFB can point `left`/`right`/`child` back into the tree.
-        // Without this, `walk_dir` recurses until the stack dies on a file we
-        // do not control.
-        let mut visited = vec![false; self.directory.len()];
-        if root.child != NOSTREAM {
-            self.walk_dir(root.child, true, &mut out, &mut attachments, &mut visited)?;
-        }
-        Ok((out, attachments))
-    }
-
-    fn walk_dir(
-        &self,
-        idx: u32,
-        take_streams: bool,
-        out: &mut Vec<PropStream>,
-        attachments: &mut Vec<Vec<PropStream>>,
-        visited: &mut [bool],
-    ) -> Result<()> {
-        if idx == NOSTREAM {
-            return Ok(());
-        }
-        let slot = visited
-            .get_mut(idx as usize)
-            .ok_or_else(|| anyhow!("MSG CFB: directory index {idx} out of range"))?;
-        if *slot {
-            return Err(anyhow!("MSG CFB: directory cycle at index {idx}"));
-        }
-        *slot = true;
-        let entry = self
-            .directory
-            .get(idx as usize)
-            .ok_or_else(|| anyhow!("MSG CFB: directory index {idx} out of range"))?;
-        self.walk_dir(entry.left, take_streams, out, attachments, visited)?;
-        if entry.obj_type == TYPE_STORAGE && entry.child != NOSTREAM {
-            if take_streams && entry.name.starts_with("__attach_version1.0_") {
-                let mut att_streams = Vec::new();
-                let mut dummy_nested = Vec::new();
-                self.walk_dir(
-                    entry.child,
-                    true,
-                    &mut att_streams,
-                    &mut dummy_nested,
-                    visited,
-                )?;
-                attachments.push(att_streams);
-            } else {
-                // Recipients / other storages have their own substg streams; ignore
-                // them so attachment/recipient bodies cannot masquerade as the message body.
-                self.walk_dir(entry.child, false, out, attachments, visited)?;
-            }
-        }
-        if take_streams && entry.obj_type == TYPE_STREAM {
-            if let Some((tag, kind)) = parse_substg_name(&entry.name) {
-                let bytes = self.read_stream(entry)?;
-                out.push(PropStream { tag, kind, bytes });
-            }
-        }
-        self.walk_dir(entry.right, take_streams, out, attachments, visited)?;
-        Ok(())
-    }
-
-    fn read_stream(&self, entry: &DirEntry) -> Result<Vec<u8>> {
-        let len = entry.stream_size as usize;
-        if entry.stream_size < self.mini_cutoff && !self.mini_stream.is_empty() {
-            read_mini_chain(
-                &self.mini_stream,
-                &self.mini_fat,
-                self.mini_sector_size,
-                entry.start_sector,
-                len,
-            )
-        } else {
-            read_fat_chain_len(
-                self.data,
-                self.sector_size,
-                &self.fat,
-                entry.start_sector,
-                len,
-            )
-        }
-    }
-}
-
-fn load_fat(
-    data: &[u8],
-    sector_size: usize,
-    first_difat: u32,
-    num_difat: usize,
-) -> Result<Vec<u32>> {
-    let mut fat_sectors =
-        Vec::with_capacity(109 + num_difat * ((sector_size / 4).saturating_sub(1)));
-    for i in 0..109 {
-        let sect = u32_le(data, 0x4C + i * 4)?;
-        if sect != FREESECT {
-            fat_sectors.push(sect);
-        }
-    }
-    let mut difat_sect = first_difat;
-    let mut hops = 0usize;
-    while difat_sect != ENDOFCHAIN && difat_sect != FREESECT {
-        hops += 1;
-        if hops > MAX_CHAIN {
-            return Err(anyhow!("MSG CFB: DIFAT cycle"));
-        }
-        let raw = sector_slice(data, sector_size, difat_sect)?;
-        let entries = raw.len() / 4;
-        if entries == 0 {
-            break;
-        }
-        for i in 0..entries - 1 {
-            let sect = u32_le(raw, i * 4)?;
-            if sect != FREESECT {
-                fat_sectors.push(sect);
-            }
-        }
-        difat_sect = u32_le(raw, (entries - 1) * 4)?;
-    }
-    let mut fat = Vec::new();
-    for sect in fat_sectors {
-        let raw = sector_slice(data, sector_size, sect)?;
-        fat.extend(parse_u32_le_table(raw));
-    }
-    Ok(fat)
-}
-
-fn load_directory(
-    data: &[u8],
-    sector_size: usize,
-    fat: &[u32],
-    first_dir: u32,
-) -> Result<Vec<DirEntry>> {
-    let raw = read_fat_chain(data, sector_size, fat, first_dir)?;
-    if raw.len() < DIR_ENTRY_SIZE {
-        return Err(anyhow!("MSG CFB: truncated directory"));
-    }
-    let mut out = Vec::with_capacity(raw.len() / DIR_ENTRY_SIZE);
-    for chunk in raw.as_chunks::<DIR_ENTRY_SIZE>().0 {
-        let obj_type = chunk[0x42];
-        let name_len = u16_le(chunk, 0x40)? as usize;
-        let name = if obj_type == 0 || !(2..=64).contains(&name_len) {
-            String::new()
-        } else {
-            let units = name_len / 2 - 1;
-            let mut utf16 = Vec::with_capacity(units);
-            for i in 0..units {
-                utf16.push(u16_le(chunk, i * 2)?);
-            }
-            String::from_utf16_lossy(&utf16)
-        };
-        out.push(DirEntry {
-            name,
-            obj_type,
-            left: u32_le(chunk, 0x44)?,
-            right: u32_le(chunk, 0x48)?,
-            child: u32_le(chunk, 0x4C)?,
-            start_sector: u32_le(chunk, 0x74)?,
-            stream_size: u64_le(chunk, 0x78)?,
-        });
-    }
-    if out.is_empty() || out[0].obj_type != TYPE_ROOT {
-        return Err(anyhow!("MSG CFB: missing root directory entry"));
-    }
-    Ok(out)
-}
-
-fn read_fat_chain(data: &[u8], sector_size: usize, fat: &[u32], start: u32) -> Result<Vec<u8>> {
-    read_fat_chain_len(data, sector_size, fat, start, usize::MAX)
-}
-
-fn read_fat_chain_len(
-    data: &[u8],
-    sector_size: usize,
-    fat: &[u32],
-    start: u32,
-    max_len: usize,
-) -> Result<Vec<u8>> {
-    if start == ENDOFCHAIN || start == FREESECT {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    let mut sect = start;
-    let mut hops = 0usize;
-    // Exact cycle detection, not just a hop ceiling: with `max_len` unbounded a
-    // two-sector loop would otherwise append `sector_size` bytes per hop until
-    // MAX_CHAIN, inflating the buffer into the hundreds of MB before failing.
-    let mut seen = vec![false; fat.len()];
-    while sect != ENDOFCHAIN && sect != FREESECT {
-        hops += 1;
-        if hops > MAX_CHAIN {
-            return Err(anyhow!("MSG CFB: FAT chain too long"));
-        }
-        if let Some(slot) = seen.get_mut(sect as usize) {
-            if *slot {
-                return Err(anyhow!("MSG CFB: FAT cycle at sector {sect}"));
-            }
-            *slot = true;
-        }
-        if sect == FATSECT || sect == DIFSECT {
-            return Err(anyhow!("MSG CFB: FAT points at metadata sector"));
-        }
-        let raw = sector_slice(data, sector_size, sect)?;
-        let remaining = max_len.saturating_sub(out.len());
-        if remaining == 0 {
-            break;
-        }
-        let take = remaining.min(raw.len());
-        out.extend_from_slice(&raw[..take]);
-        sect = fat_next(fat, sect)?;
-    }
-    if max_len != usize::MAX && out.len() > max_len {
-        out.truncate(max_len);
-    }
-    Ok(out)
-}
-
-fn read_mini_chain(
-    mini_stream: &[u8],
-    mini_fat: &[u32],
-    mini_sector_size: usize,
-    start: u32,
-    max_len: usize,
-) -> Result<Vec<u8>> {
-    if start == ENDOFCHAIN || start == FREESECT || max_len == 0 {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::with_capacity(max_len);
-    let mut sect = start;
-    let mut hops = 0usize;
-    while sect != ENDOFCHAIN && sect != FREESECT {
-        hops += 1;
-        if hops > MAX_CHAIN {
-            return Err(anyhow!("MSG CFB: mini-FAT cycle"));
-        }
-        let off = sect as usize * mini_sector_size;
-        let end = off
-            .checked_add(mini_sector_size)
-            .ok_or_else(|| anyhow!("MSG CFB: mini sector overflow"))?;
-        if end > mini_stream.len() {
-            return Err(anyhow!("MSG CFB: mini sector {sect} past mini stream"));
-        }
-        let remaining = max_len.saturating_sub(out.len());
-        if remaining == 0 {
-            break;
-        }
-        let take = remaining.min(mini_sector_size);
-        out.extend_from_slice(&mini_stream[off..off + take]);
-        sect = fat_next(mini_fat, sect)?;
-    }
-    if out.len() > max_len {
-        out.truncate(max_len);
-    }
-    Ok(out)
-}
-
-fn fat_next(fat: &[u32], sect: u32) -> Result<u32> {
-    fat.get(sect as usize)
-        .copied()
-        .ok_or_else(|| anyhow!("MSG CFB: sector {sect} missing from FAT"))
-}
-
-fn sector_slice(data: &[u8], sector_size: usize, sect: u32) -> Result<&[u8]> {
-    let off = HEADER_SIZE
-        .checked_add(sect as usize * sector_size)
-        .ok_or_else(|| anyhow!("MSG CFB: sector offset overflow"))?;
-    let end = off
-        .checked_add(sector_size)
-        .ok_or_else(|| anyhow!("MSG CFB: sector end overflow"))?;
-    data.get(off..end)
-        .ok_or_else(|| anyhow!("MSG CFB: sector {sect} truncated"))
-}
-
-fn parse_u32_le_table(raw: &[u8]) -> Vec<u32> {
-    raw.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect()
 }
 
-fn u16_le(buf: &[u8], off: usize) -> Result<u16> {
-    buf.get(off..off + 2)
-        .and_then(|s| s.try_into().ok())
-        .map(u16::from_le_bytes)
-        .ok_or_else(|| anyhow!("MSG CFB: truncated u16 at {off}"))
+struct Properties {
+    values: BTreeMap<u32, Vec<u8>>,
+    inherited_codepage: u32,
 }
-
-fn u32_le(buf: &[u8], off: usize) -> Result<u32> {
-    buf.get(off..off + 4)
-        .and_then(|s| s.try_into().ok())
-        .map(u32::from_le_bytes)
-        .ok_or_else(|| anyhow!("MSG CFB: truncated u32 at {off}"))
-}
-
-fn u64_le(buf: &[u8], off: usize) -> Result<u64> {
-    buf.get(off..off + 8)
-        .and_then(|s| s.try_into().ok())
-        .map(u64::from_le_bytes)
-        .ok_or_else(|| anyhow!("MSG CFB: truncated u64 at {off}"))
-}
-
-fn parse_substg_name(name: &str) -> Option<(String, PropKind)> {
-    let rest = name.strip_prefix("__substg1.0_")?;
-    if rest.len() < 8 {
-        return None;
+impl Properties {
+    fn binary(&self, id: u32) -> Option<&[u8]> {
+        self.values.get(&((id << 16) | 0x0102)).map(Vec::as_slice)
     }
-    let tag = rest[..4].to_ascii_uppercase();
-    let kind = match rest[4..8].to_ascii_uppercase().as_str() {
-        "001F" => PropKind::Unicode,
-        "001E" => PropKind::Ansi,
-        "0102" => PropKind::Binary,
-        _ => return None,
-    };
-    Some((tag, kind))
-}
-
-fn first_binary<'a>(streams: &'a [PropStream], tag: &str) -> Option<&'a [u8]> {
-    streams
-        .iter()
-        .find(|s| s.tag.eq_ignore_ascii_case(tag) && matches!(s.kind, PropKind::Binary))
-        .map(|s| s.bytes.as_slice())
-}
-
-fn first_string(streams: &[PropStream], tag: &str) -> Option<String> {
-    let unicode = streams
-        .iter()
-        .find(|s| s.tag.eq_ignore_ascii_case(tag) && matches!(s.kind, PropKind::Unicode));
-    if let Some(stream) = unicode {
-        return decode_prop(&stream.bytes, &stream.kind);
+    fn integer(&self, id: u32) -> Option<u32> {
+        self.values
+            .get(&((id << 16) | 0x0003))
+            .and_then(|v| v.get(..4))
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
     }
-    streams
-        .iter()
-        .find(|s| s.tag.eq_ignore_ascii_case(tag) && matches!(s.kind, PropKind::Ansi))
-        .and_then(|stream| decode_prop(&stream.bytes, &stream.kind))
-}
-
-fn decode_prop(bytes: &[u8], kind: &PropKind) -> Option<String> {
-    let text = match kind {
-        PropKind::Unicode => {
-            if bytes.len() < 2 {
-                return None;
-            }
-            let units: Vec<u16> = bytes
+    fn string(&self, id: u32) -> Result<Option<String>> {
+        if let Some(bytes) = self.values.get(&((id << 16) | 0x001F)) {
+            ensure!(bytes.len() % 2 == 0, "odd length MSG Unicode property");
+            let units: Vec<_> = bytes
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|chunk| u16::from_le_bytes(*chunk))
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
                 .collect();
-            String::from_utf16_lossy(&units)
+            return Ok(Some(
+                String::from_utf16(&units)?.trim_end_matches('\0').into(),
+            ));
         }
-        PropKind::Ansi => String::from_utf8_lossy(bytes).into_owned(),
-        PropKind::Binary => return None,
-    };
-    let trimmed = text.trim_matches('\0').trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+        self.values
+            .get(&((id << 16) | 0x001E))
+            .map(|bytes| {
+                self.decode_with_codepage(
+                    bytes,
+                    if matches!(id, 0x1000 | 0x1013) {
+                        self.integer(0x3FDE).unwrap_or_else(|| self.codepage())
+                    } else {
+                        self.codepage()
+                    },
+                )
+            })
+            .transpose()
     }
-}
-
-/// Build a v3 CFB with mini-stream `__substg1.0_*` properties (real MSG layout).
-#[doc(hidden)]
-pub fn write_fixture_msg(subject: &str, sender: &str, to: &str, body: &str) -> Vec<u8> {
-    let props = [
-        ("__substg1.0_0037001F", utf16_le(subject)),
-        ("__substg1.0_0C1F001F", utf16_le(sender)),
-        ("__substg1.0_0E04001F", utf16_le(to)),
-        ("__substg1.0_1000001F", utf16_le(body)),
-    ];
-    write_ministream_cfb(&props)
-}
-
-fn utf16_le(value: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    for unit in value.encode_utf16() {
-        out.extend_from_slice(&unit.to_le_bytes());
+    fn codepage(&self) -> u32 {
+        self.integer(0x3FFD).unwrap_or(self.inherited_codepage)
     }
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out
-}
-
-fn write_ministream_cfb(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
-    const SECTOR: usize = 512;
-    const MINI: usize = 64;
-    let n = streams.len();
-    let dir_entries = 1 + n;
-    let dir_bytes = dir_entries * DIR_ENTRY_SIZE;
-    let dir_sectors = dir_bytes.div_ceil(SECTOR);
-    let mini_sectors: Vec<Vec<u8>> = streams
-        .iter()
-        .map(|(_, data)| {
-            let mut padded = data.clone();
-            let rem = padded.len() % MINI;
-            if rem != 0 {
-                padded.resize(padded.len() + (MINI - rem), 0);
-            }
-            if padded.is_empty() {
-                padded.resize(MINI, 0);
-            }
-            padded
-        })
-        .collect();
-    let mini_stream: Vec<u8> = mini_sectors.iter().flatten().copied().collect();
-    let mini_stream_sectors = mini_stream.len().div_ceil(SECTOR).max(1);
-    let mini_fat_sectors = 1;
-
-    // Layout after the 512-byte header:
-    // 0: FAT
-    // 1..dir_sectors: directory
-    // next: mini FAT
-    // next: mini stream data
-    let fat_sect = 0u32;
-    let dir_start = 1u32;
-    let mini_fat_start = dir_start + dir_sectors as u32;
-    let mini_data_start = mini_fat_start + mini_fat_sectors as u32;
-    let total_sectors = mini_data_start as usize + mini_stream_sectors;
-
-    let mut fat = vec![FREESECT; SECTOR / 4];
-    fat[0] = FATSECT;
-    for i in 0..dir_sectors {
-        let s = dir_start as usize + i;
-        fat[s] = if i + 1 == dir_sectors {
-            ENDOFCHAIN
-        } else {
-            (s + 1) as u32
+    fn decode_ansi(&self, bytes: &[u8]) -> Result<String> {
+        self.decode_with_codepage(bytes, self.codepage())
+    }
+    fn decode_with_codepage(&self, bytes: &[u8], cp: u32) -> Result<String> {
+        let encoding = u16::try_from(cp)
+            .ok()
+            .and_then(codepage::to_encoding)
+            .ok_or_else(|| anyhow!("unsupported MSG codepage {cp}"))?;
+        let (text, _, errors) = encoding.decode(bytes);
+        ensure!(!errors, "invalid MSG text for codepage {cp}");
+        Ok(text.trim_end_matches('\0').into())
+    }
+    fn timestamp(&self, id: u32) -> Result<Option<DateTime<Utc>>> {
+        let Some(value) = self.values.get(&((id << 16) | 0x0040)) else {
+            return Ok(None);
         };
+        ensure!(value.len() >= 8, "truncated MSG FILETIME");
+        let ticks = u64::from_le_bytes(value[..8].try_into()?);
+        let seconds = i64::try_from(ticks / 10_000_000)? - 11_644_473_600;
+        Ok(Some(
+            DateTime::from_timestamp(seconds, ((ticks % 10_000_000) * 100) as u32)
+                .ok_or_else(|| anyhow!("MSG FILETIME out of range"))?,
+        ))
     }
-    fat[mini_fat_start as usize] = ENDOFCHAIN;
-    for i in 0..mini_stream_sectors {
-        let s = mini_data_start as usize + i;
-        fat[s] = if i + 1 == mini_stream_sectors {
-            ENDOFCHAIN
-        } else {
-            (s + 1) as u32
-        };
-    }
+}
 
-    let mut mini_fat = vec![FREESECT; SECTOR / 4];
-    let mut mini_index = 0u32;
-    for padded in &mini_sectors {
-        let count = (padded.len() / MINI) as u32;
-        for j in 0..count {
-            let idx = mini_index + j;
-            mini_fat[idx as usize] = if j + 1 == count { ENDOFCHAIN } else { idx + 1 };
+fn properties(
+    file: &mut File<'_>,
+    path: &Path,
+    header: usize,
+    inherited_codepage: u32,
+) -> Result<Properties> {
+    let entries: Vec<_> = file.read_storage(path)?.collect();
+    let mut values = BTreeMap::new();
+    for entry in entries {
+        if !entry.is_stream() {
+            continue;
         }
-        mini_index += count;
+        let name = entry.name();
+        // Attachment payloads are read once, directly into the caller's sink.
+        if name == "__substg1.0_37010102" {
+            continue;
+        }
+        if let Some(tag) = name
+            .strip_prefix("__substg1.0_")
+            .filter(|s| s.len() == 8)
+            .and_then(|s| u32::from_str_radix(s, 16).ok())
+        {
+            let mut bytes = Vec::new();
+            file.open_stream(entry.path())?.read_to_end(&mut bytes)?;
+            values.insert(tag, bytes);
+        } else if name == "__properties_version1.0" {
+            let mut bytes = Vec::new();
+            file.open_stream(entry.path())?.read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() >= header && (bytes.len() - header).is_multiple_of(16),
+                "invalid MSG property stream"
+            );
+            for property in bytes[header..].as_chunks::<16>().0 {
+                let tag = u32::from_le_bytes(property[..4].try_into()?);
+                if matches!(tag & 0xFFFF, 0x0002 | 0x0003 | 0x000B | 0x0040) {
+                    values.insert(tag, property[8..16].to_vec());
+                }
+            }
+        }
     }
+    Ok(Properties {
+        values,
+        inherited_codepage,
+    })
+}
 
-    let mut dir = vec![0u8; dir_sectors * SECTOR];
-    write_dir_entry(
-        &mut dir,
-        0,
-        DirWrite {
-            name: "Root Entry",
-            obj_type: TYPE_ROOT,
-            left: NOSTREAM,
-            right: NOSTREAM,
-            child: 1,
-            start: mini_data_start,
-            size: mini_stream.len() as u64,
-        },
+struct BoundedCursor {
+    inner: Cursor<Vec<u8>>,
+    limit: usize,
+}
+impl Read for BoundedCursor {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(b)
+    }
+}
+impl Seek for BoundedCursor {
+    fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(p)
+    }
+}
+impl Write for BoundedCursor {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.inner.position().saturating_add(b.len() as u64) > self.limit as u64 {
+            return Err(std::io::Error::other(
+                "embedded MSG exceeds attachment budget",
+            ));
+        }
+        self.inner.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn copy_embedded(source: &mut File<'_>, root: &Path, limit: usize) -> Result<Vec<u8>> {
+    let entries: Vec<_> = source.walk_storage(root)?.collect();
+    let mut target = CompoundFile::create(BoundedCursor {
+        inner: Cursor::new(Vec::new()),
+        limit,
+    })?;
+    for entry in entries {
+        let relative = entry.path().strip_prefix(root)?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let path = Path::new("/").join(relative);
+        if entry.is_storage() {
+            target.create_storage_all(&path)?;
+        } else if entry.is_stream() {
+            if let Some(parent) = path.parent() {
+                target.create_storage_all(parent)?;
+            }
+            let mut input = source.open_stream(entry.path())?;
+            let mut output = target.create_stream(&path)?;
+            if relative == Path::new("__properties_version1.0") {
+                // Embedded message headers are 24 bytes; top-level headers are 32.
+                let mut header = [0u8; 24];
+                input.read_exact(&mut header)?;
+                output.write_all(&header)?;
+                output.write_all(&[0u8; 8])?;
+            }
+            std::io::copy(&mut input, &mut output)?;
+        }
+    }
+    // Named properties of an embedded object use the outer message's mapping.
+    if source.is_storage("/__nameid_version1.0") && !target.is_storage("/__nameid_version1.0") {
+        target.create_storage("/__nameid_version1.0")?;
+        let entries: Vec<_> = source.read_storage("/__nameid_version1.0")?.collect();
+        for entry in entries.into_iter().filter(|e| e.is_stream()) {
+            std::io::copy(
+                &mut source.open_stream(entry.path())?,
+                &mut target.create_stream(entry.path())?,
+            )?;
+        }
+    }
+    target.flush()?;
+    Ok(target.into_inner().inner.into_inner())
+}
+
+pub(crate) fn write_fixture_msg(subject: &str, sender: &str, to: &str, body: &str) -> Vec<u8> {
+    let mut file = CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+    for (name, value) in [
+        ("0037001F", subject),
+        ("0C1F001F", sender),
+        ("0E04001F", to),
+        ("1000001F", body),
+    ] {
+        let data: Vec<u8> = value
+            .encode_utf16()
+            .chain(Some(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        file.create_stream(format!("/__substg1.0_{name}"))
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+    }
+    file.into_inner().into_inner()
+}
+
+// MS-OXCDATA FlatEntryList and SMTP One-Off EntryIDs. Directory EntryIDs require
+// an external address book; transport Reply-To remains the fallback for those.
+fn reply_recipient(bytes: &[u8], props: &Properties) -> Result<Option<EmailAddress>> {
+    ensure!(bytes.len() >= 8, "truncated MSG reply recipient list");
+    let count = u32::from_le_bytes(bytes[..4].try_into()?) as usize;
+    let size = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
+    ensure!(
+        size == bytes.len() - 8 && count <= size / 4,
+        "invalid MSG reply recipient list size"
     );
-    let mut mini_start = 0u32;
-    for (i, (name, data)) in streams.iter().enumerate() {
-        let idx = i + 1;
-        let right = if idx + 1 < dir_entries {
-            idx as u32 + 1
-        } else {
-            NOSTREAM
-        };
-        write_dir_entry(
-            &mut dir,
-            idx,
-            DirWrite {
-                name,
-                obj_type: TYPE_STREAM,
-                left: NOSTREAM,
-                right,
-                child: NOSTREAM,
-                start: mini_start,
-                size: data.len() as u64,
-            },
-        );
-        mini_start += (mini_sectors[i].len() / MINI) as u32;
-    }
-
-    let mut out = vec![0u8; HEADER_SIZE + total_sectors * SECTOR];
-    out[..8].copy_from_slice(&OLE_SIGNATURE);
-    out[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
-    out[0x1A..0x1C].copy_from_slice(&0x0003u16.to_le_bytes());
-    out[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
-    out[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
-    out[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
-    out[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
-    out[0x30..0x34].copy_from_slice(&dir_start.to_le_bytes());
-    out[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
-    out[0x3C..0x40].copy_from_slice(&mini_fat_start.to_le_bytes());
-    out[0x40..0x44].copy_from_slice(&1u32.to_le_bytes());
-    out[0x44..0x48].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
-    out[0x4C..0x50].copy_from_slice(&fat_sect.to_le_bytes());
-    for i in 1..109 {
-        let off = 0x4C + i * 4;
-        out[off..off + 4].copy_from_slice(&FREESECT.to_le_bytes());
-    }
-
-    write_u32_table(&mut out[HEADER_SIZE..HEADER_SIZE + SECTOR], &fat);
-    let dir_off = HEADER_SIZE + dir_start as usize * SECTOR;
-    out[dir_off..dir_off + dir.len()].copy_from_slice(&dir);
-    let mini_fat_off = HEADER_SIZE + mini_fat_start as usize * SECTOR;
-    write_u32_table(&mut out[mini_fat_off..mini_fat_off + SECTOR], &mini_fat);
-    let mini_data_off = HEADER_SIZE + mini_data_start as usize * SECTOR;
-    out[mini_data_off..mini_data_off + mini_stream.len()].copy_from_slice(&mini_stream);
-    out
-}
-
-struct DirWrite<'a> {
-    name: &'a str,
-    obj_type: u8,
-    left: u32,
-    right: u32,
-    child: u32,
-    start: u32,
-    size: u64,
-}
-
-fn write_dir_entry(dir: &mut [u8], index: usize, spec: DirWrite<'_>) {
-    let DirWrite {
-        name,
-        obj_type,
-        left,
-        right,
-        child,
-        start,
-        size,
-    } = spec;
-    let off = index * DIR_ENTRY_SIZE;
-    let entry = &mut dir[off..off + DIR_ENTRY_SIZE];
-    let units: Vec<u16> = name.encode_utf16().collect();
-    for (i, unit) in units.iter().enumerate() {
-        let o = i * 2;
-        entry[o..o + 2].copy_from_slice(&unit.to_le_bytes());
-    }
-    let name_len = ((units.len() + 1) * 2) as u16;
-    entry[0x40..0x42].copy_from_slice(&name_len.to_le_bytes());
-    entry[0x42] = obj_type;
-    entry[0x43] = 1;
-    entry[0x44..0x48].copy_from_slice(&left.to_le_bytes());
-    entry[0x48..0x4C].copy_from_slice(&right.to_le_bytes());
-    entry[0x4C..0x50].copy_from_slice(&child.to_le_bytes());
-    entry[0x74..0x78].copy_from_slice(&start.to_le_bytes());
-    entry[0x78..0x80].copy_from_slice(&size.to_le_bytes());
-}
-
-fn write_u32_table(dst: &mut [u8], values: &[u32]) {
-    for (i, value) in values.iter().enumerate() {
-        let off = i * 4;
-        dst[off..off + 4].copy_from_slice(&value.to_le_bytes());
-    }
-}
-
-#[cfg(test)]
-mod cfb_hardening_tests {
-    use super::*;
-
-    fn dir_entry(name: &str, obj_type: u8, left: u32, right: u32, child: u32) -> DirEntry {
-        DirEntry {
-            name: name.to_string(),
-            obj_type,
-            left,
-            right,
-            child,
-            start_sector: ENDOFCHAIN,
-            stream_size: 0,
+    let mut tail = &bytes[8..];
+    let mut result = None;
+    const PROVIDER: &[u8; 16] = b"\xa4\x1f\x2b\x81\xa3\xbe\x19\x10\x9d\x6e\x00\xdd\x01\x0f\x54\x02";
+    for _ in 0..count {
+        ensure!(tail.len() >= 4, "truncated MSG reply entry size");
+        let length = u32::from_le_bytes(tail[..4].try_into()?) as usize;
+        tail = &tail[4..];
+        let entry = tail
+            .get(..length)
+            .ok_or_else(|| anyhow!("truncated MSG reply entry"))?;
+        let padded = length
+            .checked_add(3)
+            .ok_or_else(|| anyhow!("reply entry overflow"))?
+            & !3;
+        tail = tail
+            .get(padded..)
+            .or_else(|| tail.get(length..).filter(|tail| tail.is_empty()))
+            .ok_or_else(|| anyhow!("truncated reply entry padding"))?;
+        if result.is_some() || entry.get(4..20) != Some(PROVIDER.as_slice()) {
+            continue;
+        }
+        ensure!(entry.len() >= 24, "truncated MSG One-Off EntryID");
+        let unicode = u16::from_le_bytes(entry[22..24].try_into()?) & 0x8000 != 0;
+        let mut strings = &entry[24..];
+        let mut fields = Vec::new();
+        for _ in 0..3 {
+            if unicode {
+                let end = strings
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .position(|p| *p == [0, 0])
+                    .ok_or_else(|| anyhow!("unterminated MSG One-Off string"))?
+                    * 2;
+                let units: Vec<_> = strings[..end]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| u16::from_le_bytes(*p))
+                    .collect();
+                fields.push(String::from_utf16(&units)?);
+                strings = &strings[end + 2..];
+            } else {
+                let end = strings
+                    .iter()
+                    .position(|b| *b == 0)
+                    .ok_or_else(|| anyhow!("unterminated MSG One-Off string"))?;
+                fields.push(props.decode_ansi(&strings[..end])?);
+                strings = &strings[end + 1..];
+            }
+        }
+        if fields[1].eq_ignore_ascii_case("SMTP") {
+            result = Some(EmailAddress {
+                name: Some(fields[0].clone()).filter(|s| !s.is_empty()),
+                address: fields[2].clone(),
+            });
         }
     }
-
-    /// A `.msg` is untrusted input. A FAT that loops must be rejected on the
-    /// second visit, not after MAX_CHAIN hops — with an unbounded `max_len`
-    /// each hop appends a whole sector, so the hop ceiling alone lets a
-    /// two-sector loop inflate the buffer into the hundreds of MB first.
-    #[test]
-    fn fat_cycle_is_rejected_before_the_buffer_can_grow() {
-        let sector_size = 64usize;
-        let data = vec![0u8; HEADER_SIZE + sector_size * 4];
-        // 0 -> 1 -> 0 -> ...
-        let fat = vec![1u32, 0u32, ENDOFCHAIN, ENDOFCHAIN];
-
-        // Assert the *sector-precise* message: the old hop-ceiling path also
-        // ends in a "FAT cycle" error, just after ~1M hops and a buffer in the
-        // hundreds of MB. Only exact detection names the repeated sector, so
-        // this is what distinguishes the fix from the bug.
-        let err = read_fat_chain(&data, sector_size, &fat, 0).expect_err("cycle must be rejected");
-        assert!(err.to_string().contains("FAT cycle at sector 0"), "{err}");
-
-        // A self-loop is the degenerate case and must behave the same.
-        let fat_self = vec![0u32, ENDOFCHAIN, ENDOFCHAIN, ENDOFCHAIN];
-        let err = read_fat_chain(&data, sector_size, &fat_self, 0)
-            .expect_err("self-loop must be rejected");
-        assert!(err.to_string().contains("FAT cycle at sector 0"), "{err}");
-    }
-
-    #[test]
-    fn acyclic_fat_chain_still_reads_every_sector() {
-        let sector_size = 64usize;
-        let mut data = vec![0u8; HEADER_SIZE + sector_size * 3];
-        data[HEADER_SIZE] = 0xAA;
-        data[HEADER_SIZE + sector_size] = 0xBB;
-        let fat = vec![1u32, ENDOFCHAIN, ENDOFCHAIN];
-
-        let out = read_fat_chain(&data, sector_size, &fat, 0).expect("acyclic chain reads");
-        assert_eq!(out.len(), sector_size * 2);
-        assert_eq!(out[0], 0xAA);
-        assert_eq!(out[sector_size], 0xBB);
-    }
-
-    /// A directory whose `left`/`right`/`child` point back into the tree must
-    /// error, not recurse until the stack dies.
-    #[test]
-    fn directory_cycle_is_rejected_instead_of_exhausting_the_stack() {
-        // root -> child 1; entry 1 points its `right` back at itself.
-        let directory = vec![
-            dir_entry("Root Entry", TYPE_STORAGE, NOSTREAM, NOSTREAM, 1),
-            dir_entry("__substg1.0_1000001F", TYPE_STREAM, NOSTREAM, 1, NOSTREAM),
-        ];
-        let cfb = CfbFile {
-            data: &[],
-            sector_size: 64,
-            mini_sector_size: 64,
-            mini_cutoff: 4096,
-            fat: Vec::new(),
-            mini_fat: Vec::new(),
-            directory,
-            mini_stream: Vec::new(),
-        };
-
-        let err = cfb
-            .root_substg_streams()
-            .map(|_| ())
-            .expect_err("directory cycle must be rejected");
-        assert!(err.to_string().contains("directory cycle"), "{err}");
-    }
-
-    #[test]
-    fn an_out_of_range_directory_index_is_an_error_not_a_panic() {
-        let directory = vec![dir_entry(
-            "Root Entry",
-            TYPE_STORAGE,
-            NOSTREAM,
-            NOSTREAM,
-            99,
-        )];
-        let cfb = CfbFile {
-            data: &[],
-            sector_size: 64,
-            mini_sector_size: 64,
-            mini_cutoff: 4096,
-            fat: Vec::new(),
-            mini_fat: Vec::new(),
-            directory,
-            mini_stream: Vec::new(),
-        };
-
-        let err = cfb
-            .root_substg_streams()
-            .map(|_| ())
-            .expect_err("out-of-range must error");
-        assert!(err.to_string().contains("out of range"), "{err}");
-    }
+    ensure!(tail.is_empty(), "trailing MSG reply entries");
+    Ok(result)
 }

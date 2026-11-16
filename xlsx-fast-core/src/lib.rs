@@ -3,7 +3,10 @@
 
 //! # xlsx-fast-core
 //!
-//! High-performance Excel (.xlsx) parser with SIMD optimizations.
+//! Excel XLSX, XLS and XLSB parsing with a shared cell output contract.
+//!
+//! XLS/XLSB use Calamine binary readers with record and resource preflight.
+//! They materialize the workbook before output; the architecture below is XLSX.
 //!
 //! ## Features
 //!
@@ -27,7 +30,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
-//! ## Architecture
+//! ## XLSX architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
@@ -63,6 +66,17 @@ use std::io::{BufRead, Cursor};
 use std::path::Path;
 use std::sync::Arc;
 
+mod binary;
+
+/// Parse an XLS, XLSB or XLSX workbook, detecting the format from its contents.
+pub use parse_xlsx as parse_excel;
+/// Parse XLS, XLSB or XLSX bytes without creating a temporary file.
+pub use parse_xlsx_bytes as parse_excel_bytes;
+/// Write any supported Excel workbook to NDJSON.
+pub use parse_xlsx_to_ndjson as parse_excel_to_ndjson;
+/// Write any supported Excel workbook to an NDJSON sink.
+pub use parse_xlsx_to_writer as parse_excel_to_writer;
+
 fn local_name(name: &[u8]) -> &[u8] {
     if let Some(pos) = name.iter().position(|&b| b == b':') {
         &name[pos + 1..]
@@ -79,7 +93,7 @@ fn local_name(name: &[u8]) -> &[u8] {
 #[cfg(feature = "arrow")]
 pub mod arrow;
 
-/// Configuration options for XLSX parsing.
+/// Configuration options for Excel workbook parsing.
 ///
 /// # Example
 ///
@@ -115,10 +129,11 @@ pub struct ParseOptions {
     /// any date or number formatting applied.
     pub raw_values: bool,
 
-    /// Max uncompressed part size to load into memory (bytes).
+    /// Aggregate ZIP expansion budget (XLSX/XLSB), in bytes.
     ///
-    /// Parts larger than this threshold are streamed rather than
-    /// loaded entirely into memory. Default: 128 MiB.
+    /// For XLS this also caps input bytes and estimated dense-range allocations.
+    /// XLS/XLSB apply a separate retained-cell estimate against this same ceiling.
+    /// Exceeding a budget returns an error. Default: 128 MiB.
     pub max_inflate: usize,
 }
 
@@ -202,12 +217,35 @@ pub struct Cell {
     pub value: CellValue,
 }
 
+impl Cell {
+    fn as_parts(&self) -> CellPartsRef<'_> {
+        CellPartsRef {
+            row: self.row,
+            col: self.col,
+            formula: self.formula.as_deref(),
+            value: match &self.value {
+                CellValue::Empty => CellValueRef::Empty,
+                CellValue::Bool { v } => CellValueRef::Bool { v: *v },
+                CellValue::Number { v } => CellValueRef::Number { v: *v },
+                CellValue::String { v } => CellValueRef::String { v },
+                CellValue::Raw { v } => CellValueRef::Raw { v },
+                CellValue::Error { v } => CellValueRef::Error { v },
+                CellValue::Date { iso, serial } => CellValueRef::Date {
+                    iso: iso.clone(),
+                    serial: *serial,
+                },
+            },
+        }
+    }
+}
+
 /// The decoded value of a single Excel cell.
 ///
 /// Variants map directly to the OOXML cell types (`t` attribute) plus a
 /// post-processed `Date` variant emitted when `decode_dates` is enabled and the
 /// cell carries a date-formatted style. `Raw` is used when `raw_values` is set,
-/// preserving the original string form of a numeric cell without conversion.
+/// preserving the original XML string form for XLSX. Binary formats reconstruct
+/// raw strings from decoded values.
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -526,29 +564,52 @@ fn open_optional_part_reader<'a>(
         .with_context(|| format!("read optional XLSX part: {name}"))
 }
 
-/// Parse an `.xlsx` file from disk and return a fully materialized [`Workbook`].
+/// Parse XLS, XLSB or XLSX from disk into a fully materialized [`Workbook`].
 ///
 /// Memory-maps the archive, decodes shared strings and styles once, then walks
 /// every sheet stream to collect [`Cell`]s into [`Sheet`]s. Suitable for files
 /// that fit comfortably in memory.
 pub fn parse_xlsx(path: impl AsRef<Path>, options: ParseOptions) -> Result<Workbook> {
-    let path = path.as_ref();
-    let archive = open_archive(path)?;
-    parse_xlsx_from_archive(archive, options)
+    match open_workbook_source(path.as_ref(), options)? {
+        WorkbookSource::Binary(workbook) => Ok(workbook),
+        WorkbookSource::Xml(archive) => parse_xlsx_from_archive(archive, options),
+    }
 }
 
-/// Parse an Excel (.xlsx) workbook from raw bytes.
+enum WorkbookSource {
+    Xml(XlsxArchive),
+    Binary(Workbook),
+}
+
+fn open_workbook_source(path: &Path, options: ParseOptions) -> Result<WorkbookSource> {
+    if binary::is_xls_path(path)? {
+        return binary::parse_xls_path(path, options).map(WorkbookSource::Binary);
+    }
+    let archive = open_archive(path)?;
+    if binary::is_xlsb(&archive) {
+        return binary::parse_xlsb(&archive, options).map(WorkbookSource::Binary);
+    }
+    Ok(WorkbookSource::Xml(archive))
+}
+
+/// Parse an XLS, XLSB or XLSX workbook from raw bytes.
 ///
-/// Accepts the complete OOXML package as a byte slice (e.g. from an HTTP
+/// Accepts a complete binary workbook or OOXML package (e.g. from an HTTP
 /// upload or in-memory buffer) and returns a fully materialized
 /// [`Workbook`].  No temporary file is written.
 pub fn parse_xlsx_bytes(bytes: Vec<u8>, options: ParseOptions) -> Result<Workbook> {
+    if binary::is_xls(&bytes) {
+        return binary::parse_xls(&bytes, options);
+    }
     let archive = open_archive_bytes(bytes)?;
     parse_xlsx_from_archive(archive, options)
 }
 
 /// Internal: parse an XLSX from an already-open archive.
 fn parse_xlsx_from_archive(archive: XlsxArchive, options: ParseOptions) -> Result<Workbook> {
+    if binary::is_xlsb(&archive) {
+        return binary::parse_xlsb(&archive, options);
+    }
     let workbook_path = archive.office_document_path(options.max_inflate, "xl/workbook.xml")?;
 
     let workbook_xml = read_part_bytes(&archive, &workbook_path, options.max_inflate)
@@ -657,14 +718,47 @@ pub fn parse_xlsx_to_ndjson(
 /// Streaming variant of [`parse_xlsx_to_ndjson`] that writes NDJSON records
 /// into an arbitrary [`Write`](std::io::Write) sink (stdout, network socket,
 /// in-memory buffer). The same record schema is used: one `sheet` line per
-/// worksheet followed by one `cell` line per non-empty cell.
+/// worksheet followed by one `cell` line per non-empty cell. XLS/XLSB are
+/// materialized under their budgets before writing; XLSX retains its XML path.
 pub fn parse_xlsx_to_writer<W: std::io::Write>(
     path: impl AsRef<Path>,
     out: &mut W,
     options: ParseOptions,
 ) -> Result<()> {
     let path = path.as_ref();
-    let archive = open_archive(path)?;
+    let archive = match open_workbook_source(path, options)? {
+        WorkbookSource::Xml(archive) => archive,
+        WorkbookSource::Binary(workbook) => {
+            for sheet in workbook.sheets {
+                serde_json::to_writer(
+                    &mut *out,
+                    &NdjsonSheet {
+                        kind: "sheet",
+                        id: sheet.id,
+                        name: &sheet.name,
+                    },
+                )?;
+                out.write_all(b"\n")?;
+                for cell in &sheet.cells {
+                    let parts = cell.as_parts();
+                    serde_json::to_writer(
+                        &mut *out,
+                        &NdjsonCell {
+                            kind: "cell",
+                            sheet_id: sheet.id,
+                            sheet_name: None,
+                            row: parts.row,
+                            col: parts.col,
+                            formula: parts.formula,
+                            value: parts.value,
+                        },
+                    )?;
+                    out.write_all(b"\n")?;
+                }
+            }
+            return Ok(());
+        }
+    };
 
     let workbook_path = archive.office_document_path(options.max_inflate, "xl/workbook.xml")?;
 
