@@ -81,12 +81,12 @@ fn length_is_counted_in_characters_after_references_are_resolved() {
 fn cdata_is_element_text() {
     assert_eq!(errors_for("<v><![CDATA[a & b]]></v>"), Vec::<String>::new());
     assert_eq!(errors_for("<v>a <![CDATA[&]]> b</v>"), Vec::<String>::new());
-    // Whitespace around the value is still not part of it.
-    assert_eq!(
-        errors_for("<v>\n   <![CDATA[a & b]]>\n  </v>"),
-        Vec::<String>::new()
-    );
-    assert_eq!(errors_for("<v>  caf&#233; </v>"), Vec::<String>::new());
+    // xs:string preserves surrounding whitespace, including around CDATA.
+    for body in ["<v>\n   <![CDATA[a & b]]>\n  </v>", "<v>  caf&#233; </v>"] {
+        let errors = errors_for(body);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("enumeration"), "{errors:?}");
+    }
     let errors = errors_for("<n><![CDATA[<<<<]]></n>");
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("maxLength"), "{errors:?}");
