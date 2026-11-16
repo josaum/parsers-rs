@@ -250,6 +250,12 @@ python3 vendor/parsers-rs/src/scripts/consumer_surface_check.py --dist dist --co
 
 ## Third-party licences
 
+`web-fast-crawl` bundles the unmodified Schema.org context under CC-BY-SA-3.0;
+[the context notice](web-fast-crawl/contexts/NOTICE.md) records its source, hash,
+attribution and terms. This applies to the context data; the Rust source remains
+MIT OR Apache-2.0. `deny.toml` scopes this data-license exception to the crawler.
+
+
 `web-fast-core` links four crates under the Mozilla Public License 2.0, through
 its HTML parser `scraper`: `cssparser`, `cssparser-macros`, `selectors` and
 `dtoa-short`. They are used unmodified, at the versions `Cargo.lock` records,

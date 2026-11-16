@@ -81,6 +81,13 @@ allow = ["MPL-2.0"]
 crate = "selectors"
 allow = ["MPL-2.0"]
 
+# The crawler bundles an unmodified Schema.org context as data. Its CC-BY-SA
+# terms and attribution are recorded in web-fast-crawl/contexts/NOTICE.md;
+# Rust source remains MIT OR Apache-2.0. This exception is crate-scoped.
+[[licenses.exceptions]]
+crate = "web-fast-crawl"
+allow = ["CC-BY-SA-3.0"]
+
 [bans]
 # Two versions of one crate in the lockfile. This cannot be "deny" today:
 # every duplicate below is pulled in by a dependency's own dependency, and

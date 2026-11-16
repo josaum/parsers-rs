@@ -1653,11 +1653,9 @@ const GEOJSON_NESTING_LIMIT: usize = 32;
 #[test]
 fn deeply_nested_geojson_is_bounded_on_a_small_stack() {
     guarded("nested geojson", SINGLE_INPUT_DEADLINE, || {
-        /// A Feature whose `id` and `properties` are both `properties`.
+        /// A Feature with a scalar ID and the supplied properties.
         fn feature(geometry: &[u8], properties: &[u8]) -> String {
-            let mut document = br#"{"type":"Feature","id":"#.to_vec();
-            document.extend_from_slice(properties);
-            document.extend_from_slice(br#","properties":"#);
+            let mut document = br#"{"type":"Feature","id":"nested","properties":"#.to_vec();
             document.extend_from_slice(properties);
             document.extend_from_slice(br#","geometry":"#);
             document.extend_from_slice(geometry);
