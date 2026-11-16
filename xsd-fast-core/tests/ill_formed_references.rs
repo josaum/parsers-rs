@@ -104,7 +104,7 @@ fn an_entity_declared_in_the_internal_subset_resolves() {
             &format!("{doctype}<r a=\"&val;\"><e>&val;</e><e> &val; </e></r>"),
             100
         ),
-        Vec::<String>::new()
+        vec!["value \" A \" not in enumeration [A, a & b]".to_string()]
     );
     // Replacement text holding a reference, an external entity and an
     // undeclared name are not resolved: the reference is kept and reported.

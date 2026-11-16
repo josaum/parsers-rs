@@ -521,7 +521,7 @@ fn nested_tables_report_only_their_own_rows_and_cells() {
     for table in &document.tables {
         assert_eq!(
             table.rows,
-            [[if table.ordinal as usize == depth {
+            [[if table.ordinal as usize == depth - 1 {
                 "x"
             } else {
                 ""
