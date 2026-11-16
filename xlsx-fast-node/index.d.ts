@@ -130,8 +130,8 @@ export function parseXlsxArrowIpc(
 ): void;
 
 /** Parse XLS, XLSB or XLSX, detected from workbook contents. */
-export const parseExcel: typeof parseXlsx;
+export function parseExcel(path: string, options?: ParseOptions): Workbook;
 /** Export XLS, XLSB or XLSX cells to NDJSON. */
-export const parseExcelNdjson: typeof parseXlsxNdjson;
+export function parseExcelNdjson(path: string, outPath: string, options?: ParseOptions): void;
 /** Export XLS, XLSB or XLSX cells using the existing Arrow IPC schema. */
-export const parseExcelArrowIpc: typeof parseXlsxArrowIpc;
+export function parseExcelArrowIpc(path: string, outPath: string, options?: ParseOptions): void;
