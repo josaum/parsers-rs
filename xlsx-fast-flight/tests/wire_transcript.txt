@@ -1,0 +1,174 @@
+Handshake without a bearer
+    0 responses
+Handshake
+    0 responses
+ListFlights without a bearer
+    Unauthenticated: missing authorization metadata
+ListFlights
+    2 flights
+    path=book.xlsx tickets=["book.xlsx"] total_bytes=2142 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+    path=sub/Upper.XLSX tickets=["sub/Upper.XLSX"] total_bytes=2142 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+GetFlightInfo book.xlsx without a bearer
+    Unauthenticated: missing authorization metadata
+GetFlightInfo book.xlsx
+    path=book.xlsx tickets=["book.xlsx"] total_bytes=2142 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+GetFlightInfo book.xlsx?sheet=Sheet1&range=A1:B2
+    path=book.xlsx?sheet=Sheet1&range=A1:B2 tickets=["book.xlsx"] total_bytes=2142 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+GetFlightInfo book.xlsx?table=x&max_inflate=0
+    path=book.xlsx?table=x&max_inflate=0 tickets=["book.xlsx"] total_bytes=2142 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+GetFlightInfo book.xlsx?batch=0
+    InvalidArgument: batch must be > 0
+GetFlightInfo book.xlsx?batch=x
+    InvalidArgument: batch must be a positive integer
+GetFlightInfo book.xlsx?raw=maybe
+    InvalidArgument: invalid boolean value
+GetFlightInfo book.xlsx?range=A:5
+    InvalidArgument: range must use cell:cell, row:row, or col:col
+GetFlightInfo book.xlsx?threads=x
+    InvalidArgument: threads must be a non-negative integer
+GetFlightInfo sub/Upper.XLSX
+    path=sub/Upper.XLSX tickets=["sub/Upper.XLSX"] total_bytes=2142 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+GetFlightInfo sub\Upper.XLSX
+    NotFound: file not found
+GetFlightInfo missing.xlsx
+    NotFound: file not found
+GetFlightInfo ../outside.xlsx
+    NotFound: file not found
+GetFlightInfo link.xlsx
+    NotFound: file not found
+GetFlightInfo <base>/outside.xlsx
+    NotFound: file not found
+GetFlightInfo parts ["sub", "Upper.XLSX?batch=2"]
+    path=sub/Upper.XLSX?batch=2 tickets=["sub/Upper.XLSX"] total_bytes=2142 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+GetFlightInfo parts ["sub", "..", "book.xlsx"]
+    path=sub/../book.xlsx tickets=["book.xlsx"] total_bytes=2142 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+GetFlightInfo cmd book.xlsx?batch=2
+    path=cmd:book.xlsx?batch=2 tickets=["book.xlsx"] total_bytes=2142 total_records=-1 schema_len=768 schema_fnv=74f2697e80ba6fd1
+GetFlightInfo cmd book.xlsx?batch=0
+    InvalidArgument: batch must be > 0
+GetFlightInfo cmd �
+    InvalidArgument: descriptor cmd must be utf-8 path
+GetFlightInfo cmd 
+    InvalidArgument: missing flight descriptor path
+PollFlightInfo book.xlsx without a bearer
+    Unauthenticated: missing authorization metadata
+PollFlightInfo book.xlsx
+    Unimplemented: poll_flight_info
+GetSchema book.xlsx without a bearer
+    Unauthenticated: missing authorization metadata
+GetSchema book.xlsx
+    schema_len=768 schema_fnv=74f2697e80ba6fd1
+GetSchema missing.xlsx?batch=0
+    schema_len=768 schema_fnv=74f2697e80ba6fd1
+DoGet book.xlsx without a bearer
+    Unauthenticated: missing authorization metadata
+DoGet book.xlsx
+    messages=2 bytes=2808 fnv=db37e02937d3972f batches=1 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
+DoGet book.xlsx?batch=1
+    messages=5 bytes=8624 fnv=627c847a43403048 batches=4 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
+DoGet book.xlsx?sheet=Nope
+    messages=1 bytes=720 fnv=b6046f9afd5dcb7f batches=0 rows=0 columns=[]
+DoGet book.xlsx?sheets=Sheet1,Nope&range=B1:C1
+    messages=2 bytes=2680 fnv=396c770a534b4150 batches=1 rows=2 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
+DoGet book.xlsx?raw=1&formulas=yes&sheet_names=off&dates=0&threads=2
+    messages=2 bytes=2808 fnv=9273872285c1c751 batches=1 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
+DoGet book.xlsx?table=x&max_inflate=0
+    messages=2 bytes=2808 fnv=db37e02937d3972f batches=1 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
+DoGet book.xlsx?batch=0
+    InvalidArgument: batch must be > 0
+DoGet book.xlsx?range=A:5
+    InvalidArgument: range must use cell:cell, row:row, or col:col
+DoGet book.xlsx?
+    messages=2 bytes=2808 fnv=db37e02937d3972f batches=1 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
+DoGet sub/Upper.XLSX
+    messages=2 bytes=2808 fnv=db37e02937d3972f batches=1 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
+DoGet sub\Upper.XLSX
+    NotFound: file not found
+DoGet notes.txt
+    Internal: External error: open zip archive
+DoGet missing.xlsx
+    NotFound: file not found
+DoGet ../outside.xlsx
+    NotFound: file not found
+DoGet sub/../book.xlsx
+    messages=2 bytes=2808 fnv=db37e02937d3972f batches=1 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
+DoGet link.xlsx
+    NotFound: file not found
+DoGet <base>/outside.xlsx
+    NotFound: file not found
+DoGet 
+    NotFound: file not found
+DoGet �
+    InvalidArgument: ticket must be utf-8 path
+DoGet sub
+    NotFound: file not found
+DoPut without a bearer
+    Unauthenticated: missing authorization metadata
+DoPut
+    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
+DoExchange descriptor book.xlsx without a bearer
+    Unauthenticated: missing authorization metadata
+DoExchange descriptor book.xlsx
+    messages=2 bytes=2808 fnv=db37e02937d3972f batches=1 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
+DoExchange descriptor book.xlsx?batch=0
+    InvalidArgument: batch must be > 0
+DoExchange descriptor missing.xlsx
+    NotFound: file not found
+DoExchange app_metadata book.xlsx?batch=1
+    messages=5 bytes=8624 fnv=627c847a43403048 batches=4 rows=4 columns=["sheet_id", "sheet_name", "row", "col", "value_type", "bool_value", "number_value", "string_value", "error_value", "date_iso", "date_serial", "formula"]
+DoExchange app_metadata ../outside.xlsx
+    NotFound: file not found
+DoExchange an empty message
+    InvalidArgument: exchange requires descriptor or app_metadata path
+DoExchange no message
+    InvalidArgument: exchange missing initial message
+DoAction parsers.flight.codec_capabilities.v1  without a bearer
+    Unauthenticated: missing authorization metadata
+DoAction parsers.flight.codec_capabilities.v1 
+    ["{}"]
+DoAction unknown 
+    Unimplemented: do_action
+ListActions without a bearer
+    Unauthenticated: missing authorization metadata
+ListActions
+    ["parsers.flight.codec_capabilities.v1: cached codec capabilities"]
+GetFlightInfo <base>/probe-nope.xlsx
+    NotFound: file not found
+GetFlightInfo <base>/probe-outside.xlsx
+    NotFound: file not found
+GetFlightInfo ../probe-nope.xlsx
+    NotFound: file not found
+GetFlightInfo ../probe-outside.xlsx
+    NotFound: file not found
+GetFlightInfo probe-dangling.xlsx
+    NotFound: file not found
+GetFlightInfo probe-link.xlsx
+    NotFound: file not found
+GetFlightInfo ..%2fprobe-outside.xlsx
+    NotFound: file not found
+GetFlightInfo probe\u{0}nul.xlsx
+    NotFound: file not found
+GetFlightInfo probe-dir
+    NotFound: file not found
+GetFlightInfo 
+    NotFound: file not found
+DoGet <base>/probe-nope.xlsx
+    NotFound: file not found
+DoGet <base>/probe-outside.xlsx
+    NotFound: file not found
+DoGet ../probe-nope.xlsx
+    NotFound: file not found
+DoGet ../probe-outside.xlsx
+    NotFound: file not found
+DoGet probe-dangling.xlsx
+    NotFound: file not found
+DoGet probe-link.xlsx
+    NotFound: file not found
+DoGet ..%2fprobe-outside.xlsx
+    NotFound: file not found
+DoGet probe\u{0}nul.xlsx
+    NotFound: file not found
+DoGet probe-dir
+    NotFound: file not found
+DoGet 
+    NotFound: file not found

@@ -4,23 +4,42 @@ use pyo3::prelude::*;
 
 /// Extract specific 1-based pages from `source` into a new PDF at `output`.
 #[pyfunction]
-fn extract_pdf_pages_py(source: &str, pages: Vec<usize>, output: &str) -> PyResult<()> {
-    PdfWriter::extract_pages(source, &pages, output)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+fn extract_pdf_pages_py(
+    py: Python<'_>,
+    source: &str,
+    pages: Vec<usize>,
+    output: &str,
+) -> PyResult<()> {
+    py.detach(|| -> PyResult<()> {
+        PdfWriter::extract_pages(source, &pages, output)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
 }
 
 /// Extract specific 1-based pages from a PDF path and return subset PDF bytes.
 #[pyfunction]
-fn extract_pdf_pages_to_bytes_py(source: &str, pages: Vec<usize>) -> PyResult<Vec<u8>> {
-    PdfWriter::extract_pages_to_bytes(source, &pages)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+fn extract_pdf_pages_to_bytes_py(
+    py: Python<'_>,
+    source: &str,
+    pages: Vec<usize>,
+) -> PyResult<Vec<u8>> {
+    py.detach(|| -> PyResult<Vec<u8>> {
+        PdfWriter::extract_pages_to_bytes(source, &pages)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
 }
 
 /// Extract specific 1-based pages from in-memory PDF bytes.
 #[pyfunction]
-fn extract_pdf_pages_from_bytes_py(data: &[u8], pages: Vec<usize>) -> PyResult<Vec<u8>> {
-    PdfWriter::extract_pages_from_bytes(data, &pages)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+fn extract_pdf_pages_from_bytes_py(
+    py: Python<'_>,
+    data: &[u8],
+    pages: Vec<usize>,
+) -> PyResult<Vec<u8>> {
+    py.detach(|| -> PyResult<Vec<u8>> {
+        PdfWriter::extract_pages_from_bytes(data, &pages)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
 }
 
 #[pymodule]

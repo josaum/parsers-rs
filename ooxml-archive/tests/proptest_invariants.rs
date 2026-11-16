@@ -10,7 +10,7 @@ use ooxml_archive::{
 };
 use proptest::prelude::*;
 use std::io::{Cursor, Write};
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod as ZipCompression, ZipWriter};
 
 /// Path segment that can appear inside an OOXML package part path.
@@ -68,7 +68,7 @@ fn rel_type() -> impl Strategy<Value = String> {
 fn zip_bytes(parts: &[(&str, &[u8], ZipCompression)]) -> Vec<u8> {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     for (name, body, method) in parts {
-        let options = FileOptions::default().compression_method(*method);
+        let options = SimpleFileOptions::default().compression_method(*method);
         writer.start_file(*name, options).unwrap();
         writer.write_all(body).unwrap();
     }

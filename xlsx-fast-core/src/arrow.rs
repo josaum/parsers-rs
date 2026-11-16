@@ -247,7 +247,7 @@ where
 
     let shared_strings = if let Some(path) = shared_strings_path.as_deref() {
         if let Some(reader) = open_optional_part_reader(&archive, path, options.max_inflate)? {
-            parse_shared_strings_reader(reader)?
+            parse_shared_strings_reader(reader, options.max_inflate)?
         } else {
             StringTable::default()
         }
@@ -364,7 +364,7 @@ where
 {
     let reader = open_part_reader(archive, &task.sheet_path, options.max_inflate)
         .with_context(|| format!("read sheet: {}", task.sheet_path))?;
-    let xml_reader = quick_xml::Reader::from_reader(reader);
+    let xml_reader = quick_xml::Reader::from_reader(crate::repairing(reader, options.max_inflate));
     parse_sheet_reader_with(
         xml_reader,
         shared_strings,
@@ -374,7 +374,7 @@ where
         arrow_options.range_filter.as_deref(),
         |cell| {
             builder.push(task.sheet_id, &task.sheet_name, cell);
-            if builder.len() >= builder.capacity {
+            if builder.is_full() {
                 let batch = builder.finish(schema)?;
                 emit(batch)?;
             }
@@ -509,7 +509,7 @@ fn parse_sheet_parallel(
 ) -> Result<()> {
     let reader = open_part_reader(archive, &task.sheet_path, options.max_inflate)
         .with_context(|| format!("read sheet: {}", task.sheet_path))?;
-    let xml_reader = quick_xml::Reader::from_reader(reader);
+    let xml_reader = quick_xml::Reader::from_reader(crate::repairing(reader, options.max_inflate));
     let mut builder = ArrowBatchBuilder::new(
         arrow_options.batch_size,
         arrow_options.include_sheet_names,
@@ -524,7 +524,7 @@ fn parse_sheet_parallel(
         arrow_options.range_filter.as_deref(),
         |cell| {
             builder.push(task.sheet_id, &task.sheet_name, cell);
-            if builder.len() >= builder.capacity {
+            if builder.is_full() {
                 let batch = builder.finish(schema)?;
                 if msg_tx.send(WorkerMsg::Batch(batch)).is_err() {
                     return Err(anyhow!("arrow consumer dropped"));
@@ -562,7 +562,19 @@ struct ArrowBatchBuilder {
     date_serial: Float64Builder,
     formula: GenericStringBuilder<i32>,
     len: usize,
+    /// Text bytes appended to the string columns since the last batch.
+    text_bytes: usize,
 }
+
+/// Text a batch may hold before it is closed early (64 MiB).
+///
+/// Every cell's text is copied into its batch, so a workbook with one long
+/// shared string and many cells that refer to it would otherwise fill a batch
+/// with their product: 16,384 rows of a 1 MiB string is 16 GiB, and more than
+/// the 2 GiB a `Utf8` column can address. Ordinary workbooks never reach this
+/// and still get `batch_size` rows per batch. Lowering it only produces more,
+/// smaller batches.
+const MAX_BATCH_TEXT_BYTES: usize = 64 * 1024 * 1024;
 
 impl ArrowBatchBuilder {
     fn new(
@@ -588,11 +600,17 @@ impl ArrowBatchBuilder {
             date_serial: Float64Builder::with_capacity(capacity),
             formula: GenericStringBuilder::with_capacity(capacity, string_bytes),
             len: 0,
+            text_bytes: 0,
         }
     }
 
     fn len(&self) -> usize {
         self.len
+    }
+
+    /// Whether the batch should be emitted before another cell is added.
+    fn is_full(&self) -> bool {
+        self.len >= self.capacity || self.text_bytes >= MAX_BATCH_TEXT_BYTES
     }
 
     fn push(&mut self, sheet_id: u32, sheet_name: &str, cell: CellPartsRef<'_>) {
@@ -612,6 +630,19 @@ impl ArrowBatchBuilder {
                 return;
             }
         }
+        let mut text_bytes = cell.formula.map_or(0, str::len);
+        if self.include_sheet_names {
+            text_bytes += sheet_name.len();
+        }
+        text_bytes += match &cell.value {
+            CellValueRef::String { v } | CellValueRef::Raw { v } | CellValueRef::Error { v } => {
+                v.len()
+            }
+            CellValueRef::Date { iso, .. } => iso.len(),
+            CellValueRef::Empty | CellValueRef::Bool { .. } | CellValueRef::Number { .. } => 0,
+        };
+        self.text_bytes = self.text_bytes.saturating_add(text_bytes);
+
         self.sheet_id.append_value(sheet_id);
         if self.include_sheet_names {
             self.sheet_name.append_value(sheet_name);

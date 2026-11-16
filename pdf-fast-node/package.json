@@ -1,26 +1,27 @@
 {
   "name": "pdf-fast-node",
-  "version": "0.2.5",
+  "version": "0.2.11",
   "description": "High-performance PDF parser/table/text N-API bindings, full parity with the Rust core using Arrow IPC Buffers",
   "main": "index.js",
   "types": "index.d.ts",
-  "license": "MIT",
+  "license": "(MIT OR Apache-2.0)",
   "author": "Dionisio Chiuratto Agourakis",
   "repository": {
     "type": "git",
-    "url": "https://github.com/fast-parser-inc/parsers-rs.git",
+    "url": "https://github.com/josaum/parsers-rs.git",
     "directory": "pdf-fast-node"
   },
-  "homepage": "https://github.com/fast-parser-inc/parsers-rs#readme",
+  "homepage": "https://github.com/josaum/parsers-rs#readme",
   "bugs": {
-    "url": "https://github.com/fast-parser-inc/parsers-rs/issues"
+    "url": "https://github.com/josaum/parsers-rs/issues"
   },
   "files": [
     "index.js",
     "index.d.ts",
     "*.node",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "LICENSE-APACHE"
   ],
   "engines": {
     "node": ">=16"

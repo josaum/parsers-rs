@@ -1,6 +1,6 @@
 [package]
 name = "pdf-fast-core"
-version = "0.2.5"
+version = "0.2.11"
 edition.workspace = true
 authors.workspace = true
 description = "Byte-level, xref-free PDF scanner focused on zero-copy extraction"
@@ -41,7 +41,12 @@ glyph-catalog = []   # retained only to keep downstream cfg compatibility; not p
 # ── Core (always on) ─────────────────────────────────────────────────────
 anyhow      = "1.0"
 bumpalo     = "3.17"
-libdeflater = "0.12"
+# Below 1: libdeflater 1.26 bundles a libdeflate whose AVX-512 VNNI adler32
+# does not compile under the zig clang the release builds its manylinux
+# x86_64 wheels with ("requires target feature 'evex512'"), which failed the
+# v2026.11.13.1 release. 0.14 builds through zig. See the hold in
+# .github/dependabot.yml; ci.yml's Linux wheel leg builds the same way.
+libdeflater = "0.14"
 memchr      = "2.7"
 
 # ── Optional ─────────────────────────────────────────────────────────────
@@ -51,7 +56,7 @@ rayon       = { version = "1.10", optional = true }
 serde       = { version = "1.0", features = ["derive", "rc"], optional = true }
 tiny-skia   = { version = "0.11", optional = true }
 hayro       = { version = "0.5", optional = true }
-hayro-ccitt = { version = "0.2", optional = true }
+hayro-ccitt = { version = "0.5", optional = true }
 
 # Used for /Rotate correction in page_rasterized_png and PNG/JPEG payload handling.
 [dependencies.image]
@@ -63,5 +68,8 @@ optional         = true
 [dev-dependencies]
 flate2      = "1.0"
 tempfile    = "3.10"
-base64      = "0.22"
+base64      = { version = "0.23", default-features = false, features = ["std"] }
 csv         = "1"
+
+[lints]
+workspace = true

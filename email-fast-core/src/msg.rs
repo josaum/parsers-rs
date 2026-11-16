@@ -1,6 +1,6 @@
 //! MS-OXMSG property/recipient/attachment projection over the shared CFB reader.
 use crate::{mime, Attachment, Email, EmailAddress, EmailBody, ParseOptions, ThreadInfo};
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, ensure, Result};
 use base64::Engine;
 use cfb::CompoundFile;
 use chrono::{DateTime, Utc};
@@ -25,7 +25,8 @@ pub(crate) fn parse_with_sink(
         bytes.len() <= options.max_inflate,
         "MSG input exceeds max_inflate"
     );
-    let mut file = CompoundFile::open(Cursor::new(bytes)).context("read MSG CFB compound file")?;
+    let mut file = CompoundFile::open(Cursor::new(bytes))
+        .map_err(|error| anyhow!("read MSG CFB compound file: {error}"))?;
     let entries: Vec<_> = file.walk().collect();
     ensure!(
         entries.len() <= options.max_mime_parts,
@@ -93,10 +94,19 @@ pub(crate) fn parse_with_sink(
             name: recipient.string(0x3001)?,
             address: recipient
                 .string(0x39FE)?
-                .or(recipient.string(0x3003)?)
+                .or(
+                    if recipient
+                        .string(0x3002)?
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("SMTP"))
+                    {
+                        recipient.string(0x3003)?
+                    } else {
+                        None
+                    },
+                )
                 .unwrap_or_default(),
         };
-        match recipient.integer(0x0C15).unwrap_or(1) {
+        match recipient.integer(0x0C15).unwrap_or(1) & 0x0f {
             1 => to.push(address),
             2 => cc.push(address),
             3 => bcc.push(address),
@@ -517,6 +527,13 @@ pub(crate) fn write_fixture_msg(subject: &str, sender: &str, to: &str, body: &st
             .write_all(&data)
             .unwrap();
     }
+    let paths: Vec<_> = file.walk().map(|entry| entry.path().to_owned()).collect();
+    for path in paths {
+        file.set_created_time(&path, std::time::UNIX_EPOCH)
+            .expect("fixture creation time");
+        file.set_modified_time(&path, std::time::UNIX_EPOCH)
+            .expect("fixture modification time");
+    }
     file.into_inner().into_inner()
 }
 
@@ -590,4 +607,27 @@ fn reply_recipient(bytes: &[u8], props: &Properties) -> Result<Option<EmailAddre
     }
     ensure!(tail.is_empty(), "trailing MSG reply entries");
     Ok(result)
+}
+
+/// Build a CFB fixture containing the supplied streams, creating parent storages.
+pub(crate) fn write_fixture_streams(streams: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut file = CompoundFile::create(Cursor::new(Vec::new())).expect("fixture CFB");
+    for (name, bytes) in streams {
+        let path = Path::new("/").join(name);
+        if let Some(parent) = path.parent() {
+            file.create_storage_all(parent).expect("fixture storage");
+        }
+        file.create_stream(path)
+            .expect("fixture stream")
+            .write_all(bytes)
+            .expect("fixture data");
+    }
+    let paths: Vec<_> = file.walk().map(|entry| entry.path().to_owned()).collect();
+    for path in paths {
+        file.set_created_time(&path, std::time::UNIX_EPOCH)
+            .expect("fixture creation time");
+        file.set_modified_time(&path, std::time::UNIX_EPOCH)
+            .expect("fixture modification time");
+    }
+    file.into_inner().into_inner()
 }

@@ -1,0 +1,33 @@
+[package]
+name = "xlsx-fast-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+xlsx-fast-core = { path = ".." }
+serde_json = "1.0"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[[bin]]
+name = "xlsx_container"
+path = "fuzz_targets/xlsx_container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xlsx_sheet_xml"
+path = "fuzz_targets/xlsx_sheet_xml.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone fuzz crate: intentionally outside the office-parsers-rs
+# workspace (members are explicit) and outside any parent workspace, so the
+# workspace lockfile and build never see libFuzzer.
+[workspace]

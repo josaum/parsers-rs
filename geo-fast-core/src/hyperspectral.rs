@@ -134,6 +134,65 @@ pub struct HyperspectralMetadata {
     pub bbox: Option<BBox>,
 }
 
+/// Where the pixels of one band lie in a cube's pixel data.
+///
+/// The pixel at (`line`, `sample`) starts at
+/// `first + line * line_stride + sample * sample_stride`.
+struct BandLayout {
+    /// Offset of the band's first pixel.
+    first: usize,
+    /// Bytes from a pixel to the one below it.
+    line_stride: usize,
+    /// Bytes from a pixel to the one on its right.
+    sample_stride: usize,
+    /// One past the last byte of the band's last pixel.
+    end: usize,
+}
+
+impl BandLayout {
+    /// Computes the layout of band `band_index`.
+    ///
+    /// Returns `None` when a position does not fit in `usize`, which no data
+    /// in memory can satisfy. `metadata.lines` and `metadata.samples` must be
+    /// non-zero.
+    fn new(metadata: &HyperspectralMetadata, band_index: u32) -> Option<Self> {
+        let element = metadata.data_type.byte_size();
+        let lines = usize::try_from(metadata.lines).ok()?;
+        let samples = usize::try_from(metadata.samples).ok()?;
+        let bands = usize::try_from(metadata.bands).ok()?;
+        let band = usize::try_from(band_index).ok()?;
+
+        let row = samples.checked_mul(element)?;
+        let (first, line_stride, sample_stride) = match metadata.interleave {
+            // All of band 0, then all of band 1, …
+            Interleave::Bsq => (band.checked_mul(lines)?.checked_mul(row)?, row, element),
+            // Line 0 of every band, then line 1 of every band, …
+            Interleave::Bil => (band.checked_mul(row)?, bands.checked_mul(row)?, element),
+            // Every band of pixel 0, then every band of pixel 1, …
+            Interleave::Bip => {
+                let pixel = bands.checked_mul(element)?;
+                (
+                    band.checked_mul(element)?,
+                    samples.checked_mul(pixel)?,
+                    pixel,
+                )
+            }
+        };
+        let end = lines
+            .checked_sub(1)?
+            .checked_mul(line_stride)?
+            .checked_add(samples.checked_sub(1)?.checked_mul(sample_stride)?)?
+            .checked_add(first)?
+            .checked_add(element)?;
+        Some(Self {
+            first,
+            line_stride,
+            sample_stride,
+            end,
+        })
+    }
+}
+
 /// Parser for ENVI hyperspectral headers and band data.
 pub struct HyperspectralParser;
 
@@ -236,6 +295,15 @@ impl HyperspectralParser {
     /// Read a single band from BSQ/BIL/BIP interleaved binary data.
     ///
     /// Returns pixel values as `Vec<f32>` (converted from the native type).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeoError::InvalidFormat`] when `band_index` is out of range,
+    /// or when `data` is too short to hold every pixel of that band at the
+    /// header's offset, dimensions and interleave. The dimensions come from
+    /// the header, so they are checked against `data` before any output is
+    /// allocated. Returns [`GeoError::UnsupportedFormat`] for complex pixel
+    /// types.
     pub fn read_band(
         data: &[u8],
         metadata: &HyperspectralMetadata,
@@ -247,62 +315,61 @@ impl HyperspectralParser {
                 band_index, metadata.bands
             )));
         }
+        if matches!(
+            metadata.data_type,
+            EnviDataType::ComplexF32 | EnviDataType::ComplexF64
+        ) {
+            return Err(GeoError::UnsupportedFormat(format!(
+                "Reading {:?} pixel data not yet implemented",
+                metadata.data_type
+            )));
+        }
 
-        let elem_size = metadata.data_type.byte_size();
-        let pixels_per_band = (metadata.lines * metadata.samples) as usize;
-        let offset = metadata.header_offset as usize;
         let big_endian = metadata.byte_order == 1;
+        let data = usize::try_from(metadata.header_offset)
+            .ok()
+            .and_then(|offset| data.get(offset..))
+            .ok_or_else(|| {
+                GeoError::InvalidFormat(format!(
+                    "ENVI header offset {} is beyond the {} bytes of data",
+                    metadata.header_offset,
+                    data.len()
+                ))
+            })?;
 
-        let data = &data[offset..];
+        let lines = metadata.lines as usize;
+        let samples = metadata.samples as usize;
+        if lines == 0 || samples == 0 {
+            return Ok(Vec::new());
+        }
+        let layout = BandLayout::new(metadata, band_index)
+            .filter(|layout| layout.end <= data.len())
+            .ok_or_else(|| {
+                GeoError::InvalidFormat(format!(
+                    "ENVI band {band_index} of a {}x{}x{} {} cube does not fit in {} bytes of \
+                     pixel data",
+                    metadata.samples,
+                    metadata.lines,
+                    metadata.bands,
+                    metadata.interleave.as_str(),
+                    data.len()
+                ))
+            })?;
 
-        let mut result = Vec::with_capacity(pixels_per_band);
-
-        match metadata.interleave {
-            Interleave::Bsq => {
-                // Band sequential: band_index * lines * samples * elem_size
-                let band_start = band_index as usize * pixels_per_band * elem_size;
-                for i in 0..pixels_per_band {
-                    let pos = band_start + i * elem_size;
-                    result.push(Self::read_pixel(
-                        data,
-                        pos,
-                        &metadata.data_type,
-                        big_endian,
-                    )?);
-                }
-            }
-            Interleave::Bil => {
-                // Band interleaved by line
-                let samples = metadata.samples as usize;
-                let bands = metadata.bands as usize;
-                let bi = band_index as usize;
-                for line in 0..metadata.lines as usize {
-                    let line_start = line * bands * samples * elem_size;
-                    let band_start = line_start + bi * samples * elem_size;
-                    for s in 0..samples {
-                        let pos = band_start + s * elem_size;
-                        result.push(Self::read_pixel(
-                            data,
-                            pos,
-                            &metadata.data_type,
-                            big_endian,
-                        )?);
-                    }
-                }
-            }
-            Interleave::Bip => {
-                // Band interleaved by pixel
-                let bands = metadata.bands as usize;
-                let bi = band_index as usize;
-                for pixel in 0..pixels_per_band {
-                    let pos = (pixel * bands + bi) * elem_size;
-                    result.push(Self::read_pixel(
-                        data,
-                        pos,
-                        &metadata.data_type,
-                        big_endian,
-                    )?);
-                }
+        // Every pixel of the band lies below `layout.end`, which is inside
+        // `data`: the positions below cannot overflow, and `lines * samples`
+        // pixels of at least one byte each cannot outnumber the bytes of data.
+        let mut result = Vec::with_capacity(lines * samples);
+        for line in 0..lines {
+            let line_start = layout.first + line * layout.line_stride;
+            for sample in 0..samples {
+                let pos = line_start + sample * layout.sample_stride;
+                result.push(Self::read_pixel(
+                    data,
+                    pos,
+                    &metadata.data_type,
+                    big_endian,
+                )?);
             }
         }
 
@@ -316,13 +383,36 @@ impl HyperspectralParser {
     /// ```
     ///
     /// Output is in `[-1.0, 1.0]`.  Pixels where `NIR + Red == 0` are set to 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `nir_band` and `red_band` differ in length. A caller that
+    /// does not control both lengths uses [`Self::try_compute_ndvi`].
     pub fn compute_ndvi(nir_band: &[f32], red_band: &[f32]) -> Vec<f32> {
-        assert_eq!(
-            nir_band.len(),
-            red_band.len(),
-            "NIR and Red bands must have equal length"
-        );
-        nir_band
+        match Self::try_compute_ndvi(nir_band, red_band) {
+            Ok(ndvi) => ndvi,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// Compute NDVI from near-infrared and red bands of unchecked lengths.
+    ///
+    /// The same values as [`Self::compute_ndvi`], for bands that come from a
+    /// caller or a file and may not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeoError::Validation`] when `nir_band` and `red_band` differ
+    /// in length.
+    pub fn try_compute_ndvi(nir_band: &[f32], red_band: &[f32]) -> Result<Vec<f32>, GeoError> {
+        if nir_band.len() != red_band.len() {
+            return Err(GeoError::Validation(format!(
+                "NIR and Red bands must have equal length, got {} and {}",
+                nir_band.len(),
+                red_band.len()
+            )));
+        }
+        Ok(nir_band
             .iter()
             .zip(red_band.iter())
             .map(|(&nir, &red)| {
@@ -333,7 +423,7 @@ impl HyperspectralParser {
                     (nir - red) / sum
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// Compute the spectral angle (in radians) between a pixel spectrum and
@@ -344,12 +434,36 @@ impl HyperspectralParser {
     /// ```
     ///
     /// Smaller angle → more similar spectra.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `pixel_spectrum` and `reference` differ in length. A
+    /// caller that does not control both lengths uses
+    /// [`Self::try_spectral_angle`].
     pub fn spectral_angle(pixel_spectrum: &[f32], reference: &[f32]) -> f32 {
-        assert_eq!(
-            pixel_spectrum.len(),
-            reference.len(),
-            "Spectra must have equal length"
-        );
+        match Self::try_spectral_angle(pixel_spectrum, reference) {
+            Ok(angle) => angle,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// Compute the spectral angle between two spectra of unchecked lengths.
+    ///
+    /// The same value as [`Self::spectral_angle`], for spectra that come from
+    /// a caller or a file and may not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeoError::Validation`] when `pixel_spectrum` and `reference`
+    /// differ in length.
+    pub fn try_spectral_angle(pixel_spectrum: &[f32], reference: &[f32]) -> Result<f32, GeoError> {
+        if pixel_spectrum.len() != reference.len() {
+            return Err(GeoError::Validation(format!(
+                "Spectra must have equal length, got {} and {}",
+                pixel_spectrum.len(),
+                reference.len()
+            )));
+        }
         let dot: f64 = pixel_spectrum
             .iter()
             .zip(reference.iter())
@@ -368,10 +482,10 @@ impl HyperspectralParser {
 
         let denom = norm_a * norm_b;
         if denom < 1e-12 {
-            return std::f32::consts::FRAC_PI_2; // 90 degrees for zero vectors
+            return Ok(std::f32::consts::FRAC_PI_2); // 90 degrees for zero vectors
         }
         let cos_angle = (dot / denom).clamp(-1.0, 1.0);
-        cos_angle.acos() as f32
+        Ok(cos_angle.acos() as f32)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
@@ -459,14 +573,15 @@ impl HyperspectralParser {
         data_type: &EnviDataType,
         big_endian: bool,
     ) -> Result<f32, GeoError> {
-        let end = pos + data_type.byte_size();
-        if end > data.len() {
-            return Err(GeoError::InvalidFormat(format!(
-                "Read past end of data at offset {pos} (data len {})",
-                data.len()
-            )));
-        }
-        let bytes = &data[pos..end];
+        let bytes = pos
+            .checked_add(data_type.byte_size())
+            .and_then(|end| data.get(pos..end))
+            .ok_or_else(|| {
+                GeoError::InvalidFormat(format!(
+                    "Read past end of data at offset {pos} (data len {})",
+                    data.len()
+                ))
+            })?;
 
         let val: f32 = match data_type {
             EnviDataType::U8 => bytes[0] as f32,
@@ -719,6 +834,54 @@ mod tests {
         assert!((ndvi[1] - 0.2).abs() < 1e-6); // (0.6-0.4)/(0.6+0.4)
         assert!((ndvi[2] - 0.0).abs() < 1e-6); // zero / zero → 0
         assert!((ndvi[3] - 0.0).abs() < 1e-6); // equal → 0
+    }
+
+    /// Bands of different lengths used to be an `assert_eq!` and nothing
+    /// else: a caller holding two arrays it did not make had no way to ask.
+    #[test]
+    fn mismatched_band_lengths_are_an_error_from_the_try_forms() {
+        let error = HyperspectralParser::try_compute_ndvi(&[0.8, 0.6], &[0.2])
+            .expect_err("bands of 2 and 1 samples");
+        assert!(
+            matches!(&error, GeoError::Validation(message) if message.contains("2 and 1")),
+            "{error}"
+        );
+        let error = HyperspectralParser::try_spectral_angle(&[1.0], &[1.0, 0.0, 0.0])
+            .expect_err("spectra of 1 and 3 samples");
+        assert!(
+            matches!(&error, GeoError::Validation(message) if message.contains("1 and 3")),
+            "{error}"
+        );
+        // Empty inputs match each other.
+        assert_eq!(
+            HyperspectralParser::try_compute_ndvi(&[], &[]).expect("empty"),
+            Vec::<f32>::new()
+        );
+    }
+
+    #[test]
+    fn try_forms_agree_with_the_panicking_forms() {
+        let (nir, red) = ([0.8f32, 0.6, 0.0, 0.5], [0.2f32, 0.4, 0.0, 0.5]);
+        assert_eq!(
+            HyperspectralParser::try_compute_ndvi(&nir, &red).expect("ndvi"),
+            HyperspectralParser::compute_ndvi(&nir, &red)
+        );
+        assert_eq!(
+            HyperspectralParser::try_spectral_angle(&nir, &red).expect("angle"),
+            HyperspectralParser::spectral_angle(&nir, &red)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "NIR and Red bands must have equal length")]
+    fn compute_ndvi_still_panics_on_mismatched_lengths() {
+        HyperspectralParser::compute_ndvi(&[0.8, 0.6], &[0.2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Spectra must have equal length")]
+    fn spectral_angle_still_panics_on_mismatched_lengths() {
+        HyperspectralParser::spectral_angle(&[1.0], &[1.0, 0.0]);
     }
 
     #[test]

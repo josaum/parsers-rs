@@ -1,0 +1,82 @@
+ListFlights without a bearer
+    Unauthenticated: missing authorization metadata
+ListFlights
+    2 flights
+    path=minimal.docx tickets=["minimal.docx"] total_bytes=1204 total_records=-1 schema_len=768 schema_fnv=ae21ca40a19657b6
+    path=sub/Upper.DOCX tickets=["sub/Upper.DOCX"] total_bytes=1204 total_records=-1 schema_len=768 schema_fnv=ae21ca40a19657b6
+GetFlightInfo minimal.docx without a bearer
+    Unauthenticated: missing authorization metadata
+GetFlightInfo minimal.docx
+    path=minimal.docx tickets=["minimal.docx"] total_bytes=1204 total_records=-1 schema_len=768 schema_fnv=ae21ca40a19657b6
+GetFlightInfo minimal.docx?table=metadata
+    path=minimal.docx?table=metadata tickets=["minimal.docx"] total_bytes=1204 total_records=-1 schema_len=256 schema_fnv=8e01a2d3ba4b5fd8
+GetFlightInfo minimal.docx?table=no_such_table
+    InvalidArgument: unknown table
+GetFlightInfo sub/Upper.DOCX
+    path=sub/Upper.DOCX tickets=["sub/Upper.DOCX"] total_bytes=1204 total_records=-1 schema_len=768 schema_fnv=ae21ca40a19657b6
+GetFlightInfo missing.docx
+    NotFound: file not found
+GetFlightInfo ../minimal.docx
+    NotFound: file not found
+DoGet minimal.docx without a bearer
+    Unauthenticated: missing authorization metadata
+DoGet minimal.docx
+    messages=2 bytes=2812 fnv=ea48e40955674597 batches=1 rows=3 columns=["paragraph_id", "owner_kind", "owner_id", "block_index", "para_xml_id", "style_id", "style_name", "outline_level", "num_id", "num_level", "toc_level", "text"]
+DoGet minimal.docx?table=metadata
+    messages=1 bytes=196 fnv=7ddb901585f5ee7c batches=0 rows=0 columns=[]
+DoGet minimal.docx?table=paragraphs&batch=1
+    messages=4 bytes=6988 fnv=e45cf4cd242e9f09 batches=3 rows=3 columns=["paragraph_id", "owner_kind", "owner_id", "block_index", "para_xml_id", "style_id", "style_name", "outline_level", "num_id", "num_level", "toc_level", "text"]
+DoGet minimal.docx?table=no_such_table
+    InvalidArgument: unknown table
+DoGet sub/Upper.DOCX
+    messages=2 bytes=2812 fnv=ea48e40955674597 batches=1 rows=3 columns=["paragraph_id", "owner_kind", "owner_id", "block_index", "para_xml_id", "style_id", "style_name", "outline_level", "num_id", "num_level", "toc_level", "text"]
+DoGet notes.txt
+    Internal: External error: open zip archive
+DoGet missing.docx
+    NotFound: file not found
+DoGet ../minimal.docx
+    NotFound: file not found
+DoPut without a bearer
+    Unauthenticated: missing authorization metadata
+DoPut
+    Unimplemented: do_put is not supported; Flight servers are read-only parse egress (no write-back)
+GetFlightInfo <base>/probe-nope.docx
+    NotFound: file not found
+GetFlightInfo <base>/probe-outside.docx
+    NotFound: file not found
+GetFlightInfo ../probe-nope.docx
+    NotFound: file not found
+GetFlightInfo ../probe-outside.docx
+    NotFound: file not found
+GetFlightInfo probe-dangling.docx
+    NotFound: file not found
+GetFlightInfo probe-link.docx
+    NotFound: file not found
+GetFlightInfo ..%2fprobe-outside.docx
+    NotFound: file not found
+GetFlightInfo probe\u{0}nul.docx
+    NotFound: file not found
+GetFlightInfo probe-dir
+    NotFound: file not found
+GetFlightInfo 
+    NotFound: file not found
+DoGet <base>/probe-nope.docx
+    NotFound: file not found
+DoGet <base>/probe-outside.docx
+    NotFound: file not found
+DoGet ../probe-nope.docx
+    NotFound: file not found
+DoGet ../probe-outside.docx
+    NotFound: file not found
+DoGet probe-dangling.docx
+    NotFound: file not found
+DoGet probe-link.docx
+    NotFound: file not found
+DoGet ..%2fprobe-outside.docx
+    NotFound: file not found
+DoGet probe\u{0}nul.docx
+    NotFound: file not found
+DoGet probe-dir
+    NotFound: file not found
+DoGet 
+    NotFound: file not found

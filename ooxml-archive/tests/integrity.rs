@@ -1,6 +1,6 @@
 use ooxml_archive::OoxmlArchive;
 use std::io::{Cursor, Write};
-use zip::{write::FileOptions, CompressionMethod, ZipWriter};
+use zip::{write::SimpleFileOptions as FileOptions, CompressionMethod, ZipWriter};
 
 fn package(method: CompressionMethod) -> Vec<u8> {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));

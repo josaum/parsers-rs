@@ -1,6 +1,6 @@
 [package]
 name = "xlsx-fast-flight"
-version = "0.2.2"
+version = "0.2.8"
 edition.workspace = true
 authors.workspace = true
 description = "Apache Arrow Flight server for xlsx-fast-core"
@@ -25,3 +25,6 @@ serde_json = { workspace = true }
 [dev-dependencies]
 jsonwebtoken = { workspace = true }
 tempfile = "3.10"
+
+[lints]
+workspace = true

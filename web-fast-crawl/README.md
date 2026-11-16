@@ -289,7 +289,7 @@ semantics, offline contexts, provenance, indexing, and ranking. Browser tests ex
 real Chromium/Chrome with local JS/API fixtures; CI installs pinned Playwright and
 Chromium. They need no external commerce service.
 
-Rust source uses the workspace MIT license. The bundled Schema.org context uses
+Rust source uses the workspace MIT OR Apache-2.0 license. The bundled Schema.org context uses
 CC BY-SA 3.0; see [contexts/NOTICE.md](contexts/NOTICE.md) for attribution, source,
 and digest. The crate's SPDX expression accounts for both. Specification sources
 and conformance boundaries are in [SPEC_COMPLIANCE.md](../SPEC_COMPLIANCE.md).

@@ -49,16 +49,27 @@
 //! The parser extracts slide content by traversing the relationship
 //! chain: presentation.xml → slide relationships → individual slides.
 //! Masters and layouts are resolved for complete text extraction.
+//!
+//! # Files on disk
+//!
+//! Functions that take a path memory-map the file. It must not be modified
+//! or truncated, by this process or any other, while it is being read: a
+//! truncated file can make reads of the mapping fault (`SIGBUS` on Unix),
+//! and a modified one can change the bytes under the parser. Functions that
+//! take bytes have no such requirement.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::DateTime;
 use ooxml_archive::{
-    parse_relationships, part_dir, rels_path_for_part, resolve_part, source_part_from_rels,
-    OoxmlArchive, PartReader, RelEntry, Relationships,
+    parse_relationships, parse_simple_props, part_dir, rels_path_for_part, resolve_part,
+    source_part_from_rels, utf8::LossyUtf8, OoxmlArchive, PartReader, RelEntry, Relationships,
 };
-use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::escape::resolve_predefined_entity;
+use quick_xml::events::attributes::Attribute;
+use quick_xml::events::{BytesRef, BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, Cursor};
@@ -107,6 +118,26 @@ impl Default for ParseOptions {
     }
 }
 
+/// The entries of `map` in key order.
+///
+/// A `HashMap` iterates in an order that changes from one process to the
+/// next, so anything written from one (JSON, NDJSON, Arrow rows) goes
+/// through here: the same input must give the same bytes every time.
+pub(crate) fn sorted_entries<V>(map: &HashMap<String, V>) -> Vec<(&String, &V)> {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    entries
+}
+
+/// Serializes a map with its keys in order; see [`sorted_entries`].
+fn serialize_sorted_map<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    V: Serialize,
+{
+    serializer.collect_map(sorted_entries(map))
+}
+
 /// Document metadata from core, app, and custom properties.
 ///
 /// Corresponds to `docProps/core.xml`, `docProps/app.xml`, and
@@ -114,10 +145,13 @@ impl Default for ParseOptions {
 #[derive(Debug, Serialize, Default)]
 pub struct Metadata {
     /// Dublin Core properties (title, creator, subject, etc.).
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub core: HashMap<String, String>,
     /// Application properties (Application, AppVersion, etc.).
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub app: HashMap<String, String>,
     /// Custom document properties defined by the user.
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub custom: HashMap<String, String>,
 }
 
@@ -235,11 +269,19 @@ pub struct TableCell {
 #[derive(Debug, Serialize)]
 pub struct Comment {
     /// Comment ID within the comments part.
+    ///
+    /// A legacy comment carries its own index. A modern (threaded) comment is
+    /// identified by a GUID, so its ID is its 1-based position in the part,
+    /// replies included.
+    ///
+    /// The ID is not unique per slide, let alone per deck: a legacy index is
+    /// counted per author, and a modern position starts again in every part.
     pub id: u32,
     /// Author name from the comment authors list, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
-    /// ISO 8601 timestamp of the comment, if present in the XML.
+    /// ISO 8601 timestamp of the comment, if present in the XML (`dt` on a
+    /// legacy comment, `created` on a modern one).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date: Option<String>,
     /// Comment text content.
@@ -366,6 +408,12 @@ const REL_NOTES_SLIDE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";
 const REL_COMMENTS: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+/// Threaded ("modern") comments, written by PowerPoint since 2021.
+const REL_MODERN_COMMENTS: &str =
+    "http://schemas.microsoft.com/office/2018/10/relationships/comments";
+/// The author list the modern comments refer to.
+const REL_MODERN_AUTHORS: &str =
+    "http://schemas.microsoft.com/office/2018/10/relationships/authors";
 const REL_IMAGE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 
 /// Parse a .pptx file and return a fully materialized [`PptxDocument`].
@@ -580,7 +628,7 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
             if let Some(reader) =
                 open_optional_part_reader(&archive, &master.target, options.max_inflate)?
             {
-                let content = parse_slide(reader)?;
+                let content = parse_slide(reader, options.max_inflate)?;
                 master.shapes = content.shapes;
                 master.tables = content.tables;
             }
@@ -592,7 +640,7 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
             if let Some(reader) =
                 open_optional_part_reader(&archive, &layout.target, options.max_inflate)?
             {
-                let content = parse_slide(reader)?;
+                let content = parse_slide(reader, options.max_inflate)?;
                 layout.shapes = content.shapes;
                 layout.tables = content.tables;
             }
@@ -601,6 +649,11 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
 
     let mut slides = Vec::new();
     let mut comments = Vec::new();
+    // Read once, on the first slide that has modern comments.
+    // Read once per deck: every read is charged to the inflate budget.
+    let mut legacy_authors: Option<HashMap<u32, String>> = None;
+    // `Some(None)` is an author list that could not be read.
+    let mut modern_authors: Option<Option<HashMap<String, String>>> = None;
     for (id, rid) in slide_ids {
         if let Some(target) = presentation_rels.by_id.get(&rid) {
             let slide_path = resolve_part(&part_dir(&presentation_path), target);
@@ -614,7 +667,7 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
             };
             let slide_reader = open_part_reader(&archive, &slide_path, options.max_inflate)
                 .with_context(|| format!("read slide: {slide_path}"))?;
-            let mut slide = parse_slide(slide_reader)?;
+            let mut slide = parse_slide(slide_reader, options.max_inflate)?;
             slide.id = id;
 
             if options.extract_notes {
@@ -623,7 +676,7 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
                     if let Some(reader) =
                         open_optional_part_reader(&archive, &notes_path, options.max_inflate)?
                     {
-                        slide.notes = parse_notes(reader)?;
+                        slide.notes = parse_notes(reader, options.max_inflate)?;
                     }
                 }
             }
@@ -634,12 +687,44 @@ fn parse_pptx_from_archive(archive: PptxArchive, options: ParseOptions) -> Resul
                     if let Some(xml) =
                         read_optional_part_bytes(&archive, &comments_path, options.max_inflate)?
                     {
-                        let authors = parse_comment_authors(&archive, options.max_inflate)?;
-                        let mut slide_comments = parse_comments(&xml, &authors)?;
+                        let authors = match legacy_authors.as_ref() {
+                            Some(authors) => authors,
+                            None => legacy_authors
+                                .insert(parse_comment_authors(&archive, options.max_inflate)?),
+                        };
+                        let mut slide_comments = parse_comments(&xml, authors)?;
                         for comment in slide_comments.iter_mut() {
                             comment.slide_id = id;
                         }
                         comments.extend(slide_comments);
+                    }
+                }
+                if let Some(comments_target) = slide_rels.by_type.get(REL_MODERN_COMMENTS) {
+                    let comments_path = resolve_part(&part_dir(&slide_path), comments_target);
+                    let authors = modern_authors.get_or_insert_with(|| {
+                        // The fallback is where PowerPoint puts the part.
+                        let authors_path = presentation_rels
+                            .by_type
+                            .get(REL_MODERN_AUTHORS)
+                            .map_or_else(
+                                || "ppt/authors.xml".to_string(),
+                                |target| resolve_part(&part_dir(&presentation_path), target),
+                            );
+                        parse_modern_comment_authors(&archive, &authors_path, options.max_inflate)
+                            .ok()
+                    });
+                    // A broken modern comments part, or a broken author list,
+                    // costs this slide its modern comments and nothing else:
+                    // the deck parsed before these parts were read at all.
+                    let slide_comments = authors.as_ref().and_then(|authors| {
+                        let xml =
+                            read_optional_part_bytes(&archive, &comments_path, options.max_inflate)
+                                .ok()??;
+                        parse_modern_comments(&xml, authors).ok()
+                    });
+                    for mut comment in slide_comments.unwrap_or_default() {
+                        comment.slide_id = id;
+                        comments.push(comment);
                     }
                 }
             }
@@ -675,8 +760,7 @@ fn parse_presentation(
     max_inflate: usize,
 ) -> Result<PresentationParts> {
     let xml = read_part_bytes(archive, path, max_inflate)?;
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = xml_reader(Cursor::new(xml), max_inflate);
     let mut buf = Vec::new();
     let mut slide_ids = Vec::new();
     let mut masters = Vec::new();
@@ -685,23 +769,19 @@ fn parse_presentation(
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
+                let raw = e.name().as_ref().as_bytes().to_vec();
                 let name = local_name(&raw);
                 if name == b"sldId" {
                     let mut id = 0u32;
                     let mut rid = None;
-                    for attr in e.attributes().flatten() {
-                        let raw = attr.key.as_ref();
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let raw = attr.key.as_ref().as_bytes();
                         if raw == b"id" {
-                            id = attr
-                                .decode_and_unescape_value(reader.decoder())?
+                            id = attr_text(&attr, reader.get_ref(), &e)?
                                 .parse::<u32>()
                                 .unwrap_or(0);
                         } else if raw == b"r:id" {
-                            rid = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            rid = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                         }
                     }
                     if let Some(rid) = rid {
@@ -709,12 +789,9 @@ fn parse_presentation(
                     }
                 } else if name == b"sldMasterId" {
                     let mut rid = None;
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"r:id" {
-                            rid = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        if attr.key.as_ref().as_bytes() == b"r:id" {
+                            rid = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                         }
                     }
                     if let Some(rid) = rid {
@@ -727,12 +804,9 @@ fn parse_presentation(
                     }
                 } else if name == b"sldLayoutId" {
                     let mut rid = None;
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"r:id" {
-                            rid = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        if attr.key.as_ref().as_bytes() == b"r:id" {
+                            rid = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                         }
                     }
                     if let Some(rid) = rid {
@@ -755,287 +829,303 @@ fn parse_presentation(
     Ok((slide_ids, masters, layouts))
 }
 
-fn parse_slide<R: BufRead>(reader: R) -> Result<Slide> {
-    let mut reader = Reader::from_reader(reader);
-    reader.config_mut().trim_text(false);
-    let mut buf = Vec::new();
-    let mut slide = Slide {
-        id: 0,
-        name: None,
-        shapes: Vec::new(),
-        tables: Vec::new(),
-        notes: Vec::new(),
-    };
-    let mut current_shape: Option<ShapeText> = None;
-    let mut current_paragraph: Option<ParagraphBuilder> = None;
-    let mut current_run: Option<Run> = None;
-    let mut current_table: Option<TableBuilder> = None;
-    let mut in_text = false;
-    let mut in_table = false;
-    let mut in_cell = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"cSld" {
-                    if let Some(val) = attr_value(&reader, &e, b"name")? {
-                        slide.name = Some(val);
-                    }
-                } else if name == b"sp" {
-                    current_shape = Some(ShapeText {
-                        shape_id: None,
-                        name: None,
-                        placeholder: None,
-                        paragraphs: Vec::new(),
-                    });
-                } else if name == b"cNvPr" {
-                    if let Some(shape) = current_shape.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"id")? {
-                            shape.shape_id = val.parse::<u32>().ok();
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"name")? {
-                            shape.name = Some(val);
-                        }
-                    }
-                } else if name == b"ph" {
-                    if let Some(shape) = current_shape.as_mut() {
-                        shape.placeholder = attr_value(&reader, &e, b"type")?;
-                    }
-                } else if name == b"p" {
-                    current_paragraph = Some(ParagraphBuilder::default());
-                } else if name == b"pPr" {
-                    if let Some(p) = current_paragraph.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"lvl")? {
-                            p.level = val.parse::<u8>().ok();
-                        }
-                    }
-                } else if name == b"r" {
-                    current_run = Some(Run {
-                        text: String::new(),
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                    });
-                } else if name == b"rPr" {
-                    if let Some(run) = current_run.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"b")? {
-                            run.bold = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"i")? {
-                            run.italic = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"u")? {
-                            run.underline = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                    }
-                } else if name == b"t" {
-                    in_text = true;
-                } else if name == b"tbl" {
-                    in_table = true;
-                    current_table = Some(TableBuilder::default());
-                } else if name == b"tr" && in_table {
-                    if let Some(table) = current_table.as_mut() {
-                        table.rows.push(TableRowBuilder::default());
-                    }
-                } else if name == b"tc" && in_table {
-                    if let Some(table) = current_table.as_mut() {
-                        if let Some(row) = table.rows.last_mut() {
-                            row.cells.push(TableCell {
-                                text: String::new(),
-                            });
-                        }
-                    }
-                    in_cell = true;
-                }
-            }
-            Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"br" {
-                    if let Some(run) = current_run.as_mut() {
-                        run.text.push('\n');
-                    }
-                }
-            }
-            Ok(Event::Text(e)) => {
-                if in_text {
-                    let value = e.unescape()?.to_string();
-                    if in_table {
-                        if let Some(table) = current_table.as_mut() {
-                            if let Some(row) = table.rows.last_mut() {
-                                if in_cell {
-                                    if let Some(cell) = row.cells.last_mut() {
-                                        cell.text.push_str(&value);
-                                    }
-                                }
-                            }
-                        }
-                    } else if let Some(run) = current_run.as_mut() {
-                        run.text.push_str(&value);
-                    }
-                }
-            }
-            Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"t" {
-                    in_text = false;
-                } else if name == b"r" {
-                    if let Some(run) = current_run.take() {
-                        if let Some(p) = current_paragraph.as_mut() {
-                            if !run.text.is_empty() {
-                                p.runs.push(run);
-                            }
-                        }
-                    }
-                } else if name == b"p" {
-                    if let Some(p) = current_paragraph.take() {
-                        let paragraph = p.finish();
-                        if in_table {
-                            if let Some(table) = current_table.as_mut() {
-                                if let Some(row) = table.rows.last_mut() {
-                                    if let Some(cell) = row.cells.last_mut() {
-                                        cell.text.push_str(&paragraph.text);
-                                    }
-                                }
-                            }
-                        } else if let Some(shape) = current_shape.as_mut() {
-                            shape.paragraphs.push(paragraph);
-                        }
-                    }
-                } else if name == b"sp" {
-                    if let Some(shape) = current_shape.take() {
-                        if !shape.paragraphs.is_empty() {
-                            slide.shapes.push(shape);
-                        }
-                    }
-                } else if name == b"tbl" {
-                    in_table = false;
-                    if let Some(table) = current_table.take() {
-                        slide.tables.push(table.finish());
-                    }
-                } else if name == b"tc" {
-                    in_cell = false;
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(anyhow!("parse slide: {err}")),
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    Ok(slide)
+fn parse_slide<R: BufRead>(reader: R, limit: usize) -> Result<Slide> {
+    read_slide_content(reader, limit, SlidePart::Slide, "parse slide")
 }
 
-fn parse_notes<R: BufRead>(reader: R) -> Result<Vec<ShapeText>> {
-    let mut reader = Reader::from_reader(reader);
-    reader.config_mut().trim_text(false);
+fn parse_notes<R: BufRead>(reader: R, limit: usize) -> Result<Vec<ShapeText>> {
+    Ok(read_slide_content(reader, limit, SlidePart::Notes, "parse notes")?.shapes)
+}
+
+/// Which kind of part a [`SlideContent`] reader is walking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlidePart {
+    /// A slide, layout or master: shapes, tables, the slide name and
+    /// placeholder types.
+    Slide,
+    /// A notes slide: shapes and their placeholder types only.
+    Notes,
+}
+
+fn read_slide_content<R: BufRead>(
+    reader: R,
+    limit: usize,
+    part: SlidePart,
+    context: &str,
+) -> Result<Slide> {
+    let mut reader = xml_reader(reader, limit);
     let mut buf = Vec::new();
-    let mut shapes = Vec::new();
-    let mut current_shape: Option<ShapeText> = None;
-    let mut current_paragraph: Option<ParagraphBuilder> = None;
-    let mut current_run: Option<Run> = None;
-    let mut in_text = false;
+    let mut content = SlideContent::new(part);
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"sp" {
-                    current_shape = Some(ShapeText {
-                        shape_id: None,
-                        name: None,
-                        placeholder: None,
-                        paragraphs: Vec::new(),
-                    });
-                } else if name == b"cNvPr" {
-                    if let Some(shape) = current_shape.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"id")? {
-                            shape.shape_id = val.parse::<u32>().ok();
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"name")? {
-                            shape.name = Some(val);
-                        }
-                    }
-                } else if name == b"p" {
-                    current_paragraph = Some(ParagraphBuilder::default());
-                } else if name == b"pPr" {
-                    if let Some(p) = current_paragraph.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"lvl")? {
-                            p.level = val.parse::<u8>().ok();
-                        }
-                    }
-                } else if name == b"r" {
-                    current_run = Some(Run {
-                        text: String::new(),
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                    });
-                } else if name == b"rPr" {
-                    if let Some(run) = current_run.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"b")? {
-                            run.bold = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"i")? {
-                            run.italic = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                        if let Some(val) = attr_value(&reader, &e, b"u")? {
-                            run.underline = val == "1" || val.eq_ignore_ascii_case("true");
-                        }
-                    }
-                } else if name == b"t" {
-                    in_text = true;
-                }
+            Ok(Event::Start(e)) => content.open(&reader, &e)?,
+            // A self-closed element is an element without children: PowerPoint
+            // writes `cNvPr`, `ph`, `pPr`, `rPr` and `br` that way.
+            Ok(Event::Empty(e)) => {
+                content.open(&reader, &e)?;
+                content.close(local_name(e.name().into_inner().as_bytes()));
             }
-            Ok(Event::Text(e)) => {
-                if in_text {
-                    let value = e.unescape()?.to_string();
-                    if let Some(run) = current_run.as_mut() {
-                        run.text.push_str(&value);
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
+                if content.in_text {
+                    if let Some(text) = character_data(&event) {
+                        content.text(&text);
                     }
                 }
             }
-            Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"t" {
-                    in_text = false;
-                } else if name == b"r" {
-                    if let Some(run) = current_run.take() {
-                        if let Some(p) = current_paragraph.as_mut() {
-                            if !run.text.is_empty() {
-                                p.runs.push(run);
-                            }
-                        }
-                    }
-                } else if name == b"p" {
-                    if let Some(p) = current_paragraph.take() {
-                        let paragraph = p.finish();
-                        if let Some(shape) = current_shape.as_mut() {
-                            shape.paragraphs.push(paragraph);
-                        }
-                    }
-                } else if name == b"sp" {
-                    if let Some(shape) = current_shape.take() {
-                        if !shape.paragraphs.is_empty() {
-                            shapes.push(shape);
-                        }
-                    }
-                }
-            }
+            Ok(Event::End(e)) => content.close(local_name(e.name().into_inner().as_bytes())),
             Ok(Event::Eof) => break,
-            Err(err) => return Err(anyhow!("parse notes: {err}")),
+            Err(err) => return Err(anyhow!("{context}: {err}")),
             _ => {}
         }
         buf.clear();
     }
 
-    Ok(shapes)
+    Ok(content.slide)
+}
+
+/// Reader state for the shape tree of a slide, layout, master or notes slide.
+///
+/// The output is flat (shapes and tables, never nested), so element nesting
+/// in the input costs no stack and no recursion.
+#[derive(Debug)]
+struct SlideContent {
+    part: SlidePart,
+    slide: Slide,
+    current_shape: Option<ShapeText>,
+    current_paragraph: Option<ParagraphBuilder>,
+    current_run: Option<Run>,
+    current_table: Option<TableBuilder>,
+    in_text: bool,
+    in_table: bool,
+    in_cell: bool,
+    /// The open table cell already holds a paragraph, so the next one starts
+    /// on a new line.
+    cell_has_paragraph: bool,
+}
+
+impl SlideContent {
+    fn new(part: SlidePart) -> Self {
+        Self {
+            part,
+            slide: Slide {
+                id: 0,
+                name: None,
+                shapes: Vec::new(),
+                tables: Vec::new(),
+                notes: Vec::new(),
+            },
+            current_shape: None,
+            current_paragraph: None,
+            current_run: None,
+            current_table: None,
+            in_text: false,
+            in_table: false,
+            in_cell: false,
+            cell_has_paragraph: false,
+        }
+    }
+
+    /// The table cell being filled, if the reader is inside one.
+    fn open_cell(&mut self) -> Option<&mut TableCell> {
+        if !self.in_cell {
+            return None;
+        }
+        self.current_table
+            .as_mut()
+            .and_then(|table| table.rows.last_mut())
+            .and_then(|row| row.cells.last_mut())
+    }
+
+    fn open<R: BufRead>(
+        &mut self,
+        reader: &Reader<LossyUtf8<R>>,
+        e: &BytesStart<'_>,
+    ) -> Result<()> {
+        let is_slide = self.part == SlidePart::Slide;
+        match local_name(e.name().into_inner().as_bytes()) {
+            b"cSld" if is_slide => {
+                if let Some(val) = attr_value(reader, e, b"name")? {
+                    self.slide.name = Some(val);
+                }
+            }
+            b"sp" => {
+                self.current_shape = Some(ShapeText {
+                    shape_id: None,
+                    name: None,
+                    placeholder: None,
+                    paragraphs: Vec::new(),
+                });
+            }
+            b"cNvPr" => {
+                if let Some(shape) = self.current_shape.as_mut() {
+                    let [id, name] = attr_values(reader, e, [b"id", b"name"])?;
+                    if let Some(id) = id {
+                        shape.shape_id = id.parse::<u32>().ok();
+                    }
+                    if let Some(name) = name {
+                        shape.name = Some(name);
+                    }
+                }
+            }
+            // Notes shapes are placeholders too: `body` is the notes text.
+            b"ph" => {
+                if let Some(shape) = self.current_shape.as_mut() {
+                    shape.placeholder = attr_value(reader, e, b"type")?;
+                }
+            }
+            b"p" => {
+                self.current_paragraph = Some(ParagraphBuilder::default());
+                // Paragraphs of one cell are lines of its text; without the
+                // separator "Total" and "Revenue" read as "TotalRevenue".
+                let follows_a_paragraph = self.cell_has_paragraph;
+                if let Some(cell) = self.open_cell() {
+                    if follows_a_paragraph {
+                        cell.text.push('\n');
+                    }
+                    self.cell_has_paragraph = true;
+                }
+            }
+            // A field carries its own `pPr`; only the paragraph's own counts.
+            b"pPr" if self.current_run.is_none() => {
+                if let Some(p) = self.current_paragraph.as_mut() {
+                    if let Some(val) = attr_value(reader, e, b"lvl")? {
+                        p.level = val.parse::<u8>().ok();
+                    }
+                }
+            }
+            // A field (`fld`: slide number, date) is a run whose text is the
+            // value PowerPoint last rendered.
+            b"r" | b"fld" => {
+                self.current_run = Some(Run {
+                    text: String::new(),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                });
+            }
+            b"rPr" => {
+                if let Some(run) = self.current_run.as_mut() {
+                    let [bold, italic, underline] = attr_values(reader, e, [b"b", b"i", b"u"])?;
+                    if let Some(val) = bold {
+                        run.bold = is_true(&val);
+                    }
+                    if let Some(val) = italic {
+                        run.italic = is_true(&val);
+                    }
+                    // `u` is an underline style (`sng`, `dbl`, ...), not a
+                    // boolean; every value but `none` underlines.
+                    if let Some(val) = underline {
+                        run.underline = val != "none";
+                    }
+                }
+            }
+            b"t" => self.in_text = true,
+            b"br" => self.line_break(),
+            b"tbl" if is_slide => {
+                self.in_table = true;
+                self.in_cell = false;
+                self.current_table = Some(TableBuilder::default());
+            }
+            b"tr" if is_slide && self.in_table => {
+                if let Some(table) = self.current_table.as_mut() {
+                    table.rows.push(TableRowBuilder::default());
+                }
+            }
+            b"tc" if is_slide && self.in_table => {
+                if let Some(row) = self
+                    .current_table
+                    .as_mut()
+                    .and_then(|table| table.rows.last_mut())
+                {
+                    row.cells.push(TableCell {
+                        text: String::new(),
+                    });
+                }
+                self.in_cell = true;
+                self.cell_has_paragraph = false;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Records a vertical line break (`a:br`), a sibling of the runs.
+    fn line_break(&mut self) {
+        if self.in_table {
+            if let Some(cell) = self.open_cell() {
+                cell.text.push('\n');
+            }
+        } else if let Some(run) = self.current_run.as_mut() {
+            run.text.push('\n');
+        } else if let Some(p) = self.current_paragraph.as_mut() {
+            p.runs.push(Run {
+                text: "\n".to_string(),
+                bold: false,
+                italic: false,
+                underline: false,
+            });
+        }
+    }
+
+    /// Appends character data found inside `a:t`.
+    fn text(&mut self, value: &str) {
+        if self.in_table {
+            // Table text is collected per cell, not per run.
+            if let Some(cell) = self.open_cell() {
+                cell.text.push_str(value);
+            }
+        } else if let Some(run) = self.current_run.as_mut() {
+            run.text.push_str(value);
+        }
+    }
+
+    fn close(&mut self, name: &[u8]) {
+        let is_slide = self.part == SlidePart::Slide;
+        match name {
+            b"t" => self.in_text = false,
+            b"r" | b"fld" => {
+                if let Some(run) = self.current_run.take() {
+                    if let Some(p) = self.current_paragraph.as_mut() {
+                        if !run.text.is_empty() {
+                            p.runs.push(run);
+                        }
+                    }
+                }
+            }
+            b"p" => {
+                if let Some(p) = self.current_paragraph.take() {
+                    // Inside a table the text already went to the cell.
+                    if !self.in_table {
+                        if let Some(shape) = self.current_shape.as_mut() {
+                            shape.paragraphs.push(p.finish());
+                        }
+                    }
+                }
+            }
+            b"sp" => {
+                if let Some(shape) = self.current_shape.take() {
+                    if !shape.paragraphs.is_empty() {
+                        self.slide.shapes.push(shape);
+                    }
+                }
+            }
+            b"tbl" if is_slide => {
+                self.in_table = false;
+                self.in_cell = false;
+                if let Some(table) = self.current_table.take() {
+                    self.slide.tables.push(table.finish());
+                }
+            }
+            b"tc" if is_slide => self.in_cell = false,
+            _ => {}
+        }
+    }
+}
+
+/// Whether an `xsd:boolean` attribute value is true.
+fn is_true(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true")
 }
 
 fn parse_comment_authors(
@@ -1046,29 +1136,23 @@ fn parse_comment_authors(
     else {
         return Ok(HashMap::new());
     };
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let limit = buffer_limit(&xml);
+    let mut reader = xml_reader(Cursor::new(xml), limit);
     let mut buf = Vec::new();
     let mut authors = HashMap::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
+                let raw = e.name().as_ref().as_bytes().to_vec();
                 if local_name(&raw) == b"cmAuthor" {
                     let mut id = None;
                     let mut name = None;
-                    for attr in e.attributes().flatten() {
-                        let key = local_name(attr.key.as_ref());
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let key = local_name(attr.key.as_ref().as_bytes());
                         if key == b"id" {
-                            id = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .parse::<u32>()
-                                .ok();
+                            id = attr_text(&attr, reader.get_ref(), &e)?.parse::<u32>().ok();
                         } else if key == b"name" {
-                            name = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            name = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                         }
                     }
                     if let (Some(id), Some(name)) = (id, name) {
@@ -1086,74 +1170,209 @@ fn parse_comment_authors(
 }
 
 fn parse_comments(xml: &[u8], authors: &HashMap<u32, String>) -> Result<Vec<Comment>> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let limit = buffer_limit(xml);
+    let mut reader = xml_reader(Cursor::new(xml), limit);
     let mut buf = Vec::new();
     let mut comments = Vec::new();
     let mut current: Option<Comment> = None;
     let mut in_text = false;
 
     loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
+        let event = reader.read_event_into(&mut buf);
+        let self_closed = matches!(event, Ok(Event::Empty(_)));
+        match event {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let raw = e.name().as_ref().as_bytes().to_vec();
                 let name = local_name(&raw);
                 if name == b"cm" {
                     let mut id = 0u32;
                     let mut author_id = None;
                     let mut date = None;
-                    for attr in e.attributes().flatten() {
-                        let key = local_name(attr.key.as_ref());
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let key = local_name(attr.key.as_ref().as_bytes());
                         if key == b"idx" || key == b"id" {
-                            id = attr
-                                .decode_and_unescape_value(reader.decoder())?
+                            id = attr_text(&attr, reader.get_ref(), &e)?
                                 .parse::<u32>()
                                 .unwrap_or(0);
                         } else if key == b"authorId" {
-                            author_id = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .parse::<u32>()
-                                .ok();
+                            author_id = attr_text(&attr, reader.get_ref(), &e)?.parse::<u32>().ok();
                         } else if key == b"dt" {
-                            date = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            date = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                         }
                     }
                     let author = author_id.and_then(|id| authors.get(&id).cloned());
-                    current = Some(Comment {
+                    let comment = Comment {
                         id,
                         author,
                         date,
                         text: None,
                         slide_id: 0,
-                    });
-                } else if name == b"t" {
+                    };
+                    if self_closed {
+                        comments.push(comment);
+                    } else {
+                        current = Some(comment);
+                    }
+                // Legacy comments hold their text in `p:text`, modern ones
+                // in DrawingML runs (`a:t`).
+                } else if !self_closed && (name == b"t" || name == b"text") {
                     in_text = true;
                 }
             }
-            Ok(Event::Text(e)) => {
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
                 if in_text {
-                    let value = e.unescape()?.to_string();
-                    if let Some(comment) = current.as_mut() {
-                        let mut text = comment.text.take().unwrap_or_default();
-                        text.push_str(&value);
-                        comment.text = Some(text);
+                    if let (Some(comment), Some(value)) = (current.as_mut(), character_data(&event))
+                    {
+                        comment
+                            .text
+                            .get_or_insert_with(String::new)
+                            .push_str(&value);
                     }
                 }
             }
             Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
+                let raw = e.name().as_ref().as_bytes().to_vec();
                 let name = local_name(&raw);
-                if name == b"t" {
+                if name == b"t" || name == b"text" {
                     in_text = false;
                 } else if name == b"cm" {
+                    in_text = false;
                     if let Some(comment) = current.take() {
                         comments.push(comment);
                     }
                 }
             }
+            Ok(Event::Eof) => break,
+            Err(err) => return Err(anyhow!("parse comments: {err}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(comments)
+}
+
+/// Reads the modern author list: author GUID, in lower case, to display name.
+fn parse_modern_comment_authors(
+    archive: &PptxArchive,
+    path: &str,
+    max_inflate: usize,
+) -> Result<HashMap<String, String>> {
+    let Some(xml) = read_optional_part_bytes(archive, path, max_inflate)? else {
+        return Ok(HashMap::new());
+    };
+    let limit = buffer_limit(&xml);
+    let mut reader = xml_reader(Cursor::new(xml), limit);
+    let mut buf = Vec::new();
+    let mut authors = HashMap::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if local_name(e.name().as_ref().as_bytes()) == b"author" {
+                    if let [Some(id), Some(name)] = attr_values(&reader, &e, [b"id", b"name"])? {
+                        // GUIDs are written in either case.
+                        authors.insert(id.to_ascii_lowercase(), name);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => return Err(anyhow!("parse comment authors: {err}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(authors)
+}
+
+/// Reads a modern (threaded) comments part.
+///
+/// A comment and each of its replies become one [`Comment`] each, the comment
+/// first and its replies after it. Modern comments are identified by GUID,
+/// which [`Comment::id`] cannot hold, so `id` is the 1-based position in the
+/// part. Paragraphs of one comment are joined by a line feed.
+fn parse_modern_comments(xml: &[u8], authors: &HashMap<String, String>) -> Result<Vec<Comment>> {
+    let limit = buffer_limit(xml);
+    let mut reader = xml_reader(Cursor::new(xml), limit);
+    let mut buf = Vec::new();
+    let mut comments: Vec<Comment> = Vec::new();
+    // The open comment and, inside it, the open reply: its index into
+    // `comments` and whether its body already holds a paragraph. Text belongs
+    // to the innermost.
+    let mut open: Vec<(usize, bool)> = Vec::new();
+    // Only the body (`txBody`) is the comment; extension lists carry
+    // DrawingML text of their own.
+    let mut in_body = false;
+    let mut in_text = false;
+
+    loop {
+        let event = reader.read_event_into(&mut buf);
+        let self_closed = matches!(event, Ok(Event::Empty(_)));
+        match event {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                match local_name(e.name().as_ref().as_bytes()) {
+                    b"cm" | b"reply" => {
+                        let [author_id, date] =
+                            attr_values(&reader, &e, [b"authorId", b"created"])?;
+                        let id = u32::try_from(comments.len() + 1).unwrap_or(u32::MAX);
+                        comments.push(Comment {
+                            id,
+                            author: author_id
+                                .and_then(|id| authors.get(&id.to_ascii_lowercase()).cloned()),
+                            date,
+                            text: None,
+                            slide_id: 0,
+                        });
+                        if !self_closed {
+                            open.push((comments.len() - 1, false));
+                        }
+                    }
+                    b"txBody" => in_body = !self_closed,
+                    // Paragraphs are lines, as in a table cell: every paragraph
+                    // after the first starts on a new line, empty ones included.
+                    b"p" if in_body => {
+                        if let Some((index, has_paragraph)) = open.last_mut() {
+                            if *has_paragraph {
+                                if let Some(comment) = comments.get_mut(*index) {
+                                    comment.text.get_or_insert_with(String::new).push('\n');
+                                }
+                            }
+                            *has_paragraph = true;
+                        }
+                    }
+                    b"br" if in_body => {
+                        let comment = open.last().and_then(|(index, _)| comments.get_mut(*index));
+                        if let Some(comment) = comment {
+                            comment.text.get_or_insert_with(String::new).push('\n');
+                        }
+                    }
+                    b"t" if in_body => in_text = !self_closed,
+                    _ => {}
+                }
+            }
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
+                if in_text {
+                    let comment = open.last().and_then(|(index, _)| comments.get_mut(*index));
+                    if let (Some(comment), Some(value)) = (comment, character_data(&event)) {
+                        comment
+                            .text
+                            .get_or_insert_with(String::new)
+                            .push_str(&value);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => match local_name(e.name().as_ref().as_bytes()) {
+                b"t" => in_text = false,
+                b"txBody" => {
+                    in_body = false;
+                    in_text = false;
+                }
+                b"cm" | b"reply" => {
+                    in_body = false;
+                    in_text = false;
+                    open.pop();
+                }
+                _ => {}
+            },
             Ok(Event::Eof) => break,
             Err(err) => return Err(anyhow!("parse comments: {err}")),
             _ => {}
@@ -1178,73 +1397,54 @@ fn parse_metadata(archive: &PptxArchive, max_inflate: usize) -> Result<Metadata>
     Ok(metadata)
 }
 
-fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
-    let mut buf = Vec::new();
-    let mut out = HashMap::new();
-    let mut current_key: Option<String> = None;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let key = local_name(&raw);
-                current_key = Some(String::from_utf8_lossy(key).to_string());
-            }
-            Ok(Event::Text(e)) => {
-                if let Some(key) = current_key.take() {
-                    let value = e.unescape()?.to_string();
-                    if !value.is_empty() {
-                        out.insert(key, normalize_datetime(&value));
-                    }
-                }
-            }
-            Ok(Event::End(_)) => {
-                current_key = None;
-            }
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(anyhow!("parse props: {err}")),
-            _ => {}
-        }
-        buf.clear();
-    }
-    Ok(out)
-}
-
+/// Reads custom properties: property name to the text of its value element.
+///
+/// The value element is the first child of `property` (`vt:lpwstr`,
+/// `vt:i4`, ...). Whitespace around it is not the value.
 fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let limit = buffer_limit(xml);
+    let mut reader = xml_reader(Cursor::new(xml), limit);
     let mut buf = Vec::new();
     let mut out = HashMap::new();
-    let mut current_name: Option<String> = None;
+    let mut depth = 0usize;
+    // The open property's name and the character data of its value so far.
+    let mut pending: Option<(String, String)> = None;
+    // Depth of the open value element, while the reader is inside it.
+    let mut value_depth: Option<usize> = None;
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                if local_name(&raw) == b"property" {
-                    for attr in e.attributes().flatten() {
-                        if local_name(attr.key.as_ref()) == b"name" {
-                            current_name = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                depth += 1;
+                if local_name(e.name().as_ref().as_bytes()) == b"property" {
+                    pending = None;
+                    value_depth = None;
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        if local_name(attr.key.as_ref().as_bytes()) == b"name" {
+                            let name = attr_text(&attr, reader.get_ref(), &e)?.to_string();
+                            pending = Some((name, String::new()));
                         }
                     }
+                } else if pending.is_some() && value_depth.is_none() {
+                    value_depth = Some(depth);
                 }
             }
-            Ok(Event::Text(e)) => {
-                if let Some(name) = current_name.take() {
-                    let value = e.unescape()?.to_string();
-                    if !value.is_empty() {
-                        out.insert(name, normalize_datetime(&value));
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
+                if value_depth.is_some() {
+                    if let (Some((_, value)), Some(piece)) =
+                        (pending.as_mut(), character_data(&event))
+                    {
+                        value.push_str(&piece);
                     }
                 }
             }
             Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                if local_name(&raw) == b"property" {
-                    current_name = None;
+                if value_depth == Some(depth)
+                    || local_name(e.name().as_ref().as_bytes()) == b"property"
+                {
+                    store_prop(&mut out, pending.take());
+                    value_depth = None;
                 }
+                depth = depth.saturating_sub(1);
             }
             Ok(Event::Eof) => break,
             Err(err) => return Err(anyhow!("parse custom props: {err}")),
@@ -1253,6 +1453,15 @@ fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
         buf.clear();
     }
     Ok(out)
+}
+
+/// Stores a finished property value; a property without text has no value.
+fn store_prop(out: &mut HashMap<String, String>, pending: Option<(String, String)>) {
+    if let Some((key, value)) = pending {
+        if !value.is_empty() {
+            out.insert(key, normalize_datetime(&value));
+        }
+    }
 }
 
 fn normalize_datetime(value: &str) -> String {
@@ -1311,31 +1520,25 @@ fn parse_content_types(
     let Some(xml) = read_optional_part_bytes(archive, "[Content_Types].xml", max_inflate)? else {
         return Ok(HashMap::new());
     };
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let limit = buffer_limit(&xml);
+    let mut reader = xml_reader(Cursor::new(xml), limit);
     let mut buf = Vec::new();
     let mut map = HashMap::new();
     let mut defaults: HashMap<String, String> = HashMap::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
+                let raw = e.name().as_ref().as_bytes().to_vec();
                 let name = local_name(&raw);
                 if name == b"Default" {
                     let mut ext = None;
                     let mut ct = None;
-                    for attr in e.attributes().flatten() {
-                        let key = local_name(attr.key.as_ref());
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let key = local_name(attr.key.as_ref().as_bytes());
                         if key == b"Extension" {
-                            ext = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            ext = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                         } else if key == b"ContentType" {
-                            ct = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            ct = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                         }
                     }
                     if let (Some(ext), Some(ct)) = (ext, ct) {
@@ -1344,18 +1547,12 @@ fn parse_content_types(
                 } else if name == b"Override" {
                     let mut part_name = None;
                     let mut ct = None;
-                    for attr in e.attributes().flatten() {
-                        let key = local_name(attr.key.as_ref());
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let key = local_name(attr.key.as_ref().as_bytes());
                         if key == b"PartName" {
-                            part_name = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            part_name = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                         } else if key == b"ContentType" {
-                            ct = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            ct = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                         }
                     }
                     if let (Some(part_name), Some(ct)) = (part_name, ct) {
@@ -1403,19 +1600,114 @@ fn guess_content_type(path: &str) -> Option<String> {
 }
 
 fn attr_value<R: BufRead>(
-    reader: &Reader<R>,
+    reader: &Reader<LossyUtf8<R>>,
     e: &quick_xml::events::BytesStart<'_>,
     key: &[u8],
 ) -> Result<Option<String>> {
-    for attr in e.attributes().flatten() {
-        if local_name(attr.key.as_ref()) == key {
-            return Ok(Some(
-                attr.decode_and_unescape_value(reader.decoder())?
-                    .to_string(),
-            ));
+    for attr in e.attributes().with_checks(false).flatten() {
+        if local_name(attr.key.as_ref().as_bytes()) == key {
+            return Ok(Some(attr_text(&attr, reader.get_ref(), e)?.to_string()));
         }
     }
     Ok(None)
+}
+
+/// Reads several attributes in one pass over the start tag.
+///
+/// Returns the values in the order of `keys`, matched by local name; the
+/// first occurrence of a name wins, as with [`attr_value`]. One pass matters:
+/// every walk of a tag's attributes costs time quadratic in their number.
+fn attr_values<R: BufRead, const N: usize>(
+    reader: &Reader<LossyUtf8<R>>,
+    e: &BytesStart<'_>,
+    keys: [&[u8]; N],
+) -> Result<[Option<String>; N]> {
+    let mut values: [Option<String>; N] = std::array::from_fn(|_| None);
+    for attr in e.attributes().with_checks(false).flatten() {
+        let key = local_name(attr.key.as_ref().as_bytes());
+        if let Some(slot) = keys.iter().position(|candidate| *candidate == key) {
+            if values[slot].is_none() {
+                values[slot] = Some(attr_text(&attr, reader.get_ref(), e)?.to_string());
+            }
+        }
+    }
+    Ok(values)
+}
+
+/// Returns the character data of a text, CDATA or reference event.
+///
+/// Decoding is lenient: a stray non-UTF-8 byte becomes U+FFFD, so one bad
+/// character costs that character rather than the whole presentation. CDATA
+/// is literal character data and is never unescaped.
+fn character_data<'a>(event: &'a Event<'_>) -> Option<Cow<'a, str>> {
+    match event {
+        // The reader hands references over as events of their own, so text
+        // holds no escapes. A bare `&` stays in the text as written.
+        Event::Text(text) => Some(Cow::Borrowed(&**text)),
+        Event::CData(data) => Some(Cow::Borrowed(&**data)),
+        Event::GeneralRef(reference) => Some(reference_text(reference)),
+        _ => None,
+    }
+}
+
+/// Resolves one `&name;` or `&#number;` reference to the text it stands for.
+///
+/// The five predefined entities and decimal or hexadecimal character
+/// references resolve to their character. Anything else (an entity this
+/// parser does not know, a character reference to no character) is kept as
+/// written, so the reader of the output sees what the file said.
+fn reference_text<'a>(reference: &'a BytesRef<'_>) -> Cow<'a, str> {
+    let name: &str = reference;
+    let resolved = match reference.resolve_char_ref() {
+        Ok(Some(ch)) => Some(Cow::Owned(ch.to_string())),
+        Ok(None) => resolve_predefined_entity(name).map(Cow::Borrowed),
+        Err(_) => None,
+    };
+    resolved.unwrap_or_else(|| Cow::Owned(format!("&{name};")))
+}
+
+/// Creates the XML reader every part is read with.
+///
+/// The part is read as UTF-8, each byte that is not UTF-8 replaced by U+FFFD,
+/// so one bad character costs that character in text; an attribute read
+/// with [`attr_text`] still rejects it. `limit` is the size the part's raw
+/// bytes were held to: repair can triple a part, and a part it grows past
+/// that is refused.
+fn xml_reader<R: BufRead>(input: R, limit: usize) -> Reader<LossyUtf8<R>> {
+    let mut reader = Reader::from_reader(LossyUtf8::with_limit(input, limit as u64));
+    let config = reader.config_mut();
+    // Whitespace is text: trimming would delete the spaces around a reference.
+    config.trim_text(false);
+    // A bare `&` is not well-formed, but real tools write it ("AT&T"). It is
+    // kept as text instead of costing the whole part.
+    config.allow_dangling_amp = true;
+    reader
+}
+
+/// Decodes one attribute value, resolving references.
+///
+/// The value is normalized as XML 1.0 requires: a literal tab, line feed or
+/// carriage return becomes a space, while one written as a character
+/// reference (`&#9;`) is kept.
+///
+/// `tag` is the start or empty tag the attribute was read from, through
+/// `input`. A value in which `input` replaced bytes that are not UTF-8 with
+/// U+FFFD is an error, as a value that is not UTF-8 always was. A U+FFFD the
+/// part really holds, or a replacement elsewhere in the part, is not.
+fn attr_text<'a, R: BufRead>(
+    attr: &Attribute<'a>,
+    input: &LossyUtf8<R>,
+    tag: &str,
+) -> Result<Cow<'a, str>> {
+    if input.repaired_in(tag.as_bytes(), 1..=2, attr.value.as_bytes()) {
+        return Err(anyhow!("attribute value is not UTF-8"));
+    }
+    Ok(attr.normalized_value(XmlVersion::Implicit1_0)?)
+}
+
+/// The repair limit for a part read whole, with no part limit in scope.
+fn buffer_limit(xml: &[u8]) -> usize {
+    ooxml_archive::utf8::unknown_limit(xml.len())
 }
 
 fn local_name(name: &[u8]) -> &[u8] {

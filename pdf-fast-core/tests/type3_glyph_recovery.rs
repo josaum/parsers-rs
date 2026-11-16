@@ -40,6 +40,17 @@ use pdf_fast_core::{ParseOptions, PdfDocument};
 /// whose object numbering does not line up produces a document that parses into
 /// the wrong resource tree, which is a fixture bug that looks like a parser
 /// bug. Every object here is written at a recorded offset.
+/// The learned-shape catalog is one per process, and the test harness runs
+/// tests on parallel threads: a test that clears it while another is
+/// learning makes that one fail now and then. Reading glyph outlines
+/// consults it too, so every test in this file holds this for its whole run.
+fn catalog_lock() -> std::sync::MutexGuard<'static, ()> {
+    static CATALOG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CATALOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn pdf(objects: Vec<Vec<u8>>) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::with_capacity(objects.len());
@@ -185,6 +196,7 @@ fn quote_pdf() -> Vec<u8> {
 
 #[test]
 fn type3_outlines_are_extracted_and_their_text_is_recovered_by_shape() {
+    let _catalog = catalog_lock();
     glyph_catalog::clear_learned();
     let doc = PdfDocument::from_slice(&two_page_pdf(), ParseOptions::default())
         .expect("the Type 3 document must parse");
@@ -265,6 +277,7 @@ fn type3_outlines_are_extracted_and_their_text_is_recovered_by_shape() {
 /// confused with a fixture that was readable all along.
 #[test]
 fn an_empty_catalog_reports_unknown_rather_than_guessing() {
+    let _catalog = catalog_lock();
     glyph_catalog::clear_learned();
     let doc = PdfDocument::from_slice(&two_page_pdf(), ParseOptions::default())
         .expect("the outline document must parse");
@@ -295,6 +308,7 @@ fn an_empty_catalog_reports_unknown_rather_than_guessing() {
 /// rendering of the same shape.
 #[test]
 fn a_shape_learned_from_outlines_is_recovered_for_a_different_rendering() {
+    let _catalog = catalog_lock();
     glyph_catalog::clear_learned();
 
     let outline = |jitter: f32| {
@@ -354,6 +368,7 @@ fn a_shape_learned_from_outlines_is_recovered_for_a_different_rendering() {
 /// count, because a count passes with the kerning ignored.
 #[test]
 fn a_tj_array_shows_every_string_with_its_kerning_applied() {
+    let _catalog = catalog_lock();
     glyph_catalog::clear_learned();
     let doc = PdfDocument::from_slice(&tj_pdf(), ParseOptions::default())
         .expect("the document must parse");
@@ -385,6 +400,7 @@ fn a_tj_array_shows_every_string_with_its_kerning_applied() {
 /// `'` and `"` show their string, so their glyphs are drawn too.
 #[test]
 fn the_quote_operators_show_their_string() {
+    let _catalog = catalog_lock();
     glyph_catalog::clear_learned();
     let doc = PdfDocument::from_slice(&quote_pdf(), ParseOptions::default())
         .expect("the document must parse");

@@ -1,6 +1,6 @@
 [package]
 name = "xsd-fast-core"
-version = "0.2.5"
+version = "0.3.2"
 edition.workspace = true
 authors.workspace = true
 description = "High-performance XSD schema parser with Arrow schema derivation and simple-type validation"
@@ -26,10 +26,14 @@ arrow-array = { workspace = true, optional = true }
 arrow-ipc = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
 memmap2 = "0.9"
-quick-xml = "0.36"
-serde = { version = "1.0", features = ["derive"] }
+ooxml-archive = { path = "../ooxml-archive" }
+quick-xml = "0.42"
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 indexmap = { version = "2.2", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3.10"
+
+[lints]
+workspace = true

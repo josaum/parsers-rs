@@ -8,4 +8,8 @@ module.exports = {
   bboxAreaKm2: native.bboxAreaKm2Js,
   splitBboxAntimeridianJson: native.splitBboxAntimeridianJson,
   strtreeQueryJson: native.strtreeQueryJson,
+  geotiffMetadataJson: native.geotiffMetadataJson,
+  geotiffBands: native.geotiffBands,
+  computeNdvi: native.computeNdvi,
+  spectralAngle: native.spectralAngle,
 };

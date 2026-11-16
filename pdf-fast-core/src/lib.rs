@@ -49,13 +49,14 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
 #[cfg(feature = "rasterize")]
 use std::io::Write as IoWrite;
 use std::path::Path;
+use std::rc::Rc;
 #[cfg(feature = "arrow")]
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -77,6 +78,8 @@ pub mod lzw;
 pub mod bitmap_components;
 #[cfg(feature = "rasterize")]
 mod ccitt;
+#[cfg(feature = "rasterize")]
+mod render_guard;
 #[cfg(feature = "rasterize")]
 pub use bitmap_components::{
     BitmapComponentOptions, BitmapComponentPage, BitmapGlyphCandidate, BitmapTextLine,
@@ -169,7 +172,40 @@ impl std::error::Error for DecodeBudgetExceeded {}
 
 const MAX_FORM_XOBJECT_DEPTH: usize = 8;
 
+/// Deepest `q` nesting the content interpreters keep saved state for.
+///
+/// Every `q` copies the current state, and in the rasterizer a state can own
+/// a clip mask the size of the page surface, so an unbounded run of `q`
+/// turns a few kilobytes of compressed content into gigabytes. PDF 32000-1
+/// Annex C names 28 as the nesting a reader must support; this allows about
+/// ten times that. Saves past the limit are counted rather than stored, so
+/// the `Q` operators that close them still pair up correctly.
+///
+/// A `Q` that closes a counted save has no state of its own to restore.
+/// Leaving the state alone would let a color, matrix or clip set inside the
+/// pair leak out to everything after it, and popping a stored state would
+/// unbalance every pair around it. Instead the state is copied once, at the
+/// first save past the limit, and every `Q` past the limit restores that
+/// copy. This is exact for the outermost pair past the limit and for any
+/// run of saves that change nothing; inside deeper pairs a restore goes back
+/// further than it should, but never to a state from outside the region
+/// past the limit, and nothing set there survives the `Q` that leaves it.
+/// All three content interpreters (text, rasterizer, table primitives)
+/// behave this way.
+const MAX_GRAPHICS_STATE_DEPTH: usize = 256;
+
+/// Most components one color operator can set.
+///
+/// A DeviceN color space has at most 32 colorants (PDF 32000-1 §8.6.6.5), and
+/// no other space has more. Operands beyond that are not a color; keeping them
+/// would let one operator hold an arbitrary amount of memory that every
+/// following `q` then copies.
+const MAX_COLOR_COMPONENTS: usize = 32;
+
 type PageImagePayload = (Option<Vec<u8>>, Option<String>);
+
+/// A page-tree node still to visit, with the `/Resources` it inherits.
+type PendingPageNode = ((u32, u16), Option<Rc<PdfDictionary>>);
 
 #[derive(Debug)]
 struct FormXObjectTraversalExceeded {
@@ -252,6 +288,22 @@ impl DecodedByteBudget {
             Err(error) if is_decode_length_limit(&error) => Err(self.stream_limit_error()),
             Err(error) => Err(error),
         }
+    }
+
+    /// Fail when `bytes` would not fit in what is left of the budget.
+    ///
+    /// Unlike [`Self::charge_resource_bytes`] nothing is deducted: this is for
+    /// transient memory that is released again before the call returns.
+    #[cfg(feature = "rasterize")]
+    fn ensure_available(&self, bytes: usize) -> Result<()> {
+        let remaining = self
+            .remaining
+            .lock()
+            .map_err(|_| anyhow!("PDF decoded-byte budget lock poisoned"))?;
+        if bytes > *remaining {
+            return Err(self.total_limit_error());
+        }
+        Ok(())
     }
 
     fn charge_resource_bytes(&self, bytes: usize) -> Result<()> {
@@ -401,6 +453,17 @@ pub struct PdfDocument {
     storage: PdfStorage,
     #[cfg_attr(feature = "serde", serde(skip))]
     object_index: HashMap<(u32, u16), usize>,
+    /// The catalog the newest trailer's `/Root` names, when the
+    /// cross-reference chain could be followed.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    catalog: Option<(u32, u16)>,
+    /// Entries and sections examined while following the cross-reference
+    /// chain.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    xref_work: usize,
+    /// In-use entries the chain kept, before it was applied or discarded.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    xref_entries: usize,
     #[cfg_attr(feature = "serde", serde(skip))]
     decoded_byte_budget: DecodedByteBudget,
     /// PDF header line (e.g. `%PDF-1.7`) when one was recovered.
@@ -419,6 +482,17 @@ pub struct PdfDocument {
 
 impl PdfDocument {
     /// Parse a PDF from a file path using memory mapping when possible.
+    ///
+    /// The file is mapped read-only and the mapping lives as long as the
+    /// returned document; when it cannot be mapped, it is read into memory
+    /// instead.
+    ///
+    /// The file must not be modified or truncated, by this process or any
+    /// other, while the document is alive. Nothing here can enforce that: a
+    /// truncated file makes reads of the mapping fault (`SIGBUS` on Unix), and
+    /// a modified one changes the bytes under the parsed document. Copy the
+    /// file first, or parse it with `PdfDocument::from_bytes`, when another
+    /// writer may touch it.
     #[cfg(feature = "mmap")]
     pub fn open(path: impl AsRef<Path>, options: ParseOptions) -> Result<Self> {
         let path = path.as_ref();
@@ -426,6 +500,12 @@ impl PdfDocument {
             File::open(path).with_context(|| format!("open file: {}", path.display()))?;
         ensure_file_within_document_limit(&file, options.max_document_bytes)
             .with_context(|| format!("preflight PDF file: {}", path.display()))?;
+        // SAFETY: `Mmap::map` is unsafe because the mapping is only sound
+        // while no one modifies or truncates the file, which no code here can
+        // enforce. The crate states that contract on this function: the
+        // caller must not let the file change while the document lives.
+        // Within this process the mapping is read-only and is never written
+        // through; it is owned by the document and unmapped when it drops.
         let storage = if let Ok(mmap) = unsafe { Mmap::map(&file) } {
             PdfStorage::Mmap(mmap)
         } else {
@@ -547,14 +627,29 @@ impl PdfDocument {
                                     }
                                 }
 
+                                // Objects in an object stream are stored one
+                                // after another. An offset that lands inside
+                                // an object already read is refused: N offsets
+                                // aimed at one large value would otherwise
+                                // materialize it N times, turning a few
+                                // kilobytes of input into gigabytes.
+                                //
+                                // The table is walked in offset order, not
+                                // table order: a writer that lists the
+                                // objects out of order must not have the
+                                // earlier ones mistaken for overlaps.
+                                offsets.sort_by_key(|(_, offset)| *offset);
+                                let mut parsed_end = 0usize;
                                 for (obj_num, offset) in offsets {
                                     let mut obj_cursor = first.saturating_add(offset);
-                                    if obj_cursor >= decoded.len() {
+                                    if obj_cursor >= decoded.len() || obj_cursor < parsed_end {
                                         continue;
                                     }
                                     skip_whitespace_and_comments(decoded, &mut obj_cursor);
                                     let mut parser = ValueParser::new(decoded, obj_cursor);
-                                    if let Ok(value) = parser.parse_value() {
+                                    let parsed = parser.parse_value();
+                                    parsed_end = parsed_end.max(parser.pos);
+                                    if let Ok(value) = parsed {
                                         let (dictionary, array) = match value {
                                             PdfValue::Dictionary(d) => (Some(d), None),
                                             PdfValue::Array(a) => (None, Some(a)),
@@ -582,11 +677,18 @@ impl PdfDocument {
         }
         objects.extend(objstm_objects);
 
-        let object_index = objects
+        // Scan order first: a later definition of an object replaces an
+        // earlier one, which is right for a file whose revisions were
+        // appended in order and is all there is to go on when the
+        // cross-reference data is missing or broken.
+        let mut object_index: HashMap<(u32, u16), usize> = objects
             .iter()
             .enumerate()
             .map(|(index, object)| ((object.object_number, object.generation), index))
             .collect();
+        // Then the document as its cross-reference chain defines it.
+        let (catalog, xref_work, xref_entries) =
+            apply_xref_chain(bytes, &objects, &streams, &mut object_index);
 
         if objects.len() >= options.max_objects {
             warnings.push(PdfWarning {
@@ -606,9 +708,12 @@ impl PdfDocument {
             return Err(anyhow!("PDF streams exceed max_total_decoded_bytes"));
         }
 
-        let document = Self {
+        let mut document = Self {
             storage,
             object_index,
+            catalog,
+            xref_work,
+            xref_entries,
             decoded_byte_budget,
             header,
             objects,
@@ -619,6 +724,12 @@ impl PdfDocument {
         };
         if document.pages().len() > options.max_pages {
             return Err(anyhow!("PDF document exceeds max_pages"));
+        }
+        if options.extract_text {
+            document.populate_text_fragments();
+        }
+        if !options.extract_cmaps {
+            document.cmaps.clear();
         }
         Ok(document)
     }
@@ -664,6 +775,22 @@ impl PdfDocument {
                 .as_ref(),
             _ => None,
         }
+    }
+
+    /// Units of work spent following the cross-reference chain: one per
+    /// entry examined and a fixed cost per section. Exposed so tests can
+    /// bound the work a hostile file causes without timing it.
+    #[doc(hidden)]
+    pub fn xref_chain_work(&self) -> usize {
+        self.xref_work
+    }
+
+    /// In-use cross-reference entries kept while following the chain,
+    /// whether or not the chain was then applied. Exposed so tests can
+    /// show nothing is kept for objects the scan never produced.
+    #[doc(hidden)]
+    pub fn xref_chain_entries(&self) -> usize {
+        self.xref_entries
     }
 
     /// Resolve pages and their associated content/image streams.
@@ -798,7 +925,9 @@ impl PdfDocument {
         let (png_bytes, apply_fast_path_rotation) =
             if let Some(png) = fast_path.and_then(|(bytes, _format)| bytes) {
                 (png, true)
-            } else if let Some(png) = self.rasterized_page_image_payload_hayro(page_index, dpi)? {
+            } else if let Some(png) = self
+                .rasterized_page_image_payload_hayro((page.object_number, page.generation), dpi)?
+            {
                 // Hayro applies the page's initial transform, including
                 // `/Rotate`, while rendering.
                 (png, false)
@@ -876,13 +1005,27 @@ impl PdfDocument {
 
     /// Render a page with the full PDF interpreter and propagate resource-
     /// budget failures to the caller.
+    ///
+    /// `page_index` counts the pages [`Self::pages`] returns. An index past
+    /// the last of them gives `Ok(None)`, with or without the `rasterize`
+    /// feature, which is what the language bindings have always passed on;
+    /// [`Self::page_rasterized_png`] reports the same index as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the page is refused as unsafe to interpret or
+    /// when a resource budget is spent.
     #[cfg(feature = "rasterize")]
     pub fn page_rasterized_png_interpreted_checked(
         &self,
         page_index: usize,
         dpi: f32,
     ) -> Result<Option<Vec<u8>>> {
-        self.rasterized_page_image_payload_hayro(page_index, dpi)
+        let pages = self.pages();
+        let Some(page) = pages.iter().find(|page| page.page_index == page_index) else {
+            return Ok(None);
+        };
+        self.rasterized_page_image_payload_hayro((page.object_number, page.generation), dpi)
     }
 
     /// Stub without the `rasterize` feature: the full interpreter is not
@@ -906,17 +1049,14 @@ impl PdfDocument {
         Ok(None)
     }
 
+    /// Renders the page that is indirect object `page_object` with the full
+    /// interpreter, after [`render_guard::vet_page`] has accepted it.
     #[cfg(feature = "rasterize")]
     fn rasterized_page_image_payload_hayro(
         &self,
-        page_index: usize,
+        page_object: (u32, u16),
         dpi: f32,
     ) -> Result<Option<Vec<u8>>> {
-        use hayro::hayro_interpret::InterpreterSettings;
-        use hayro::hayro_syntax::Pdf;
-        use hayro::RenderSettings;
-        use std::sync::Arc;
-
         if !dpi.is_finite() || !(1.0..=600.0).contains(&dpi) {
             return Ok(None);
         }
@@ -933,22 +1073,192 @@ impl PdfDocument {
         let reserved_before_render = replay_bytes
             .and_then(|bytes| bytes.checked_add(self.bytes().len()))
             .ok_or_else(|| self.decoded_byte_budget.total_limit_error())?;
+        // The guard's decoding is overhead and is released as it goes: it
+        // gets an allowance of its own, the caller's configured limit rather
+        // than what is left of it, so it never competes with the render for
+        // the budget and never exceeds a limit the caller set.
+        let vet_allowance = self.decoded_byte_budget.max_total;
         self.decoded_byte_budget
             .charge_resource_bytes(reserved_before_render)?;
 
+        // The interpreter builds its page list by recursing over `/Kids`
+        // as soon as the document is opened, before anything can look at
+        // the tree through its object model. Bound the tree on this crate's
+        // reading of it first.
+        if self.page_tree_depth_exceeds(render_guard::MAX_PAGE_TREE_DEPTH) {
+            return Err(anyhow!(
+                "interpreted render refused: the page tree is nested deeper than {} levels",
+                render_guard::MAX_PAGE_TREE_DEPTH
+            ));
+        }
+
+        // The interpreter recurses, and a stack overflow aborts the process
+        // rather than unwinding. Run it on a thread whose stack size is
+        // known, so the guard's budget does not depend on how much stack the
+        // caller happens to have left. The stack is reserved address space;
+        // the system commits pages only as they are touched. If the thread
+        // cannot be created the render fails: it never falls back to the
+        // caller's stack. A panic on that thread is the interpreter failing
+        // on this file, so it ends the render with an error and never
+        // reaches the caller as a panic.
         let pdf_bytes = self.bytes().to_vec();
+        let budget = &self.decoded_byte_budget;
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("pdf-fast-render".to_string())
+                .stack_size(render_guard::RENDER_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    Self::interpret_on_render_stack(
+                        budget,
+                        pdf_bytes,
+                        page_object,
+                        dpi,
+                        vet_allowance,
+                    )
+                })
+                .map_err(|error| {
+                    anyhow!("interpreted render refused: no render thread ({error})")
+                })?;
+            // The payload is dropped unread: it is the interpreter's own
+            // text, and the error names the failure without it.
+            worker.join().unwrap_or_else(|_| {
+                Err(anyhow!(
+                    "interpreted render failed: the interpreter panicked on this page"
+                ))
+            })
+        })
+    }
+
+    /// Whether any chain of `/Kids` is longer than `limit`, on this crate's
+    /// own reading of the objects. Iterative; a cycle counts as too deep.
+    #[cfg(feature = "rasterize")]
+    fn page_tree_depth_exceeds(&self, limit: usize) -> bool {
+        let kids_of = |id: (u32, u16)| -> Vec<(u32, u16)> {
+            let Some(kids) = self
+                .object_by_id(id.0, id.1)
+                .and_then(|object| object.dictionary.as_ref())
+                .and_then(|dictionary| dictionary.get("Kids"))
+                .and_then(|kids| self.resolve_array(kids))
+            else {
+                return Vec::new();
+            };
+            kids.iter()
+                .filter_map(|kid| match kid {
+                    PdfValue::Reference {
+                        object_number,
+                        generation,
+                    } => Some((*object_number, *generation)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Height of each node once known; a node still on the path has none.
+        let mut heights: HashMap<(u32, u16), usize> = HashMap::new();
+        let mut on_path: HashSet<(u32, u16)> = HashSet::new();
+        for object in &self.objects {
+            let root = (object.object_number, object.generation);
+            if heights.contains_key(&root)
+                || object
+                    .dictionary
+                    .as_ref()
+                    .is_none_or(|dictionary| dictionary.get("Kids").is_none())
+            {
+                continue;
+            }
+            let mut path = vec![(root, kids_of(root), 0usize)];
+            on_path.insert(root);
+            while let Some((id, kids, tallest)) = path.last_mut() {
+                if let Some(kid) = kids.pop() {
+                    if let Some(height) = heights.get(&kid) {
+                        *tallest = (*tallest).max(*height);
+                    } else if on_path.contains(&kid) {
+                        return true;
+                    } else {
+                        on_path.insert(kid);
+                        let next = kids_of(kid);
+                        path.push((kid, next, 0));
+                        if path.len() > limit {
+                            return true;
+                        }
+                    }
+                    continue;
+                }
+                let (id, height) = (*id, *tallest + 1);
+                if height > limit {
+                    return true;
+                }
+                on_path.remove(&id);
+                heights.insert(id, height);
+                path.pop();
+                if let Some((_, _, tallest)) = path.last_mut() {
+                    *tallest = (*tallest).max(height);
+                }
+            }
+        }
+        false
+    }
+
+    /// Opens the document with the full interpreter, vets the page and
+    /// renders it. Must run on a stack of
+    /// [`render_guard::RENDER_STACK_BYTES`].
+    #[cfg(feature = "rasterize")]
+    fn interpret_on_render_stack(
+        budget: &DecodedByteBudget,
+        pdf_bytes: Vec<u8>,
+        page_object: (u32, u16),
+        dpi: f32,
+        vet_allowance: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        use hayro::hayro_interpret::InterpreterSettings;
+        use hayro::hayro_syntax::object::ObjectIdentifier;
+        use hayro::hayro_syntax::Pdf;
+        use hayro::RenderSettings;
+        use std::sync::Arc;
+
         let Ok(pdf) = Pdf::new(Arc::new(pdf_bytes)) else {
             return Ok(None);
         };
-        let Some(page) = pdf.pages().get(page_index) else {
+        // A page index counts this crate's pages, which list a page once
+        // however often `/Kids` names it. The interpreter lists it once per
+        // entry, so the same index can be a different page there. Find the
+        // interpreter's copy of the page that was asked for by its object
+        // number; a page it does not have is not rendered at all.
+        let Ok(object_number) = i32::try_from(page_object.0) else {
             return Ok(None);
         };
+        let wanted = ObjectIdentifier::new(object_number, i32::from(page_object.1));
+        let Some(page) = pdf
+            .pages()
+            .iter()
+            .find(|page| page.raw().obj_id() == Some(wanted))
+        else {
+            return Ok(None);
+        };
+        // The interpreter enters nested content streams with no cycle or
+        // depth guard of its own, and a stack overflow there aborts the
+        // process. Vet the exact page object it is about to render, on its
+        // own object model, so there is no second parser to disagree with
+        // it. The check has a decode allowance of its own and takes nothing
+        // from the document's budget.
         let (width, height) = page.render_dimensions();
+        let scale = dpi / 72.0;
+        // Pixels the page renders to, for the image bound; a size that is not
+        // a positive finite number counts as none and leaves the floor.
+        let page_pixels = f64::from(width * scale) * f64::from(height * scale);
+        let page_pixels = if page_pixels.is_finite() && page_pixels > 0.0 {
+            page_pixels as u64
+        } else {
+            0
+        };
+        render_guard::vet_page(
+            page,
+            vet_allowance,
+            render_guard::image_pixel_budget(page_pixels),
+        )?;
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return Ok(None);
         }
 
-        let scale = dpi / 72.0;
         let px_width = (width * scale) as u16;
         let px_height = (height * scale) as u16;
         if px_width == 0 || px_height == 0 {
@@ -956,17 +1266,17 @@ impl PdfDocument {
         }
         let pixel_count = u64::from(px_width)
             .checked_mul(u64::from(px_height))
-            .ok_or_else(|| self.decoded_byte_budget.total_limit_error())?;
+            .ok_or_else(|| budget.total_limit_error())?;
         if pixel_count > 100_000_000 {
             return Ok(None);
         }
         let rgba_bytes = usize::try_from(
             pixel_count
                 .checked_mul(4)
-                .ok_or_else(|| self.decoded_byte_budget.total_limit_error())?,
+                .ok_or_else(|| budget.total_limit_error())?,
         )
-        .map_err(|_| self.decoded_byte_budget.total_limit_error())?;
-        self.decoded_byte_budget.charge_resource_bytes(rgba_bytes)?;
+        .map_err(|_| budget.total_limit_error())?;
+        budget.charge_resource_bytes(rgba_bytes)?;
         let settings = RenderSettings {
             x_scale: scale,
             y_scale: scale,
@@ -981,9 +1291,7 @@ impl PdfDocument {
         if rgba.len() != rgba_bytes {
             return Err(anyhow!("Hayro raster size changed after bounded preflight"));
         }
-        self.decoded_byte_budget
-            .encode_rgba_png(rgba, width, height)
-            .map(Some)
+        budget.encode_rgba_png(rgba, width, height).map(Some)
     }
 
     /// Extract the largest embedded image from a page (JPEG, JBIG2, etc.).
@@ -1428,7 +1736,7 @@ impl PdfDocument {
     /// order: columns left-to-right, top-to-bottom within each column.
     ///
     /// Each block carries the indices into the slice returned by
-    /// [`semantic_text_runs_for_page`] that belong to it. Within a block
+    /// `semantic_text_runs_for_page` that belong to it. Within a block
     /// the indices are *not* re-sorted — callers should keep the runs in
     /// PDF emission order so kerning sequences and per-glyph runs stay
     /// adjacent.
@@ -2349,7 +2657,7 @@ impl PdfDocument {
     /// TRUE-SCAN path: glyph geometry from the RASTER, not the content
     /// stream. Renders the page, binarizes, extracts connected-component ink
     /// glyphs with Moore-traced outlines (see [`raster_glyphs`]), and bands
-    /// them with the same [`band_text_lines`] pass as the vector path. Output
+    /// them with the same `band_text_lines` pass as the vector path. Output
     /// is shape-identical to [`Self::vector_glyph_descriptor_lines`] for one
     /// page, so the entire self-labelled decoding stack runs unchanged on
     /// scanned input.
@@ -2449,7 +2757,7 @@ impl PdfDocument {
     /// Visual text lines with per-glyph cluster membership — the substrate
     /// for self-labelled glyph decoding. For each page: `(crop_box,
     /// [(x, cluster_id), ...])` per line, glyphs sorted by x. The crop box and
-    /// the membership come from the SAME banding pass ([`band_text_lines`]),
+    /// the membership come from the SAME banding pass (`band_text_lines`),
     /// so a recognised crop and its glyph sequence can never disagree about
     /// which glyphs are on the line.
     pub fn vector_glyph_cluster_lines(
@@ -2479,7 +2787,7 @@ impl PdfDocument {
 
     /// Extract text from `page_index` using the glyph-shape catalog, bypassing
     /// the CMap/ToUnicode path entirely.  Useful as a fallback when
-    /// [`semantic_text_runs_for_page`] returns a high `cmap_fallback_chars`
+    /// `semantic_text_runs_for_page` returns a high `cmap_fallback_chars`
     /// ratio, indicating the font uses a custom encoding without a proper
     /// ToUnicode entry.  Returns `None` if the page has no vector glyph runs
     /// or if no glyph in the runs is known to the catalog.
@@ -2544,13 +2852,29 @@ impl PdfDocument {
     }
 
     fn pages_from_catalog(&self) -> Option<Vec<PdfPage>> {
-        let catalog = self.objects.iter().find(|object| {
-            object
-                .dictionary
-                .as_ref()
-                .and_then(|dict| dict.get_name("Type"))
-                == Some("Catalog")
-        })?;
+        // The document is the one the newest trailer's `/Root` names. A
+        // file saved with incremental updates holds a catalog per revision,
+        // and the first in the file is the oldest. Without a usable
+        // cross-reference chain, the catalog latest in the file is the best
+        // guess for the same reason.
+        let catalog = self
+            .catalog
+            .and_then(|(number, generation)| self.object_by_id(number, generation))
+            .or_else(|| {
+                // Latest in the file, by where each object's bytes are. An
+                // object unpacked from an object stream has its container's
+                // offset; its place in `objects` says nothing about order.
+                self.objects
+                    .iter()
+                    .filter(|object| {
+                        object
+                            .dictionary
+                            .as_ref()
+                            .and_then(|dict| dict.get_name("Type"))
+                            == Some("Catalog")
+                    })
+                    .max_by_key(|object| object.span.start)
+            })?;
         let pages_ref = match catalog.dictionary.as_ref()?.get("Pages")? {
             PdfValue::Reference {
                 object_number,
@@ -2559,7 +2883,7 @@ impl PdfDocument {
             _ => return None,
         };
         let mut pages = Vec::new();
-        self.collect_pages_from_node(pages_ref, None, &mut pages);
+        self.collect_pages_from_node(pages_ref, &mut pages);
         if pages.is_empty() {
             None
         } else {
@@ -2567,48 +2891,60 @@ impl PdfDocument {
         }
     }
 
-    fn collect_pages_from_node(
-        &self,
-        node_ref: (u32, u16),
-        inherited_resources: Option<PdfDictionary>,
-        pages: &mut Vec<PdfPage>,
-    ) {
-        let Some(object) = self.object_by_id(node_ref.0, node_ref.1) else {
-            return;
-        };
-        let Some(dictionary) = object.dictionary.as_ref() else {
-            return;
-        };
-
-        let resources = dictionary
-            .get("Resources")
-            .and_then(|value| self.resolve_dictionary(value))
-            .cloned()
-            .or(inherited_resources);
-
-        match dictionary.get_name("Type") {
-            Some("Page") => {
-                let page_index = pages.len();
-                pages.push(self.page_from_object(object, page_index, resources));
+    /// Collect the leaf pages under `root`, in document order.
+    ///
+    /// The walk keeps its own stack and visits each node once. A page tree is
+    /// a tree, but a malformed or hostile file can make `/Kids` point back at
+    /// an ancestor, chain nodes thousands deep, or share one subtree between
+    /// many parents; following those by recursion overflows the stack, and
+    /// following shared subtrees repeatedly multiplies a kilobyte of input
+    /// into billions of pages. Visiting each node once bounds the work by the
+    /// number of objects in the file.
+    fn collect_pages_from_node(&self, root: (u32, u16), pages: &mut Vec<PdfPage>) {
+        let mut visited: HashSet<(u32, u16)> = HashSet::new();
+        let mut pending: Vec<PendingPageNode> = vec![(root, None)];
+        while let Some((node_ref, inherited_resources)) = pending.pop() {
+            if !visited.insert(node_ref) {
+                continue;
             }
-            Some("Pages") | None => {
-                if let Some(PdfValue::Array(kids)) = dictionary.get("Kids") {
-                    for kid in kids {
-                        if let PdfValue::Reference {
-                            object_number,
-                            generation,
-                        } = kid
-                        {
-                            self.collect_pages_from_node(
-                                (*object_number, *generation),
-                                resources.clone(),
-                                pages,
-                            );
+            let Some(object) = self.object_by_id(node_ref.0, node_ref.1) else {
+                continue;
+            };
+            let Some(dictionary) = object.dictionary.as_ref() else {
+                continue;
+            };
+
+            let resources = dictionary
+                .get("Resources")
+                .and_then(|value| self.resolve_dictionary(value))
+                .map(|resources| Rc::new(resources.clone()))
+                .or(inherited_resources);
+
+            match dictionary.get_name("Type") {
+                Some("Page") => {
+                    let page_index = pages.len();
+                    let resources = resources.map(|resources| {
+                        Rc::try_unwrap(resources).unwrap_or_else(|shared| (*shared).clone())
+                    });
+                    pages.push(self.page_from_object(object, page_index, resources));
+                }
+                Some("Pages") | None => {
+                    if let Some(PdfValue::Array(kids)) = dictionary.get("Kids") {
+                        // Reversed so the first kid is popped, and so visited,
+                        // first: pages come out in document order.
+                        for kid in kids.iter().rev() {
+                            if let PdfValue::Reference {
+                                object_number,
+                                generation,
+                            } = kid
+                            {
+                                pending.push(((*object_number, *generation), resources.clone()));
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -2810,6 +3146,108 @@ impl PdfDocument {
             };
         }
         None
+    }
+
+    fn populate_text_fragments(&mut self) {
+        let mut fallback_bindings = HashMap::new();
+        for object in &self.objects {
+            let Some(dict) = object.dictionary.as_ref() else {
+                continue;
+            };
+            if dict.get("Font").is_some() {
+                fallback_bindings.extend(self.resolve_font_bindings(dict));
+            }
+            if let Some(resources) = dict
+                .get("Resources")
+                .and_then(|value| self.resolve_dictionary(value))
+            {
+                fallback_bindings.extend(self.resolve_font_bindings(resources));
+            }
+        }
+
+        let mut stream_bindings: HashMap<usize, HashMap<String, FontBinding>> = HashMap::new();
+        for page in self.pages() {
+            let Some(object) = self.object_by_id(page.object_number, page.generation) else {
+                continue;
+            };
+            let Some(dictionary) = object.dictionary.as_ref() else {
+                continue;
+            };
+            let resources = page
+                .resources
+                .as_ref()
+                .or_else(|| self.resolve_inherited_resources(dictionary));
+            let Some(resources) = resources else {
+                continue;
+            };
+            let page_bindings = self.resolve_font_bindings(resources);
+            if page_bindings.is_empty() {
+                continue;
+            }
+            for &stream_index in &page.content_streams {
+                stream_bindings
+                    .entry(stream_index)
+                    .or_default()
+                    .extend(page_bindings.clone());
+            }
+        }
+
+        for (stream_index, stream) in self.streams.iter().enumerate() {
+            if let Some(dict) = self
+                .object_by_id(stream.object_number, stream.generation)
+                .and_then(|object| object.dictionary.as_ref())
+            {
+                if let Some(resources) = dict
+                    .get("Resources")
+                    .and_then(|value| self.resolve_dictionary(value))
+                {
+                    let own_bindings = self.resolve_font_bindings(resources);
+                    if !own_bindings.is_empty() {
+                        stream_bindings
+                            .entry(stream_index)
+                            .or_default()
+                            .extend(own_bindings);
+                    }
+                }
+            }
+        }
+
+        let mut fragments = Vec::new();
+        for (stream_index, stream) in self.streams.iter().enumerate() {
+            if stream.kind != PdfStreamKind::Content {
+                continue;
+            }
+            let decoded_bytes = self.stream_decoded_bytes(stream_index).or_else(|| {
+                if stream.filters.is_empty() || matches!(stream.decode_status, DecodeStatus::Raw) {
+                    self.stream_raw_bytes(stream_index)
+                } else {
+                    None
+                }
+            });
+            let Some(decoded_bytes) = decoded_bytes else {
+                continue;
+            };
+            if let Some(specific) = stream_bindings.get(&stream_index) {
+                let mut combined = fallback_bindings.clone();
+                combined.extend(specific.clone());
+                fragments.extend(extract_text_fragments(
+                    decoded_bytes,
+                    stream.object_number,
+                    stream.generation,
+                    stream_index,
+                    &combined,
+                ));
+            } else {
+                fragments.extend(extract_text_fragments(
+                    decoded_bytes,
+                    stream.object_number,
+                    stream.generation,
+                    stream_index,
+                    &fallback_bindings,
+                ));
+            }
+        }
+        self.text_fragments = fragments;
     }
 
     fn resolve_font_bindings(&self, resources: &PdfDictionary) -> HashMap<String, FontBinding> {
@@ -3510,8 +3948,107 @@ pub struct PdfDictionaryEntry {
     pub value: PdfValue,
 }
 
+/// An array or dictionary part-way through being copied by
+/// [`PdfValue::clone`].
+enum CopiedContainer<'a> {
+    Array {
+        rest: std::slice::Iter<'a, PdfValue>,
+        copied: Vec<PdfValue>,
+    },
+    Dictionary {
+        rest: std::slice::Iter<'a, PdfDictionaryEntry>,
+        copied: Vec<PdfDictionaryEntry>,
+        /// Key of the entry whose value is being copied.
+        key: &'a str,
+    },
+}
+
+/// Copies a value without recursing once per level of nesting.
+///
+/// The derived implementation calls itself for every array and dictionary
+/// level, and a value nested to the parser's limit then needs more stack to
+/// copy than to parse: page resources are copied on the way to every reader.
+/// Containers being copied are kept in a list instead.
+impl Clone for PdfValue {
+    fn clone(&self) -> Self {
+        let mut open: Vec<CopiedContainer<'_>> = Vec::new();
+        let mut source = self;
+        loop {
+            let mut finished = match source {
+                Self::Null => Some(Self::Null),
+                Self::Bool(value) => Some(Self::Bool(*value)),
+                Self::Integer(value) => Some(Self::Integer(*value)),
+                Self::Real(value) => Some(Self::Real(*value)),
+                Self::Name(value) => Some(Self::Name(value.clone())),
+                Self::String(value) => Some(Self::String(value.clone())),
+                Self::HexString(value) => Some(Self::HexString(value.clone())),
+                Self::Reference {
+                    object_number,
+                    generation,
+                } => Some(Self::Reference {
+                    object_number: *object_number,
+                    generation: *generation,
+                }),
+                Self::Raw(value) => Some(Self::Raw(value.clone())),
+                Self::Array(values) => {
+                    open.push(CopiedContainer::Array {
+                        rest: values.iter(),
+                        copied: Vec::with_capacity(values.len()),
+                    });
+                    None
+                }
+                Self::Dictionary(dictionary) => {
+                    open.push(CopiedContainer::Dictionary {
+                        rest: dictionary.entries.iter(),
+                        copied: Vec::with_capacity(dictionary.entries.len()),
+                        key: "",
+                    });
+                    None
+                }
+            };
+            // Hand a finished copy to the container it belongs in, and keep
+            // closing containers until one has another child to copy.
+            loop {
+                let Some(top) = open.last_mut() else {
+                    // Nothing is open, so the copy is the whole value: a
+                    // container that was just opened is still in the list.
+                    return finished.unwrap_or(Self::Null);
+                };
+                match top {
+                    CopiedContainer::Array { rest, copied } => {
+                        copied.extend(finished.take());
+                        if let Some(next) = rest.next() {
+                            source = next;
+                            break;
+                        }
+                    }
+                    CopiedContainer::Dictionary { rest, copied, key } => {
+                        if let Some(value) = finished.take() {
+                            copied.push(PdfDictionaryEntry {
+                                key: (*key).to_owned(),
+                                value,
+                            });
+                        }
+                        if let Some(entry) = rest.next() {
+                            *key = &entry.key;
+                            source = &entry.value;
+                            break;
+                        }
+                    }
+                }
+                finished = open.pop().map(|container| match container {
+                    CopiedContainer::Array { copied, .. } => Self::Array(copied),
+                    CopiedContainer::Dictionary { copied, .. } => {
+                        Self::Dictionary(PdfDictionary { entries: copied })
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// A PDF value as recovered from a dictionary or array.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[cfg_attr(feature = "serde", serde(tag = "type", content = "value"))]
 pub enum PdfValue {
@@ -4342,6 +4879,11 @@ struct ContentState {
     ctm: ContentMatrix,
     graphics_stack: Vec<ContentMatrix>,
     color_stack: Vec<(PdfColor, PdfColor)>, // (fill_color, stroke_color)
+    /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
+    unsaved_states: usize,
+    /// The matrix and colors at the first `q` past the limit, restored by
+    /// every `Q` past it.
+    overflow_state: Option<(ContentMatrix, PdfColor, PdfColor)>,
     text_matrix: ContentMatrix,
     line_matrix: ContentMatrix,
     leading: f32,
@@ -4362,6 +4904,8 @@ impl Default for ContentState {
             ctm: IDENTITY_MATRIX,
             graphics_stack: Vec::new(),
             color_stack: Vec::new(),
+            unsaved_states: 0,
+            overflow_state: None,
             text_matrix: IDENTITY_MATRIX,
             line_matrix: IDENTITY_MATRIX,
             leading: 0.0,
@@ -4384,7 +4928,7 @@ impl Default for ContentState {
     }
 }
 
-/// How a [`FontBinding`] resolves a byte string to characters.
+/// How a `FontBinding` resolves a byte string to characters.
 ///
 /// Higher tiers (earlier variants) are preferred and produce zero `cmap_fallback_chars`;
 /// lower tiers either map approximately or fall through to a Latin-1 byte cast.
@@ -4632,7 +5176,10 @@ struct GraphicsState {
     fill_paint: Paint<'static>,
     stroke_paint: Paint<'static>,
     stroke: Stroke,
-    clip_mask: Option<Mask>,
+    /// Shared between a state and the copies `q` saves of it. A mask is one
+    /// byte per surface pixel, so copying it per saved state would make
+    /// nesting cost memory; it is copied only when a nested clip changes it.
+    clip_mask: Option<Rc<Mask>>,
 }
 
 #[cfg(feature = "rasterize")]
@@ -4660,6 +5207,11 @@ struct PageRasterizer<'a> {
     px_width: u32,
     px_height: u32,
     state_stack: Vec<GraphicsState>,
+    /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
+    unsaved_states: usize,
+    /// The state at the first `q` past the limit, restored by every `Q` past
+    /// it. It shares its clip mask with the state it was copied from.
+    overflow_state: Option<GraphicsState>,
     path_builder: PathBuilder,
     pending_clip: Option<FillRule>,
     form_stack: Vec<(u32, u16)>,
@@ -4707,6 +5259,11 @@ pub struct PdfImagePlacement {
 struct TablePrimitiveExtractor<'a> {
     doc: &'a PdfDocument,
     state_stack: Vec<PrimitiveState>,
+    /// `q` operators seen past [`MAX_GRAPHICS_STATE_DEPTH`], awaiting their `Q`.
+    unsaved_states: usize,
+    /// The state at the first `q` past the limit, restored by every `Q` past
+    /// it.
+    overflow_state: Option<PrimitiveState>,
     path_segments: Vec<LineSegment>,
     current_point: Option<(f32, f32)>,
     subpath_start: Option<(f32, f32)>,
@@ -4723,16 +5280,12 @@ impl UnicodeMap {
             .iter()
             .filter_map(|range| hex_token_bytes(&range.start).ok().map(|bytes| bytes.len()))
             .collect::<Vec<_>>();
-        map.code_lengths.sort_unstable();
-        map.code_lengths.dedup();
-        if map.code_lengths.is_empty() {
-            map.code_lengths.extend([1, 2]);
-        }
 
         for entry in &cmap.entries {
             match entry {
                 PdfCMapEntry::Char { src, dst } => {
                     if let (Ok(src), Some(dst)) = (hex_token_bytes(src), unicode_hex_token(dst)) {
+                        map.code_lengths.push(src.len());
                         map.chars.insert(src, dst);
                     }
                 }
@@ -4741,18 +5294,28 @@ impl UnicodeMap {
                     end,
                     dst_start,
                 } => {
-                    if let (Some(byte_len), Some(start), Some(end), Some(dst_start)) = (
+                    if let (Some(byte_len), Some(start_val), Some(end_val)) = (
                         hex_token_bytes(start).ok().map(|bytes| bytes.len()),
                         hex_token_u32(start),
                         hex_token_u32(end),
-                        unicode_hex_scalar(dst_start),
                     ) {
-                        map.ranges.push(UnicodeRange {
-                            byte_len,
-                            start,
-                            end,
-                            dst_start,
-                        });
+                        map.code_lengths.push(byte_len);
+                        if start_val == end_val {
+                            if let (Ok(src), Some(dst)) =
+                                (hex_token_bytes(start), unicode_hex_token(dst_start))
+                            {
+                                map.chars.insert(src, dst);
+                                continue;
+                            }
+                        }
+                        if let Some(dst_start) = unicode_hex_scalar(dst_start) {
+                            map.ranges.push(UnicodeRange {
+                                byte_len,
+                                start: start_val,
+                                end: end_val,
+                                dst_start,
+                            });
+                        }
                     }
                 }
                 PdfCMapEntry::RangeArray { start, end, dsts } => {
@@ -4761,6 +5324,7 @@ impl UnicodeMap {
                         hex_token_u32(start),
                         hex_token_u32(end),
                     ) {
+                        map.code_lengths.push(byte_len);
                         map.range_arrays.push(UnicodeRangeArray {
                             byte_len,
                             start,
@@ -4772,6 +5336,39 @@ impl UnicodeMap {
                         });
                     }
                 }
+            }
+        }
+
+        // An empty source code (`<>`) names no bytes. Kept as a code length it
+        // would match at every position without consuming input, so decoding
+        // would never advance.
+        map.code_lengths.retain(|len| *len > 0);
+        map.chars.remove(&[][..]);
+        map.code_lengths.sort_unstable();
+        map.code_lengths.dedup();
+        if map.code_lengths.is_empty() {
+            map.code_lengths.extend([1, 2]);
+        }
+
+        // Some Type1 ToUnicode CMaps (e.g. Adobe InDesign) emit 1-byte bfchar
+        // keys for glyphs (`<2E>`, `<41>`) alongside a 2-byte `<0020>` entry
+        // for space while declaring `<0000> <FFFF>` as the codespace range.
+        // When 1-byte codes are active, mirror `<00XX>` entries onto `[XX]`
+        // without overwriting explicit 1-byte mappings.
+        if map.code_lengths.contains(&1) {
+            let zero_prefixed: Vec<(u8, String)> = map
+                .chars
+                .iter()
+                .filter_map(|(k, v)| {
+                    if k.len() == 2 && k[0] == 0 {
+                        Some((k[1], v.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (low_byte, dst) in zero_prefixed {
+                map.chars.entry(vec![low_byte]).or_insert(dst);
             }
         }
 
@@ -4814,7 +5411,9 @@ impl UnicodeMap {
         let value = bytes_to_u32(code);
         for range in &self.ranges {
             if range.byte_len == code.len() && value >= range.start && value <= range.end {
-                let scalar = range.dst_start + (value - range.start);
+                // The destination start comes from the file; a range that runs
+                // past `u32::MAX` names no scalar value.
+                let scalar = range.dst_start.checked_add(value - range.start)?;
                 return char::from_u32(scalar).map(|ch| ch.to_string());
             }
         }
@@ -6483,8 +7082,8 @@ fn scan_stream(
     dictionary: Option<&PdfDictionary>,
     dictionary_range: Option<ByteRange>,
     options: ParseOptions,
-    stream_index: usize,
-    text_fragments: &mut Vec<PdfTextFragment>,
+    _stream_index: usize,
+    _text_fragments: &mut Vec<PdfTextFragment>,
     cmaps: &mut Vec<PdfCMap>,
     warnings: &mut Vec<PdfWarning>,
     indirect_integers: &HashMap<(u32, u16), i64>,
@@ -6579,15 +7178,7 @@ fn scan_stream(
                 kind = decoded_kind;
             }
         }
-        if options.extract_text && kind == PdfStreamKind::Content {
-            text_fragments.extend(extract_text_fragments(
-                decoded_bytes,
-                header.object_number,
-                header.generation,
-                stream_index,
-            ));
-        }
-        if options.extract_cmaps && kind == PdfStreamKind::CMap {
+        if (options.extract_cmaps || options.extract_text) && kind == PdfStreamKind::CMap {
             if let Some(cmap) = parse_cmap(decoded_bytes, header.object_number, header.generation) {
                 cmaps.push(cmap);
             }
@@ -6829,7 +7420,16 @@ fn collect_indirect_integers(
     headers
         .iter()
         .filter_map(|header| {
-            let mut parser = ValueParser::new(bytes, header.header_end);
+            // Only an integer object is wanted, so anything that does not
+            // start like a number is skipped without parsing it. Parsing a
+            // whole array or dictionary here, once per object header, made
+            // the scan quadratic in the document size.
+            let mut cursor = header.header_end;
+            skip_whitespace_and_comments(bytes, &mut cursor);
+            if !matches!(bytes.get(cursor), Some(b'+' | b'-' | b'.' | b'0'..=b'9')) {
+                return None;
+            }
+            let mut parser = ValueParser::new(bytes, cursor);
             match parser.parse_value().ok()? {
                 PdfValue::Integer(value) => {
                     Some(((header.object_number, header.generation), value))
@@ -6969,10 +7569,18 @@ fn find_obj_markers_simd_x86_64(bytes: &[u8], offsets: &mut Vec<usize>) -> usize
     };
 
     let mut cursor = 0usize;
+    // SAFETY: the intrinsic needs SSE2, which is part of the x86_64 baseline
+    // this function is compiled for. It touches no memory.
     let target = unsafe { _mm_set1_epi8(b'o' as i8) };
     while cursor + 16 <= bytes.len() {
+        // SAFETY: SSE2 is baseline on x86_64. The loop condition
+        // `cursor + 16 <= bytes.len()` keeps the 16 bytes read from
+        // `bytes[cursor..]` inside the slice, and `_mm_loadu_si128` is the
+        // unaligned load, so the cast pointer needs no alignment.
         let chunk = unsafe { _mm_loadu_si128(bytes[cursor..].as_ptr() as *const __m128i) };
+        // SAFETY: SSE2 is baseline on x86_64; register-only, no memory access.
         let matches = unsafe { _mm_cmpeq_epi8(chunk, target) };
+        // SAFETY: SSE2 is baseline on x86_64; register-only, no memory access.
         let mut bitmask = unsafe { _mm_movemask_epi8(matches) } as u32;
         while bitmask != 0 {
             let trailing = bitmask.trailing_zeros() as usize;
@@ -6992,11 +7600,21 @@ fn find_obj_markers_simd_aarch64(bytes: &[u8], offsets: &mut Vec<usize>) -> usiz
     use std::arch::aarch64::{uint8x16_t, vceqq_u8, vdupq_n_u8, vld1q_u8, vst1q_u8};
 
     let mut cursor = 0usize;
+    // SAFETY: the intrinsic needs NEON, which is part of the aarch64 baseline
+    // this function is compiled for. It touches no memory.
     let target = unsafe { vdupq_n_u8(b'o') };
     while cursor + 16 <= bytes.len() {
+        // SAFETY: NEON is baseline on aarch64. The loop condition
+        // `cursor + 16 <= bytes.len()` keeps the 16 bytes read from
+        // `bytes[cursor..]` inside the slice; `vld1q_u8` has no alignment
+        // requirement.
         let chunk = unsafe { vld1q_u8(bytes[cursor..].as_ptr()) };
+        // SAFETY: NEON is baseline on aarch64; register-only, no memory access.
         let matches: uint8x16_t = unsafe { vceqq_u8(chunk, target) };
         let mut lanes = [0u8; 16];
+        // SAFETY: NEON is baseline on aarch64. `lanes` is a live, writable
+        // `[u8; 16]`, exactly the 16 bytes `vst1q_u8` stores, and the store
+        // has no alignment requirement.
         unsafe { vst1q_u8(lanes.as_mut_ptr(), matches) };
         let mut bitmask = 0u32;
         for (index, lane) in lanes.iter().enumerate() {
@@ -7227,6 +7845,485 @@ fn reverse_parse_ascii_digits(bytes: &[u8], end: usize, max_digits: usize) -> Op
     Some((value, start))
 }
 
+/// Work the cross-reference chain may do, per byte of file.
+///
+/// One unit is one entry examined; a section costs [`XREF_SECTION_COST`].
+/// Sections may not overlap, and the shortest table entry (`0 0n` and a line
+/// end) is five bytes, so every table in a file together holds fewer
+/// entries than a fifth of its length. A cross-reference stream is refused
+/// past [`XREF_DECODE_MULTIPLE`] times the file length decoded, one row per
+/// byte at the least, and each is read once. Eight units a byte covers both
+/// with room to spare; a chain that spends it is abandoned and the scan's
+/// own answer stands.
+const XREF_WORK_PER_BYTE: usize = 8;
+
+/// Work charged for entering one cross-reference section.
+const XREF_SECTION_COST: usize = 64;
+
+/// Largest decoded cross-reference stream accepted, as a multiple of the
+/// file length. A real one is far smaller than its file; a hostile one can
+/// inflate megabytes of rows from a few bytes.
+const XREF_DECODE_MULTIPLE: usize = 4;
+
+/// Where the cross-reference chain says an in-use object is.
+#[derive(Clone, Copy)]
+enum XrefEntry {
+    /// At a byte offset in the file, with this generation.
+    At(usize, u16),
+    /// Inside the object stream with this object number.
+    Packed(u32),
+}
+
+/// The in-use entries read so far and the work spent reading them.
+struct XrefChain<'a> {
+    bytes: &'a [u8],
+    /// Object numbers the scan produced. No entry is kept for any other.
+    known: &'a HashSet<u32>,
+    /// The newest in-use entry for each known object.
+    entries: HashMap<u32, XrefEntry>,
+    work: usize,
+    budget: usize,
+}
+
+impl XrefChain<'_> {
+    /// Spends `units` of work; `None` once the budget is gone.
+    fn charge(&mut self, units: usize) -> Option<()> {
+        self.work = self.work.saturating_add(units);
+        (self.work <= self.budget).then_some(())
+    }
+
+    /// Records an in-use entry unless a newer section already placed the
+    /// object or the scan never saw it.
+    fn offer(&mut self, number: u32, entry: XrefEntry) -> Option<()> {
+        self.charge(1)?;
+        if self.known.contains(&number) {
+            self.entries.entry(number).or_insert(entry);
+        }
+        Some(())
+    }
+
+    /// Reads the classic table at `offset`. Returns its trailer and where
+    /// the section ends. Free entries are read past and not recorded.
+    ///
+    /// The format accepted is the renderer's (hayro-syntax 0.5.0,
+    /// `xref.rs` 762-786 and `XRefEntry::read` at 670-692): after each
+    /// `first count` header, exactly twenty bytes per entry, ten digits of
+    /// offset, a separator, five digits of generation, a separator and `n`
+    /// for in use. Anything else is `None`, as it is there.
+    fn read_table(&mut self, offset: usize) -> Option<(PdfDictionary, usize)> {
+        let bytes = self.bytes;
+        let blanks = |cursor: &mut usize| {
+            while bytes
+                .get(*cursor)
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0))
+            {
+                *cursor += 1;
+            }
+        };
+        let digits = |field: &[u8]| -> Option<usize> {
+            field.iter().try_fold(0usize, |value, byte| {
+                byte.is_ascii_digit()
+                    .then(|| {
+                        value
+                            .checked_mul(10)?
+                            .checked_add(usize::from(*byte - b'0'))
+                    })
+                    .flatten()
+            })
+        };
+        let mut cursor = offset.checked_add(4)?;
+        loop {
+            self.charge(1)?;
+            blanks(&mut cursor);
+            if bytes.get(cursor..)?.starts_with(b"trailer") {
+                cursor = cursor.checked_add(7)?;
+                break;
+            }
+            let mut parser = ValueParser::new(bytes, cursor);
+            let first = number_to_u32(parser.parse_number_token().ok()?)?;
+            cursor = parser.pos;
+            blanks(&mut cursor);
+            let mut parser = ValueParser::new(bytes, cursor);
+            let count = number_to_u32(parser.parse_number_token().ok()?)?;
+            cursor = parser.pos;
+            blanks(&mut cursor);
+            for index in 0..count {
+                let end = cursor.checked_add(20)?;
+                let entry = bytes.get(cursor..end)?;
+                let position = digits(entry.get(..10)?)?;
+                let generation = u16::try_from(digits(entry.get(11..16)?)?).ok()?;
+                if entry.get(17) == Some(&b'n') {
+                    self.offer(
+                        first.checked_add(index)?,
+                        XrefEntry::At(position, generation),
+                    )?;
+                } else {
+                    self.charge(1)?;
+                }
+                cursor = end;
+            }
+        }
+        skip_whitespace_and_comments(bytes, &mut cursor);
+        let mut parser = ValueParser::new(bytes, cursor);
+        match parser.parse_value().ok()? {
+            PdfValue::Dictionary(trailer) => Some((trailer, parser.pos)),
+            _ => None,
+        }
+    }
+
+    /// Reads the rows of a cross-reference stream straight from its decoded
+    /// bytes. Free rows are read past and not recorded.
+    fn read_stream(&mut self, dictionary: &PdfDictionary, data: &[u8]) -> Option<()> {
+        let integers = |value: &PdfValue| -> Option<Vec<usize>> {
+            match value {
+                PdfValue::Array(items) => items
+                    .iter()
+                    .map(|item| match item {
+                        PdfValue::Integer(number) => usize::try_from(*number).ok(),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => None,
+            }
+        };
+        let widths = integers(dictionary.get("W")?)?;
+        let [kind_width, second_width, third_width] = <[usize; 3]>::try_from(widths).ok()?;
+        if kind_width > 8 || second_width > 8 || third_width > 8 {
+            return None;
+        }
+        let row = kind_width + second_width + third_width;
+        if row == 0 {
+            return None;
+        }
+        let ranges = match dictionary.get("Index") {
+            Some(index) => integers(index)?,
+            None => vec![0, usize::try_from(dictionary.get_integer("Size")?).ok()?],
+        };
+        let field = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .fold(0u64, |value, byte| value << 8 | u64::from(*byte))
+        };
+        let mut rows = data.chunks_exact(row);
+        for [start, count] in ranges.as_chunks::<2>().0 {
+            self.charge(1)?;
+            let first = u32::try_from(*start).ok()?;
+            for index in 0..*count {
+                let Some(row) = rows.next() else {
+                    return Some(());
+                };
+                let (kind, rest) = row.split_at_checked(kind_width)?;
+                let (second, third) = rest.split_at_checked(second_width)?;
+                let number = first.checked_add(u32::try_from(index).ok()?)?;
+                // A missing type field means an in-use object.
+                match if kind_width == 0 { 1 } else { field(kind) } {
+                    1 => self.offer(
+                        number,
+                        XrefEntry::At(
+                            usize::try_from(field(second)).ok()?,
+                            u16::try_from(field(third)).ok()?,
+                        ),
+                    )?,
+                    2 => self.offer(
+                        number,
+                        XrefEntry::Packed(u32::try_from(field(second)).ok()?),
+                    )?,
+                    _ => self.charge(1)?,
+                }
+            }
+        }
+        Some(())
+    }
+}
+
+/// Whether `offset` begins a line, allowing leading blanks.
+///
+/// A cross-reference table is entered only at an `xref` keyword that stands
+/// at the start of its line. One written after a `%`, or in the middle of
+/// other tokens, is a comment or data, not a section.
+fn starts_its_line(bytes: &[u8], offset: usize) -> bool {
+    let before = bytes.get(..offset).unwrap_or_default();
+    before
+        .iter()
+        .rev()
+        .take(64)
+        .find(|byte| !matches!(byte, b' ' | b'\t'))
+        .is_none_or(|byte| matches!(byte, b'\n' | b'\r'))
+}
+
+/// Points `object_index` at the copy of each object the cross-reference
+/// chain calls current, and returns the catalog the newest trailer names
+/// together with the work spent.
+///
+/// The chain does two things and no more. It names the newest trailer's
+/// `/Root`, and where the scan found several copies of an object number it
+/// says which one is current. It starts at the last `startxref` and follows
+/// `/Prev`; a table and its `/XRefStm` are one section; the newest section
+/// that lists an object in use wins and an older one never overrides it.
+///
+/// Free entries are ignored. The interpreter that renders pages ignores
+/// them too, and text extraction has to describe the same document it
+/// draws: a content stream a later revision marks free but a page still
+/// references is drawn, so it is extracted.
+///
+/// Everything is bounded by what the scan found. An entry is kept only for
+/// an object number the scan produced. A table is entered only at an `xref`
+/// keyword at the start of a line, outside every scanned object and outside
+/// every section already read, so sections cannot overlap or be re-read.
+/// A cross-reference stream is one the scan parsed as an object, decoded
+/// here whether or not decoded streams are being kept, and refused past
+/// [`XREF_DECODE_MULTIPLE`] times the file length. All of it draws on one
+/// budget of [`XREF_WORK_PER_BYTE`] units per byte of file.
+///
+/// The chain is all or nothing, because the renderer's is. A table that is
+/// not in the strict twenty-byte entry format, an in-use entry that does
+/// not land exactly on that object's header, a section that cannot be
+/// read, a `/Root` that is not a catalog, or a spent budget each discard
+/// everything read: the scan-order index stands for every object and no
+/// catalog is returned.
+///
+/// # Known differences from the renderer
+///
+/// Two remain, both older than this function.
+///
+/// * This function refuses some tables the renderer follows: one with
+///   other bytes before `xref` on its line, one swallowed by an unfinished
+///   final object's span, and one written inside a stream body. Extraction
+///   then uses scan order while the renderer uses the table, so when an
+///   object is written twice they can read different copies.
+/// * An object whose only cross-reference entry is free, or one appended
+///   after the last `%%EOF` and listed nowhere, is not in the renderer's
+///   map. This crate's scan still finds it, so its text is extracted from
+///   a page the renderer draws without it.
+fn apply_xref_chain(
+    bytes: &[u8],
+    objects: &[PdfObject],
+    streams: &[PdfStream],
+    object_index: &mut HashMap<(u32, u16), usize>,
+) -> (Option<(u32, u16)>, usize, usize) {
+    let known: HashSet<u32> = objects.iter().map(|object| object.object_number).collect();
+    let mut chain = XrefChain {
+        bytes,
+        known: &known,
+        entries: HashMap::new(),
+        work: 0,
+        budget: bytes
+            .len()
+            .saturating_mul(XREF_WORK_PER_BYTE)
+            .saturating_add(4096),
+    };
+    let catalog = follow_xref_chain(&mut chain, objects, streams, object_index);
+    (catalog, chain.work, chain.entries.len())
+}
+
+/// The body of [`apply_xref_chain`], with `None` for every way the chain
+/// can fail to be usable.
+fn follow_xref_chain(
+    chain: &mut XrefChain<'_>,
+    objects: &[PdfObject],
+    streams: &[PdfStream],
+    object_index: &mut HashMap<(u32, u16), usize>,
+) -> Option<(u32, u16)> {
+    let bytes = chain.bytes;
+    let marker = memchr::memmem::rfind(bytes, b"startxref")?;
+    let mut cursor = marker.checked_add(9)?;
+    skip_whitespace_and_comments(bytes, &mut cursor);
+    let start = number_to_usize(ValueParser::new(bytes, cursor).parse_number_token().ok()?)?;
+
+    // Objects by where their header starts. Objects unpacked from an
+    // object stream carry their container's span and come after every
+    // directly written object, so the first object at an offset is the one
+    // written there.
+    let mut by_offset: HashMap<usize, usize> = HashMap::new();
+    // Objects unpacked from an object stream, by number and container.
+    let mut packed: HashMap<(u32, usize), usize> = HashMap::new();
+    // The byte ranges of directly written objects, in file order.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        match by_offset.entry(object.span.start) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                packed.insert((object.object_number, object.span.start), index);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(index);
+                spans.push((object.span.start, object.span.end));
+            }
+        }
+    }
+    spans.sort_unstable();
+    let inside_object = |offset: usize| {
+        let after = spans.partition_point(|(start, _)| *start <= offset);
+        after
+            .checked_sub(1)
+            .and_then(|index| spans.get(index))
+            .is_some_and(|(_, end)| offset < *end)
+    };
+    let at = |offset: usize| -> Option<usize> {
+        let mut cursor = offset;
+        skip_whitespace_and_comments(bytes, &mut cursor);
+        by_offset.get(&cursor).copied()
+    };
+    let decode_cap = bytes
+        .len()
+        .saturating_mul(XREF_DECODE_MULTIPLE)
+        .saturating_add(4096);
+    // Reads the cross-reference stream object at `offset` into the chain
+    // and returns its dictionary.
+    let read_stream_at = |chain: &mut XrefChain<'_>,
+                          seen: &mut HashSet<usize>,
+                          offset: usize|
+     -> Option<PdfDictionary> {
+        let index = at(offset)?;
+        if !seen.insert(index) {
+            return None;
+        }
+        let object = objects.get(index)?;
+        let dictionary = object.dictionary.as_ref()?;
+        let stream = streams.get(object.stream_index?)?;
+        let decoded;
+        let data: &[u8] = match stream.decoded.as_deref() {
+            Some(kept) => kept,
+            None => {
+                let raw = bytes.get(stream.raw_range.start..stream.raw_range.end)?;
+                decoded = decode_filters(
+                    raw,
+                    &stream.filters,
+                    dictionary.get("DecodeParms"),
+                    decode_cap,
+                )
+                .ok()?;
+                &decoded
+            }
+        };
+        if data.len() > decode_cap {
+            return None;
+        }
+        chain.read_stream(dictionary, data)?;
+        Some(dictionary.clone())
+    };
+
+    let mut root: Option<(u32, u16)> = None;
+    let mut tables: Vec<(usize, usize)> = Vec::new();
+    let mut seen_streams: HashSet<usize> = HashSet::new();
+    let mut next = Some(start);
+    while let Some(offset) = next.take() {
+        chain.charge(XREF_SECTION_COST)?;
+        let mut cursor = offset;
+        skip_whitespace_and_comments(bytes, &mut cursor);
+        let is_table = bytes
+            .get(cursor..)
+            .is_some_and(|rest| rest.starts_with(b"xref"));
+        let trailer = if is_table {
+            let enterable = starts_its_line(bytes, cursor)
+                && !inside_object(cursor)
+                && !tables
+                    .iter()
+                    .any(|(start, end)| *start <= cursor && cursor < *end);
+            if !enterable {
+                return None;
+            }
+            let (trailer, end) = chain.read_table(cursor)?;
+            tables.push((cursor, end));
+            // A hybrid file's stream belongs to this section: it places the
+            // objects the table could not describe.
+            if let Some(hybrid) = trailer
+                .get_integer("XRefStm")
+                .and_then(|value| usize::try_from(value).ok())
+            {
+                read_stream_at(chain, &mut seen_streams, hybrid)?;
+            }
+            trailer
+        } else {
+            read_stream_at(chain, &mut seen_streams, offset)?
+        };
+        if root.is_none() {
+            if let Some(PdfValue::Reference {
+                object_number,
+                generation,
+            }) = trailer.get("Root")
+            {
+                root = Some((*object_number, *generation));
+            }
+        }
+        next = trailer
+            .get_integer("Prev")
+            .and_then(|value| usize::try_from(value).ok());
+    }
+
+    // Every in-use entry at an offset must land exactly on the header of
+    // that object, number and generation, as the scan recorded it. The
+    // renderer reads `N G obj` at the offset with no skipping and compares
+    // the identifier (hayro-syntax 0.5.0, `xref.rs` 518-522), and on the
+    // first offset that fails it throws its whole map away and rebuilds by
+    // scanning (534-545). So one bad entry here discards the whole chain.
+    let mut placed: Vec<(u32, usize)> = Vec::new();
+    let mut packed_entries: Vec<(u32, u32)> = Vec::new();
+    for (number, entry) in &chain.entries {
+        match *entry {
+            XrefEntry::At(offset, generation) => {
+                let found = *by_offset.get(&offset)?;
+                let object = objects.get(found)?;
+                if object.object_number != *number || object.generation != generation {
+                    return None;
+                }
+                placed.push((*number, found));
+            }
+            XrefEntry::Packed(container) => packed_entries.push((*number, container)),
+        }
+    }
+
+    let root = root?;
+    // Every generation the scan indexed, by object number.
+    let mut generations: HashMap<u32, Vec<u16>> = HashMap::new();
+    for (number, generation) in object_index.keys() {
+        generations.entry(*number).or_default().push(*generation);
+    }
+    let mut chosen = object_index.clone();
+    let choose = |chosen: &mut HashMap<(u32, u16), usize>, number: u32, found: usize| {
+        let Some(object) = objects.get(found) else {
+            return;
+        };
+        for generation in generations.get(&number).into_iter().flatten() {
+            chosen.remove(&(number, *generation));
+        }
+        chosen.insert((number, object.generation), found);
+    };
+    for (number, found) in placed {
+        choose(&mut chosen, number, found);
+    }
+    // Then the objects inside object streams, now that every container is
+    // settled. One this scan did not unpack keeps the scan's answer: the
+    // renderer does not rebuild its map over an object stream.
+    for (number, container) in packed_entries {
+        let found = chosen
+            .get(&(container, 0))
+            .and_then(|index| objects.get(*index))
+            .and_then(|container| packed.get(&(number, container.span.start)));
+        if let Some(found) = found {
+            choose(&mut chosen, number, *found);
+        }
+    }
+    let root_index = *generations
+        .get(&root.0)
+        .into_iter()
+        .flatten()
+        .find_map(|generation| chosen.get(&(root.0, *generation)))?;
+    if !chain.entries.contains_key(&root.0) {
+        return None;
+    }
+    let is_catalog = objects
+        .get(root_index)?
+        .dictionary
+        .as_ref()
+        .and_then(|dictionary| dictionary.get_name("Type"))
+        == Some("Catalog");
+    if !is_catalog {
+        return None;
+    }
+    *object_index = chosen;
+    Some((root.0, objects.get(root_index)?.generation))
+}
+
 fn skip_whitespace_and_comments(bytes: &[u8], cursor: &mut usize) {
     loop {
         while *cursor < bytes.len() && bytes[*cursor].is_ascii_whitespace() {
@@ -7264,76 +8361,188 @@ fn is_delimiter(byte: u8) -> bool {
     )
 }
 
+/// Deepest array or dictionary nesting the object parser follows.
+///
+/// Real documents nest a handful of levels; an input that nests deeper is
+/// malformed or hostile and is refused. The parser keeps its open containers
+/// in a list on the heap, so this bound is not what protects the parser's
+/// own stack. It bounds the depth of the [`PdfValue`] tree the parser hands
+/// out, which later code walks and drops recursively: raising it deepens
+/// every one of those walks. Indirect references do not count toward it.
+const MAX_VALUE_NESTING: usize = 128;
+
 struct ValueParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Containers currently open, bounded by [`MAX_VALUE_NESTING`].
+    depth: usize,
+}
+
+/// An array or dictionary the object parser has opened and not yet closed.
+enum OpenContainer {
+    Array {
+        values: Vec<PdfValue>,
+        /// Where the element being read began, to detect one that consumed
+        /// nothing.
+        element_start: usize,
+    },
+    Dictionary {
+        entries: Vec<PdfDictionaryEntry>,
+        /// Key of the entry whose value is being read.
+        key: String,
+    },
+}
+
+impl OpenContainer {
+    fn into_value(self) -> PdfValue {
+        match self {
+            Self::Array { values, .. } => PdfValue::Array(values),
+            Self::Dictionary { entries, .. } => PdfValue::Dictionary(PdfDictionary { entries }),
+        }
+    }
+}
+
+/// What the first token of a value turned out to be.
+enum ValueStart {
+    /// A value that holds no other values, read in full.
+    Scalar(PdfValue),
+    /// The opening delimiter of an array or dictionary, consumed.
+    Container(OpenContainer),
 }
 
 impl<'a> ValueParser<'a> {
     fn new(bytes: &'a [u8], pos: usize) -> Self {
-        Self { bytes, pos }
+        Self {
+            bytes,
+            pos,
+            depth: 0,
+        }
     }
 
+    /// Record one more open container, refusing nesting past the limit.
+    fn enter_container(&mut self) -> Result<()> {
+        if self.depth >= MAX_VALUE_NESTING {
+            return Err(anyhow!(
+                "PDF value nesting exceeds {MAX_VALUE_NESTING} levels"
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// Parse one value, however deeply its arrays and dictionaries nest.
+    ///
+    /// Open containers are kept in a list rather than on the call stack, so
+    /// the stack this needs does not grow with the input's nesting.
     fn parse_value(&mut self) -> Result<PdfValue> {
+        let mut open: Vec<OpenContainer> = Vec::new();
+        loop {
+            let mut value = match self.parse_value_start()? {
+                ValueStart::Scalar(value) => Some(value),
+                ValueStart::Container(container) => {
+                    open.push(container);
+                    None
+                }
+            };
+            // Hand a finished value to the container that holds it, and keep
+            // closing containers until one asks for another child.
+            loop {
+                let Some(top) = open.last_mut() else {
+                    // No container is open, so `value` is the whole value: a
+                    // container that was just opened is still in the list.
+                    return value.ok_or_else(|| anyhow!("unexpected end of input"));
+                };
+                if let Some(value) = value.take() {
+                    match top {
+                        OpenContainer::Array {
+                            values,
+                            element_start,
+                        } => {
+                            if self.pos == *element_start {
+                                // A stray delimiter (`)`, `>`, `{`, `}`) parses
+                                // as an empty bareword without consuming it.
+                                // Pushing that value and looping would never
+                                // advance, so the array is refused.
+                                return Err(anyhow!("unexpected delimiter in PDF array"));
+                            }
+                            values.push(value);
+                        }
+                        OpenContainer::Dictionary { entries, key } => {
+                            entries.push(PdfDictionaryEntry {
+                                key: std::mem::take(key),
+                                value,
+                            });
+                        }
+                    }
+                }
+                skip_whitespace_and_comments(self.bytes, &mut self.pos);
+                match top {
+                    OpenContainer::Array { element_start, .. } => {
+                        if self.bytes.get(self.pos) != Some(&b']') {
+                            *element_start = self.pos;
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                    OpenContainer::Dictionary { key, .. } => {
+                        if self.bytes.get(self.pos..self.pos + 2) != Some(b">>") {
+                            // `parse_name` consumes at least the solidus, so
+                            // every pass makes progress even when the value
+                            // that follows is empty.
+                            *key = self.parse_name()?;
+                            break;
+                        }
+                        self.pos += 2;
+                    }
+                }
+                self.depth -= 1;
+                value = open.pop().map(OpenContainer::into_value);
+            }
+        }
+    }
+
+    /// Read a scalar in full, or consume a container's opening delimiter.
+    fn parse_value_start(&mut self) -> Result<ValueStart> {
         skip_whitespace_and_comments(self.bytes, &mut self.pos);
         let Some(byte) = self.bytes.get(self.pos).copied() else {
             return Err(anyhow!("unexpected end of input"));
         };
-        match byte {
-            b'<' if self.bytes.get(self.pos + 1) == Some(&b'<') => self.parse_dictionary(),
-            b'[' => self.parse_array(),
-            b'/' => self.parse_name().map(PdfValue::Name),
-            b'(' => self
-                .parse_literal_string()
-                .map(|bytes| PdfValue::String(decode_pdf_text(&bytes))),
-            b'<' => self
-                .parse_hex_string()
-                .map(|bytes| PdfValue::HexString(to_upper_hex(&bytes))),
+        let scalar = match byte {
+            b'<' if self.bytes.get(self.pos + 1) == Some(&b'<') => {
+                self.enter_container()?;
+                self.pos += 2;
+                return Ok(ValueStart::Container(OpenContainer::Dictionary {
+                    entries: Vec::new(),
+                    key: String::new(),
+                }));
+            }
+            b'[' => {
+                self.enter_container()?;
+                self.pos += 1;
+                return Ok(ValueStart::Container(OpenContainer::Array {
+                    values: Vec::new(),
+                    element_start: self.pos,
+                }));
+            }
+            b'/' => PdfValue::Name(self.parse_name()?),
+            b'(' => PdfValue::String(decode_pdf_text(&self.parse_literal_string()?)),
+            b'<' => PdfValue::HexString(to_upper_hex(&self.parse_hex_string()?)),
             b't' if self.bytes.get(self.pos..self.pos + 4) == Some(b"true") => {
                 self.pos += 4;
-                Ok(PdfValue::Bool(true))
+                PdfValue::Bool(true)
             }
             b'f' if self.bytes.get(self.pos..self.pos + 5) == Some(b"false") => {
                 self.pos += 5;
-                Ok(PdfValue::Bool(false))
+                PdfValue::Bool(false)
             }
             b'n' if self.bytes.get(self.pos..self.pos + 4) == Some(b"null") => {
                 self.pos += 4;
-                Ok(PdfValue::Null)
+                PdfValue::Null
             }
-            b'+' | b'-' | b'.' | b'0'..=b'9' => self.parse_number_or_reference(),
-            _ => Ok(PdfValue::Raw(self.parse_bareword())),
-        }
-    }
-
-    fn parse_dictionary(&mut self) -> Result<PdfValue> {
-        self.pos += 2;
-        let mut entries = Vec::new();
-        loop {
-            skip_whitespace_and_comments(self.bytes, &mut self.pos);
-            if self.bytes.get(self.pos..self.pos + 2) == Some(b">>") {
-                self.pos += 2;
-                break;
-            }
-            let key = self.parse_name()?;
-            let value = self.parse_value()?;
-            entries.push(PdfDictionaryEntry { key, value });
-        }
-        Ok(PdfValue::Dictionary(PdfDictionary { entries }))
-    }
-
-    fn parse_array(&mut self) -> Result<PdfValue> {
-        self.pos += 1;
-        let mut values = Vec::new();
-        loop {
-            skip_whitespace_and_comments(self.bytes, &mut self.pos);
-            if self.bytes.get(self.pos) == Some(&b']') {
-                self.pos += 1;
-                break;
-            }
-            values.push(self.parse_value()?);
-        }
-        Ok(PdfValue::Array(values))
+            b'+' | b'-' | b'.' | b'0'..=b'9' => self.parse_number_or_reference()?,
+            _ => PdfValue::Raw(self.parse_bareword()),
+        };
+        Ok(ValueStart::Scalar(scalar))
     }
 
     fn parse_name(&mut self) -> Result<String> {
@@ -7507,8 +8716,8 @@ fn decode_filters(
                 crate::lzw::decode_lzw_limited(&current, early_change, max_len)?
             }
             "ASCIIHexDecode" | "AHx" => decode_ascii_hex(&current)?,
-            "ASCII85Decode" | "A85" => decode_ascii85(&current)?,
-            "RunLengthDecode" | "RL" => decode_run_length(&current)?,
+            "ASCII85Decode" | "A85" => decode_ascii85(&current, max_len)?,
+            "RunLengthDecode" | "RL" => decode_run_length(&current, max_len)?,
             other => return Err(anyhow!("unsupported PDF filter: {}", other)),
         };
         if matches!(filter.as_str(), "FlateDecode" | "Fl" | "LZWDecode" | "LZW") {
@@ -7673,12 +8882,37 @@ fn decode_ascii_hex(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decode_ascii85(raw: &[u8]) -> Result<Vec<u8>> {
+/// The error for a filter stage whose output passes the stream limit.
+///
+/// The wording carries `max_decoded_stream_len` because that is what
+/// [`is_decode_length_limit`] recognizes as a budget failure.
+fn decoded_len_limit_error(filter: &str, max_len: usize) -> anyhow::Error {
+    anyhow!("{filter} decoded stream exceeds max_decoded_stream_len {max_len}")
+}
+
+/// One ASCII85 group of five base-85 digits as its four-byte value.
+///
+/// Five digits can spell a number above `u32::MAX` (`s8W-!` is the largest
+/// valid group); such a group is malformed, and computing it in 32 bits would
+/// overflow.
+fn ascii85_group_value(group: &[u32; 5]) -> Result<u32> {
+    let value = group
+        .iter()
+        .fold(0u64, |value, digit| value * 85 + u64::from(*digit));
+    u32::try_from(value).map_err(|_| anyhow!("ASCII85 group out of range"))
+}
+
+fn decode_ascii85(raw: &[u8], max_len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut group = [0u32; 5];
     let mut len = 0usize;
     let mut i = 0usize;
     while i < raw.len() {
+        // `z` expands one byte to four, so the limit is enforced as the output
+        // grows rather than after the whole stage has been materialized.
+        if out.len() > max_len {
+            return Err(decoded_len_limit_error("ASCII85", max_len));
+        }
         match raw[i] {
             b'~' if raw.get(i + 1) == Some(&b'>') => break,
             b'z' if len == 0 => {
@@ -7698,8 +8932,7 @@ fn decode_ascii85(raw: &[u8]) -> Result<Vec<u8>> {
         }
         i += 1;
         if len == 5 {
-            let value =
-                (((group[0] * 85 + group[1]) * 85 + group[2]) * 85 + group[3]) * 85 + group[4];
+            let value = ascii85_group_value(&group)?;
             out.extend_from_slice(&value.to_be_bytes());
             len = 0;
         }
@@ -7708,17 +8941,26 @@ fn decode_ascii85(raw: &[u8]) -> Result<Vec<u8>> {
         for item in group.iter_mut().skip(len) {
             *item = 84;
         }
-        let value = (((group[0] * 85 + group[1]) * 85 + group[2]) * 85 + group[3]) * 85 + group[4];
+        let value = ascii85_group_value(&group)?;
         let bytes = value.to_be_bytes();
         out.extend_from_slice(&bytes[..len - 1]);
+    }
+    if out.len() > max_len {
+        return Err(decoded_len_limit_error("ASCII85", max_len));
     }
     Ok(out)
 }
 
-fn decode_run_length(raw: &[u8]) -> Result<Vec<u8>> {
+fn decode_run_length(raw: &[u8], max_len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     while cursor < raw.len() {
+        // A repeat run expands two bytes to 128, and chained RunLength
+        // filters compound that, so the limit is enforced as the output grows
+        // rather than after the whole stage has been materialized.
+        if out.len() > max_len {
+            return Err(decoded_len_limit_error("RunLength", max_len));
+        }
         let length = raw[cursor];
         cursor += 1;
         match length {
@@ -7744,6 +8986,9 @@ fn decode_run_length(raw: &[u8]) -> Result<Vec<u8>> {
             }
         }
     }
+    if out.len() > max_len {
+        return Err(decoded_len_limit_error("RunLength", max_len));
+    }
     Ok(out)
 }
 
@@ -7761,6 +9006,7 @@ fn extract_text_fragments(
     object_number: u32,
     generation: u16,
     stream_index: usize,
+    font_bindings: &HashMap<String, FontBinding>,
 ) -> Vec<PdfTextFragment> {
     let mut fragments = Vec::new();
     let mut cursor = 0usize;
@@ -7771,7 +9017,14 @@ fn extract_text_fragments(
         match token {
             ContentToken::Value(value) => operands.push(value),
             ContentToken::Operator(operator) => {
+                let binding = current_font
+                    .as_deref()
+                    .and_then(|name| font_bindings.get(name));
                 match operator.as_str() {
+                    "BI" => {
+                        skip_inline_image(bytes, &mut cursor, &operands);
+                        operands.clear();
+                    }
                     "Tf" => {
                         current_font = operands.iter().find_map(|value| match value {
                             ContentValue::Name(name) => Some(name.clone()),
@@ -7781,7 +9034,7 @@ fn extract_text_fragments(
                     "Tj" | "'" => {
                         if let Some(text) = operands
                             .last()
-                            .and_then(|value| content_value_text(value, None))
+                            .and_then(|value| content_value_text(value, binding))
                         {
                             if !text.is_empty() {
                                 fragments.push(PdfTextFragment {
@@ -7798,7 +9051,7 @@ fn extract_text_fragments(
                     "\"" => {
                         if let Some(text) = operands
                             .last()
-                            .and_then(|value| content_value_text(value, None))
+                            .and_then(|value| content_value_text(value, binding))
                         {
                             if !text.is_empty() {
                                 fragments.push(PdfTextFragment {
@@ -7816,7 +9069,7 @@ fn extract_text_fragments(
                         if let Some(ContentValue::Array(items)) = operands.last() {
                             let text = items
                                 .iter()
-                                .filter_map(|value| content_value_text(value, None))
+                                .filter_map(|value| content_value_text(value, binding))
                                 .collect::<Vec<_>>()
                                 .join("");
                             if !text.is_empty() {
@@ -7872,18 +9125,41 @@ fn extract_semantic_text_runs(
                         operands.clear();
                     }
                     "q" => {
-                        state.graphics_stack.push(state.ctm);
-                        state
-                            .color_stack
-                            .push((state.fill_color.clone(), state.stroke_color.clone()));
+                        if state.graphics_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
+                            if state.unsaved_states == 0 {
+                                state.overflow_state = Some((
+                                    state.ctm,
+                                    state.fill_color.clone(),
+                                    state.stroke_color.clone(),
+                                ));
+                            }
+                            state.unsaved_states = state.unsaved_states.saturating_add(1);
+                        } else {
+                            state.graphics_stack.push(state.ctm);
+                            state
+                                .color_stack
+                                .push((state.fill_color.clone(), state.stroke_color.clone()));
+                        }
                     }
                     "Q" => {
-                        if let Some(matrix) = state.graphics_stack.pop() {
-                            state.ctm = matrix;
-                        }
-                        if let Some((fill, stroke)) = state.color_stack.pop() {
-                            state.fill_color = fill;
-                            state.stroke_color = stroke;
+                        if state.unsaved_states > 0 {
+                            state.unsaved_states -= 1;
+                            if let Some((matrix, fill, stroke)) = state.overflow_state.clone() {
+                                state.ctm = matrix;
+                                state.fill_color = fill;
+                                state.stroke_color = stroke;
+                            }
+                            if state.unsaved_states == 0 {
+                                state.overflow_state = None;
+                            }
+                        } else {
+                            if let Some(matrix) = state.graphics_stack.pop() {
+                                state.ctm = matrix;
+                            }
+                            if let Some((fill, stroke)) = state.color_stack.pop() {
+                                state.fill_color = fill;
+                                state.stroke_color = stroke;
+                            }
                         }
                     }
                     "cm" => {
@@ -8182,8 +9458,59 @@ fn is_content_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0')
 }
 
+/// Deepest array nesting the content-stream tokenizer follows.
+///
+/// A content stream only nests arrays one level (`TJ`, dash patterns), so
+/// anything deeper is malformed. The arrays still open are kept in a list,
+/// not on the call stack, so the bound limits memory and nonsense, not
+/// stack: at one recursive call per level, 128 levels needed more than
+/// 192 KiB of a 256 KiB thread in an unoptimized build.
+const MAX_CONTENT_ARRAY_NESTING: usize = 128;
+
+/// Reads the next token of a content stream.
+///
+/// Returns `None`, the same answer as the end of the stream, when arrays
+/// nest past [`MAX_CONTENT_ARRAY_NESTING`] or an array is never closed, so a
+/// caller stops reading a stream it cannot make sense of.
 fn next_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> {
     skip_whitespace_and_comments(bytes, cursor);
+    if bytes.get(*cursor) != Some(&b'[') {
+        return next_scalar_content_token(bytes, cursor);
+    }
+    // The arrays opened and not yet closed, outermost first.
+    let mut open: Vec<Vec<ContentValue>> = Vec::new();
+    loop {
+        skip_whitespace_and_comments(bytes, cursor);
+        match bytes.get(*cursor) {
+            Some(b'[') => {
+                if open.len() >= MAX_CONTENT_ARRAY_NESTING {
+                    return None;
+                }
+                *cursor += 1;
+                open.push(Vec::new());
+            }
+            Some(b']') => {
+                *cursor += 1;
+                let finished = ContentValue::Array(open.pop()?);
+                match open.last_mut() {
+                    Some(parent) => parent.push(finished),
+                    None => return Some(ContentToken::Value(finished)),
+                }
+            }
+            _ => {
+                let item = match next_scalar_content_token(bytes, cursor)? {
+                    ContentToken::Value(value) => value,
+                    ContentToken::Operator(_) => ContentValue::Other,
+                };
+                open.last_mut()?.push(item);
+            }
+        }
+    }
+}
+
+/// Reads one token that is not an array. The cursor must already be past
+/// any whitespace.
+fn next_scalar_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> {
     let byte = *bytes.get(*cursor)?;
     match byte {
         b'(' => {
@@ -8205,22 +9532,6 @@ fn next_content_token(bytes: &[u8], cursor: &mut usize) -> Option<ContentToken> 
             let value = parser.parse_hex_string().ok()?;
             *cursor = parser.pos;
             Some(ContentToken::Value(ContentValue::HexString(value)))
-        }
-        b'[' => {
-            *cursor += 1;
-            let mut items = Vec::new();
-            loop {
-                skip_whitespace_and_comments(bytes, cursor);
-                if bytes.get(*cursor) == Some(&b']') {
-                    *cursor += 1;
-                    break;
-                }
-                match next_content_token(bytes, cursor)? {
-                    ContentToken::Value(value) => items.push(value),
-                    ContentToken::Operator(_) => items.push(ContentValue::Other),
-                }
-            }
-            Some(ContentToken::Value(ContentValue::Array(items)))
         }
         b'/' => {
             let mut parser = ValueParser::new(bytes, *cursor);
@@ -8286,11 +9597,17 @@ fn operands_as_pair(values: &[ContentValue]) -> Option<(f32, f32)> {
     Some((first, second))
 }
 
+/// The numeric operands of a color operator, as its components.
+///
+/// At most the last [`MAX_COLOR_COMPONENTS`] are kept.
 fn operands_as_numbers(values: &[ContentValue]) -> Option<Vec<f64>> {
-    let numbers: Vec<f64> = values
+    let mut numbers: Vec<f64> = values
         .iter()
+        .rev()
         .filter_map(|v| content_number(v).map(|n| n as f64))
+        .take(MAX_COLOR_COMPONENTS)
         .collect();
+    numbers.reverse();
     if numbers.is_empty() {
         None
     } else {
@@ -8359,6 +9676,8 @@ impl<'a> PageRasterizer<'a> {
             px_width,
             px_height,
             state_stack: vec![GraphicsState::default()],
+            unsaved_states: 0,
+            overflow_state: None,
             path_builder: PathBuilder::new(),
             pending_clip: None,
             form_stack: Vec::new(),
@@ -8415,11 +9734,28 @@ impl<'a> PageRasterizer<'a> {
     ) -> Result<()> {
         match operator {
             "q" => {
-                let current = self.state_stack.last().cloned().unwrap_or_default();
-                self.state_stack.push(current);
+                if self.state_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = self.state_stack.last().cloned();
+                    }
+                    self.unsaved_states = self.unsaved_states.saturating_add(1);
+                } else {
+                    let current = self.state_stack.last().cloned().unwrap_or_default();
+                    self.state_stack.push(current);
+                }
             }
             "Q" => {
-                if self.state_stack.len() > 1 {
+                if self.unsaved_states > 0 {
+                    self.unsaved_states -= 1;
+                    if let (Some(saved), Some(current)) =
+                        (self.overflow_state.as_ref(), self.state_stack.last_mut())
+                    {
+                        *current = saved.clone();
+                    }
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = None;
+                    }
+                } else if self.state_stack.len() > 1 {
                     self.state_stack.pop();
                 }
             }
@@ -8459,16 +9795,16 @@ impl<'a> PageRasterizer<'a> {
                     self.path_builder.close();
                 }
             }
-            "f" | "F" => self.execute_paint(Some(FillRule::Winding), false, false),
-            "f*" => self.execute_paint(Some(FillRule::EvenOdd), false, false),
-            "S" => self.execute_paint(None, true, false),
-            "s" => self.execute_paint(None, true, true),
-            "B" => self.execute_paint(Some(FillRule::Winding), true, false),
-            "B*" => self.execute_paint(Some(FillRule::EvenOdd), true, false),
-            "b" => self.execute_paint(Some(FillRule::Winding), true, true),
-            "b*" => self.execute_paint(Some(FillRule::EvenOdd), true, true),
+            "f" | "F" => self.execute_paint(Some(FillRule::Winding), false, false)?,
+            "f*" => self.execute_paint(Some(FillRule::EvenOdd), false, false)?,
+            "S" => self.execute_paint(None, true, false)?,
+            "s" => self.execute_paint(None, true, true)?,
+            "B" => self.execute_paint(Some(FillRule::Winding), true, false)?,
+            "B*" => self.execute_paint(Some(FillRule::EvenOdd), true, false)?,
+            "b" => self.execute_paint(Some(FillRule::Winding), true, true)?,
+            "b*" => self.execute_paint(Some(FillRule::EvenOdd), true, true)?,
             "n" => {
-                self.execute_paint(None, false, false);
+                self.execute_paint(None, false, false)?;
             }
             "w" => {
                 if let Some(width) = operands.iter().rev().find_map(content_number) {
@@ -8560,7 +9896,34 @@ impl<'a> PageRasterizer<'a> {
         Ok(())
     }
 
-    fn execute_paint(&mut self, fill_rule: Option<FillRule>, stroke: bool, close: bool) {
+    /// Refuse one more clip mask when the masks alive would outgrow the budget.
+    ///
+    /// A clip mask is one byte per surface pixel. Saved states share a mask
+    /// until a nested clip changes it, so `W n q W n q …` holds one distinct
+    /// mask per level that clips again, and only those are counted. The masks
+    /// are released when the page is done, so they are checked against the
+    /// decoded-byte budget rather than charged to it.
+    fn ensure_clip_mask_budget(&self) -> Result<()> {
+        let mask_bytes = (self.px_width as usize).saturating_mul(self.px_height as usize);
+        let mut distinct: Vec<*const Mask> = self
+            .state_stack
+            .iter()
+            .filter_map(|state| state.clip_mask.as_ref().map(Rc::as_ptr))
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let alive = distinct.len() + 1;
+        self.doc
+            .decoded_byte_budget
+            .ensure_available(alive.saturating_mul(mask_bytes))
+    }
+
+    fn execute_paint(
+        &mut self,
+        fill_rule: Option<FillRule>,
+        stroke: bool,
+        close: bool,
+    ) -> Result<()> {
         if close {
             self.path_builder.close();
         }
@@ -8568,22 +9931,34 @@ impl<'a> PageRasterizer<'a> {
         let builder = std::mem::replace(&mut self.path_builder, PathBuilder::new());
         let Some(path) = builder.finish() else {
             self.path_builder = PathBuilder::new();
-            return;
+            return Ok(());
         };
+        // A clip allocates a mask when the state has none, or when the one
+        // it has is shared with a saved state and must be copied to change.
+        if pending_clip.is_some()
+            && self.state_stack.last().is_some_and(|state| {
+                state
+                    .clip_mask
+                    .as_ref()
+                    .is_none_or(|mask| Rc::strong_count(mask) > 1)
+            })
+        {
+            self.ensure_clip_mask_budget()?;
+        }
         let Some(state) = self.state_stack.last_mut() else {
             self.path_builder = PathBuilder::new();
-            return;
+            return Ok(());
         };
         let transform = pdf_matrix_to_skia(matrix_multiply(self.base_ctm, state.ctm));
         if let Some(rule) = pending_clip {
             if let Some(mask) = state.clip_mask.as_mut() {
-                mask.intersect_path(&path, rule, true, transform);
+                Rc::make_mut(mask).intersect_path(&path, rule, true, transform);
             } else if let Some(mut mask) = Mask::new(self.px_width, self.px_height) {
                 mask.fill_path(&path, rule, true, transform);
-                state.clip_mask = Some(mask);
+                state.clip_mask = Some(Rc::new(mask));
             }
         }
-        let clip_mask = state.clip_mask.as_ref();
+        let clip_mask = state.clip_mask.as_deref();
         if let Some(rule) = fill_rule {
             self.pixmap
                 .fill_path(&path, &state.fill_paint, rule, transform, clip_mask);
@@ -8600,6 +9975,7 @@ impl<'a> PageRasterizer<'a> {
             self.painted = true;
         }
         self.path_builder = PathBuilder::new();
+        Ok(())
     }
 }
 
@@ -8608,6 +9984,8 @@ impl<'a> TablePrimitiveExtractor<'a> {
         Self {
             doc,
             state_stack: vec![PrimitiveState::default()],
+            unsaved_states: 0,
+            overflow_state: None,
             path_segments: Vec::new(),
             current_point: None,
             subpath_start: None,
@@ -8645,11 +10023,30 @@ impl<'a> TablePrimitiveExtractor<'a> {
     ) -> Result<()> {
         match operator {
             "q" => {
+                // One state per `q` with no limit made a stream of nothing
+                // but `q` cost twelve times its own size in saved matrices.
                 let state = self.state_stack.last().copied().unwrap_or_default();
-                self.state_stack.push(state);
+                if self.state_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = Some(state);
+                    }
+                    self.unsaved_states = self.unsaved_states.saturating_add(1);
+                } else {
+                    self.state_stack.push(state);
+                }
             }
             "Q" => {
-                if self.state_stack.len() > 1 {
+                if self.unsaved_states > 0 {
+                    self.unsaved_states -= 1;
+                    if let (Some(saved), Some(current)) =
+                        (self.overflow_state, self.state_stack.last_mut())
+                    {
+                        *current = saved;
+                    }
+                    if self.unsaved_states == 0 {
+                        self.overflow_state = None;
+                    }
+                } else if self.state_stack.len() > 1 {
                     self.state_stack.pop();
                 }
             }
@@ -9020,14 +10417,16 @@ fn parse_cmap(bytes: &[u8], object_number: u32, generation: u16) -> Option<PdfCM
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Some((start, end, dst_start)) = parse_bfrange_line(trimmed) {
+                if trimmed.contains('[') {
+                    if let Some((start, end, dsts)) = parse_bfrange_array_line(trimmed) {
+                        entries.push(PdfCMapEntry::RangeArray { start, end, dsts });
+                    }
+                } else if let Some((start, end, dst_start)) = parse_bfrange_line(trimmed) {
                     entries.push(PdfCMapEntry::Range {
                         start,
                         end,
                         dst_start,
                     });
-                } else if let Some((start, end, dsts)) = parse_bfrange_array_line(trimmed) {
-                    entries.push(PdfCMapEntry::RangeArray { start, end, dsts });
                 }
             }
             rest = &after[end_pos..];
@@ -10253,6 +11652,70 @@ endobj
             fallback_total, char_total,
             "All chars should be fallback when no CMap exists"
         );
+    }
+
+    /// A 1-byte Type1 ToUnicode CMap that declares a 2-byte `<0000> <FFFF>`
+    /// codespace range while mapping 1-byte ligature codes (`<1C>` -> `ffi`,
+    /// `<1D>` -> `fl`, `<1E>` -> `ff`, `<1F>` -> `fi`, `<1B>` -> thin space)
+    /// and a 2-byte `<0020>` space entry must decode cleanly on both
+    /// `semantic_text_runs` and `text_fragments` with zero fallback chars.
+    #[test]
+    fn cmap_decodes_one_byte_ligatures_under_two_byte_codespace_and_in_text_fragments() {
+        let cmap = "/CIDInit /ProcSet findresource begin\n\
+            12 dict begin\n\
+            begincmap\n\
+            /CMapName /Adobe-Identity-UCS def\n\
+            /CMapType 2 def\n\
+            1 begincodespacerange\n\
+            <0000> <FFFF>\n\
+            endcodespacerange\n\
+            8 beginbfchar\n\
+            <1B> <2009>\n\
+            <1C> <006600660069>\n\
+            <1D> <0066006C>\n\
+            <1E> <00660066>\n\
+            <1F> <00660069>\n\
+            <0020> <0020>\n\
+            <38> <0038>\n\
+            <B0> <00B0>\n\
+            endbfchar\n\
+            endcmap\n";
+        let content = "BT\n/F1 12 Tf\n<1C201D201E201F20381BB0> Tj\nET";
+        let pdf = build_pdf_with_font_and_stream(Some(cmap), content, "Type1");
+        let doc = PdfDocument::from_slice(&pdf, ParseOptions::default()).unwrap();
+        let runs = doc.semantic_text_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "ffi fl ff fi 8\u{2009}°");
+        assert_eq!(runs[0].cmap_fallback_chars, 0);
+        assert_eq!(doc.text_fragments.len(), 1);
+        assert_eq!(doc.text_fragments[0].text, "ffi fl ff fi 8\u{2009}°");
+    }
+
+    /// A 2-byte Type0 CID font with a ToUnicode CMap mapping `<0210>` -> `.`
+    /// must decode in `doc.text_fragments` as well as `doc.semantic_text_runs()`.
+    #[test]
+    fn text_fragments_decode_cid_font_via_page_font_bindings() {
+        let cmap = "/CIDInit /ProcSet findresource begin\n\
+            12 dict begin\n\
+            begincmap\n\
+            /CMapName /Adobe-Identity-UCS def\n\
+            /CMapType 2 def\n\
+            1 begincodespacerange\n\
+            <0000> <FFFF>\n\
+            endcodespacerange\n\
+            1 beginbfchar\n\
+            <0210> <002E>\n\
+            endbfchar\n\
+            endcmap\n";
+        let content = "BT\n/F1 10 Tf\n<0210> Tj\nET";
+        let pdf = build_pdf_with_font_and_stream(Some(cmap), content, "Type0");
+        let doc = PdfDocument::from_slice(&pdf, ParseOptions::default()).unwrap();
+        assert_eq!(doc.text_fragments.len(), 1);
+        assert_eq!(doc.text_fragments[0].text, ".");
+        let runs = doc.semantic_text_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, ".");
+        assert_eq!(runs[0].cmap_fallback_chars, 0);
     }
 
     // ── Test PDF builders ─────────────────────────────────────────────────

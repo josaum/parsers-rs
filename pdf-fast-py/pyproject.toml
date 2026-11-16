@@ -4,15 +4,15 @@ build-backend = "maturin"
 
 [project]
 name = "pdf-fast"
-version = "0.2.5"
+version = "0.2.11"
 description = "High-performance PDF parser powered by Rust"
 readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.8"
 authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 dependencies = [
     "numpy>=1.26",
-    "pyarrow>=25.0.1",  # IPC reader floor for Rust arrow* =58.3.0
+    "pyarrow>=25.0.1",  # IPC reader floor for Rust arrow* =58.4.1
 ]
 keywords = [
     "pdf",
@@ -26,8 +26,10 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -37,6 +39,12 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Text Processing :: General",
 ]
+
+[project.urls]
+Homepage = "https://github.com/josaum/parsers-rs"
+Repository = "https://github.com/josaum/parsers-rs/tree/main/pdf-fast-py"
+Documentation = "https://github.com/josaum/parsers-rs#readme"
+"Bug Tracker" = "https://github.com/josaum/parsers-rs/issues"
 
 [tool.maturin]
 module-name = "pdf_fast._core"

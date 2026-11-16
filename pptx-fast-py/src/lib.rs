@@ -58,25 +58,33 @@ fn build_options(max_inflate: Option<usize>) -> ParseOptions {
 
 #[pyfunction]
 #[pyo3(signature = (path, max_inflate=None))]
-fn parse_pptx_json_py(path: &Bound<'_, PyAny>, max_inflate: Option<usize>) -> PyResult<String> {
-    let doc = parse_pptx(fs_path(path)?, build_options(max_inflate))
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    serde_json::to_string(&doc).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+fn parse_pptx_json_py(
+    py: Python<'_>,
+    path: &Bound<'_, PyAny>,
+    max_inflate: Option<usize>,
+) -> PyResult<String> {
+    let path_fs = fs_path(path)?;
+    py.detach(|| -> PyResult<String> {
+        let doc = parse_pptx(path_fs, build_options(max_inflate))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        serde_json::to_string(&doc).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    })
 }
 
 #[pyfunction]
 #[pyo3(signature = (path, out_path, max_inflate=None))]
 fn parse_pptx_ndjson_py(
+    py: Python<'_>,
     path: &Bound<'_, PyAny>,
     out_path: &Bound<'_, PyAny>,
     max_inflate: Option<usize>,
 ) -> PyResult<()> {
-    parse_pptx_to_ndjson(
-        fs_path(path)?,
-        fs_path(out_path)?,
-        build_options(max_inflate),
-    )
-    .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    let path_fs = fs_path(path)?;
+    let out_path_fs = fs_path(out_path)?;
+    py.detach(|| -> PyResult<()> {
+        parse_pptx_to_ndjson(path_fs, out_path_fs, build_options(max_inflate))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    })
 }
 
 /// Encode one named shredded table to `out_path` as an in-memory-built Arrow
@@ -84,50 +92,60 @@ fn parse_pptx_ndjson_py(
 #[pyfunction]
 #[pyo3(signature = (path, out_path, table, max_inflate=None, batch_size=None))]
 fn parse_pptx_arrow_ipc_bytes_py(
+    py: Python<'_>,
     path: &Bound<'_, PyAny>,
     out_path: &Bound<'_, PyAny>,
     table: &str,
     max_inflate: Option<usize>,
     batch_size: Option<usize>,
 ) -> PyResult<usize> {
-    let arrow_options = ArrowOptions {
-        batch_size: batch_size.unwrap_or(16_384),
-    };
-    let ipc = parse_pptx_to_arrow_ipc_bytes(
-        fs_path(path)?,
-        build_options(max_inflate),
-        arrow_options,
-        table,
-    )
-    .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    std::fs::write(fs_path(out_path)?, &ipc)
+    let path_fs = fs_path(path)?;
+    let out_path_fs = fs_path(out_path)?;
+    py.detach(|| -> PyResult<usize> {
+        let arrow_options = ArrowOptions {
+            batch_size: batch_size.unwrap_or(16_384),
+        };
+        let ipc = parse_pptx_to_arrow_ipc_bytes(
+            path_fs,
+            build_options(max_inflate),
+            arrow_options,
+            table,
+        )
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    Ok(ipc.len())
+        std::fs::write(out_path_fs, &ipc)
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(ipc.len())
+    })
 }
 
 /// Write every shredded table into `out_dir`; return the paths written.
 #[pyfunction]
 #[pyo3(signature = (path, out_dir, max_inflate=None, batch_size=None))]
 fn parse_pptx_arrow_dataset_py(
+    py: Python<'_>,
     path: &Bound<'_, PyAny>,
     out_dir: &Bound<'_, PyAny>,
     max_inflate: Option<usize>,
     batch_size: Option<usize>,
 ) -> PyResult<Vec<String>> {
-    let arrow_options = ArrowOptions {
-        batch_size: batch_size.unwrap_or(16_384),
-    };
-    let outputs = parse_pptx_to_arrow_dataset(
-        fs_path(path)?,
-        fs_path(out_dir)?,
-        build_options(max_inflate),
-        arrow_options,
-    )
-    .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    Ok(outputs
-        .into_iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect())
+    let path_fs = fs_path(path)?;
+    let out_dir_fs = fs_path(out_dir)?;
+    py.detach(|| -> PyResult<Vec<String>> {
+        let arrow_options = ArrowOptions {
+            batch_size: batch_size.unwrap_or(16_384),
+        };
+        let outputs = parse_pptx_to_arrow_dataset(
+            path_fs,
+            out_dir_fs,
+            build_options(max_inflate),
+            arrow_options,
+        )
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(outputs
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect())
+    })
 }
 
 /// Write every embedded image into `out_dir`; return the paths written.
@@ -138,28 +156,35 @@ fn parse_pptx_arrow_dataset_py(
 #[pyfunction]
 #[pyo3(signature = (path, out_dir, max_inflate=None))]
 fn extract_pptx_images_py(
+    py: Python<'_>,
     path: &Bound<'_, PyAny>,
     out_dir: &Bound<'_, PyAny>,
     max_inflate: Option<usize>,
 ) -> PyResult<Vec<String>> {
-    let images = extract_pptx_images(
-        fs_path(path)?,
-        fs_path(out_dir)?,
-        build_options(max_inflate),
-    )
-    .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    Ok(images
-        .into_iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect())
+    let path_fs = fs_path(path)?;
+    let out_dir_fs = fs_path(out_dir)?;
+    py.detach(|| -> PyResult<Vec<String>> {
+        let images = extract_pptx_images(path_fs, out_dir_fs, build_options(max_inflate))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        Ok(images
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect())
+    })
 }
 
 #[pyfunction]
 #[pyo3(signature = (bytes, max_inflate=None))]
-fn parse_pptx_bytes_py(bytes: &[u8], max_inflate: Option<usize>) -> PyResult<String> {
-    let doc = pptx_fast_core::parse_pptx_bytes(bytes.to_vec(), build_options(max_inflate))
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    serde_json::to_string(&doc).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+fn parse_pptx_bytes_py(
+    py: Python<'_>,
+    bytes: &[u8],
+    max_inflate: Option<usize>,
+) -> PyResult<String> {
+    py.detach(|| -> PyResult<String> {
+        let doc = pptx_fast_core::parse_pptx_bytes(bytes.to_vec(), build_options(max_inflate))
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        serde_json::to_string(&doc).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    })
 }
 
 #[pymodule]

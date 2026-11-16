@@ -145,7 +145,7 @@ Prebuilt binaries available for:
 
 ## License
 
-MIT
+Licensed under either of MIT ([LICENSE](LICENSE)) or Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your option.
 
 ## Related Packages
 

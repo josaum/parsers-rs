@@ -325,21 +325,21 @@ struct ImageRow {
 
 fn collect_pptx_tables(doc: &PptxDocument) -> PptxTables {
     let mut tables = PptxTables::default();
-    for (key, value) in &doc.metadata.core {
+    for (key, value) in crate::sorted_entries(&doc.metadata.core) {
         tables.metadata.push(MetadataRow {
             section: "core".to_string(),
             key: key.clone(),
             value: value.clone(),
         });
     }
-    for (key, value) in &doc.metadata.app {
+    for (key, value) in crate::sorted_entries(&doc.metadata.app) {
         tables.metadata.push(MetadataRow {
             section: "app".to_string(),
             key: key.clone(),
             value: value.clone(),
         });
     }
-    for (key, value) in &doc.metadata.custom {
+    for (key, value) in crate::sorted_entries(&doc.metadata.custom) {
         tables.metadata.push(MetadataRow {
             section: "custom".to_string(),
             key: key.clone(),

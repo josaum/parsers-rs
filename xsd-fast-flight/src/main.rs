@@ -27,9 +27,10 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use flight_ipc_config::{
-    capability_json, do_put_unsupported, parse_writer_policies_for_process, split_query,
-    FlightIpcDirection, FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction,
-    ParserRoute, CAPABILITY_ACTION,
+    capability_json, do_put_unsupported, parse_writer_policies_for_process, resolve_path,
+    root_relative_error_text, root_relative_status, split_query, FlightIpcDirection,
+    FlightIpcObservationGuard, FlightRequestAuthVerifier, FlightRpcAction, ParserRoute,
+    CAPABILITY_ACTION,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -247,8 +248,9 @@ impl FlightService for XsdFlightService {
 
     async fn poll_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
+        self.authorize(&request)?;
         Err(Status::unimplemented("poll_flight_info"))
     }
 
@@ -275,6 +277,7 @@ impl FlightService for XsdFlightService {
         let parse_opts = self.parse_options.clone();
 
         stream_schema_description(
+            &self.root,
             path,
             query,
             parse_opts,
@@ -286,8 +289,11 @@ impl FlightService for XsdFlightService {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        // The bearer is checked first: an unauthenticated caller learns
+        // nothing about the server, not even that it is read-only.
+        self.authorize(&request)?;
         Err(do_put_unsupported())
     }
 
@@ -320,6 +326,7 @@ impl FlightService for XsdFlightService {
         };
 
         stream_schema_description(
+            &self.root,
             path,
             query,
             self.parse_options.clone(),
@@ -373,7 +380,9 @@ impl FlightService for XsdFlightService {
                                 tx.blocking_send(Ok(arrow_flight::Result { body: bytes.into() }));
                         }
                         Err(e) => {
-                            let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
+                            let _ = tx.blocking_send(Err(Status::internal(
+                                root_relative_error_text(&e.to_string(), &root),
+                            )));
                         }
                     }
                 });
@@ -405,7 +414,9 @@ impl FlightService for XsdFlightService {
                                 tx.blocking_send(Ok(arrow_flight::Result { body: bytes.into() }));
                         }
                         Err(e) => {
-                            let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
+                            let _ = tx.blocking_send(Err(Status::internal(
+                                root_relative_error_text(&e.to_string(), &root),
+                            )));
                         }
                     }
                 });
@@ -452,6 +463,7 @@ impl FlightService for XsdFlightService {
 // ── Streaming helper ─────────────────────────────────────────────────────────
 
 fn stream_schema_description(
+    root: &Path,
     path: PathBuf,
     query: FlightQuery,
     parse_opts: ParseOptions,
@@ -494,8 +506,12 @@ fn stream_schema_description(
         .with_schema(schema)
         .with_options(write_options)
         .build(batch_stream);
+    // The parser names the file by its path on the server; the answer
+    // names it by its path below the root.
+    let root = root.to_path_buf();
     let output = flight_ipc_config::observe_flight_stream(
-        flight_stream.map(|res| res.map_err(to_status)),
+        flight_stream
+            .map(move |res| res.map_err(|err| root_relative_status(to_status(err), &root))),
         observation,
     );
     Ok(Response::new(output))
@@ -559,24 +575,6 @@ fn ticket_to_request(root: &Path, ticket: &Ticket) -> Result<(PathBuf, FlightQue
         parse_query(q_str)?
     };
     resolve_path(root, Path::new(path_str)).map(|p| (p, query))
-}
-
-fn resolve_path(root: &Path, path: &Path) -> Result<PathBuf, Status> {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let canon = joined
-        .canonicalize()
-        .map_err(|_| Status::not_found("XSD file not found"))?;
-    let root_canon = root
-        .canonicalize()
-        .map_err(|_| Status::internal("failed to resolve root"))?;
-    if !canon.starts_with(&root_canon) {
-        return Err(Status::permission_denied("path escapes root"));
-    }
-    Ok(canon)
 }
 
 fn path_to_ticket(root: &Path, path: &Path, query: &FlightQuery) -> String {
@@ -834,5 +832,222 @@ mod read_only_flight_contract_tests {
             "__missing_auth_probe__.xsd".to_owned(),
         ])));
         assert!(FlightService::get_schema(&service, request).await.is_ok());
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "../../flight-ipc-config/test-support/wire.rs"]
+mod flight_wire_test_support;
+
+#[cfg(all(test, unix))]
+mod wire_parity_tests {
+    //! What a Flight client sees from this server, pinned as text in
+    //! `tests/wire_transcript.txt`.
+    //!
+    //! The transcript was captured from the server while it still carried its
+    //! own copy of the Flight skeleton and of the path and ticket handling, so
+    //! a change to any answer in it is a change in behaviour, not in
+    //! structure. Unix only: the probes include a symbolic link and a
+    //! backslash in a file name.
+    use super::*;
+    use crate::flight_auth_test_support::required_auth_verifier;
+    use crate::flight_wire_test_support::Wire;
+
+    const EXPECTED: &str = include_str!("../tests/wire_transcript.txt");
+
+    const FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="order">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="id" type="xs:int"/>
+        <xs:element name="placed" type="xs:date" minOccurs="0"/>
+        <xs:element name="item" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="sku" type="xs:string"/>
+              <xs:element name="quantity" type="xs:int"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+      <xs:attribute name="status" type="xs:string"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>
+"#;
+
+    fn service(root: &Path) -> XsdFlightService {
+        XsdFlightService {
+            root: root.to_path_buf(),
+            parse_options: ParseOptions {
+                max_includes: 64,
+                map_date_types: true,
+                ..ParseOptions::default()
+            },
+            arrow_options: ArrowOptions {
+                max_depth: 8,
+                map_date_types: true,
+                include_attributes: true,
+                batch_size: 64,
+            },
+            write_options: IpcWriteOptions::default(),
+            capability_body: b"{}".to_vec(),
+            auth_verifier: required_auth_verifier(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_root_is_answered_like_a_missing_one() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).expect("directories");
+        let mut wire = Wire::start(service(&root), base.path()).await;
+        wire.assert_outside_paths_look_missing(base.path(), "xsd")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn every_rpc_answers_as_it_did_before_the_shared_server() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("directories");
+        std::fs::write(root.join("order.xsd"), FIXTURE).expect("fixture");
+        std::fs::write(root.join("sub").join("Upper.XSD"), FIXTURE).expect("nested");
+        std::fs::write(root.join("notes.txt"), b"not a schema").expect("other file");
+        std::fs::write(base.path().join("outside.xsd"), FIXTURE).expect("outside");
+        std::os::unix::fs::symlink(base.path().join("outside.xsd"), root.join("link.xsd"))
+            .expect("symlink");
+        let outside = base.path().join("outside.xsd");
+        let outside = outside.to_string_lossy();
+        let outside_order = format!("{outside}?element=order");
+
+        let mut wire = Wire::start(service(&root), base.path()).await;
+
+        wire.handshake(false).await;
+        wire.handshake(true).await;
+        wire.list_flights(false).await;
+        wire.list_flights(true).await;
+
+        wire.get_flight_info("order.xsd", false).await;
+        for path in [
+            "order.xsd",
+            "order.xsd?element=order",
+            "order.xsd?element=order&max_depth=1&table=x",
+            "order.xsd?element=a%20b&element=c",
+            "order.xsd?",
+            "sub/Upper.XSD",
+            "sub\\Upper.XSD",
+            "notes.txt",
+            "missing.xsd",
+            "../outside.xsd",
+            "link.xsd",
+            outside.as_ref(),
+        ] {
+            wire.get_flight_info(path, true).await;
+        }
+        wire.get_flight_info_parts(&["sub", "Upper.XSD?element=order"], true)
+            .await;
+        wire.get_flight_info_parts(&["sub", "..", "order.xsd"], true)
+            .await;
+        wire.get_flight_info_cmd(b"order.xsd?element=order", true)
+            .await;
+        wire.get_flight_info_cmd(b"\xff", true).await;
+        wire.get_flight_info_cmd(b"", true).await;
+
+        wire.poll_flight_info("order.xsd", false).await;
+        wire.poll_flight_info("order.xsd", true).await;
+
+        wire.get_schema("order.xsd", false).await;
+        wire.get_schema("order.xsd", true).await;
+        wire.get_schema("missing.xsd", true).await;
+
+        wire.do_get(b"order.xsd?element=order", false).await;
+        for ticket in [
+            "order.xsd",
+            "order.xsd?element=order",
+            "order.xsd?element=nope",
+            "order.xsd?element=order&max_depth=0",
+            "order.xsd?element=order&max_depth=x&map_dates=0",
+            "order.xsd?element=order&map_dates=true&batch=1",
+            "sub/Upper.XSD?element=order",
+            "sub\\Upper.XSD?element=order",
+            "notes.txt?element=order",
+            "missing.xsd?element=order",
+            "missing.xsd",
+            "../outside.xsd?element=order",
+            "sub/../order.xsd?element=order",
+            "link.xsd?element=order",
+            outside_order.as_str(),
+            "",
+        ] {
+            wire.do_get(ticket.as_bytes(), true).await;
+        }
+        wire.do_get(b"\xff", true).await;
+
+        wire.do_put(false).await;
+        wire.do_put(true).await;
+
+        wire.do_exchange_path("order.xsd?element=order", false)
+            .await;
+        wire.do_exchange_path("order.xsd?element=order", true).await;
+        wire.do_exchange_path("order.xsd", true).await;
+        wire.do_exchange_path("missing.xsd?element=order", true)
+            .await;
+        wire.do_exchange_metadata("order.xsd?element=order&max_depth=1", true)
+            .await;
+        wire.do_exchange_metadata("../outside.xsd?element=order", true)
+            .await;
+        wire.do_exchange("an empty message", vec![FlightData::default()], true)
+            .await;
+        wire.do_exchange("no message", Vec::new(), true).await;
+
+        wire.do_action(CAPABILITY_ACTION, "", true, false).await;
+        wire.do_action(CAPABILITY_ACTION, "", true, true).await;
+        wire.do_action("list_elements", r#"{"root":"order.xsd"}"#, true, false)
+            .await;
+        for body in [
+            r#"{"root":"order.xsd"}"#,
+            "  order.xsd ",
+            r#"{"root":"sub/Upper.XSD"}"#,
+            r#"{"path":"order.xsd"}"#,
+            "{bad",
+            r#"{"root":"notes.txt"}"#,
+            r#"{"root":"missing.xsd"}"#,
+            r#"{"root":"../outside.xsd"}"#,
+            r#"{"root":"link.xsd"}"#,
+            "",
+        ] {
+            wire.do_action("list_elements", body, true, true).await;
+        }
+        wire.do_action(
+            "describe",
+            r#"{"root":"order.xsd","element":"order"}"#,
+            false,
+            false,
+        )
+        .await;
+        for body in [
+            r#"{"root":"order.xsd","element":"order"}"#,
+            r#"{"root":"order.xsd","element":"nope"}"#,
+            r#"{"root":"order.xsd"}"#,
+            r#"{"element":"order"}"#,
+            "order.xsd",
+            r#"{"root":"missing.xsd","element":"order"}"#,
+            r#"{"root":"../outside.xsd","element":"order"}"#,
+        ] {
+            wire.do_action("describe", body, false, true).await;
+        }
+        wire.do_action("unknown", "", true, true).await;
+        wire.list_actions(false).await;
+        wire.list_actions(true).await;
+        wire.path_probes(&root, base.path(), "xsd").await;
+
+        assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
     }
 }

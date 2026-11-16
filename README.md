@@ -8,27 +8,28 @@ Every published wheel and Node tarball is bound by `release-manifest.json` and `
 
 ---
 
-## Workspace Catalog (43 Crates)
+## Workspace Catalog (45 Crates)
 
 A crate belongs in `parsers-rs` when it provides a deterministic, side-effect-free parser, a generic format writer, a shared Arrow IPC / Flight transport contract, or a generic acquisition layer with zero dependencies on any downstream consumer. Network and browser execution live in `web-fast-crawl`, separate from the parser cores.
 
 | Domain | Rust Core / Writer | Python Binding (`abi3`) | Node-API Binding (`napi-2`) | Arrow Flight Service | Capabilities |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **JSON** | `json-fast-core` (`0.1.7`) | `json-fast-py` (`json_fast`) | `json-fast-node` | `json-fast-flight` (`0.1.1`) | SIMD JSON/JSONL parsing, JSON Schema validation, JSON-RPC 2.0, JSON:API, JWT/JWK split, JSON-LD context peek, Arrow batches |
-| **XSD / XML** | `xsd-fast-core` (`0.2.5`) | `xsd-fast-py` (`xsd_fast`) | `xsd-fast-node` | `xsd-fast-flight` (`0.2.1`) | XSD schema parsing, element/type introspection, XML validation, and Arrow schema derivation |
-| **DOCX** | `docx-fast-core` (`0.2.6`) | `docx-fast-py` (`docx_fast`) | `docx-fast-node` | `docx-fast-flight` (`0.2.2`) | Read-only DOCX structure extraction, tables, paragraphs, metadata, NDJSON & Arrow IPC streaming |
-| **Excel (Read)** | `xlsx-fast-core` (`0.2.6`) | `xlsx-fast-py` (`xlsx_fast`) | `xlsx-fast-node` | `xlsx-fast-flight` (`0.2.2`) | Read-only XLSX/XLS/XLSB workbook extraction, typed cells, formulas, NDJSON & Arrow IPC output |
-| **XLSX (Write)** | `xlsx-fast-write` (`0.2.0`) | `xlsx-fast-write-py` (`xlsx_fast_write`) | `xlsx-fast-write-node` | — | Streaming XLSX writer with zero-copy XML sheet writing, shared-strings deduplication, wrap/zebra/freeze-rows styling |
-| **PPTX** | `pptx-fast-core` (`0.2.6`) | `pptx-fast-py` (`pptx_fast`) | `pptx-fast-node` | `pptx-fast-flight` (`0.2.2`) | Read-only PPTX slide, shape, table, notes, and embedded media extraction, NDJSON & Arrow datasets |
-| **PDF (Read)** | `pdf-fast-core` (`0.2.5`) | `pdf-fast-py` (`pdf_fast`) | `pdf-fast-node` | — | Read-only PDF text, glyph catalog, vector/raster images, CCITT/LZW, tables, page rendering, and Arrow batches |
-| **PDF (Write)** | `pdf-fast-write` (`0.2.0`) | `pdf-fast-write-py` (`pdf_fast_write`) | `pdf-fast-write-node` | — | Direct PDF 1.7 writer for vector primitives, TrueType font subsetting, raster images, and structured tables |
-| **Email** | `email-fast-core` (`0.2.7`) | `email-fast-py` (`email_fast`) | `email-fast-node` | `email-fast-flight` (`0.2.1`) | Read-only EML (RFC 5322), OLE/CFB `.msg`, and `mbox` extraction with bounded attachment budgets and Arrow IPC |
-| **Geospatial** | `geo-fast-core` (`0.2.1`) | `geo-fast-py` (`geo_fast`) | `geo-fast-node` | — | GeoParquet, Shapefile, FlatGeobuf, GeoJSON, GeoTIFF, SAR, thermal, hyperspectral, WMS/WFS, and GeoArrow IPC |
-| **Ontology** | `ontology-fast-core` (`0.1.1`) | `ontology-fast-py` (`ontology_fast`) | — | — | Canonical Turtle/RDF reading and indexed triple store with strict memory and triple-count budgets |
-| **Web / HTML** | `web-fast-core` (`0.1.1`) | — | — | — | Deterministic, side-effect-free HTML5 DOM & table extraction with Apache Arrow record batches |
+| **JSON** | `json-fast-core` (`0.1.13`) | `json-fast-py` (`json_fast`) | `json-fast-node` | `json-fast-flight` (`0.1.7`) | SIMD JSON/JSONL parsing, JSON Schema validation, JSON-RPC 2.0, JSON:API, JWT/JWK split, JSON-LD context peek, Arrow batches |
+| **XSD / XML** | `xsd-fast-core` (`0.3.2`) | `xsd-fast-py` (`xsd_fast`) | `xsd-fast-node` | `xsd-fast-flight` (`0.2.7`) | XSD schema parsing, element/type introspection, XML validation, and Arrow schema derivation |
+| **DOCX** | `docx-fast-core` (`0.2.12`) | `docx-fast-py` (`docx_fast`) | `docx-fast-node` | `docx-fast-flight` (`0.2.8`) | Read-only DOCX structure extraction, tables, paragraphs, metadata, NDJSON & Arrow IPC streaming |
+| **Excel (Read)** | `xlsx-fast-core` (`0.2.12`) | `xlsx-fast-py` (`xlsx_fast`) | `xlsx-fast-node` | `xlsx-fast-flight` (`0.2.8`) | Read-only XLSX/XLS/XLSB workbook extraction, typed cells, formulas, merged ranges, NDJSON & Arrow IPC streaming |
+| **XLSX (Write)** | `xlsx-fast-write` (`0.2.6`) | `xlsx-fast-write-py` (`xlsx_fast_write`) | `xlsx-fast-write-node` | — | Streaming XLSX writer with zero-copy XML sheet writing, shared-strings deduplication, wrap/zebra/freeze-rows styling |
+| **PPTX** | `pptx-fast-core` (`0.2.12`) | `pptx-fast-py` (`pptx_fast`) | `pptx-fast-node` | `pptx-fast-flight` (`0.2.8`) | Read-only PPTX slide, shape, table, notes, and embedded media extraction, NDJSON & Arrow datasets |
+| **PDF (Read)** | `pdf-fast-core` (`0.2.11`) | `pdf-fast-py` (`pdf_fast`) | `pdf-fast-node` | — | Read-only PDF text, glyph catalog, vector/raster images, CCITT/LZW, tables, page rendering, and Arrow batches |
+| **PDF (Write)** | `pdf-fast-write` (`0.2.6`) | `pdf-fast-write-py` (`pdf_fast_write`) | `pdf-fast-write-node` | — | Direct PDF 1.7 writer for vector primitives, TrueType font subsetting, raster images, and structured tables |
+| **Email** | `email-fast-core` (`0.2.13`) | `email-fast-py` (`email_fast`) | `email-fast-node` | `email-fast-flight` (`0.2.7`) | Read-only EML (RFC 5322), OLE/CFB `.msg`, and `mbox` extraction with bounded attachment budgets and Arrow IPC |
+| **Geospatial** | `geo-fast-core` (`0.2.7`) | `geo-fast-py` (`geo_fast`) | `geo-fast-node` | — | GeoParquet, Shapefile, FlatGeobuf, GeoJSON, GeoTIFF, SAR, thermal, hyperspectral, WMS/WFS, and GeoArrow IPC |
+| **Ontology** | `ontology-fast-core` (`0.1.7`) | `ontology-fast-py` (`ontology_fast`) | — | — | Canonical Turtle/RDF reading and indexed triple store with strict memory and triple-count budgets |
+| **MCTS / Search** | `mcts-fast-core` (`0.2.1`) | `mcts-fast-py` (`mcts_fast_py`) | — | — | Arena-based PUCT Monte Carlo Tree Search with embedding-guided simulation for ontology/KB navigation |
+| **Web / HTML** | `web-fast-core` (`0.1.7`) | — | — | — | Deterministic, side-effect-free HTML5 DOM & table extraction with Apache Arrow record batches |
 | **Semantic Crawler** | [`web-fast-crawl`](web-fast-crawl/README.md) (`0.1.0`) | — | — | — | Bounded HTTP/browser crawling, hydration/API JSON, commerce observations, offline JSON-LD, provenance and indexed RDF graphs |
-| **OOXML ZIP** | `ooxml-archive` (`0.1.4`) | — | — | — | Shared OOXML ZIP reader, aggregate `max_inflate` decompression bomb guard, and relationship resolution |
-| **Flight Config** | `flight-ipc-config` (`0.1.0`) | — | — | — | Shared Arrow Flight IPC compression (`LZ4`/`ZSTD`), JWT bearer authentication, and transport configuration |
+| **OOXML ZIP** | `ooxml-archive` (`0.1.10`) | — | — | — | Shared OOXML ZIP reader, aggregate `max_inflate` decompression bomb guard, and relationship resolution |
+| **Flight Config** | `flight-ipc-config` (`0.1.6`) | — | — | — | Shared Arrow Flight IPC compression (`LZ4`/`ZSTD`), JWT bearer authentication, and transport configuration |
 
 ---
 
@@ -41,7 +42,103 @@ A crate belongs in `parsers-rs` when it provides a deterministic, side-effect-fr
 3. **Hardened Arrow Flight Services (`*-flight`)**:
    All six Arrow Flight services (`docx`, `xlsx`, `pptx`, `email`, `xsd`, `json`) are strictly read-only (`do_put` and mutating actions fail loud), require valid JWT bearer authorization before request parsing, reject symlinks during directory enumeration across both POSIX and Windows, prevent path traversal outside `--root`, and normalize Flight tickets to canonical `/` separators on every OS.
 4. **Pinned Arrow Wire Format**:
-   All workspace members share an exact Apache Arrow wire pin (`arrow = "=58.3.0"`, `arrow-array = "=58.3.0"`, `arrow-ipc = "=58.3.0"`, `arrow-schema = "=58.3.0"`, `arrow-flight = "=58.3.0"`), enforced by `.leio-code/rust-doctors`.
+   All workspace members share an exact Apache Arrow wire pin (`arrow = "=58.4.1"`, `arrow-array = "=58.4.1"`, `arrow-ipc = "=58.4.1"`, `arrow-schema = "=58.4.1"`, `arrow-flight = "=58.4.1"`), enforced by `.leio-code/rust-doctors`.
+
+---
+
+## Limits and guarantees
+
+The limits each parser enforces on its input, with the default and the name
+that holds it in the source. A limit that is a `ParseOptions` / `JsonLimits`
+field can be changed by the caller; a `const` cannot.
+
+| Crate | Limit | Default | Source |
+|-------|-------|---------|--------|
+| `ooxml-archive` | Bytes inflated across one archive view | 128 MiB | `DEFAULT_MAX_INFLATE`, `ooxml-archive/src/lib.rs` |
+| `docx-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `docx-fast-core/src/lib.rs` |
+| | Nested table depth | 32 | `MAX_TABLE_DEPTH` |
+| | `basedOn` style links followed | 64 | `MAX_STYLE_CHAIN` |
+| `xlsx-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `xlsx-fast-core/src/lib.rs` |
+| `pptx-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `pptx-fast-core/src/lib.rs` |
+| `email-fast-core` | One attachment / all attachments | 100 MiB / 100 MiB | `ParseOptions::max_attachment_size`, `max_total_attachment_bytes`, `email-fast-core/src/lib.rs` |
+| | MIME container nesting depth | 32 | `MAX_MIME_DEPTH` |
+| | Input / decoded payload bytes | 128 MiB each | `ParseOptions::max_inflate` |
+| | MIME/MSG tree depth / parts / per-part headers | 64 / 10,000 / 256 KiB | `max_mime_depth`, `max_mime_parts`, `max_header_bytes` |
+| | Header-decoding work per message | 3,000,000,000 characters walked | `MAX_HEADER_DECODE_COST` |
+| | Multipart boundary length | 200 bytes | `MAX_BOUNDARY_LEN` |
+| `json-fast-core` | Input size | 8 MiB | `DEFAULT_MAX_INPUT_BYTES`, `json-fast-core/src/lib.rs` |
+| | Nesting depth | 64 | `DEFAULT_MAX_NESTING_DEPTH` |
+| | Tokens | 1,000,000 | `DEFAULT_MAX_TOKENS` |
+| | JSONL lines / records | 100,000 / 100,000 | `DEFAULT_MAX_LINES`, `DEFAULT_MAX_RECORDS` |
+| | Retained bytes / Arrow IPC bytes | 64 MiB / 64 MiB | `DEFAULT_MAX_RETAINED_BYTES`, `DEFAULT_MAX_IPC_BYTES` |
+| | JSON Schema `$ref` hops | 32 | `MAX_REF_DEPTH`, `json-fast-core/src/schema.rs` |
+| `xsd-fast-core` | Schema bytes, root plus includes | 32 MiB | `DEFAULT_MAX_SCHEMA_BYTES`, `xsd-fast-core/src/parser.rs` |
+| | One `schemaLocation` value | 4 KiB | `DEFAULT_MAX_SCHEMA_LOCATION_BYTES` |
+| | Included or imported files | 64 | `ParseOptions::max_includes` |
+| | Include chain depth | 32 | `MAX_INCLUDE_NESTING` |
+| | Nesting of type-bearing constructs | 64 | `MAX_NESTING_DEPTH` |
+| | Chain of named simple types followed | 64 | `MAX_OWN_TYPE_CHAIN` |
+| | Attributes copied by `xs:attribute ref` / `xs:attributeGroup ref` | 262,144 | `MAX_EXPANDED_NODES` |
+| | Nested attribute groups followed | 32 | `MAX_ATTRIBUTE_GROUP_NESTING` |
+| | Attribute text copied by references (names, defaults, fixed values); past it the attribute is left out | 16 MiB | `MAX_EXPANDED_TEXT_BYTES` |
+| | Facets copied into derived simple types that add their own; past it the type keeps only its own | 262,144 units | `MAX_SETTLE_COPY_UNITS` |
+| | Validation findings reported | 100 | `ValidateOptions::max_errors`, `xsd-fast-core/src/validator.rs` |
+| `web-fast-core` | Input size | 32 MiB | `ParseOptions::max_input_bytes`, `web-fast-core/src/lib.rs` |
+| | Emitted nodes | 250,000 | `ParseOptions::max_nodes` |
+| | Emitted text | 32 MiB | `ParseOptions::max_text_bytes` |
+| `geo-fast-core` | GeoJSON nesting depth | 32 | `MAX_NESTING_DEPTH`, `geo-fast-core/src/geojson.rs` |
+| | GeoTIFF decoded bytes per input byte | 8 uncompressed, 32,768 compressed | `UNCOMPRESSED_EXPANSION`, `COMPRESSED_EXPANSION`, `geo-fast-core/src/geotiff.rs` |
+| | GeoTIFF band data returned | the larger of 4 bytes per input byte and twice the `tiff` decoder's buffer cap | `BAND_BYTES_PER_INPUT_BYTE`, `BAND_BYTES_PER_DECODED_BYTE`, `max_band_bytes` |
+
+`pdf-fast-core` has limits of its own; they are documented next to the
+constants in that crate and are not repeated here.
+
+Two names that look like limits and are not: `ParseOptions::max_inflate` in
+`email-fast-core` is accepted and has no effect, because that crate inflates
+nothing; and `MAX_BATCH_TEXT_BYTES` in `xlsx-fast-core/src/arrow.rs` (64 MiB)
+is the size at which an Arrow batch is closed, which a batch passes by up to
+one cell, not a bound on the input.
+
+**What is tested.** Every core crate has `tests/malformed_input_smoke.rs`: a
+deterministic, fixed-seed byte mutator over valid seed documents
+(`tools/mutation_smoke.rs`) that fails on any panic, runs under an allocator
+that aborts past 1 GiB of live memory (`ALLOCATION_CAP_BYTES`), and feeds
+deeply nested inputs to the parser on a 256 KiB thread stack
+(`SMALL_STACK_BYTES`). The workspace tests run on Linux, macOS and Windows on
+every pull request (`rust` and `rust-platforms` in `.github/workflows/ci.yml`).
+Coverage-guided libFuzzer targets live in the `fuzz/` directory of each of
+those crates except `pdf-fast-core` and `ontology-fast-core`, and start from
+the same seed documents. They cover the in-memory readers built with default
+features. They do not cover the Arrow writers (the `arrow` feature), the
+memory-mapped and path-based readers, or `geo-fast-core`'s HTTP clients; the
+smoke tests above are what exercises the Arrow writers. The targets run weekly
+in `.github/workflows/fuzz.yml`, and for a few seconds on a pull request that
+changes a fuzz crate.
+
+The same workflow runs, weekly and not on pull requests, a build with the
+minimum supported Rust version and Miri over the hand-written SIMD scans:
+the SSE2 and NEON versions of `find_first_digit` (`xlsx-fast-core`) and of
+`find_obj_markers_simd` (`pdf-fast-core`). The AVX2 version of
+`find_first_digit` is not interpreted by Miri, and no other `unsafe` code is:
+the remaining blocks are memory maps and the Arrow C data interface of the
+Python bindings.
+
+**What is not guaranteed.**
+
+- The limits bound memory and recursion. They do not bound wall-clock time,
+  except where a constant above says so (`MAX_HEADER_DECODE_COST`,
+  `MAX_BOUNDARY_LEN`): a large input within its limits takes time in
+  proportion to its size.
+- On malformed input the goal is an error or a partial result, never a panic,
+  stack overflow or unbounded allocation. What a parser extracts from a
+  damaged file is not specified and may change between versions.
+- Fuzzing and mutation testing find bugs; they do not prove there are none,
+  and the readers listed above as not fuzzed have no fuzzing at all.
+- No sandboxing and no constant-time behaviour. A caller that parses hostile
+  files should still isolate the process and set its own time limit.
+- The minimum supported Rust version is the `rust-version` in `Cargo.toml`
+  (1.94); releases are built with the toolchain pinned in
+  `rust-toolchain.toml`.
 
 ---
 
@@ -58,13 +155,13 @@ To keep `parsers-rs` a clean, shared foundation rather than a component coupled 
 
 ---
 
-## Release Matrix & Provenance (84 Artifacts)
+## Release Matrix & Provenance (88 Artifacts)
 
-Every tagged release (`vYYYY.MM.DD`) builds and publishes **84 binary artifacts** after the reusable CI verification workflow passes:
+Every tagged release (`vYYYY.MM.DD`) builds and publishes **88 binary artifacts** after the reusable CI verification workflow passes:
 
 | Artifact Family | Count | Targets |
 | :--- | :--- | :--- |
-| **Python Wheels (`cp38-abi3`)** | **44** (11 crates × 4 targets) | `aarch64-apple-darwin` (`macosx_11_0_arm64`)<br>`x86_64-unknown-linux-gnu` (`manylinux_2_17_x86_64`)<br>`aarch64-unknown-linux-gnu` (`manylinux_2_17_aarch64`)<br>`x86_64-pc-windows-msvc` (`win_amd64`) |
+| **Python Wheels (`cp38-abi3`)** | **48** (12 crates × 4 targets) | `aarch64-apple-darwin` (`macosx_11_0_arm64`)<br>`x86_64-unknown-linux-gnu` (`manylinux_2_17_x86_64`)<br>`aarch64-unknown-linux-gnu` (`manylinux_2_17_aarch64`)<br>`x86_64-pc-windows-msvc` (`win_amd64`) |
 | **Node-API Tarballs (`napi-2`)** | **40** (10 crates × 4 targets) | `darwin-arm64` (`aarch64-apple-darwin`)<br>`linux-x64-gnu` (`x86_64-unknown-linux-gnu`)<br>`linux-arm64-gnu` (`aarch64-unknown-linux-gnu`)<br>`win32-x64-msvc` (`x86_64-pc-windows-msvc`) |
 
 ### Release Integrity Gates
@@ -74,7 +171,7 @@ Every tagged release (`vYYYY.MM.DD`) builds and publishes **84 binary artifacts*
 - **Single Authoritative CycloneDX SBOM per Wheel**:
   `scripts/inject_sbom.py` generates and embeds exactly one CycloneDX SBOM (`<dist-info>/sboms/core.json`) per wheel corresponding to its Rust core/writer crate, strips any stray SBOMs, and recomputes `RECORD` SHA-256 digests and byte sizes.
 - **Complete Matrix & Native Header Verification**:
-  `scripts/release_manifest.py --out dist --require-complete` verifies that all 84 artifacts are present without duplicates, checks that every `.so`, `.pyd`, and `.node` binary matches its target's native `ELF64`, `Mach-O ARM64`, or `PE32+ AMD64` machine header, refuses dirty git trees, and writes `dist/release-manifest.json` and `dist/SHA256SUMS`.
+  `scripts/release_manifest.py --out dist --require-complete` verifies that all 88 artifacts are present without duplicates, checks that every `.so`, `.pyd`, and `.node` binary matches its target's native `ELF64`, `Mach-O ARM64`, or `PE32+ AMD64` machine header, refuses dirty git trees, and writes `dist/release-manifest.json` and `dist/SHA256SUMS`.
 
 ---
 
@@ -90,7 +187,7 @@ benchmarks.
 # Format check
 cargo fmt --all --check
 
-# Lint all 43 crates and all targets (default and Arrow feature sets)
+# Lint all 45 crates and all targets (default and Arrow feature sets)
 RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked
 RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked \
   --features docx-fast-core/arrow,xlsx-fast-core/arrow,pptx-fast-core/arrow,pdf-fast-core/arrow,email-fast-core/arrow,json-fast-core/arrow,xsd-fast-core/arrow,web-fast-core/arrow
@@ -150,3 +247,25 @@ Verify consumer pin integrity in CI with:
 python3 vendor/parsers-rs/src/scripts/verify_consumer_pin.py --vendor vendor/parsers-rs
 python3 vendor/parsers-rs/src/scripts/consumer_surface_check.py --dist dist --consumer .
 ```
+
+## Third-party licences
+
+`web-fast-core` links four crates under the Mozilla Public License 2.0, through
+its HTML parser `scraper`: `cssparser`, `cssparser-macros`, `selectors` and
+`dtoa-short`. They are used unmodified, at the versions `Cargo.lock` records,
+and their source is published on crates.io (`https://crates.io/crates/<name>`)
+and in the `servo/rust-cssparser`, `servo/stylo` and `upsuper/dtoa-short`
+repositories on GitHub. MPL-2.0 asks a distributor of a binary that contains
+them to say where that source is; it puts no condition on the rest of the
+code. `deny.toml` allows MPL-2.0 for these four crates and for no other.
+
+## License
+
+Licensed under either of
+
+- MIT license ([LICENSE](LICENSE))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+
+at your option. Every wheel and Node tarball carries both texts: wheels under `*.dist-info/licenses/`, tarballs at the package root. The release workflow refuses to publish an artifact that is missing either one.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this repository shall be dual licensed as above, without any additional terms or conditions.

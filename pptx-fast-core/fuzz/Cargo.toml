@@ -1,0 +1,33 @@
+[package]
+name = "pptx-fast-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pptx-fast-core = { path = "..", default-features = false }
+serde_json = "1.0"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[[bin]]
+name = "pptx_container"
+path = "fuzz_targets/pptx_container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pptx_slide_xml"
+path = "fuzz_targets/pptx_slide_xml.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone fuzz crate: intentionally outside the office-parsers-rs
+# workspace (members are explicit) and outside any parent workspace, so the
+# workspace lockfile and build never see libFuzzer.
+[workspace]

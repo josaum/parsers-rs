@@ -1,6 +1,6 @@
 [package]
 name = "json-fast-flight"
-version = "0.1.1"
+version = "0.1.7"
 edition.workspace = true
 authors.workspace = true
 description = "Arrow Flight server that streams JSON / JSONL files as Apache Arrow RecordBatches"
@@ -27,3 +27,6 @@ tonic = { workspace = true }
 [dev-dependencies]
 jsonwebtoken = { workspace = true }
 tempfile = "3.10"
+
+[lints]
+workspace = true

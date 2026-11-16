@@ -93,7 +93,11 @@ def wheel(directory, distribution="ontology_fast", platform="macosx_11_0_arm64")
             else next(target for target, tag in PLATFORMS.items() if tag == platform)
         )
         suffix = ".pyd" if target.endswith("windows-msvc") else ".so"
-        archive.writestr(f"{distribution}/_native.abi3{suffix}", native_header(target))
+        # The extension sits in the package the wheel installs, which is named
+        # by the binding's module-name and need not match its distribution:
+        # mcts-fast is distributed as `mcts_fast` and installs `mcts_fast_py`.
+        package = load_script("binding_modules").import_name(crate)
+        archive.writestr(f"{package}/_native.abi3{suffix}", native_header(target))
     return path
 
 
@@ -147,7 +151,7 @@ def test_complete_matrix_stamps_wheels_and_node_provenance(tmp_path, generator):
             node_package(tmp_path, crate, platform)
     assert generator.main(["--out", str(tmp_path), "--require-complete"]) == 0
     manifest = json.loads((tmp_path / release.MANIFEST_NAME).read_text(encoding="utf-8"))
-    assert len(manifest["artifacts"]) == 84  # 11 Python bindings x 4 targets + 10 Node bindings x 4
+    assert len(manifest["artifacts"]) == 88  # 12 Python bindings x 4 targets + 10 Node bindings x 4
     assert manifest["source"] == {"commit": "a" * 40, "dirty": False}
     for artifact in manifest["artifacts"]:
         path = tmp_path / artifact["file"]
@@ -203,6 +207,29 @@ def test_wheel_rejects_non_native_extension_payload(tmp_path):
         for name, payload in entries.items():
             archive.writestr(name, payload)
     with pytest.raises(SystemExit, match="native architecture"):
+        release.artifact_target(path)
+
+
+def test_wheel_with_two_native_extensions_is_rejected(tmp_path):
+    path = wheel(tmp_path)
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("ontology_fast/_second.abi3.so", native_header("aarch64-apple-darwin"))
+    with pytest.raises(SystemExit, match="exactly one native extension, found 2"):
+        release.artifact_target(path)
+
+
+def test_a_native_extension_in_the_dist_info_is_not_the_package_one(tmp_path):
+    path = wheel(tmp_path)
+    entries = {}
+    with zipfile.ZipFile(path) as archive:
+        entries = {name: archive.read(name) for name in archive.namelist()}
+    native = entries.pop("ontology_fast/_native.abi3.so")
+    info = next(name.split("/")[0] for name in entries if name.endswith(".dist-info/WHEEL"))
+    entries[f"{info}/_native.abi3.so"] = native
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, payload in entries.items():
+            archive.writestr(name, payload)
+    with pytest.raises(SystemExit, match="exactly one native extension, found 0"):
         release.artifact_target(path)
 
 

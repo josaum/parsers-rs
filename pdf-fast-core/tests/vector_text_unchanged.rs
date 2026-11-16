@@ -12,7 +12,6 @@
 //! outline API and once through the semantic API that reads the characters — so
 //! it separates "produced no outlines" from "read no text", which are different
 //! facts and a test asserting only the first would not notice losing the second.
-#![cfg(feature = "glyph-catalog")]
 
 use pdf_fast_core::{ParseOptions, PdfDocument};
 

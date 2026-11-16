@@ -1,6 +1,6 @@
 [package]
 name = "web-fast-core"
-version = "0.1.1"
+version = "0.1.7"
 edition.workspace = true
 authors.workspace = true
 description = "Deterministic, side-effect-free HTML parser with Arrow support"
@@ -24,9 +24,12 @@ arrow-schema = { workspace = true, optional = true }
 encoding_rs = "0.8"
 scraper = { version = "0.29", default-features = false, features = ["atomic"] }
 ego-tree = "0.11"
+# Same version scraper already uses; needed to stop tree construction at the
+# nesting limit. Adds no package to the lockfile.
+html5ever = "0.40"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2.0"
 url = "2.5"
 
@@ -36,3 +39,5 @@ tempfile = "3.10"
 [[bench]]
 name = "html_paths"
 harness = false
+[lints]
+workspace = true

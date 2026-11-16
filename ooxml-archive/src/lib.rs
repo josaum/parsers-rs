@@ -8,17 +8,25 @@
 use anyhow::{anyhow, Context, Result};
 use flate2::read::DeflateDecoder;
 use memmap2::Mmap;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use rawzip::{
     CompressionMethod, ZipArchive, ZipArchiveEntryWayfinder, ZipSliceArchive, ZipVerification,
 };
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read};
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+mod properties;
+#[doc(hidden)]
+pub mod utf8;
+
+pub use properties::parse_simple_props;
 
 /// Transitional Office Open XML officeDocument relationship type.
 pub const REL_OFFICE_DOCUMENT: &str =
@@ -80,12 +88,18 @@ struct EntryMeta {
 #[derive(Debug)]
 pub struct OoxmlArchive {
     archive: ZipSliceArchive<ArchiveStorage>,
-    entries: HashMap<String, EntryMeta>,
+    /// Ordered by name, so [`OoxmlArchive::part_names`] is sorted without
+    /// sorting on each call.
+    entries: BTreeMap<String, EntryMeta>,
     inflate_budget: SharedInflateBudget,
 }
 
 impl OoxmlArchive {
     /// Open a package from a filesystem path, preferring a read-only mmap.
+    ///
+    /// The mapping lives as long as the archive. The file must not be
+    /// modified or truncated, by this process or any other, while the archive
+    /// is alive; see [`Self::open_with_budget`].
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_budget(path, InflateBudget::shared())
     }
@@ -95,14 +109,25 @@ impl OoxmlArchive {
     /// This is required when parallel workers reopen the same package: each
     /// archive owns its ZIP index, while every part read charges one common
     /// aggregate limit.
+    ///
+    /// The file is mapped read-only and the mapping lives as long as the
+    /// archive; when it cannot be mapped, it is read into memory instead.
+    /// The file must not be modified or truncated, by this process or any
+    /// other, while the archive is alive. Nothing here can enforce that: a
+    /// truncated file makes reads of the mapping fault (`SIGBUS` on Unix),
+    /// and a modified one changes the bytes under the archive. Read the file
+    /// yourself and use [`Self::from_bytes_with_budget`] when another writer
+    /// may touch it.
     pub fn open_with_budget(path: &Path, inflate_budget: SharedInflateBudget) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open file: {}", path.display()))?;
-        let storage = match unsafe {
-            // SAFETY: the file is mapped read-only and treated as an
-            // immutable Office package. Callers never write through this
-            // mapping; `Mmap` is dropped with the archive.
-            Mmap::map(&file)
-        } {
+        // SAFETY: `Mmap::map` is unsafe because the mapping is only sound
+        // while no one modifies or truncates the file, which no code here can
+        // enforce. The crate states that contract on this function and on
+        // `open`: the caller must not let the file change while the archive
+        // lives. Within this process the mapping is read-only, never written
+        // through, and owned by the archive, which unmaps it when dropped.
+        let mapped = unsafe { Mmap::map(&file) };
+        let storage = match mapped {
             Ok(mmap) => ArchiveStorage::Mmap(mmap),
             Err(_) => ArchiveStorage::Owned(read_all(&file)?),
         };
@@ -147,10 +172,14 @@ impl OoxmlArchive {
     /// This does not inflate or validate parts; use [`Self::read_part`] before
     /// handing a package to a format-specific secondary reader.
     pub fn as_bytes(&self) -> &[u8] {
-        self.archive.as_bytes()
+        self.archive.get_ref().as_ref()
     }
 
-    /// Central-directory part names, in hash order.
+    /// Central-directory part names, sorted byte by byte.
+    ///
+    /// A caller that walks the parts meets them in the same order every
+    /// time, so what it collects, and which part it reports a failure for,
+    /// does not vary from one process to the next.
     pub fn part_names(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
     }
@@ -162,25 +191,25 @@ impl OoxmlArchive {
     pub fn read_part(&self, name: &str, max_inflate: usize) -> Result<PartBytes<'_>> {
         let (meta, data, expected) = self.part_data(name)?;
         self.with_inflate_budget(name, max_inflate, |remaining| {
-            if expected.size() > remaining as u64 {
+            if expected.uncompressed_size > remaining as u64 {
                 return Err(oversize_error(name, max_inflate));
             }
             let part = match meta.compression {
-                CompressionMethod::Store => {
+                CompressionMethod::STORE => {
                     ensure_within_max(name, data.len(), remaining)?;
                     PartBytes::Borrowed(data)
                 }
-                CompressionMethod::Deflate => {
+                CompressionMethod::DEFLATE => {
                     PartBytes::Owned(inflate_capped(name, data, remaining)?)
                 }
                 _ => return Err(anyhow!("unsupported compression for part: {name}")),
             };
             // A zero CRC is a legitimate checksum, not a sentinel for skipping
             // verification. rawzip's generic verifier allows that sentinel.
-            if part.len() as u64 != expected.size() {
+            if part.len() as u64 != expected.uncompressed_size {
                 return Err(anyhow!("uncompressed size mismatch for part: {name}"));
             }
-            if rawzip::crc32(part.as_slice()) != expected.crc() {
+            if rawzip::crc32(part.as_slice()) != expected.crc {
                 return Err(anyhow!("CRC32 mismatch for part: {name}"));
             }
             let len = part.len();
@@ -365,37 +394,27 @@ pub struct RelEntry {
 
 /// Parse a `.rels` XML part into Id/Type maps and an entry list.
 pub fn parse_relationships(xml: &[u8]) -> Result<Relationships> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = xml_reader(repairing_reader(xml));
     let mut buf = Vec::new();
     let mut rels = Relationships::default();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if local_name(e.name().as_ref()) != b"Relationship" {
+                if local_name(e.name().as_ref().as_bytes()) != b"Relationship" {
                     buf.clear();
                     continue;
                 }
                 let mut id = None;
                 let mut rel_type = None;
                 let mut target = None;
-                for attr in e.attributes().flatten() {
-                    let key = local_name(attr.key.as_ref());
+                for attr in e.attributes().with_checks(false).flatten() {
+                    let key = local_name(attr.key.as_ref().as_bytes());
                     if key == b"Id" {
-                        id = Some(
-                            attr.decode_and_unescape_value(reader.decoder())?
-                                .to_string(),
-                        );
+                        id = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                     } else if key == b"Type" {
-                        rel_type = Some(
-                            attr.decode_and_unescape_value(reader.decoder())?
-                                .to_string(),
-                        );
+                        rel_type = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                     } else if key == b"Target" {
-                        target = Some(
-                            attr.decode_and_unescape_value(reader.decoder())?
-                                .to_string(),
-                        );
+                        target = Some(attr_text(&attr, reader.get_ref(), &e)?.to_string());
                     }
                 }
                 if let (Some(id), Some(rel_type), Some(target)) = (id, rel_type, target) {
@@ -524,6 +543,48 @@ fn normalize_join(base_dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
+/// Creates the XML reader for a relationships or property part.
+fn xml_reader<R: BufRead>(input: R) -> Reader<R> {
+    let mut reader = Reader::from_reader(input);
+    let config = reader.config_mut();
+    // Whitespace is text: trimming would delete the spaces around a reference.
+    config.trim_text(false);
+    // A bare `&` is not well-formed, but real tools write it ("AT&T"). It is
+    // kept as text instead of costing the relationships or the properties.
+    config.allow_dangling_amp = true;
+    reader
+}
+
+/// Decodes one attribute value, resolving references.
+///
+/// The value is normalized as XML 1.0 requires: a literal tab, line feed or
+/// carriage return becomes a space, while one written as a character
+/// reference (`&#9;`) is kept.
+///
+/// A value in which `input` replaced bytes that are not UTF-8 is an error,
+/// as such a value always was; `tag` is the start or empty tag the
+/// attribute was read from. A U+FFFD the part really holds, or a
+/// replacement elsewhere in the part, is not.
+fn attr_text<'a, R: BufRead>(
+    attr: &Attribute<'a>,
+    input: &utf8::LossyUtf8<R>,
+    tag: &str,
+) -> Result<Cow<'a, str>> {
+    if input.repaired_in(tag.as_bytes(), 1..=2, attr.value.as_bytes()) {
+        return Err(anyhow!("attribute value is not UTF-8"));
+    }
+    Ok(attr.normalized_value(XmlVersion::Implicit1_0)?)
+}
+
+/// Reads `xml` as UTF-8, each ill-formed sequence replaced by U+FFFD.
+///
+/// The repaired part is held to [`utf8::unknown_limit`]: the caller's limit
+/// for the raw part is not known here.
+fn repairing_reader(xml: &[u8]) -> utf8::LossyUtf8<Cursor<&[u8]>> {
+    let limit = utf8::unknown_limit(xml.len());
+    utf8::LossyUtf8::with_limit(Cursor::new(xml), limit as u64)
+}
+
 fn local_name(name: &[u8]) -> &[u8] {
     match name.iter().position(|&b| b == b':') {
         Some(pos) => &name[pos + 1..],
@@ -531,10 +592,12 @@ fn local_name(name: &[u8]) -> &[u8] {
     }
 }
 
-fn build_index(archive: &ZipSliceArchive<ArchiveStorage>) -> Result<HashMap<String, EntryMeta>> {
-    let mut map = HashMap::new();
+fn build_index(archive: &ZipSliceArchive<ArchiveStorage>) -> Result<BTreeMap<String, EntryMeta>> {
+    let mut map = BTreeMap::new();
+    let mut seen: u64 = 0;
     for entry_result in archive.entries() {
         let entry = entry_result.map_err(|err| anyhow!("read zip entry: {err}"))?;
+        seen += 1;
         if entry.is_dir() {
             continue;
         }
@@ -548,13 +611,23 @@ fn build_index(archive: &ZipSliceArchive<ArchiveStorage>) -> Result<HashMap<Stri
             compression: entry.compression_method(),
         };
         match map.entry(path) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(meta);
             }
-            std::collections::hash_map::Entry::Occupied(entry) => {
+            std::collections::btree_map::Entry::Occupied(entry) => {
                 return Err(anyhow!("duplicate ZIP part name: {}", entry.key()));
             }
         }
+    }
+    // The directory can end early without an error: a digital-signature
+    // record inside it stops the listing, hiding every entry after it. The
+    // count the archive declares is written by whoever made the file, so it
+    // is compared and nothing else: never used to size anything.
+    let declared = archive.entries_hint();
+    if seen != declared {
+        return Err(anyhow!(
+            "zip central directory lists {seen} entries but declares {declared}"
+        ));
     }
     Ok(map)
 }
@@ -594,14 +667,14 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
-    use zip::write::FileOptions;
+    use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod as ZipCompression, ZipWriter};
 
     fn write_pkg(path: &Path, parts: &[(&str, &[u8], ZipCompression)]) {
         let file = File::create(path).unwrap();
         let mut writer = ZipWriter::new(file);
         for (name, body, method) in parts {
-            let options = FileOptions::default().compression_method(*method);
+            let options = SimpleFileOptions::default().compression_method(*method);
             writer.start_file(*name, options).unwrap();
             writer.write_all(body).unwrap();
         }

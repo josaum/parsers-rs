@@ -6,6 +6,13 @@
 //! helpers `json_type`, `validate`, `jsonrpc_*`, `jsonapi_document`,
 //! `jwt_parts` and `jsonld_meta` cover the six JSON types and the derived
 //! formats.
+//!
+//! Every core call runs with the GIL released (`Python::detach`), so other
+//! Python threads keep running while a large document is parsed. Each text
+//! argument is a `str`: Python never mutates one, so the borrowed text stays
+//! valid and unchanged while the GIL is released. No `bytes`, `bytearray` or
+//! `memoryview` is accepted, which means no Python buffer is ever read without
+//! the GIL. Turning the core result into Python objects holds the GIL.
 
 #![deny(missing_docs)]
 
@@ -28,6 +35,16 @@ fn err(error: JsonError) -> PyErr {
         JsonResourceError::new_err(error.to_string())
     } else {
         PyRuntimeError::new_err(error.to_string())
+    }
+}
+
+/// Like [`err`], for a supplied schema document: the message names its URI.
+fn resource_err(uri: &str, error: &JsonError) -> PyErr {
+    let message = format!("schema resource {uri:?}: {error}");
+    if matches!(error, JsonError::ResourceLimit { .. }) {
+        JsonResourceError::new_err(message)
+    } else {
+        PyRuntimeError::new_err(message)
     }
 }
 
@@ -125,13 +142,17 @@ fn loads<'py>(
         None,
         max_retained_bytes,
     );
-    let value: Value = json_fast_core::parse_with_limits(s, &limits).map_err(err)?;
+    let value: Value = py
+        .detach(|| json_fast_core::parse_with_limits(s, &limits))
+        .map_err(err)?;
     value_to_py(py, &value)
 }
 
 /// Parse a JSONL document into a Python list of objects (blank lines skipped).
-// Independent keyword budgets are the public Python binding contract.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "independent keyword budgets are the public Python binding contract"
+)]
 #[pyfunction]
 #[pyo3(signature = (jsonl_text, *, max_input_bytes=None, max_nesting_depth=None, max_tokens=None, max_lines=None, max_records=None, max_retained_bytes=None))]
 fn loads_many<'py>(
@@ -152,31 +173,75 @@ fn loads_many<'py>(
         max_records,
         max_retained_bytes,
     );
-    let values: Vec<Value> = jsonl::parse_many_with_limits(jsonl_text, &limits).map_err(err)?;
+    let values: Vec<Value> = py
+        .detach(|| jsonl::parse_many_with_limits(jsonl_text, &limits))
+        .map_err(err)?;
     values.iter().map(|v| value_to_py(py, v)).collect()
 }
 
 /// Count non-blank lines in a JSONL document (fast streaming pass).
 #[pyfunction]
-fn count_lines(jsonl_text: &str) -> PyResult<usize> {
-    Ok(jsonl::count_lines(jsonl_text))
+fn count_lines(py: Python<'_>, jsonl_text: &str) -> usize {
+    py.detach(|| jsonl::count_lines(jsonl_text))
 }
 
 /// Return the six-type classification of a JSON document's root value.
 #[pyfunction]
-fn json_type(s: &str) -> PyResult<String> {
-    let value: Value = json_fast_core::parse(s).map_err(err)?;
-    Ok(json_fast_core::value_type(&value).as_str().to_string())
+fn json_type(py: Python<'_>, s: &str) -> PyResult<&'static str> {
+    py.detach(|| {
+        let value: Value = json_fast_core::parse(s)?;
+        Ok(json_fast_core::value_type(&value).as_str())
+    })
+    .map_err(err)
 }
 
 /// Validate a JSON document against a JSON Schema; returns a list of findings.
 ///
 /// Each finding is `{"severity": "error"|"warning", "path", "message"}`.
+/// `resources` maps a URI to the JSON text of another schema document that a
+/// `$ref` may name. Nothing is fetched: a reference that resolves neither in
+/// the schema nor in `resources` is an error finding. Documents are taken in
+/// URI order, so when two claim one URI (through `$id`) the first by URI
+/// order wins. A document that does not parse raises the usual exception,
+/// with its URI in the message.
 #[pyfunction]
-fn validate<'py>(py: Python<'py>, s: &str, schema: &str) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    let doc: Value = json_fast_core::parse(s).map_err(err)?;
-    let sch: Value = json_fast_core::parse(schema).map_err(err)?;
-    json_fast_core::schema::validate(&doc, &sch)
+#[pyo3(signature = (s, schema, *, resources=None))]
+fn validate<'py>(
+    py: Python<'py>,
+    s: &str,
+    schema: &str,
+    resources: Option<Bound<'py, PyDict>>,
+) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    // Copied with the GIL held, then put in URI order like the Node binding.
+    let mut supplied: Vec<(String, String)> = Vec::new();
+    if let Some(resources) = resources {
+        for (uri, text) in resources.iter() {
+            supplied.push((uri.extract()?, text.extract()?));
+        }
+    }
+    supplied.sort_by(|a, b| a.0.cmp(&b.0));
+    let findings = py
+        .detach(|| -> Result<_, (Option<&str>, JsonError)> {
+            let doc: Value = json_fast_core::parse(s).map_err(|e| (None, e))?;
+            let sch: Value = json_fast_core::parse(schema).map_err(|e| (None, e))?;
+            let parsed = supplied
+                .iter()
+                .map(|(uri, text)| match json_fast_core::parse(text) {
+                    Ok(value) => Ok((uri.as_str(), value)),
+                    Err(error) => Err((Some(uri.as_str()), error)),
+                })
+                .collect::<Result<Vec<(&str, Value)>, _>>()?;
+            let documents: Vec<(&str, &Value)> =
+                parsed.iter().map(|(uri, value)| (*uri, value)).collect();
+            Ok(json_fast_core::schema::validate_with_resources(
+                &doc, &sch, &documents,
+            ))
+        })
+        .map_err(|(uri, error)| match uri {
+            Some(uri) => resource_err(uri, &error),
+            None => err(error),
+        })?;
+    findings
         .into_iter()
         .map(|f| {
             let d = PyDict::new(py);
@@ -191,31 +256,39 @@ fn validate<'py>(py: Python<'py>, s: &str, schema: &str) -> PyResult<Vec<Bound<'
 /// Parse and validate a JSON-RPC 2.0 request envelope → dict.
 #[pyfunction]
 fn jsonrpc_request<'py>(py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyAny>> {
-    let request = json_fast_core::jsonrpc::JsonRpcRequest::parse(s).map_err(err)?;
-    let value: Value = serde_json::to_value(&request).map_err(runtime_err)?;
+    let value: Value = py.detach(|| -> PyResult<Value> {
+        let request = json_fast_core::jsonrpc::JsonRpcRequest::parse(s).map_err(err)?;
+        serde_json::to_value(&request).map_err(runtime_err)
+    })?;
     value_to_py(py, &value)
 }
 
 /// Parse and validate a JSON-RPC 2.0 response envelope → dict.
 #[pyfunction]
 fn jsonrpc_response<'py>(py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyAny>> {
-    let response = json_fast_core::jsonrpc::JsonRpcResponse::parse(s).map_err(err)?;
-    let value: Value = serde_json::to_value(&response).map_err(runtime_err)?;
+    let value: Value = py.detach(|| -> PyResult<Value> {
+        let response = json_fast_core::jsonrpc::JsonRpcResponse::parse(s).map_err(err)?;
+        serde_json::to_value(&response).map_err(runtime_err)
+    })?;
     value_to_py(py, &value)
 }
 
 /// Parse and validate a JSON:API document envelope → dict.
 #[pyfunction]
 fn jsonapi_document<'py>(py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyAny>> {
-    let document = json_fast_core::jsonapi::JsonApiDocument::parse(s).map_err(err)?;
-    let value: Value = serde_json::to_value(&document).map_err(runtime_err)?;
+    let value: Value = py.detach(|| -> PyResult<Value> {
+        let document = json_fast_core::jsonapi::JsonApiDocument::parse(s).map_err(err)?;
+        serde_json::to_value(&document).map_err(runtime_err)
+    })?;
     value_to_py(py, &value)
 }
 
 /// Split a compact JWT into `{"header", "payload", "signature"}`.
 #[pyfunction]
 fn jwt_parts<'py>(py: Python<'py>, token: &str) -> PyResult<Bound<'py, PyAny>> {
-    let parts = json_fast_core::jwt::split_jwt(token).map_err(err)?;
+    let parts = py
+        .detach(|| json_fast_core::jwt::split_jwt(token))
+        .map_err(err)?;
     let d = PyDict::new(py);
     d.set_item(intern!(py, "header"), value_to_py(py, &parts.header)?)?;
     d.set_item(intern!(py, "payload"), value_to_py(py, &parts.payload)?)?;
@@ -226,7 +299,7 @@ fn jwt_parts<'py>(py: Python<'py>, token: &str) -> PyResult<Bound<'py, PyAny>> {
 /// Peek at a JSON-LD document's `@context` / `@graph` / `@type` → dict.
 #[pyfunction]
 fn jsonld_meta<'py>(py: Python<'py>, s: &str) -> PyResult<Bound<'py, PyAny>> {
-    let meta = json_fast_core::jsonld::peek(s).map_err(err)?;
+    let meta = py.detach(|| json_fast_core::jsonld::peek(s)).map_err(err)?;
     let d = PyDict::new(py);
     if let Some(ctx) = &meta.context {
         d.set_item(intern!(py, "context"), value_to_py(py, ctx)?)?;

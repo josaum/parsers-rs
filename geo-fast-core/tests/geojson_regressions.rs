@@ -22,11 +22,14 @@ fn identifiers_preserve_escaped_strings_and_omit_missing_ids() {
 #[test]
 fn validates_feature_members() {
     let base = feature(json!({"type":"Point","coordinates":[1,2]}));
-    for id in [Value::Null, json!(true), json!([]), json!({})] {
+    for id in [json!(true), json!([]), json!({})] {
         let mut value = base.clone();
         value["id"] = id;
         assert!(geojson_to_features(&value).is_err());
     }
+    let mut null_id = base.clone();
+    null_id["id"] = Value::Null;
+    assert!(geojson_to_features(&null_id).unwrap()[0].id.is_none());
     for properties in [json!(1), json!("x"), json!([])] {
         let mut value = base.clone();
         value["properties"] = properties;

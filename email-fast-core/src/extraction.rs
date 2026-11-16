@@ -12,34 +12,18 @@ pub(crate) fn extract(
     fs::create_dir_all(directory)?;
     let bytes = crate::read_bounded(path, options.max_inflate)?;
     let mut paths = Vec::new();
-    let mut next_suffix = std::collections::HashMap::<String, u64>::new();
+    let mut used = std::collections::HashSet::new();
     let mut sink = |attachment: &Attachment, reader: &mut dyn Read, limit: usize| {
-        let name = attachment
-            .filename
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or("attachment.bin");
-        let name = crate::sanitize_filename_component(name);
-        let name = name.trim_matches(['.', ' ']);
-        let name = if name.is_empty() {
-            "attachment.bin"
-        } else {
-            name
-        };
-        let mut suffix = *next_suffix.get(name).unwrap_or(&0);
+        let base = crate::attachment_file_name(&attachment.filename, paths.len());
         let (path, mut file) = loop {
-            let path = directory.join(if suffix == 0 {
-                name.to_owned()
-            } else {
-                format!("{name}.{suffix}")
-            });
+            let name = crate::unique_file_name(base.clone(), &mut used);
+            let path = directory.join(name);
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => break (path, file),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => suffix += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             }
         };
-        next_suffix.insert(name.to_owned(), suffix + 1);
         let result = mime::copy_limited(reader, &mut file, limit).and_then(|size| {
             file.flush()?;
             Ok(size)

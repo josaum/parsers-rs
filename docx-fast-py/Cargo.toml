@@ -1,6 +1,6 @@
 [package]
 name = "docx-fast-py"
-version = "0.2.6"
+version = "0.2.12"
 edition.workspace = true
 authors.workspace = true
 description = "Python bindings for docx-fast-core"
@@ -17,4 +17,7 @@ pyo3 = { workspace = true }
 serde_json = { workspace = true }
 
 [build-dependencies]
-pyo3-build-config = "0.28.3"
+pyo3-build-config = "0.29.3"
+
+[lints]
+workspace = true

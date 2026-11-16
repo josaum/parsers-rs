@@ -33,3 +33,9 @@ __pycache__/
 
 # Optional JavaScript rendering sidecar dependencies.
 /web-fast-crawl/browser/node_modules/
+
+# local mcts wheel build output
+/dist-mcts/
+
+# Finder metadata is local state.
+.DS_Store

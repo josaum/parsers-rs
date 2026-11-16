@@ -10,8 +10,6 @@
 //! the character code mapped through `cmap` to a glyph, the outline emitted,
 //! and placed by the text matrix.
 
-#![cfg(feature = "glyph-catalog")]
-
 use pdf_fast_core::{ParseOptions, PdfDocument};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/DejaVuSans-subset.ttf");

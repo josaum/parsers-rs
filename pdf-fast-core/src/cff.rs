@@ -32,6 +32,15 @@ use std::collections::HashMap;
 /// representations of one shape would only invite them to drift.
 pub use crate::truetype::{GlyphOutline, OutlinePoint};
 
+/// Most charstring tokens — operands and operators — one glyph may execute.
+///
+/// A charstring cannot loop, but a subroutine can call others ten levels deep
+/// and each level can make many calls, so a few hundred bytes can expand into
+/// billions of operations and as many outline points. Real glyphs execute a
+/// few hundred to a few thousand tokens; this leaves two orders of magnitude
+/// of headroom while keeping the worst glyph to a few megabytes of points.
+const MAX_CHARSTRING_STEPS: usize = 1 << 18;
+
 /// A parsed CFF font.
 #[derive(Debug, Clone)]
 pub struct CffFont {
@@ -102,7 +111,8 @@ impl CffFont {
             Some(operands) if operands.len() >= 2 => {
                 let size = single_number(data, operands[0].0, operands[0].1)? as usize;
                 let offset = single_number(data, operands[1].0, operands[1].1)? as usize;
-                (offset, (offset + size).min(data.len()))
+                // Both come from the file and can be any magnitude.
+                (offset, offset.saturating_add(size).min(data.len()))
             }
             _ => (0, 0),
         };
@@ -113,7 +123,9 @@ impl CffFont {
         };
         let local_subrs = match dict_offset(data, &private, (0, 19)) {
             // A Subrs offset is relative to the Private DICT start.
-            Some(offset) => read_index(data, private_start + offset)
+            Some(offset) => private_start
+                .checked_add(offset)
+                .and_then(|start| read_index(data, start))
                 .map(|(entries, _)| entries)
                 .unwrap_or_default(),
             None => Vec::new(),
@@ -123,7 +135,9 @@ impl CffFont {
         // `head` table is authoritative when present.
         let matrix_em = dict
             .get(&(12, 7))
-            .and_then(|operands| single_number(data, operands[0].0, operands[0].1))
+            // An operator with no operands is legal, so the first may be absent.
+            .and_then(|operands| operands.first())
+            .and_then(|operand| single_number(data, operand.0, operand.1))
             .filter(|scale| *scale > 0.0)
             .map(|scale| 1.0 / scale);
         let units_per_em = units_per_em.or(matrix_em).unwrap_or(1000.0);
@@ -202,6 +216,7 @@ impl CffFont {
             depth: 0,
             open: false,
             hint_count: 0,
+            steps_left: MAX_CHARSTRING_STEPS,
         };
         interpreter.run(start, end, false)?;
         interpreter.close();
@@ -225,6 +240,7 @@ impl CffFont {
             depth: 0,
             open: false,
             hint_count: 0,
+            steps_left: MAX_CHARSTRING_STEPS,
         };
         // Only the width is wanted; running the whole charstring is the only way
         // to know whether a width operand is present, because the first
@@ -264,6 +280,8 @@ struct Interpreter<'a> {
     /// hint operators consume their operands before the mask length can be
     /// computed, and the count only ever grows.
     hint_count: usize,
+    /// Tokens this glyph may still execute; see [`MAX_CHARSTRING_STEPS`].
+    steps_left: usize,
 }
 
 impl Interpreter<'_> {
@@ -274,6 +292,7 @@ impl Interpreter<'_> {
         let data = &self.font.data;
         let mut i = start;
         while i < end {
+            self.steps_left = self.steps_left.checked_sub(1)?;
             let byte = *data.get(i)?;
             match byte {
                 // Operands. The widths are chosen so the value lands in
@@ -522,16 +541,18 @@ impl Interpreter<'_> {
                         10 => {
                             // callsubr
                             let index = self.stack.pop()?;
-                            let local = self.font.local_subrs.clone();
-                            self.call(&local, index, start, end)?;
+                            // Borrowed through the font, not `self`, so the
+                            // table is not copied on every call.
+                            let font = self.font;
+                            self.call(&font.local_subrs, index, start, end)?;
                             i += 1;
                             false
                         }
                         29 => {
                             // callgsubr
                             let index = self.stack.pop()?;
-                            let global = self.font.global_subrs.clone();
-                            self.call(&global, index, start, end)?;
+                            let font = self.font;
+                            self.call(&font.global_subrs, index, start, end)?;
                             i += 1;
                             false
                         }
@@ -672,7 +693,8 @@ impl Interpreter<'_> {
         } else {
             32768
         };
-        let index = raw_index as i32 + bias;
+        // The operand is file data: the cast saturates, so the add must too.
+        let index = (raw_index as i32).saturating_add(bias);
         if index < 0 {
             return None;
         }

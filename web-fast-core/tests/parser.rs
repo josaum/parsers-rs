@@ -167,3 +167,14 @@ fn records_invalid_json_ld_without_copying_payload_into_diagnostics() {
     assert_eq!(document.diagnostics, ["invalid_json_ld:1"]);
     assert!(document.json_ld.is_empty());
 }
+
+/// `source_sha256` is the SHA-256 of the input bytes as 64 lower-case hex
+/// digits; the known answer for `abc` pins the text across `sha2` releases.
+#[test]
+fn source_sha256_is_the_lowercase_hex_digest_of_the_input() {
+    let document = parse_html_bytes(b"abc", None, ParseOptions::default()).expect("parse");
+    assert_eq!(
+        document.source_sha256,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}

@@ -1,6 +1,6 @@
 //! JSON Schema validation — every constraint keyword in draft-07 through
-//! 2020-12 (Validation, Applicator and Unevaluated vocabularies), plus local
-//! `$ref` and boolean schemas.
+//! 2020-12 (Validation, Applicator and Unevaluated vocabularies), `$ref` and
+//! `$dynamicRef` with `$id` base URIs, and boolean schemas.
 //!
 //! Supported keywords: `type`, `nullable` (OpenAPI), `enum`, `const`,
 //! `multipleOf`, `minimum`, `maximum`, `exclusiveMinimum` (numeric or the
@@ -12,8 +12,11 @@
 //! (boolean or schema), `propertyNames`, `dependencies` (both forms),
 //! `dependentRequired`, `dependentSchemas`, `unevaluatedItems`,
 //! `unevaluatedProperties`, `allOf`, `anyOf`, `oneOf`, `not`,
-//! `if`/`then`/`else`, `$ref` (local: root, JSON-pointer fragments, and
-//! `$anchor`/plain-name fragments), `$defs` and `definitions` as containers.
+//! `if`/`then`/`else`, `$ref` and `$dynamicRef` (URIs resolved against the
+//! `$id` base URIs per RFC 3986; JSON-pointer fragments, `$anchor` and
+//! `$dynamicAnchor` names, embedded resources, and documents the caller
+//! supplies to [`validate_with_resources`]), `$defs` and `definitions` as
+//! containers.
 //!
 //! Semantics follow 2020-12 where drafts differ (2020-12 `$ref` siblings are
 //! evaluated; `prefixItems` + single-schema `items`; `contains` annotates the
@@ -24,10 +27,12 @@
 //!
 //! `format` validates only string instances. `contentEncoding`,
 //! `contentMediaType` and `contentSchema` are annotations by spec and are
-//! ignored. Core-keyword gaps that would change a document's validity
-//! (`$dynamicRef`, `$recursiveRef`) and remote `$ref` targets are surfaced as
-//! warnings so validation never silently under-checks; genuinely unknown
-//! keywords likewise warn.
+//! ignored. The 2019-09 `$recursiveRef` is not implemented and is surfaced
+//! as a warning so validation never silently under-checks; genuinely unknown
+//! keywords likewise warn. A `$ref` or `$dynamicRef` that resolves to
+//! nothing (including any document that was not supplied: nothing is ever
+//! fetched) is an error, so such a schema fails closed; only references to
+//! the [`WELL_KNOWN_META_SCHEMAS`] keep the old warning.
 //!
 //! Patterns and `format` regexes compile with the Rust `regex` crate; an
 //! ECMA-262 construct Rust `regex` cannot express makes the keyword a warning
@@ -35,8 +40,8 @@
 //!
 //! # Performance profile
 //!
-//! The document and schema are borrowed, never copied. The JSON pointer is
-//! carried as a reused working
+//! The document and schema are borrowed, never copied. `validate` allocates
+//! nothing on the happy path: the JSON pointer is carried as a reused working
 //! buffer (a finding materializes its own `String` only when one exists),
 //! patterns are compiled once and cached, `propertyNames` reuses one scratch
 //! `Value`, `uniqueItems` runs in O(n) with a hash prefilter plus exact
@@ -45,19 +50,84 @@
 //! `items` / `properties` apply to borrowed slices with no intermediate
 //! copies. Pairwise string/byte work rides the `regex` crate's memchr/SIMD
 //! fast paths; the JSON parse itself is sonic-rs (SIMD). The `mmap` crate
-//! feature adds zero-cpu-copy file entry points ([`crate::parse_file`],
-//! [`crate::validate_file`]).
+//! feature adds zero-cpu-copy file entry points (`crate::parse_file`,
+//! `crate::validate_file`).
 //!
-//! Validation also allocates scratch storage for anchor indexing, pattern
-//! caching, applicator branches, and uniqueness checks.
+//! `validate` never panics and never allocates outside the findings list, the
+//! evaluation tracker and the reference registry, which is built once per
+//! validation in time and memory linear in the schema.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 use serde_json::map::Map;
 use serde_json::Value;
 
-/// Maximum `$ref` hops before a schema is treated as cyclic.
-const MAX_REF_DEPTH: usize = 32;
+/// Deepest array/object nesting [`validate`] accepts in the schema and in the
+/// document: the parser's default, [`crate::DEFAULT_MAX_NESTING_DEPTH`].
+///
+/// Text parsed by this crate already respects it; a `Value` built in code
+/// does not, and the validator recurses once per level.
+pub const MAX_VALIDATION_NESTING_DEPTH: usize = crate::DEFAULT_MAX_NESTING_DEPTH;
+
+/// Most subschema applications that may be in progress at once.
+///
+/// The validator recurses once per application, and `$ref`, `allOf` and the
+/// other in-place keywords apply schemas without descending the document, so
+/// this depth is not bounded by the 64 levels of nesting alone. 2,048 allows
+/// 32 nested applications for every one of the 64 levels a document may
+/// have; a schema that wraps each level in a handful of `allOf`/`anyOf`/
+/// `$ref` layers uses 5 to 10.
+///
+/// Stack: an application measured 4 to 8 KiB in an unoptimized build. The
+/// worst-case depth is worked out before validating, from the longest chain
+/// of subschemas and the document's depth. Up to
+/// 48 nested applications it runs on the caller's stack; beyond that it
+/// runs, once, on a worker thread that each calling thread starts on first
+/// need and keeps: its stack is this limit times
+/// `STACK_BYTES_PER_APPLICATION`, 64 MiB of address space, touched only as
+/// far as the recursion goes.
+pub const MAX_APPLICATION_DEPTH: usize = 2_048;
+
+/// Nested applications the caller's own stack is trusted with.
+///
+/// Measured in an unoptimized build, an application costs 4 to 6 KiB of
+/// stack: about 52 of the worst shape fit a 256 KiB stack and about 102 fit
+/// 512 KiB. 48 keeps a caller on a 256 KiB stack safe. A validation whose
+/// worst case is deeper runs on a dedicated thread from the start.
+const INLINE_APPLICATION_DEPTH: usize = 48;
+
+/// Stack reserved per nested application on the dedicated thread: four
+/// times the 8 KiB measured in an unoptimized build.
+const STACK_BYTES_PER_APPLICATION: usize = 32 * 1024;
+
+/// Most bytes of remembered results per validation; past this, results are
+/// recomputed instead of kept.
+const MAX_REMEMBERED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Subschema applications allowed per schema node and document value.
+///
+/// One validation may apply at most
+/// `VALIDATION_STEPS_PER_PAIR * (schema values + 1) * (document values + 1)`
+/// subschemas. This is a backstop, not a working limit: the result of
+/// applying a `$ref` target or an `anyOf`/`oneOf`/`not`/`if`/`contains`
+/// candidate to an array or object is remembered for the rest of the
+/// validation, so a schema node is fully applied to a document value about
+/// once and the work is at most the product of the two sizes. Only schemas
+/// that fan out in place on a scalar can reach it.
+pub const VALIDATION_STEPS_PER_PAIR: u64 = 64;
+
+/// Most bytes of regular-expression text one validation may compile.
+///
+/// Counts `pattern`, `patternProperties` keys and, because `format: "regex"`
+/// compiles a string taken from the document, every distinct document
+/// string checked against that format. Each expression is compiled once and
+/// kept for the whole validation, so the bytes of pattern text bound both
+/// the compile time and the memory an input can demand. The number of
+/// expressions is deliberately not limited: a schema with 5,000 short
+/// patterns is ordinary. Beyond this many bytes validation stops with an
+/// error.
+pub const MAX_PATTERN_BYTES_PER_VALIDATION: usize = 1 << 20;
 
 /// Severity of a schema [`Finding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +210,7 @@ const CONTAINER: &[&str] = &["$defs", "definitions"];
 
 /// Constraint-relevant Core keywords that are not implemented; surfaced as
 /// warnings so a schema that relies on them cannot silently under-check.
-const UNSUPPORTED: &[&str] = &["$dynamicRef", "$recursiveRef"];
+const UNSUPPORTED: &[&str] = &["$recursiveRef"];
 
 /// Every constraint keyword this validator applies.
 const SUPPORTED: &[&str] = &[
@@ -186,6 +256,7 @@ const SUPPORTED: &[&str] = &[
     "then",
     "else",
     "$ref",
+    "$dynamicRef",
 ];
 
 /// Which instance properties/items an application of a subschema evaluated
@@ -213,24 +284,703 @@ struct Applied<'v> {
     evaluated: Evaluated<'v>,
 }
 
-struct Ctx<'a> {
-    root: &'a Value,
-    /// `$anchor`/plain-name fragment name -> borrowed schema node.
-    anchors: HashMap<&'a str, &'a Value>,
-    /// `$ref` hops taken so far; caps recursive schemas.
-    ref_depth: usize,
-    /// Compiled patterns, keyed by pattern text, so rows never recompile.
-    patterns: HashMap<String, Result<regex::Regex, String>>,
+/// One resource in the dynamic scope.
+#[derive(Debug, Clone, Copy)]
+struct Scope {
+    resource: usize,
+    /// Interned identity of the dynamic scope up to and including this
+    /// resource; 0 is the empty scope.
+    id: usize,
 }
 
-impl Ctx<'_> {
-    fn compile_pattern(&mut self, pattern: &str) -> Result<regex::Regex, String> {
+struct Ctx<'a, 'v> {
+    /// Resources, anchors and reference targets, built once per validation.
+    registry: &'a Registry<'a>,
+    /// The dynamic scope: resources entered so far that declare a
+    /// `$dynamicAnchor`, outermost first, each once. Resources without one
+    /// cannot change where a `$dynamicRef` leads, so they are left out.
+    scope: Vec<Scope>,
+    /// (enclosing scope id, resource entered) -> scope id.
+    scope_ids: HashMap<(usize, usize), usize>,
+    /// References that resolved to nothing, each reported once more at the
+    /// end so that neither `not` nor a passing alternative can hide them.
+    unresolved: Vec<Finding>,
+    /// The (schema object, `$dynamicRef`?) sites already in `unresolved`.
+    unresolved_sites: HashSet<(usize, bool)>,
+    /// Compiled patterns, keyed by pattern text, so rows never recompile.
+    patterns: HashMap<String, Result<regex::Regex, String>>,
+    /// Bytes of pattern text compiled so far.
+    pattern_bytes: usize,
+    /// Subschema applications in progress.
+    depth: usize,
+    /// Subschema applications started so far.
+    steps: u64,
+    /// Subschema applications allowed in total.
+    budget: u64,
+    /// Set once a limit is hit. Every application after that returns at
+    /// once, and `validate` reports the reason itself: a finding pushed where
+    /// the limit was hit could be discarded by `anyOf`, or turned into a pass
+    /// by `not`.
+    halted: Option<&'static str>,
+    /// Results of shared applications, by (schema node, document value)
+    /// address and dynamic scope id. Both trees are borrowed for the whole
+    /// validation, so an address identifies a node; a `$dynamicRef` below
+    /// the node can lead elsewhere in another scope, so the scope is part of
+    /// the key (always 0 for a schema without a dynamic `$dynamicRef`).
+    /// `None` is the common outcome, kept in a few bytes: passed, with no
+    /// findings and nothing evaluated.
+    remembered: HashMap<(usize, usize, usize), Option<Box<Remembered<'v>>>>,
+    /// Estimated bytes held by `remembered`.
+    remembered_bytes: usize,
+    /// Schema nodes that lie on a `$ref` cycle. Only these can be applied
+    /// to the same value twice, so only their results are remembered.
+    cyclic: &'a HashSet<usize>,
+    /// Shared applications currently running; meeting one again means the
+    /// schema applies itself to the same value without end.
+    running: HashSet<(usize, usize, usize)>,
+}
+
+/// The outcome of one subschema application, kept for reuse.
+struct Remembered<'v> {
+    passed: bool,
+    evaluated: Evaluated<'v>,
+    /// Findings with `path` relative to the value the schema was applied to.
+    findings: Vec<Finding>,
+}
+
+/// Why validation stopped at a schema that applies itself forever.
+const ENDLESS_SELF_APPLICATION: &str = "validation stopped: the schema applies itself to \
+     the same value without end (a `$ref` cycle that never descends into the document); \
+     the document was not fully validated";
+
+/// Why validation stopped at the work budget.
+const BUDGET_EXHAUSTED: &str = "validation stopped: the schema needs more subschema \
+     applications than the work budget allows (a schema that branches into itself); \
+     the document was not fully validated";
+
+/// Why validation stopped at the pattern budget.
+const PATTERN_BUDGET_EXHAUSTED: &str = "validation stopped: the schema and document ask for \
+     more than 1 MiB of regular-expression text; \
+     the document was not fully validated";
+
+/// Why validation stopped at the application depth.
+const TOO_MANY_NESTED_APPLICATIONS: &str = "validation stopped: more than 2048 subschema \
+     applications are nested inside each other; the document was not fully validated";
+
+/// Counts the values in `root` and its deepest array/object nesting, without
+/// recursion, so a `Value` nested without limit cannot overflow the stack.
+fn measure(root: &Value) -> (u64, usize) {
+    let mut values = 0u64;
+    let mut deepest = 0usize;
+    let mut pending: Vec<(&Value, usize)> = vec![(root, 0)];
+    while let Some((value, depth)) = pending.pop() {
+        values = values.saturating_add(1);
+        match value {
+            Value::Array(items) => {
+                deepest = deepest.max(depth + 1);
+                pending.extend(items.iter().map(|item| (item, depth + 1)));
+            }
+            Value::Object(map) => {
+                deepest = deepest.max(depth + 1);
+                pending.extend(map.values().map(|item| (item, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    (values, deepest)
+}
+
+/// What the schema's shape says about the work of validating with it.
+struct SchemaShape {
+    /// Addresses of the schema nodes that lie on a `$ref` cycle.
+    cyclic: HashSet<usize>,
+    /// Longest chain of nested subschemas, following `$ref` but not around
+    /// a cycle.
+    longest_chain: usize,
+    /// `$ref`s that lead back into a schema still being applied.
+    back_references: usize,
+    /// Edges walked: linear in the schema and the supplied documents.
+    edges: usize,
+}
+
+/// Finds the `$ref` cycles of a schema and its longest chain of subschemas.
+///
+/// One depth-first walk over the schema's objects and arrays, with every
+/// place a `$ref` or `$dynamicRef` can lead as an extra edge (for a dynamic
+/// one: its own target, and from there the ring of same-named
+/// `$dynamicAnchor`s, so every one is reachable without an edge per pair),
+/// using Tarjan's strongly-connected-components algorithm on an explicit
+/// stack. The ring may report anchors as cyclic that are not, which only
+/// costs remembering their results.
+/// Supplied documents are walked as far as references reach into them.
+fn schema_shape<'a>(root: &'a Value, registry: &Registry<'a>) -> SchemaShape {
+    fn children<'a>(node: &'a Value, registry: &Registry<'a>) -> Vec<&'a Value> {
+        let nested = |value: &&Value| value.is_object() || value.is_array();
+        match node {
+            Value::Array(items) => items.iter().filter(nested).collect(),
+            Value::Object(map) => {
+                let mut out: Vec<&Value> = map.values().filter(nested).collect();
+                for dynamic in [false, true] {
+                    if let Some(Some(target)) = registry.references.get(&(address(node), dynamic)) {
+                        out.extend(Some(target.node).filter(nested));
+                    }
+                }
+                // A dynamic target is itself a same-named anchor; the ring
+                // reaches every other one from it in linearly many edges.
+                out.extend(
+                    registry
+                        .dynamic_ring
+                        .get(&address(node))
+                        .copied()
+                        .filter(nested),
+                );
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+    struct Frame<'a> {
+        node: &'a Value,
+        index: usize,
+        children: Vec<&'a Value>,
+        next: usize,
+    }
+    let mut shape = SchemaShape {
+        cyclic: HashSet::new(),
+        longest_chain: 1,
+        back_references: 0,
+        edges: 0,
+    };
+    let mut indexes: HashMap<usize, usize> = HashMap::new();
+    let mut low: Vec<usize> = Vec::new();
+    let mut chain: Vec<usize> = Vec::new();
+    let mut open: Vec<bool> = Vec::new();
+    let mut component: Vec<usize> = Vec::new();
+    let mut frames: Vec<Frame<'_>> = Vec::new();
+    let enter = |node: &'_ Value,
+                 indexes: &mut HashMap<usize, usize>,
+                 low: &mut Vec<usize>,
+                 chain: &mut Vec<usize>,
+                 open: &mut Vec<bool>|
+     -> usize {
+        let index = low.len();
+        indexes.insert(address(node), index);
+        low.push(index);
+        chain.push(usize::from(node.is_object()));
+        open.push(true);
+        index
+    };
+    if !(root.is_object() || root.is_array()) {
+        return shape;
+    }
+    let index = enter(root, &mut indexes, &mut low, &mut chain, &mut open);
+    component.push(address(root));
+    frames.push(Frame {
+        node: root,
+        index,
+        children: children(root, registry),
+        next: 0,
+    });
+    while let Some(frame) = frames.last_mut() {
+        if let Some(child) = frame.children.get(frame.next).copied() {
+            frame.next += 1;
+            shape.edges += 1;
+            let own = usize::from(frame.node.is_object());
+            match indexes.get(&address(child)).copied() {
+                Some(seen) if open[seen] => {
+                    // Back into a schema that is still being walked.
+                    low[frame.index] = low[frame.index].min(seen);
+                    shape.back_references += 1;
+                    if seen == frame.index {
+                        shape.cyclic.insert(address(child));
+                    }
+                }
+                Some(seen) => {
+                    chain[frame.index] = chain[frame.index].max(own + chain[seen]);
+                }
+                None => {
+                    let index = enter(child, &mut indexes, &mut low, &mut chain, &mut open);
+                    component.push(address(child));
+                    frames.push(Frame {
+                        node: child,
+                        index,
+                        children: children(child, registry),
+                        next: 0,
+                    });
+                }
+            }
+            continue;
+        }
+        let Some(done) = frames.pop() else {
+            break;
+        };
+        shape.longest_chain = shape.longest_chain.max(chain[done.index]);
+        if low[done.index] == done.index {
+            // `done` roots a component: everything walked since it began.
+            let start = component
+                .iter()
+                .rposition(|member| *member == address(done.node))
+                .unwrap_or(0);
+            let members = component.split_off(start);
+            for member in &members {
+                if let Some(index) = indexes.get(member) {
+                    open[*index] = false;
+                }
+            }
+            if members.len() > 1 {
+                shape.cyclic.extend(members);
+            }
+        }
+        if let Some(parent) = frames.last_mut() {
+            let own = usize::from(parent.node.is_object());
+            low[parent.index] = low[parent.index].min(low[done.index]);
+            chain[parent.index] = chain[parent.index].max(own + chain[done.index]);
+        }
+    }
+    shape
+}
+
+/// The result of one validation, with the counters the tests bound work by.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the counters are read by tests")
+)]
+struct Outcome {
+    findings: Vec<Finding>,
+    /// Subschema applications started.
+    steps: u64,
+    /// Results kept for reuse.
+    remembered: usize,
+    /// Whether the validation ran on a dedicated thread.
+    spawned: bool,
+}
+
+impl Outcome {
+    fn stopped(reason: impl Into<String>) -> Self {
+        Self {
+            findings: vec![Finding::error("$", reason)],
+            steps: 0,
+            remembered: 0,
+            spawned: false,
+        }
+    }
+}
+
+/// Why validation could not start on a dedicated thread.
+const NO_VALIDATION_THREAD: &str = "validation stopped: this schema and document need a \
+     dedicated stack and the thread for it could not be started; the document was not validated";
+
+/// Why validation on the dedicated thread did not return.
+const VALIDATION_THREAD_FAILED: &str = "validation stopped: the validation thread ended \
+     abnormally; the document was not validated";
+
+/// Runs one validation. `budget` of `None` applies the documented budget.
+fn run(document: &Value, schema: &Value, budget: Option<u64>) -> Outcome {
+    run_with_resources(document, schema, &[], budget)
+}
+
+/// Runs one validation with supplied schema documents.
+fn run_with_resources(
+    document: &Value,
+    schema: &Value,
+    resources: &[(&str, &Value)],
+    budget: Option<u64>,
+) -> Outcome {
+    let (mut schema_values, schema_depth) = measure(schema);
+    let (document_values, document_depth) = measure(document);
+    for (what, depth) in [("schema", schema_depth), ("document", document_depth)] {
+        if depth > MAX_VALIDATION_NESTING_DEPTH {
+            return Outcome::stopped(format!(
+                "the {what} is nested {depth} levels deep; the limit is \
+                 {MAX_VALIDATION_NESTING_DEPTH}; the document was not validated"
+            ));
+        }
+    }
+    for (uri, resource) in resources {
+        let (values, depth) = measure(resource);
+        if depth > MAX_VALIDATION_NESTING_DEPTH {
+            return Outcome::stopped(format!(
+                "the supplied schema {uri:?} is nested {depth} levels deep; the limit is \
+                 {MAX_VALIDATION_NESTING_DEPTH}; the document was not validated"
+            ));
+        }
+        schema_values = schema_values.saturating_add(values);
+    }
+    let budget = budget.unwrap_or_else(|| {
+        VALIDATION_STEPS_PER_PAIR
+            .saturating_mul(schema_values.saturating_add(1))
+            .saturating_mul(document_values.saturating_add(1))
+    });
+    let registry = match Registry::build(schema, resources) {
+        Ok(registry) => registry,
+        Err(reason) => return Outcome::stopped(reason),
+    };
+    let shape = schema_shape(schema, &registry);
+    // Worst-case nesting of applications, decided once. Without a cycle it
+    // is the longest chain of subschemas. With one, a chain can restart at
+    // every level of the document and once more per reference that leads
+    // back into the cycle (the same schema cannot be entered twice on one
+    // value). A dynamic scope can grow by each resource declaring a
+    // `$dynamicAnchor` before a cycle meets itself under the same scope.
+    let mut worst_depth = if shape.cyclic.is_empty() {
+        shape.longest_chain
+    } else {
+        shape
+            .longest_chain
+            .saturating_mul(shape.back_references + 1)
+            .saturating_mul(document_depth + 1)
+    };
+    if registry.dynamic {
+        worst_depth = worst_depth.saturating_mul(registry.dynamic_resources() + 1);
+    }
+    let registry = &registry;
+    if worst_depth <= INLINE_APPLICATION_DEPTH {
+        return run_on_this_stack(document, schema, budget, registry, &shape.cyclic);
+    }
+    let cyclic = &shape.cyclic;
+    let outcome =
+        on_large_stack(move || run_on_this_stack(document, schema, budget, registry, cyclic));
+    match outcome {
+        Ok(mut outcome) => {
+            outcome.spawned = true;
+            outcome
+        }
+        Err(reason) => Outcome::stopped(reason),
+    }
+}
+
+/// A unit of work handed to the large-stack thread.
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+thread_local! {
+    /// This thread's large-stack worker, started on first need and stopped
+    /// when the thread exits (dropping the sender ends the worker's loop).
+    /// Nothing is shared between calling threads.
+    static LARGE_STACK_WORKER: std::cell::RefCell<Option<std::sync::mpsc::Sender<Job>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Starts a parked thread whose stack holds [`MAX_APPLICATION_DEPTH`]
+/// applications (64 MiB of address space, touched only as far as used).
+fn start_large_stack_worker() -> Option<std::sync::mpsc::Sender<Job>> {
+    let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+    std::thread::Builder::new()
+        .name("json-schema-validation".to_owned())
+        .stack_size(MAX_APPLICATION_DEPTH * STACK_BYTES_PER_APPLICATION)
+        .spawn(move || {
+            for job in queue {
+                // A panicking job must not take the worker with it; the
+                // caller learns of it because its reply never arrives.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            }
+        })
+        .ok()?;
+    Some(jobs)
+}
+
+/// Boxes `work` so that it is gone before its reply sender is.
+///
+/// [`on_large_stack`] hands the box to another thread and treats the loss of
+/// the reply sender as proof that nothing borrowed by `work` is in use there
+/// any more. That has to hold when the box is run, when `work` panics, and
+/// when the box is dropped without ever running, so the order is written
+/// down in a struct (fields drop in declaration order) instead of being left
+/// to the order in which a closure happens to drop its captures.
+fn reply_last<'env, T: Send + 'env>(
+    work: impl FnOnce() -> T + Send + 'env,
+    reply: std::sync::mpsc::SyncSender<T>,
+) -> Box<dyn FnOnce() + Send + 'env> {
+    struct ReplyLast<F, T> {
+        // Dropped first: holds everything borrowed for `'env`.
+        work: Option<F>,
+        // Dropped second: its loss releases the waiting caller.
+        reply: std::sync::mpsc::SyncSender<T>,
+    }
+    let pending = ReplyLast {
+        work: Some(work),
+        reply,
+    };
+    Box::new(move || {
+        // Take the struct as a whole; capturing its fields one by one would
+        // bring back the unspecified order.
+        let mut pending = pending;
+        if let Some(work) = pending.work.take() {
+            let value = work();
+            let _ = pending.reply.send(value);
+        }
+    })
+}
+
+/// Runs `work` on this thread's large-stack worker and waits for it.
+///
+/// Starting a thread per validation cost more than a shallow validation
+/// itself, so each calling thread keeps one worker and reuses it.
+///
+/// # Errors
+///
+/// Returns the message to report when the worker cannot be started or
+/// `work` panics. A panic leaves the worker usable for later calls.
+fn on_large_stack<'env, T: Send + 'env>(
+    work: impl FnOnce() -> T + Send + 'env,
+) -> Result<T, &'static str> {
+    let (reply, result) = std::sync::mpsc::sync_channel::<T>(1);
+    let job = reply_last(work, reply);
+    // SAFETY: only the lifetime bound of the boxed closure changes. The
+    // closure borrows data that lives for `'env`, which outlives this call,
+    // and this function does not return while anything borrowed for `'env`
+    // is still alive on another thread. Every path below ends in one of two
+    // ways. Either the job is dropped on this thread, unsent. Or
+    // `result.recv()` returns, which needs a reply or the loss of the reply
+    // sender, and `reply_last` orders both after the end of `work`: a reply
+    // is sent only once `work` has been consumed by its call, and the
+    // sender is dropped only after `work` (run, unrun or unwinding).
+    // The value sent back is owned by this thread from then on, and a panic
+    // payload is `'static`.
+    let job: Job = unsafe {
+        std::mem::transmute::<Box<dyn FnOnce() + Send + 'env>, Box<dyn FnOnce() + Send + 'static>>(
+            job,
+        )
+    };
+    let sent = LARGE_STACK_WORKER.try_with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let mut job = job;
+        // A worker whose thread is gone is replaced once.
+        for _ in 0..2 {
+            if slot.is_none() {
+                *slot = start_large_stack_worker();
+            }
+            let Some(jobs) = slot.as_ref() else {
+                return false;
+            };
+            match jobs.send(job) {
+                Ok(()) => return true,
+                Err(std::sync::mpsc::SendError(returned)) => {
+                    job = returned;
+                    *slot = None;
+                }
+            }
+        }
+        false
+    });
+    if !matches!(sent, Ok(true)) {
+        return Err(NO_VALIDATION_THREAD);
+    }
+    result.recv().map_err(|_| VALIDATION_THREAD_FAILED)
+}
+
+/// Validates on the current thread's stack.
+fn run_on_this_stack<'a>(
+    document: &Value,
+    schema: &'a Value,
+    budget: u64,
+    registry: &'a Registry<'a>,
+    cyclic: &'a HashSet<usize>,
+) -> Outcome {
+    let mut findings = Vec::new();
+    let mut ctx = Ctx {
+        registry,
+        scope: Vec::new(),
+        scope_ids: HashMap::new(),
+        unresolved: Vec::new(),
+        unresolved_sites: HashSet::new(),
+        patterns: HashMap::new(),
+        pattern_bytes: 0,
+        depth: 0,
+        steps: 0,
+        budget,
+        halted: None,
+        remembered: HashMap::new(),
+        remembered_bytes: 0,
+        cyclic,
+        running: HashSet::new(),
+    };
+    let mut path = String::from("$");
+    validate_node(document, schema, &mut path, &mut ctx, &mut findings);
+    if let Some(reason) = ctx.halted {
+        // Findings gathered around an abandoned application are not
+        // verdicts, so only the reason is reported.
+        findings = vec![Finding::error("$", reason)];
+    } else {
+        // An unresolvable reference fails the validation even where `not`
+        // or another alternative discarded its finding.
+        if !ctx.unresolved.is_empty() {
+            // Only the unresolved findings are indexed, never the others.
+            let mut missing: HashMap<(&str, &str), bool> = ctx
+                .unresolved
+                .iter()
+                .map(|f| ((f.path.as_str(), f.message.as_str()), true))
+                .collect();
+            for finding in &findings {
+                if let Some(absent) =
+                    missing.get_mut(&(finding.path.as_str(), finding.message.as_str()))
+                {
+                    *absent = false;
+                }
+            }
+            let appended: Vec<Finding> = ctx
+                .unresolved
+                .iter()
+                .filter(|f| {
+                    missing
+                        .insert((f.path.as_str(), f.message.as_str()), false)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            findings.extend(appended);
+        }
+        findings.extend(
+            registry
+                .warnings
+                .iter()
+                .map(|warning| Finding::warning("$", warning.clone())),
+        );
+    }
+    Outcome {
+        findings,
+        steps: ctx.steps,
+        remembered: ctx.remembered.len(),
+        spawned: false,
+    }
+}
+
+impl<'a> Ctx<'a, '_> {
+    /// Hands the shared state to a context for values with another lifetime
+    /// (the scratch value of `propertyNames`); [`Ctx::rejoin`] takes it back.
+    fn fork<'s>(&mut self) -> Ctx<'a, 's> {
+        Ctx {
+            registry: self.registry,
+            scope: std::mem::take(&mut self.scope),
+            scope_ids: std::mem::take(&mut self.scope_ids),
+            unresolved: std::mem::take(&mut self.unresolved),
+            unresolved_sites: std::mem::take(&mut self.unresolved_sites),
+            patterns: std::mem::take(&mut self.patterns),
+            pattern_bytes: self.pattern_bytes,
+            depth: self.depth,
+            steps: self.steps,
+            budget: self.budget,
+            halted: self.halted,
+            remembered: HashMap::new(),
+            remembered_bytes: 0,
+            cyclic: self.cyclic,
+            running: HashSet::new(),
+        }
+    }
+
+    fn rejoin(&mut self, inner: Ctx<'a, '_>) {
+        self.scope = inner.scope;
+        self.scope_ids = inner.scope_ids;
+        self.unresolved = inner.unresolved;
+        self.unresolved_sites = inner.unresolved_sites;
+        self.patterns = inner.patterns;
+        self.pattern_bytes = inner.pattern_bytes;
+        self.steps = inner.steps;
+        self.halted = inner.halted;
+    }
+}
+
+impl Ctx<'_, '_> {
+    /// Compiles `pattern` once per validation, within the pattern budget.
+    ///
+    /// Returns `None` when the budget is exhausted; validation is then
+    /// halted, so the caller only has to stop.
+    fn compile_pattern(&mut self, pattern: &str) -> Option<Result<regex::Regex, String>> {
         if let Some(hit) = self.patterns.get(pattern).cloned() {
-            return hit;
+            return Some(hit);
+        }
+        self.pattern_bytes = self.pattern_bytes.saturating_add(pattern.len());
+        if self.pattern_bytes > MAX_PATTERN_BYTES_PER_VALIDATION {
+            self.halted = Some(PATTERN_BUDGET_EXHAUSTED);
+            return None;
         }
         let compiled = regex::Regex::new(pattern).map_err(|e| e.to_string());
         self.patterns.insert(pattern.to_string(), compiled.clone());
-        compiled
+        Some(compiled)
+    }
+
+    /// Identity of the current dynamic scope, for remembered results.
+    fn scope_id(&self) -> usize {
+        self.scope.last().map_or(0, |scope| scope.id)
+    }
+
+    /// Enters `resource` into the dynamic scope. Returns whether it was
+    /// added, in which case the caller must [`Ctx::leave`] afterwards.
+    ///
+    /// Only resources declaring a `$dynamicAnchor` name that no resource
+    /// further out declares are kept, and only when some `$dynamicRef` can
+    /// consult them: the scope, and the remembered-result key built from it,
+    /// stay as short as the number of distinct names.
+    fn enter(&mut self, resource: usize) -> bool {
+        let registry = self.registry;
+        if !registry.dynamic {
+            return false;
+        }
+        let Some(declared) = registry.resources.get(resource) else {
+            return false;
+        };
+        // Only the outermost declarer of a name is ever used, so a resource
+        // whose names are all declared further out changes nothing. The
+        // scope therefore holds at most one resource per distinct name.
+        let adds_a_name = declared.dynamic_anchors.keys().any(|name| {
+            !self.scope.iter().any(|scope| {
+                registry
+                    .resources
+                    .get(scope.resource)
+                    .is_some_and(|outer| outer.dynamic_anchors.contains_key(name))
+            })
+        });
+        if !adds_a_name {
+            return false;
+        }
+        let next = self.scope_ids.len() + 1;
+        let id = *self
+            .scope_ids
+            .entry((self.scope_id(), resource))
+            .or_insert(next);
+        self.scope.push(Scope { resource, id });
+        true
+    }
+
+    fn leave(&mut self) {
+        self.scope.pop();
+    }
+}
+
+impl<'a> Ctx<'a, '_> {
+    /// The outermost `$dynamicAnchor` named `name` in the dynamic scope.
+    fn outermost_dynamic_anchor(&self, name: &str) -> Option<(&'a Value, usize)> {
+        let registry = self.registry;
+        self.scope.iter().find_map(|scope| {
+            let declared = registry.resources.get(scope.resource)?;
+            declared
+                .dynamic_anchors
+                .get(name)
+                .map(|node| (*node, scope.resource))
+        })
+    }
+
+    /// Records a `$ref`/`$dynamicRef` that resolves to nothing: an error
+    /// here, and once per reference site at the end of the validation.
+    fn unresolvable(
+        &mut self,
+        site: (usize, bool),
+        reference: &str,
+        path: &str,
+        findings: &mut Vec<Finding>,
+    ) {
+        let keyword = if site.1 { "$dynamicRef" } else { "$ref" };
+        let finding = Finding::error(
+            path,
+            format!(
+                "{keyword} {reference:?} does not resolve to a schema in this document or the \
+                 supplied schema documents (nothing is fetched); the reference was not \
+                 followed, so the value is not accepted"
+            ),
+        );
+        if self.unresolved_sites.insert(site) {
+            self.unresolved.push(finding.clone());
+        }
+        findings.push(finding);
     }
 }
 
@@ -238,17 +988,89 @@ impl Ctx<'_> {
 ///
 /// Returns every [`Finding`] (errors and warnings). Use [`has_errors`] to test
 /// whether the document violates the schema.
+///
+/// Validation is bounded. When the schema or the document is nested deeper
+/// than [`MAX_VALIDATION_NESTING_DEPTH`], when more than
+/// [`MAX_APPLICATION_DEPTH`] subschema applications nest, or when the work
+/// budget ([`VALIDATION_STEPS_PER_PAIR`]) runs out, the result is a single
+/// [`Severity::Error`] finding at `$` that says so: an unfinished validation
+/// is never reported as a clean document.
+///
+/// One case differs from validators that stop at the first matching
+/// alternative. A schema that applies itself to the same value again while
+/// that application is still running, with no step into the document in
+/// between, is such an error even when another alternative would have
+/// matched first: `a = {"anyOf": [{"type": "integer"}, {"$ref": "#/$defs/a"}]}`
+/// stops with an error for `1`, where a short-circuiting validator accepts
+/// it. Every alternative is evaluated here, and that one never finishes.
+///
+/// # References
+///
+/// `$ref` and `$dynamicRef` resolve against base URIs (RFC 3986): the root
+/// schema's base is empty, and every `$id` sets a new base for its
+/// subschema, which may be embedded anywhere in the schema. Targets are
+/// JSON-pointer fragments, `$anchor`/`$dynamicAnchor` names (scoped to the
+/// resource that declares them) and whole resources. `$dynamicRef` follows
+/// the 2020-12 dynamic scope, and `unevaluatedProperties`/`unevaluatedItems`
+/// see through it as through `$ref`. Nothing is ever fetched: to resolve a
+/// reference to another document, pass that document to
+/// [`validate_with_resources`].
+///
+/// **Fails closed.** A reference that is followed and resolves to nothing
+/// is an [`Severity::Error`] finding naming the reference, so the document is
+/// not accepted, even under `not` or beside an alternative that passes.
+/// Before this, such a `$ref` was a warning and was skipped, which accepted
+/// the value. A reference the validation never reaches is not reported.
+/// One exception keeps the old behaviour: a reference to one of the
+/// [`WELL_KNOWN_META_SCHEMAS`] that is not defined locally is a warning and
+/// is skipped, since no schema can resolve those offline.
+///
+/// Identifiers count where 2020-12 says they do: an `$id` or anchor inside
+/// instance data (`enum`, `const`, ...) or an unknown keyword is ignored.
+/// When two schema resources share a URI, the first in document order is
+/// used and a warning names the URI. When the root's `$schema` names
+/// draft-04, draft-06 or draft-07, an object holding `$ref` sets no base URI
+/// and no anchor, as those drafts ignore every keyword beside `$ref` (the
+/// root excepted, see below).
+///
+/// Resolving URIs is bounded too: more URI text than
+/// `URI_BYTES_PER_SCHEMA_BYTE` (16) per byte of schema text, plus 1 MiB,
+/// stops the validation with an error. A fragment-only reference (`#...`)
+/// costs only its fragment. The document root's `$id` names it in every
+/// dialect, even beside a draft-07 `$ref`.
 pub fn validate(document: &Value, schema: &Value) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    let mut ctx = Ctx {
-        root: schema,
-        anchors: collect_anchors(schema),
-        ref_depth: 0,
-        patterns: HashMap::new(),
-    };
-    let mut path = String::from("$");
-    validate_node(document, schema, &mut path, &mut ctx, &mut findings);
-    findings
+    run(document, schema, None).findings
+}
+
+/// Validate a document against a schema plus caller-supplied schema documents.
+///
+/// Each entry of `resources` is `(retrieval URI, schema document)`. A
+/// `$ref` to that URI, or to the document's own `$id`, resolves inside it,
+/// and references inside it resolve against its `$id`, or its retrieval URI
+/// when it has none. Nothing is fetched from the network or the file
+/// system, ever: a reference to a document that is not supplied fails
+/// closed, as described on [`validate`], which this otherwise equals. The
+/// supplied documents count toward the work budget and the nesting limit
+/// like the schema itself.
+///
+/// # Examples
+///
+/// ```
+/// use json_fast_core::schema::{has_errors, validate_with_resources};
+/// use serde_json::json;
+///
+/// let schema = json!({"$ref": "https://example.com/positive.json"});
+/// let positive = json!({"type": "integer", "minimum": 1});
+/// let resources = [("https://example.com/positive.json", &positive)];
+/// assert!(validate_with_resources(&json!(3), &schema, &resources).is_empty());
+/// assert!(has_errors(&validate_with_resources(&json!(0), &schema, &resources)));
+/// ```
+pub fn validate_with_resources(
+    document: &Value,
+    schema: &Value,
+    resources: &[(&str, &Value)],
+) -> Vec<Finding> {
+    run_with_resources(document, schema, resources, None).findings
 }
 
 /// True when any finding is an [`Severity::Error`].
@@ -257,6 +1079,15 @@ pub fn has_errors(findings: &[Finding]) -> bool {
 }
 
 /// Parse two JSON strings and validate `document` against `schema`.
+///
+/// Equivalent to [`validate`] on the parsed values, including its
+/// fail-closed handling of references that do not resolve: such a `$ref`
+/// used to be a warning and is now an error.
+///
+/// # Errors
+///
+/// Returns the parse error when either string is not JSON within the
+/// default limits.
 pub fn validate_str(document: &str, schema: &str) -> crate::Result<Vec<Finding>> {
     let doc: Value = crate::parse(document)?;
     let sch: Value = crate::parse(schema)?;
@@ -272,7 +1103,32 @@ fn validate_node<'v>(
     value: &'v Value,
     schema: &Value,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
+    findings: &mut Vec<Finding>,
+) -> Evaluated<'v> {
+    if ctx.halted.is_some() {
+        return Evaluated::default();
+    }
+    ctx.steps += 1;
+    if ctx.steps > ctx.budget {
+        ctx.halted = Some(BUDGET_EXHAUSTED);
+        return Evaluated::default();
+    }
+    if ctx.depth >= MAX_APPLICATION_DEPTH {
+        ctx.halted = Some(TOO_MANY_NESTED_APPLICATIONS);
+        return Evaluated::default();
+    }
+    ctx.depth += 1;
+    let evaluated = apply_schema(value, schema, path, ctx, findings);
+    ctx.depth -= 1;
+    evaluated
+}
+
+fn apply_schema<'v>(
+    value: &'v Value,
+    schema: &Value,
+    path: &mut String,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     match schema {
@@ -284,7 +1140,20 @@ fn validate_node<'v>(
             ));
             Evaluated::default()
         }
-        Value::Object(obj) => apply_object(value, obj, path, ctx, findings),
+        Value::Object(obj) => {
+            // A subschema with its own `$id` enters its resource.
+            let registry = ctx.registry;
+            let entered = registry.dynamic
+                && registry
+                    .roots
+                    .get(&address(schema))
+                    .is_some_and(|resource| ctx.enter(*resource));
+            let evaluated = apply_object(value, address(schema), obj, path, ctx, findings);
+            if entered {
+                ctx.leave();
+            }
+            evaluated
+        }
         _ => {
             findings.push(Finding::warning(
                 path,
@@ -301,7 +1170,7 @@ fn applying<'v>(
     value: &'v Value,
     schema: &Value,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Applied<'v> {
     let mut local = Vec::new();
@@ -319,18 +1188,123 @@ fn applying_soft<'v>(
     value: &'v Value,
     schema: &Value,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Applied<'v> {
+    applying_shared(value, schema, path, ctx, findings, true)
+}
+
+/// Applies a subschema whose outcome can be asked for again: a `$ref`
+/// target, or a candidate of `anyOf`/`oneOf`/`not`/`if`/`contains`.
+///
+/// The outcome for an array or object is remembered by (schema node,
+/// document value), so a recursive schema that offers several alternatives
+/// per level does each piece of work once instead of once per path to it.
+/// Meeting an application that is still running means the schema applies
+/// itself to the same value forever; that stops the validation.
+///
+/// With `soft`, errors feed the verdict only and warnings are surfaced.
+fn applying_shared<'v>(
+    value: &'v Value,
+    schema: &Value,
+    path: &mut String,
+    ctx: &mut Ctx<'_, 'v>,
+    findings: &mut Vec<Finding>,
+    soft: bool,
+) -> Applied<'v> {
+    let schema_address = std::ptr::from_ref(schema) as usize;
+    if !ctx.cyclic.contains(&schema_address) {
+        // Not on a `$ref` cycle: this pair cannot come up again.
+        let mut local = Vec::new();
+        let evaluated = validate_node(value, schema, path, ctx, &mut local);
+        let passed = !local.iter().any(|f| f.severity == Severity::Error);
+        if soft {
+            local.retain(|f| f.severity == Severity::Warning);
+        }
+        findings.append(&mut local);
+        return Applied { passed, evaluated };
+    }
+    let key = (schema_address, address(value), ctx.scope_id());
+    let surfaced = |finding: &Finding| !soft || finding.severity == Severity::Warning;
+    match ctx.remembered.get(&key) {
+        Some(None) => {
+            return Applied {
+                passed: true,
+                evaluated: Evaluated::default(),
+            };
+        }
+        Some(Some(known)) => {
+            findings.extend(
+                known
+                    .findings
+                    .iter()
+                    .filter(|finding| surfaced(finding))
+                    .map(|finding| Finding {
+                        severity: finding.severity,
+                        path: format!("{path}{}", finding.path),
+                        message: finding.message.clone(),
+                    }),
+            );
+            return Applied {
+                passed: known.passed,
+                evaluated: known.evaluated.clone(),
+            };
+        }
+        None => {}
+    }
+    if !ctx.running.insert(key) {
+        ctx.halted = Some(ENDLESS_SELF_APPLICATION);
+        return Applied {
+            passed: true,
+            evaluated: Evaluated::default(),
+        };
+    }
+    let base = path.len();
     let mut local = Vec::new();
     let evaluated = validate_node(value, schema, path, ctx, &mut local);
+    ctx.running.remove(&key);
     let passed = !local.iter().any(|f| f.severity == Severity::Error);
-    findings.extend(
-        local
-            .into_iter()
-            .filter(|f| f.severity == Severity::Warning),
-    );
+    let container = value.is_array() || value.is_object();
+    if container && ctx.halted.is_none() && ctx.remembered_bytes < MAX_REMEMBERED_BYTES {
+        let plain = local.is_empty() && evaluated.props.is_empty() && evaluated.items.is_empty();
+        // A map slot is about 48 bytes; the rest is what the entry owns.
+        let mut bytes = 48;
+        let entry = (!plain).then(|| {
+            let relative: Vec<Finding> = local
+                .iter()
+                .map(|finding| Finding {
+                    severity: finding.severity,
+                    path: finding.path.get(base..).unwrap_or_default().to_owned(),
+                    message: finding.message.clone(),
+                })
+                .collect();
+            bytes += 128
+                + 24 * (evaluated.props.len() + evaluated.items.len())
+                + relative
+                    .iter()
+                    .map(|f| 56 + f.path.len() + f.message.len())
+                    .sum::<usize>();
+            Box::new(Remembered {
+                passed,
+                evaluated: evaluated.clone(),
+                findings: relative,
+            })
+        });
+        ctx.remembered_bytes += bytes;
+        ctx.remembered.insert(key, entry);
+    }
+    findings.extend(local.into_iter().filter(surfaced));
     Applied { passed, evaluated }
+}
+
+/// Reads a keyword whose value is a count. The specification allows any
+/// number with an integral value, so `1.0` is 1.
+fn count_keyword(obj: &Map<String, Value>, key: &str) -> Option<u64> {
+    let value = obj.get(key)?;
+    value.as_u64().or_else(|| {
+        let float = value.as_f64()?;
+        (float >= 0.0 && float.fract() == 0.0 && float < 1.8e19).then_some(float as u64)
+    })
 }
 
 /// Concat `<path>/<n>` into the buffer without allocating.
@@ -353,9 +1327,10 @@ fn push_index(path: &mut String, index: usize) {
 
 fn apply_object<'v>(
     value: &'v Value,
+    schema_address: usize,
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     // Classify every keyword first: anything this validator neither applies
@@ -386,24 +1361,39 @@ fn apply_object<'v>(
         return evaluated;
     }
 
-    if let Some(reference) = obj.get("$ref").and_then(|r| r.as_str()) {
-        match resolve_ref(reference, ctx) {
-            Some(target) if ctx.ref_depth < MAX_REF_DEPTH => {
-                ctx.ref_depth += 1;
-                let applied = applying(value, target, path, ctx, findings);
-                ctx.ref_depth -= 1;
-                if applied.passed {
-                    evaluated.merge(&applied.evaluated);
-                }
+    for (keyword, dynamic) in [("$ref", false), ("$dynamicRef", true)] {
+        let Some(reference) = obj.get(keyword).and_then(Value::as_str) else {
+            continue;
+        };
+        let registry = ctx.registry;
+        let site = (schema_address, dynamic);
+        let Some(Some(target)) = registry.references.get(&site) else {
+            if registry.meta_schema_sites.contains(&site) {
+                findings.push(Finding::warning(
+                    path,
+                    format!(
+                        "{keyword} {reference:?} names a JSON Schema meta-schema, which is not \
+                         bundled; skipped (supply it to validate_with_resources to apply it)"
+                    ),
+                ));
+            } else {
+                ctx.unresolvable(site, reference, path, findings);
             }
-            Some(_) => findings.push(Finding::warning(
-                path,
-                format!("$ref {reference:?} exceeds the recursion budget; skipped"),
-            )),
-            None => findings.push(Finding::warning(
-                path,
-                format!("$ref {reference:?} does not resolve in this document; skipped"),
-            )),
+            continue;
+        };
+        // A `$dynamicRef` to a `$dynamicAnchor` leads to the outermost
+        // resource in the dynamic scope that declares the same name.
+        let (node, resource) = target
+            .dynamic
+            .and_then(|name| ctx.outermost_dynamic_anchor(name))
+            .unwrap_or((target.node, target.resource));
+        let entered = ctx.enter(resource);
+        let applied = applying_shared(value, node, path, ctx, findings, false);
+        if entered {
+            ctx.leave();
+        }
+        if applied.passed {
+            evaluated.merge(&applied.evaluated);
         }
     }
 
@@ -428,7 +1418,7 @@ fn apply_object<'v>(
 
     evaluated.merge(&check_combinators(value, obj, path, ctx, findings));
 
-    check_unevaluated(value, obj, path, ctx, &evaluated, findings);
+    check_unevaluated(value, obj, path, ctx, &mut evaluated, findings);
 
     evaluated
 }
@@ -568,7 +1558,14 @@ fn check_numeric(n: f64, obj: &Map<String, Value>, path: &str, findings: &mut Ve
         if m > 0.0 && m.is_finite() {
             let quotient = n / m;
             let epsilon = 1e-9 * quotient.abs().max(1.0);
-            if (quotient - quotient.round()).abs() > epsilon {
+            let off = if quotient.is_finite() {
+                (quotient - quotient.round()).abs() > epsilon
+            } else {
+                // The division overflowed; the remainder is still exact.
+                let remainder = (n % m).abs();
+                remainder > 1e-9 * m && m - remainder > 1e-9 * m
+            };
+            if off {
                 findings.push(Finding::error(
                     path,
                     format!("{n} is not a multiple of {m}"),
@@ -587,11 +1584,11 @@ fn check_string(
     s: &str,
     obj: &Map<String, Value>,
     path: &str,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, '_>,
     findings: &mut Vec<Finding>,
 ) {
     let len = s.chars().count() as u64;
-    if let Some(min) = obj.get("minLength").and_then(|m| m.as_u64()) {
+    if let Some(min) = count_keyword(obj, "minLength") {
         if len < min {
             findings.push(Finding::error(
                 path,
@@ -599,7 +1596,7 @@ fn check_string(
             ));
         }
     }
-    if let Some(max) = obj.get("maxLength").and_then(|m| m.as_u64()) {
+    if let Some(max) = count_keyword(obj, "maxLength") {
         if len > max {
             findings.push(Finding::error(
                 path,
@@ -609,7 +1606,7 @@ fn check_string(
     }
     if let Some(p) = obj.get("pattern").and_then(|p| p.as_str()) {
         match ctx.compile_pattern(p) {
-            Ok(re) => {
+            Some(Ok(re)) => {
                 if !re.is_match(s) {
                     findings.push(Finding::error(
                         path,
@@ -617,14 +1614,28 @@ fn check_string(
                     ));
                 }
             }
-            Err(e) => findings.push(Finding::warning(
+            Some(Err(e)) => findings.push(Finding::warning(
                 path,
                 format!("invalid pattern {p:?}: {e}"),
             )),
+            None => return,
         }
     }
     if let Some(f) = obj.get("format").and_then(|f| f.as_str()) {
-        match check_format(f, s) {
+        // `regex` compiles a string from the document: it goes through the
+        // same cache and budget as the schema's own patterns.
+        let checked = if f == "regex" {
+            match ctx.compile_pattern(s) {
+                Some(Ok(_)) => Ok(()),
+                Some(Err(e)) => Err(FormatError::Violation(format!(
+                    "not a valid regular expression: {e}"
+                ))),
+                None => return,
+            }
+        } else {
+            check_format(f, s)
+        };
+        match checked {
             Ok(()) => {}
             Err(FormatError::Unimplemented) => findings.push(Finding::warning(
                 path,
@@ -645,7 +1656,7 @@ fn check_item<'v>(
     subschema: &Value,
     index: usize,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
     evaluated: &mut Evaluated<'v>,
 ) {
@@ -654,23 +1665,24 @@ fn check_item<'v>(
     push_index(path, index);
     let applied = applying(item, subschema, path, ctx, findings);
     path.truncate(saved);
-    if applied.passed {
-        evaluated.items.insert(index);
-        evaluated.merge(&applied.evaluated);
-    }
+    // The index is covered by this keyword whether or not the item is valid
+    // (an invalid item fails the array on its own); what the item evaluated
+    // inside itself belongs to the item, not to this array.
+    let _ = applied;
+    evaluated.items.insert(index);
 }
 
 fn check_array<'v>(
     arr: &'v [Value],
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     let mut evaluated = Evaluated::default();
     let len = arr.len() as u64;
 
-    if let Some(min) = obj.get("minItems").and_then(|m| m.as_u64()) {
+    if let Some(min) = count_keyword(obj, "minItems") {
         if len < min {
             findings.push(Finding::error(
                 path,
@@ -678,7 +1690,7 @@ fn check_array<'v>(
             ));
         }
     }
-    if let Some(max) = obj.get("maxItems").and_then(|m| m.as_u64()) {
+    if let Some(max) = count_keyword(obj, "maxItems") {
         if len > max {
             findings.push(Finding::error(
                 path,
@@ -687,7 +1699,9 @@ fn check_array<'v>(
         }
     }
 
-    check_unique_items(arr, path, findings);
+    if obj.get("uniqueItems").and_then(Value::as_bool) == Some(true) {
+        check_unique_items(arr, path, findings);
+    }
 
     // items / prefixItems / additionalItems cover the array positions; every
     // subschema that passes marks its position as evaluated.
@@ -779,13 +1793,15 @@ fn hash_value(value: &Value) -> u64 {
             Value::Bool(false) => mix_u64(h, 0x02),
             Value::Number(n) => {
                 mix_u64(h, 0x03);
-                let f = n.as_f64().unwrap_or(f64::NAN);
-                let bits = if f == 0.0 {
-                    0.0f64.to_bits()
+                // Integers (and floats holding one) hash by their exact
+                // value, as they compare: through f64, the integers near
+                // 2^64 would all land in a few buckets.
+                if let Some(integer) = exact_integer(n) {
+                    mix(h, integer as u64);
+                    mix(h, (integer >> 64) as u64);
                 } else {
-                    f.to_bits()
-                };
-                mix(h, bits);
+                    mix(h, n.as_f64().unwrap_or(f64::NAN).to_bits());
+                }
             }
             Value::String(s) => {
                 mix_u64(h, 0x04);
@@ -803,9 +1819,8 @@ fn hash_value(value: &Value) -> u64 {
             }
             Value::Object(map) => {
                 mix_u64(h, 0x06);
-                // preserve_order makes map iteration insertion-ordered, but
-                // JSON Schema object equality ignores member order. Combine
-                // per-member hashes commutatively without sorting/allocating.
+                // Members are hashed one by one and summed, so two objects
+                // that differ only in key order hash alike, as they compare.
                 let mut members = 0u64;
                 for (key, entry) in map {
                     let mut member = FNV_OFFSET;
@@ -816,7 +1831,6 @@ fn hash_value(value: &Value) -> u64 {
                     walk(&mut member, entry);
                     members = members.wrapping_add(member);
                 }
-                mix(h, map.len() as u64);
                 mix(h, members);
             }
         }
@@ -832,7 +1846,7 @@ fn check_contains<'v>(
     arr: &'v [Value],
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
     evaluated: &mut Evaluated<'v>,
 ) {
@@ -848,13 +1862,12 @@ fn check_contains<'v>(
         path.truncate(saved);
         if applied.passed {
             matched.push(i);
-            evaluated.merge(&applied.evaluated);
             evaluated.items.insert(i);
         }
     }
 
-    let min_contains = obj.get("minContains").and_then(|m| m.as_u64()).unwrap_or(1);
-    let max_contains = obj.get("maxContains").and_then(|m| m.as_u64());
+    let min_contains = count_keyword(obj, "minContains").unwrap_or(1);
+    let max_contains = count_keyword(obj, "maxContains");
 
     // minContains: 0 makes `contains` itself always pass.
     let enough = min_contains == 0 || matched.len() as u64 >= min_contains;
@@ -887,7 +1900,7 @@ fn check_prop<'v>(
     value: &'v Value,
     subschema: &Value,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
     evaluated: &mut Evaluated<'v>,
 ) {
@@ -896,10 +1909,11 @@ fn check_prop<'v>(
     path.push_str(key);
     let applied = applying(value, subschema, path, ctx, findings);
     path.truncate(saved);
-    if applied.passed {
-        evaluated.props.insert(key);
-        evaluated.merge(&applied.evaluated);
-    }
+    // The name is covered by this keyword whether or not its value is valid
+    // (an invalid value fails the object on its own); what the value
+    // evaluated inside itself belongs to the value, not to this object.
+    let _ = applied;
+    evaluated.props.insert(key);
 }
 
 fn check_object<'v>(
@@ -907,13 +1921,13 @@ fn check_object<'v>(
     map: &'v Map<String, Value>,
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     let mut evaluated = Evaluated::default();
     let size = map.len() as u64;
 
-    if let Some(min) = obj.get("minProperties").and_then(|m| m.as_u64()) {
+    if let Some(min) = count_keyword(obj, "minProperties") {
         if size < min {
             findings.push(Finding::error(
                 path,
@@ -921,7 +1935,7 @@ fn check_object<'v>(
             ));
         }
     }
-    if let Some(max) = obj.get("maxProperties").and_then(|m| m.as_u64()) {
+    if let Some(max) = count_keyword(obj, "maxProperties") {
         if size > max {
             findings.push(Finding::error(
                 path,
@@ -960,13 +1974,14 @@ fn check_object<'v>(
     if let Some(pp) = obj.get("patternProperties").and_then(|p| p.as_object()) {
         for (pattern, subschema) in pp {
             match ctx.compile_pattern(pattern) {
-                Ok(re) => patterns.push((re, subschema)),
-                Err(e) => {
+                Some(Ok(re)) => patterns.push((re, subschema)),
+                Some(Err(e)) => {
                     findings.push(Finding::warning(
                         path,
                         format!("invalid patternProperty pattern {pattern:?}: {e}"),
                     ));
                 }
+                None => return evaluated,
             }
         }
         for key in map.keys() {
@@ -986,10 +2001,13 @@ fn check_object<'v>(
         }
     }
 
+    let declared = obj.get("properties").and_then(|p| p.as_object());
     let unmatched = || -> Vec<&String> {
         map.keys()
             .filter(|key| {
-                !evaluated.props.contains(key.as_str())
+                // A declared property is matched whether or not its value
+                // is valid; only undeclared names are "additional".
+                !declared.is_some_and(|names| names.contains_key(key.as_str()))
                     && !patterns.iter().any(|(re, _)| re.is_match(key))
             })
             .collect()
@@ -1038,7 +2056,11 @@ fn check_object<'v>(
                 slot.clear();
                 slot.push_str(key);
             }
-            applying(&scratch, names, path, ctx, findings);
+            // The scratch value does not live as long as the document, so
+            // it is validated through a context of its own lifetime.
+            let mut inner = ctx.fork();
+            applying(&scratch, names, path, &mut inner, findings);
+            ctx.rejoin(inner);
             path.truncate(saved);
         }
     }
@@ -1114,7 +2136,7 @@ fn check_combinators<'v>(
     value: &'v Value,
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Ctx<'_, 'v>,
     findings: &mut Vec<Finding>,
 ) -> Evaluated<'v> {
     let mut evaluated = Evaluated::default();
@@ -1144,8 +2166,10 @@ fn check_combinators<'v>(
             if applied.passed {
                 passes += 1;
             }
-            // anyOf collects annotations from every branch, passing or not.
-            branch_evaluated.merge(&applied.evaluated);
+            // anyOf collects annotations from every branch that passed.
+            if applied.passed {
+                branch_evaluated.merge(&applied.evaluated);
+            }
         }
         if passes == 0 {
             findings.push(Finding::error(
@@ -1184,16 +2208,9 @@ fn check_combinators<'v>(
     }
 
     if let Some(not_schema) = obj.get("not") {
-        let mut local = Vec::new();
-        let _ = validate_node(value, not_schema, path, ctx, &mut local);
-        let passed = !local.iter().any(|f| f.severity == Severity::Error);
         // `not` contributes no annotations; a skipped check inside still
         // warns, because the verdict is then uncertain.
-        findings.extend(
-            local
-                .into_iter()
-                .filter(|f| f.severity == Severity::Warning),
-        );
+        let passed = applying_soft(value, not_schema, path, ctx, findings).passed;
         if passed {
             findings.push(Finding::error(path, "value matches the `not` schema"));
         }
@@ -1226,19 +2243,22 @@ fn check_unevaluated<'v>(
     value: &'v Value,
     obj: &Map<String, Value>,
     path: &mut String,
-    ctx: &mut Ctx<'_>,
-    evaluated_total: &Evaluated<'v>,
+    ctx: &mut Ctx<'_, 'v>,
+    evaluated_total: &mut Evaluated<'v>,
     findings: &mut Vec<Finding>,
 ) {
     if let Some(subschema) = obj.get("unevaluatedProperties") {
         if let Some(map) = value.as_object() {
-            for key in map.keys() {
+            for (key, member) in map {
                 if !evaluated_total.props.contains(key.as_str()) {
                     let saved = path.len();
                     path.push('/');
                     path.push_str(key);
-                    applying(&map[key], subschema, path, ctx, findings);
+                    applying(member, subschema, path, ctx, findings);
                     path.truncate(saved);
+                    // This keyword has now evaluated the property, which
+                    // an enclosing `unevaluatedProperties` must see.
+                    evaluated_total.props.insert(key.as_str());
                 }
             }
         }
@@ -1253,6 +2273,7 @@ fn check_unevaluated<'v>(
                     push_index(path, i);
                     applying(item, subschema, path, ctx, findings);
                     path.truncate(saved);
+                    evaluated_total.items.insert(i);
                 }
             }
         }
@@ -1290,39 +2311,26 @@ fn json_equal(a: &Value, b: &Value) -> bool {
 }
 
 fn numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
-    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
-        return x == y;
+    // Integers, and floats that hold an integer, are compared exactly:
+    // 2^53 + 1 and 2^53 are different numbers that share one f64.
+    match (exact_integer(a), exact_integer(b)) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => a.as_f64() == b.as_f64(),
+        _ => false,
     }
-    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
-        return x == y;
+}
+
+/// The value of `n` as an integer, when it is one.
+fn exact_integer(n: &serde_json::Number) -> Option<i128> {
+    if let Some(value) = n.as_i64() {
+        return Some(i128::from(value));
     }
-    if let (Some(x), Some(y)) = (a.as_i64(), b.as_u64()) {
-        return x >= 0 && x as u64 == y;
+    if let Some(value) = n.as_u64() {
+        return Some(i128::from(value));
     }
-    if let (Some(x), Some(y)) = (a.as_u64(), b.as_i64()) {
-        return y >= 0 && x == y as u64;
-    }
-    // Never round an integer to f64 for equality: distinct integers above
-    // 2^53 can collapse to the same float. Bounds are exclusive at 2^63/2^64
-    // because Rust float-to-integer casts saturate at those boundaries.
-    fn integer_float_equal(integer: &serde_json::Number, float: f64) -> bool {
-        if float.fract() != 0.0 {
-            return false;
-        }
-        if let Some(value) = integer.as_i64() {
-            return (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&float)
-                && float as i64 == value;
-        }
-        integer.as_u64().is_some_and(|value| {
-            (0.0..18_446_744_073_709_551_616.0).contains(&float) && float as u64 == value
-        })
-    }
-    match (a.is_f64(), b.is_f64()) {
-        (true, true) => a.as_f64() == b.as_f64(),
-        (false, true) => integer_float_equal(a, b.as_f64().unwrap()),
-        (true, false) => integer_float_equal(b, a.as_f64().unwrap()),
-        (false, false) => false,
-    }
+    let float = n.as_f64()?;
+    // Every f64 of this magnitude with no fraction converts exactly.
+    (float.is_finite() && float.fract() == 0.0 && float.abs() < 1e38).then_some(float as i128)
 }
 
 fn type_matches(value: &Value, type_name: &str) -> bool {
@@ -1344,73 +2352,758 @@ fn type_matches(value: &Value, type_name: &str) -> bool {
     }
 }
 
-/// Walk the root schema and record every `$anchor` (and `$id` in plain-name
-/// fragment form) so `$ref: "#name"` resolves. Runs once per `validate`.
-fn collect_anchors(root: &Value) -> HashMap<&str, &Value> {
-    let mut anchors = HashMap::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        let Some(obj) = node.as_object() else {
-            continue;
-        };
-        for name in [
-            obj.get("$anchor").and_then(Value::as_str),
-            obj.get("$id")
-                .and_then(Value::as_str)
-                .and_then(|id| id.strip_prefix('#')),
+/// Keywords whose values are maps from names to subschemas.
+const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "dependencies",
+];
+
+/// Keywords whose value is a subschema or an array of subschemas.
+///
+/// Identifiers count only inside these and [`SCHEMA_MAP_KEYWORDS`]: an `$id`
+/// or anchor inside instance data (`enum`, `const`, ...) or inside an
+/// unknown keyword does not identify a schema (2020-12, section 9.4.2).
+const SCHEMA_KEYWORDS: &[&str] = &[
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "items",
+    "prefixItems",
+    "additionalItems",
+    "contains",
+    "additionalProperties",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "contentSchema",
+];
+
+/// The JSON Schema meta-schemas, which no schema can resolve offline.
+///
+/// A `$ref` or `$dynamicRef` to one of these that the schema and the
+/// supplied documents do not define keeps the behaviour from before
+/// references failed closed: a [`Severity::Warning`], and the reference is
+/// skipped. Each entry matches with the `http` or `https` scheme and with any
+/// fragment or none (`...schema`, `...schema#`, `...schema#/definitions/x`).
+/// Supplying the document to [`validate_with_resources`] resolves the
+/// reference normally instead.
+pub const WELL_KNOWN_META_SCHEMAS: &[&str] = &[
+    "json-schema.org/draft-04/schema",
+    "json-schema.org/draft-06/schema",
+    "json-schema.org/draft-07/schema",
+    "json-schema.org/draft/2019-09/schema",
+    "json-schema.org/draft/2019-09/meta/core",
+    "json-schema.org/draft/2019-09/meta/applicator",
+    "json-schema.org/draft/2019-09/meta/validation",
+    "json-schema.org/draft/2019-09/meta/meta-data",
+    "json-schema.org/draft/2019-09/meta/format",
+    "json-schema.org/draft/2019-09/meta/content",
+    "json-schema.org/draft/2020-12/schema",
+    "json-schema.org/draft/2020-12/meta/core",
+    "json-schema.org/draft/2020-12/meta/applicator",
+    "json-schema.org/draft/2020-12/meta/unevaluated",
+    "json-schema.org/draft/2020-12/meta/validation",
+    "json-schema.org/draft/2020-12/meta/meta-data",
+    "json-schema.org/draft/2020-12/meta/format-annotation",
+    "json-schema.org/draft/2020-12/meta/format-assertion",
+    "json-schema.org/draft/2020-12/meta/content",
+];
+
+/// Whether `uri` (absolute, fragment allowed) names a well-known meta-schema.
+fn is_well_known_meta_schema(uri: &str) -> bool {
+    let without = uri.split_once('#').map_or(uri, |(before, _)| before);
+    let Some(rest) = without
+        .strip_prefix("https://")
+        .or_else(|| without.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    WELL_KNOWN_META_SCHEMAS.contains(&rest)
+}
+
+/// Whether a `$schema` value names draft-04, draft-06 or draft-07, where
+/// every keyword beside `$ref` is ignored, `$id` included.
+fn is_legacy_dialect(schema: &str) -> bool {
+    let without = schema.split_once('#').map_or(schema, |(before, _)| before);
+    ["draft-04", "draft-06", "draft-07"].iter().any(|draft| {
+        [
+            format!("http://json-schema.org/{draft}/schema"),
+            format!("https://json-schema.org/{draft}/schema"),
         ]
-        .into_iter()
-        .flatten()
-        .filter(|name| !name.is_empty())
-        {
-            anchors.entry(name).or_insert(node);
+        .contains(&without.to_owned())
+    })
+}
+
+/// Most bytes of resolved URI text one validation may hold or build, per
+/// byte of text in the schema and the supplied documents.
+///
+/// A resource's URI repeats its base, so a long base under many relative
+/// `$id`s would otherwise cost the product of the two. 16 leaves room for
+/// ordinary schemas (bases of about 100 bytes under short `$id`s use 4 to 8)
+/// while keeping the registry a small multiple of the schema.
+const URI_BYTES_PER_SCHEMA_BYTE: usize = 16;
+
+/// URI bytes allowed beyond [`URI_BYTES_PER_SCHEMA_BYTE`], so a small schema
+/// with a few long URIs is never refused.
+const URI_BYTES_ALLOWANCE: usize = 1 << 20;
+
+/// Why validation stopped at the URI budget.
+const URI_BUDGET_EXHAUSTED: &str = "validation stopped: resolving the schema's `$id`s and \
+     references needs more URI text than the schema's size allows (a long base URI repeated \
+     under many relative `$id`s); the document was not validated";
+
+/// What a value inside a schema document is, for finding identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// A schema or an array of schemas: `$id` and anchors here count.
+    Schema,
+    /// A map from names to schemas (`properties`, `$defs`, ...).
+    SchemaMap,
+    /// Instance data or the value of an unknown keyword: nothing here
+    /// identifies a schema, though a `$ref` here is still followed if a
+    /// reference leads into it.
+    Other,
+}
+
+/// One schema resource: a document root, or a subschema with its own `$id`.
+#[derive(Debug)]
+struct Resource<'s> {
+    /// Absolute URI without fragment; empty for a root schema without `$id`.
+    uri: String,
+    /// The schema the URI names.
+    root: &'s Value,
+    /// Plain-name fragments: `$anchor`, `$dynamicAnchor` and the legacy
+    /// `$id: "#name"` form.
+    anchors: HashMap<&'s str, &'s Value>,
+    /// `$dynamicAnchor` names only.
+    dynamic_anchors: HashMap<&'s str, &'s Value>,
+}
+
+impl<'s> Resource<'s> {
+    fn new(uri: String, root: &'s Value) -> Self {
+        Self {
+            uri,
+            root,
+            anchors: HashMap::new(),
+            dynamic_anchors: HashMap::new(),
         }
-        // Traverse schema locations only: annotation/instance data such as
-        // `const`, `enum`, `default` and `examples` cannot declare anchors.
-        for (keyword, child) in obj {
-            match keyword.as_str() {
-                "$defs" | "definitions" | "properties" | "patternProperties"
-                | "dependentSchemas" | "dependencies" => {
-                    if let Some(map) = child.as_object() {
-                        stack.extend(map.values());
-                    }
+    }
+}
+
+/// Where one `$ref` or `$dynamicRef` leads before the dynamic scope is
+/// consulted.
+#[derive(Debug, Clone, Copy)]
+struct Target<'s> {
+    /// The subschema the reference names.
+    node: &'s Value,
+    /// The resource that subschema belongs to.
+    resource: usize,
+    /// For a `$dynamicRef` whose target declares the same `$dynamicAnchor`:
+    /// that name, to be looked up in the dynamic scope.
+    dynamic: Option<&'s str>,
+}
+
+/// A `$ref` or `$dynamicRef` found while registering, resolved once every
+/// resource is known.
+struct Site<'s> {
+    address: usize,
+    reference: &'s str,
+    resource: usize,
+    dynamic: bool,
+}
+
+/// Every schema resource, anchor and reference target of one validation.
+///
+/// Built once per validation, in one document-order pass over the schema
+/// and the supplied documents plus one resolution per reference. Time and
+/// memory are linear in their size: URI text is charged to a budget of
+/// [`URI_BYTES_PER_SCHEMA_BYTE`] per byte of schema text, and each URI is
+/// held once. JSON-pointer fragments are not enumerated; each reference's
+/// pointer is walked once, here.
+#[derive(Debug, Default)]
+struct Registry<'s> {
+    resources: Vec<Resource<'s>>,
+    /// Hash of an absolute URI (no fragment) -> resources with that hash;
+    /// the URI text itself is held once, in the resource.
+    by_uri: HashMap<u64, Vec<usize>>,
+    hasher: std::hash::RandomState,
+    /// Retrieval URIs of supplied documents whose own `$id` differs.
+    aliases: HashMap<String, usize>,
+    /// Address of a resource's root schema -> resource.
+    roots: HashMap<usize, usize>,
+    /// (address of the schema object, whether it is `$dynamicRef`) -> where
+    /// the reference leads, `None` when it resolves to nothing.
+    references: HashMap<(usize, bool), Option<Target<'s>>>,
+    /// Unresolved reference sites that name a well-known meta-schema.
+    meta_schema_sites: HashSet<(usize, bool)>,
+    /// Every subschema declaring a `$dynamicAnchor`, by name: the places a
+    /// `$dynamicRef` to that name can lead.
+    dynamic_targets: HashMap<&'s str, Vec<&'s Value>>,
+    /// For each name a dynamic `$dynamicRef` uses: anchor address -> the
+    /// next anchor of that name, closing a ring through all of them.
+    dynamic_ring: HashMap<usize, &'s Value>,
+    /// Whether any `$dynamicRef` consults the dynamic scope.
+    dynamic: bool,
+    /// Schema-level notes, reported as warnings at `$`.
+    warnings: Vec<String>,
+    /// URI bytes held or built so far, and the most allowed.
+    uri_bytes: usize,
+    uri_budget: usize,
+}
+
+fn address(value: &Value) -> usize {
+    std::ptr::from_ref(value) as usize
+}
+
+/// Bytes of string and key text in `root`, without recursion.
+fn text_bytes(root: &Value) -> usize {
+    let mut bytes = 0usize;
+    let mut pending: Vec<&Value> = vec![root];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::String(text) => bytes = bytes.saturating_add(text.len()),
+            Value::Array(items) => pending.extend(items),
+            Value::Object(map) => {
+                for (key, member) in map {
+                    bytes = bytes.saturating_add(key.len());
+                    pending.push(member);
                 }
-                "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
-                    if let Some(array) = child.as_array() {
-                        stack.extend(array);
-                    }
+            }
+            _ => {}
+        }
+    }
+    bytes
+}
+
+impl<'s> Registry<'s> {
+    /// Registers `root` (base URI empty) and each `(retrieval URI, document)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason to report when the URI budget runs out.
+    fn build(root: &'s Value, documents: &[(&str, &'s Value)]) -> Result<Self, &'static str> {
+        let text = documents
+            .iter()
+            .fold(text_bytes(root), |sum, (uri, document)| {
+                sum.saturating_add(uri.len())
+                    .saturating_add(text_bytes(document))
+            });
+        let mut registry = Self {
+            uri_budget: text
+                .saturating_mul(URI_BYTES_PER_SCHEMA_BYTE)
+                .saturating_add(URI_BYTES_ALLOWANCE),
+            ..Self::default()
+        };
+        let mut sites = Vec::new();
+        registry.register(root, "", &mut sites)?;
+        for (uri, document) in documents {
+            registry.register(document, uri, &mut sites)?;
+        }
+        let mut live: HashSet<&'s str> = HashSet::new();
+        for site in sites {
+            let key = (site.address, site.dynamic);
+            let base = registry
+                .resources
+                .get(site.resource)
+                .map_or("", |declared| declared.uri.as_str());
+            let (target, meta_schema) = if let Some(fragment) = site.reference.strip_prefix('#') {
+                // A fragment-only reference names the site's own resource:
+                // no URI is built, and only the fragment is charged.
+                let meta_schema = is_well_known_meta_schema(base);
+                registry.charge(fragment.len())?;
+                (
+                    registry.resolve_in(site.resource, fragment, site.dynamic),
+                    meta_schema,
+                )
+            } else {
+                let absolute = resolve_uri(site.reference, base);
+                registry.charge(absolute.len())?;
+                (
+                    registry.resolve(&absolute, site.dynamic),
+                    is_well_known_meta_schema(&absolute),
+                )
+            };
+            if target.is_none() && meta_schema {
+                registry.meta_schema_sites.insert(key);
+            }
+            live.extend(target.and_then(|target| target.dynamic));
+            registry.references.insert(key, target);
+        }
+        registry.dynamic = !live.is_empty();
+        for name in live {
+            let Some(anchors) = registry.dynamic_targets.get(name) else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            let distinct: Vec<&'s Value> = anchors
+                .iter()
+                .copied()
+                .filter(|anchor| seen.insert(address(anchor)))
+                .collect();
+            if distinct.len() < 2 {
+                continue;
+            }
+            let next = distinct.iter().cycle().skip(1);
+            for (anchor, following) in distinct.iter().zip(next) {
+                registry.dynamic_ring.insert(address(anchor), following);
+            }
+        }
+        Ok(registry)
+    }
+
+    /// Counts `bytes` of URI text against the budget.
+    fn charge(&mut self, bytes: usize) -> Result<(), &'static str> {
+        self.uri_bytes = self.uri_bytes.saturating_add(bytes);
+        if self.uri_bytes > self.uri_budget {
+            return Err(URI_BUDGET_EXHAUSTED);
+        }
+        Ok(())
+    }
+
+    /// The resource registered under `uri` (no fragment).
+    fn lookup(&self, uri: &str) -> Option<usize> {
+        self.by_uri
+            .get(&self.hasher.hash_one(uri))
+            .and_then(|candidates| {
+                candidates.iter().copied().find(|index| {
+                    self.resources
+                        .get(*index)
+                        .is_some_and(|resource| resource.uri == uri)
+                })
+            })
+            .or_else(|| self.aliases.get(uri).copied())
+    }
+
+    /// Names document `index` by its URI and, when its own `$id` replaced
+    /// it, by its retrieval URI as well.
+    fn name_document(&mut self, index: usize, retrieval: &str) {
+        let Some(own) = self
+            .resources
+            .get(index)
+            .map(|resource| resource.uri.clone())
+        else {
+            return;
+        };
+        self.name(&own, index);
+        if own != retrieval {
+            match self.lookup(retrieval) {
+                Some(existing) if existing != index => self.warnings.push(format!(
+                    "two schema resources have the URI {retrieval:?}; references to it use \
+                     the first in document order"
+                )),
+                Some(_) => {}
+                None => {
+                    self.aliases.insert(retrieval.to_owned(), index);
                 }
-                "items" => match child {
-                    Value::Array(array) => stack.extend(array),
-                    _ => stack.push(child),
-                },
-                "additionalItems"
-                | "additionalProperties"
-                | "unevaluatedItems"
-                | "unevaluatedProperties"
-                | "contains"
-                | "propertyNames"
-                | "not"
-                | "if"
-                | "then"
-                | "else"
-                | "contentSchema" => stack.push(child),
-                _ => {}
             }
         }
     }
-    anchors
+
+    /// Registers `uri` for `resource`; the first resource in document order
+    /// keeps a URI, and a second one is reported.
+    fn name(&mut self, uri: &str, resource: usize) {
+        match self.lookup(uri) {
+            Some(existing) if existing != resource => self.warnings.push(format!(
+                "two schema resources have the URI {uri:?}; references to it use the first \
+                 in document order"
+            )),
+            Some(_) => {}
+            None => self
+                .by_uri
+                .entry(self.hasher.hash_one(uri))
+                .or_default()
+                .push(resource),
+        }
+    }
+
+    /// Records the resources, anchors and reference sites of one document,
+    /// in document order.
+    fn register(
+        &mut self,
+        document: &'s Value,
+        retrieval: &str,
+        sites: &mut Vec<Site<'s>>,
+    ) -> Result<(), &'static str> {
+        let uri = without_fragment(&resolve_uri(retrieval, ""));
+        self.charge(uri.len())?;
+        let index = self.resources.len();
+        self.resources.push(Resource::new(uri.clone(), document));
+        self.roots.insert(address(document), index);
+        if !document.is_object() {
+            self.name(&uri, index);
+        }
+        let legacy = document
+            .get("$schema")
+            .and_then(Value::as_str)
+            .is_some_and(is_legacy_dialect);
+        let mut pending: Vec<(&'s Value, usize, Role)> = vec![(document, index, Role::Schema)];
+        while let Some((node, mut resource, role)) = pending.pop() {
+            match node {
+                Value::Array(items) => {
+                    // Reversed onto the stack, so they are taken in order.
+                    pending.extend(
+                        items
+                            .iter()
+                            .rev()
+                            .filter(|item| item.is_object() || item.is_array())
+                            .map(|item| (item, resource, role)),
+                    );
+                }
+                Value::Object(map) => {
+                    if role == Role::Schema {
+                        let document_root = std::ptr::eq(node, document);
+                        // Draft-07 and older ignore every keyword beside
+                        // `$ref`, `$id` included. The document root is
+                        // exempt: generators put `$id` beside a root `$ref`,
+                        // and its `$id` names the document in every dialect.
+                        if document_root || !(legacy && map.contains_key("$ref")) {
+                            resource = self.identify(node, map, resource, document_root)?;
+                        }
+                        if document_root {
+                            self.name_document(index, &uri);
+                        }
+                    }
+                    for (keyword, dynamic) in [("$ref", false), ("$dynamicRef", true)] {
+                        if let Some(reference) = map.get(keyword).and_then(Value::as_str) {
+                            sites.push(Site {
+                                address: address(node),
+                                reference,
+                                resource,
+                                dynamic,
+                            });
+                        }
+                    }
+                    for (key, child) in map.iter().rev() {
+                        if !(child.is_object() || child.is_array()) {
+                            continue;
+                        }
+                        let child_role = match role {
+                            Role::Other => Role::Other,
+                            Role::SchemaMap => Role::Schema,
+                            Role::Schema if SCHEMA_MAP_KEYWORDS.contains(&key.as_str()) => {
+                                Role::SchemaMap
+                            }
+                            Role::Schema if SCHEMA_KEYWORDS.contains(&key.as_str()) => Role::Schema,
+                            Role::Schema => Role::Other,
+                        };
+                        pending.push((child, resource, child_role));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies one schema object's `$id`, `$anchor` and `$dynamicAnchor`;
+    /// returns the resource the object belongs to.
+    fn identify(
+        &mut self,
+        node: &'s Value,
+        map: &'s Map<String, Value>,
+        mut resource: usize,
+        document_root: bool,
+    ) -> Result<usize, &'static str> {
+        if let Some(id) = map.get("$id").and_then(Value::as_str) {
+            if let Some(name) = id.strip_prefix('#') {
+                // The draft-06/07 plain-name form is an anchor.
+                self.anchor(resource, name, node, false);
+            } else {
+                let base = self
+                    .resources
+                    .get(resource)
+                    .map_or("", |declared| declared.uri.as_str());
+                let uri = without_fragment(&resolve_uri(id, base));
+                let same = uri == base;
+                self.charge(uri.len())?;
+                if document_root {
+                    // A supplied document's own `$id` names it as well as
+                    // its retrieval URI, and is the base inside it.
+                    if let Some(declared) = self.resources.get_mut(resource) {
+                        declared.uri = uri;
+                    }
+                } else if !same {
+                    let index = self.resources.len();
+                    self.name(&uri, index);
+                    self.resources.push(Resource::new(uri, node));
+                    self.roots.insert(address(node), index);
+                    resource = index;
+                }
+            }
+        }
+        if let Some(name) = map.get("$anchor").and_then(Value::as_str) {
+            self.anchor(resource, name, node, false);
+        }
+        if let Some(name) = map.get("$dynamicAnchor").and_then(Value::as_str) {
+            self.anchor(resource, name, node, true);
+        }
+        Ok(resource)
+    }
+
+    /// Declares a plain-name fragment in `resource`; the first declaration
+    /// of a name in document order wins.
+    fn anchor(&mut self, resource: usize, name: &'s str, node: &'s Value, dynamic: bool) {
+        if name.is_empty() {
+            return;
+        }
+        let Some(declared) = self.resources.get_mut(resource) else {
+            return;
+        };
+        declared.anchors.entry(name).or_insert(node);
+        if dynamic {
+            declared.dynamic_anchors.entry(name).or_insert(node);
+            self.dynamic_targets.entry(name).or_default().push(node);
+        }
+    }
+
+    /// Finds what the absolute URI reference `absolute` names.
+    fn resolve(&self, absolute: &str, dynamic: bool) -> Option<Target<'s>> {
+        let (uri, fragment) = absolute.split_once('#').unwrap_or((absolute, ""));
+        self.resolve_in(self.lookup(uri)?, fragment, dynamic)
+    }
+
+    /// Finds what `fragment` (still percent-encoded) names in `resource`.
+    fn resolve_in(&self, mut resource: usize, fragment: &str, dynamic: bool) -> Option<Target<'s>> {
+        let declared = self.resources.get(resource)?;
+        // A fragment is percent-encoded (RFC 3986); the JSON Pointer inside
+        // it then has its own `~0`/`~1` escapes (RFC 6901).
+        let fragment = percent_decode(fragment);
+        if fragment.is_empty() {
+            return Some(Target {
+                node: declared.root,
+                resource,
+                dynamic: None,
+            });
+        }
+        if let Some(pointer) = fragment.strip_prefix('/') {
+            validate_json_pointer(&fragment).ok()?;
+            let mut node = declared.root;
+            for raw in pointer.split('/') {
+                let token = raw.replace("~1", "/").replace("~0", "~");
+                node = match node {
+                    Value::Object(map) => map.get(&token)?,
+                    Value::Array(items) => {
+                        if token.is_empty()
+                            || (token.len() > 1 && token.starts_with('0'))
+                            || !token.bytes().all(|byte| byte.is_ascii_digit())
+                        {
+                            return None;
+                        }
+                        items.get(token.parse::<usize>().ok()?)?
+                    }
+                    _ => return None,
+                };
+                // A pointer may walk into an embedded resource.
+                if let Some(inner) = self.roots.get(&address(node)) {
+                    resource = *inner;
+                }
+            }
+            return Some(Target {
+                node,
+                resource,
+                dynamic: None,
+            });
+        }
+        let node = *declared.anchors.get(fragment.as_ref())?;
+        let dynamic = if dynamic {
+            declared
+                .dynamic_anchors
+                .get_key_value(fragment.as_ref())
+                .filter(|(_, declaring)| std::ptr::eq(**declaring, node))
+                .map(|(name, _)| *name)
+        } else {
+            None
+        };
+        Some(Target {
+            node,
+            resource,
+            dynamic,
+        })
+    }
+
+    /// Resources that declare a `$dynamicAnchor`, the only ones that can
+    /// change where a `$dynamicRef` leads.
+    fn dynamic_resources(&self) -> usize {
+        self.resources
+            .iter()
+            .filter(|resource| !resource.dynamic_anchors.is_empty())
+            .count()
+    }
 }
 
-fn resolve_ref<'a>(reference: &str, ctx: &Ctx<'a>) -> Option<&'a Value> {
-    let fragment = reference.strip_prefix('#')?;
-    if fragment.is_empty() || fragment.starts_with('/') {
-        // Validate escapes before serde_json decodes them; its pointer API
-        // checks array index syntax but permits literal invalid '~' escapes.
-        validate_json_pointer(fragment).ok()?;
-        return ctx.root.pointer(fragment);
+/// The parts of a URI reference (RFC 3986, appendix B).
+#[derive(Debug, Clone, Copy)]
+struct UriParts<'u> {
+    scheme: Option<&'u str>,
+    authority: Option<&'u str>,
+    path: &'u str,
+    query: Option<&'u str>,
+    fragment: Option<&'u str>,
+}
+
+fn split_uri(text: &str) -> UriParts<'_> {
+    let (rest, fragment) = match text.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (text, None),
+    };
+    let (rest, query) = match rest.split_once('?') {
+        Some((rest, query)) => (rest, Some(query)),
+        None => (rest, None),
+    };
+    let (scheme, rest) = match rest.split_once(':') {
+        Some((scheme, after))
+            if !scheme.contains('/')
+                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        {
+            (Some(scheme), after)
+        }
+        _ => (None, rest),
+    };
+    let (authority, path) = match rest.strip_prefix("//") {
+        Some(after) => {
+            let end = after.find('/').unwrap_or(after.len());
+            (after.get(..end), after.get(end..).unwrap_or_default())
+        }
+        None => (None, rest),
+    };
+    UriParts {
+        scheme,
+        authority,
+        path,
+        query,
+        fragment,
     }
-    ctx.anchors.get(fragment).copied()
+}
+
+/// RFC 3986 section 5.2.4: removes `.` and `..` segments.
+fn remove_dot_segments(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut output: Vec<&str> = Vec::new();
+    let mut segments = path.split('/').peekable();
+    if absolute {
+        segments.next();
+    }
+    let mut trailing = false;
+    while let Some(segment) = segments.next() {
+        let last = segments.peek().is_none();
+        match segment {
+            "." => trailing = last,
+            ".." => {
+                output.pop();
+                trailing = last;
+            }
+            _ => {
+                output.push(segment);
+                trailing = false;
+            }
+        }
+    }
+    let mut out = String::with_capacity(path.len());
+    if absolute {
+        out.push('/');
+    }
+    out.push_str(&output.join("/"));
+    if trailing && !out.ends_with('/') && !output.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// Resolves a URI reference against a base URI (RFC 3986 section 5.2).
+///
+/// An empty or relative base is tolerated: the result is then relative too,
+/// which is what an embedded `$id` under a root without one should be.
+fn resolve_uri(reference: &str, base: &str) -> String {
+    let r = split_uri(reference);
+    let b = split_uri(base);
+    let (scheme, authority, path, query) = if r.scheme.is_some() {
+        (r.scheme, r.authority, remove_dot_segments(r.path), r.query)
+    } else if r.authority.is_some() {
+        (b.scheme, r.authority, remove_dot_segments(r.path), r.query)
+    } else if r.path.is_empty() {
+        (
+            b.scheme,
+            b.authority,
+            b.path.to_owned(),
+            r.query.or(b.query),
+        )
+    } else if r.path.starts_with('/') {
+        (b.scheme, b.authority, remove_dot_segments(r.path), r.query)
+    } else {
+        let merged = if b.authority.is_some() && b.path.is_empty() {
+            format!("/{}", r.path)
+        } else {
+            let directory = b
+                .path
+                .rfind('/')
+                .and_then(|slash| b.path.get(..=slash))
+                .unwrap_or_default();
+            format!("{directory}{}", r.path)
+        };
+        (b.scheme, b.authority, remove_dot_segments(&merged), r.query)
+    };
+    let mut out = String::with_capacity(reference.len() + base.len());
+    if let Some(scheme) = scheme {
+        out.push_str(scheme);
+        out.push(':');
+    }
+    if let Some(authority) = authority {
+        out.push_str("//");
+        out.push_str(authority);
+    }
+    out.push_str(&path);
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(query);
+    }
+    if let Some(fragment) = r.fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
+}
+
+/// `uri` without its fragment, if any.
+fn without_fragment(uri: &str) -> String {
+    uri.split_once('#')
+        .map_or(uri, |(before, _)| before)
+        .to_owned()
+}
+
+/// Decodes `%XX` escapes; text that is not valid UTF-8 afterwards, or has
+/// no escapes, is returned unchanged.
+fn percent_decode(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('%') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        let hex = |at: usize| bytes.get(at).and_then(|b| char::from(*b).to_digit(16));
+        match (byte, hex(index + 1), hex(index + 2)) {
+            (b'%', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                index += 3;
+            }
+            _ => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
 }
 
 /// Why a `format` check did not pass.
@@ -1926,6 +3619,409 @@ mod tests {
     }
 
     #[test]
+    fn branching_reference_cycles_are_stopped_at_once() {
+        let schema = json!({"allOf": [{"$ref": "#"}, {"$ref": "#"}]});
+        let document = json!(1);
+        // Left alone this doubled per reference hop (93, 1,533, 24,573 and
+        // 393,213 applications at 4, 8, 12 and 16 hops). The schema applies
+        // itself to the same value, which is now recognized at once.
+        let Outcome {
+            findings, steps, ..
+        } = run(&document, &schema, None);
+        assert!(steps < 10, "{steps} applications");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(findings[0].message.contains("without end"));
+        // The exhaustion survives `not` and `anyOf`, which drop inner errors.
+        let hidden = json!({"not": {"anyOf": [{"allOf": [{"$ref": "#"}, {"$ref": "#"}]}]}});
+        assert!(has_errors(&validate(&document, &hidden)));
+    }
+
+    #[test]
+    fn large_documents_stay_inside_the_budget() {
+        let schema = json!({
+            "type": "array",
+            "items": {"$ref": "#/$defs/row"},
+            "$defs": {"row": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {"id": {"type": "integer"}, "tags": {"items": {"type": "string"}}},
+                "propertyNames": {"pattern": "^[a-z]+$"},
+                "additionalProperties": false
+            }}
+        });
+        let rows = (0..20_000)
+            .map(|id| json!({"id": id, "tags": ["a", "b"]}))
+            .collect::<Vec<_>>();
+        let mut document = Value::Array(rows);
+        assert_eq!(validate(&document, &schema), []);
+        document[19_999]["id"] = json!("x");
+        let findings = validate(&document, &schema);
+        assert!(!findings.is_empty());
+        assert!(findings.iter().all(|f| f.path.starts_with("$/19999")));
+    }
+
+    #[test]
+    fn in_place_reference_chains_are_reported_as_endless() {
+        // 32 hops through 60 nested `not` would recurse 1,920 levels.
+        let mut schema = json!({"$ref": "#"});
+        for _ in 0..60 {
+            schema = json!({"not": schema});
+        }
+        let findings = validate(&json!(1), &schema);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("without end"));
+    }
+
+    #[test]
+    fn pattern_compilations_are_bounded_per_validation() {
+        // The same document string is compiled once, however often it occurs.
+        let schema = json!({"items": {"format": "regex"}});
+        let repeated = Value::Array(vec![json!("^a+$"); 50_000]);
+        assert_eq!(validate(&repeated, &schema), []);
+
+        // Distinct document strings each need a compilation: capped by bytes.
+        let distinct = |count: usize| {
+            Value::Array(
+                (0..count)
+                    .map(|i| Value::String(format!("^{i:0>1000}$")))
+                    .collect(),
+            )
+        };
+        assert_eq!(validate(&distinct(1_000), &schema), []);
+        let findings = validate(&distinct(1_100), &schema);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("regular-expression text"));
+
+        // Capped by total pattern bytes, for schema patterns as well.
+        let long = "a".repeat(MAX_PATTERN_BYTES_PER_VALIDATION / 2);
+        let schema = json!({"patternProperties": {long.clone(): true, format!("{long}b"): true, format!("{long}c"): true}});
+        let findings = validate(&json!({"k": 1}), &schema);
+        assert_eq!(findings.len(), 1);
+        assert!(has_errors(&findings));
+    }
+
+    fn stopped(findings: &[Finding]) -> bool {
+        findings
+            .iter()
+            .any(|f| f.message.contains("validation stopped"))
+    }
+
+    /// `node = oneOf[v0..v7]`, each variant an object whose `child` is a node.
+    fn union_schema(variants: usize) -> Value {
+        let alternatives = (0..variants)
+            .map(|i| {
+                json!({
+                    "type": "object",
+                    "properties": {"kind": {"const": format!("k{i}")}, "child": {"$ref": "#/$defs/node"}},
+                    "required": ["kind"]
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({"$ref": "#/$defs/node", "$defs": {"node": {"oneOf": alternatives}}})
+    }
+
+    fn union_chain(depth: usize, last_kind: &str) -> Value {
+        let mut chain = json!({ "kind": last_kind });
+        for level in 1..depth {
+            chain = json!({"kind": format!("k{}", level % 8), "child": chain});
+        }
+        chain
+    }
+
+    #[test]
+    fn recursive_discriminated_unions_validate_in_polynomial_work() {
+        let schema = union_schema(8);
+        let Outcome {
+            findings, steps, ..
+        } = run(&union_chain(40, "k3"), &schema, None);
+        assert_eq!(findings, []);
+        assert!(steps < 10_000, "{steps} applications");
+        let findings = validate(&union_chain(40, "nope"), &schema);
+        assert!(has_errors(&findings));
+        assert!(!stopped(&findings));
+    }
+
+    #[test]
+    fn linked_lists_deeper_than_32_are_fully_validated() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"v": {"type": "integer"}, "next": {"$ref": "#"}}
+        });
+        let list = |last: Value| {
+            (0..60).fold(
+                json!({ "v": last }),
+                |next, _| json!({"v": 1, "next": next}),
+            )
+        };
+        assert_eq!(validate(&list(json!(1)), &schema), []);
+        let findings = validate(&list(json!("x")), &schema);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(findings[0].path.ends_with("/next/v"));
+    }
+
+    #[test]
+    fn wrapped_recursive_schemas_validate_to_the_nesting_limit() {
+        let schema = json!({
+            "$ref": "#/$defs/node",
+            "$defs": {
+                "base": {"type": "object"},
+                "node": {"allOf": [
+                    {"$ref": "#/$defs/base"},
+                    {"properties": {"children": {"type": "array", "items": {
+                        "anyOf": [{"$ref": "#/$defs/node"}, {"type": "null"}]
+                    }}}}
+                ]}
+            }
+        });
+        // 31 tree levels are 62 levels of nesting and 155 nested applications.
+        let tree = (0..30).fold(
+            json!({"children": [null]}),
+            |inner, _| json!({"children": [inner]}),
+        );
+        assert_eq!(measure(&tree).1, 62);
+        assert_eq!(validate(&tree, &schema), []);
+    }
+
+    #[test]
+    fn many_pattern_properties_are_not_a_limit() {
+        let mut properties = Map::new();
+        let mut document = Map::new();
+        for i in 0..5_000 {
+            properties.insert(format!("p{i}"), json!({"pattern": format!("^v{i}$")}));
+            document.insert(format!("p{i}"), json!(format!("v{i}")));
+        }
+        let schema = json!({ "properties": properties });
+        assert_eq!(validate(&Value::Object(document), &schema), []);
+    }
+
+    #[test]
+    fn unique_items_ignores_key_order_and_compares_integers_exactly() {
+        let unique = json!({"uniqueItems": true});
+        assert!(fails(r#"[{"a":1,"b":2},{"b":2,"a":1}]"#, &unique));
+        assert!(fails(
+            r#"[{"a":{"x":1,"y":[2]}},{"a":{"y":[2],"x":1.0}}]"#,
+            &unique
+        ));
+        assert!(passes(r#"[{"a":1,"b":2},{"b":1,"a":2}]"#, &unique));
+        // 2^53 + 1 is not 2^53, although both round to the same f64.
+        assert!(passes("[9007199254740993, 9007199254740992.0]", &unique));
+        assert!(passes("[9007199254740993, 9007199254740992]", &unique));
+        assert!(fails("[9007199254740992, 9007199254740992.0]", &unique));
+        assert!(fails("[-3, -3.0]", &unique));
+    }
+
+    #[test]
+    fn results_are_remembered_only_where_the_schema_can_repeat() {
+        // No `$ref` cycle: nothing can be asked twice, so nothing is kept.
+        let schema = json!({"items": {"anyOf": [{"type": "object"}, {"type": "string"}, {"type": "array"}]},
+            "contains": {"not": {"type": "null"}}, "if": {"type": "array"}, "then": {"$ref": "#/$defs/x"},
+            "$defs": {"x": {"minItems": 1}}});
+        let document = Value::Array(vec![json!([]); 5_000]);
+        let outcome = run(&document, &schema, None);
+        assert_eq!(outcome.findings, []);
+        assert_eq!(outcome.remembered, 0);
+        assert!(!outcome.spawned);
+        // A recursive union needs them, and stays polynomial with them.
+        let outcome = run(&union_chain(40, "k3"), &union_schema(8), None);
+        assert_eq!(outcome.findings, []);
+        assert!(outcome.remembered > 0);
+        assert!(outcome.steps < 10_000, "{} applications", outcome.steps);
+    }
+
+    #[test]
+    fn deep_validations_run_once_on_a_stack_chosen_up_front() {
+        let list_schema = json!({"properties": {"next": {"$ref": "#"}, "v": {"type": "integer"}}});
+        let list = |depth: usize| {
+            (0..depth).fold(json!({"v": 1}), |next, _| json!({"v": 1, "next": next}))
+        };
+        // Shallow recursive documents stay on the caller's stack.
+        let shallow = run(&list(3), &list_schema, None);
+        assert!(!shallow.spawned);
+        assert_eq!(shallow.findings, []);
+        // Deep ones go straight to the large stack: the work is done once.
+        let deep = run(&list(60), &list_schema, None);
+        assert!(deep.spawned);
+        assert_eq!(deep.findings, []);
+        // Three applications per list node, less one: linear, and not doubled.
+        assert_eq!((shallow.steps, deep.steps), (11, 182));
+    }
+
+    #[test]
+    fn annotations_come_only_from_passing_schemas_at_the_same_level() {
+        // A failed `anyOf` branch evaluates nothing.
+        let schema = json!({"anyOf": [{"properties": {"a": true}, "required": ["zzz"]}, {"properties": {"b": true}}],
+            "unevaluatedProperties": false});
+        assert!(fails(r#"{"a":1,"b":2}"#, &schema));
+        assert!(passes(r#"{"b":2}"#, &schema));
+        // What a child evaluates inside itself says nothing about its parent.
+        let schema = json!({"properties": {"foo": {"properties": {"bar": true}}}, "unevaluatedProperties": false});
+        assert!(fails(r#"{"foo":{"bar":1},"bar":2}"#, &schema));
+        assert!(passes(r#"{"foo":{"bar":1}}"#, &schema));
+        let schema =
+            json!({"prefixItems": [{"prefixItems": [true, true]}], "unevaluatedItems": false});
+        assert!(fails("[[1,2],3]", &schema));
+        assert!(passes("[[1,2]]", &schema));
+    }
+
+    #[test]
+    fn a_failing_declared_property_is_reported_once() {
+        let leaf = json!({"type": "object", "properties": {"v": {"type": "integer"}}, "additionalProperties": false});
+        let schema = (0..25).fold(leaf, |inner, _| {
+            json!({"type": "object", "properties": {"c": inner}, "additionalProperties": false, "unevaluatedProperties": false})
+        });
+        let document = (0..25).fold(json!({"v": "x"}), |inner, _| json!({ "c": inner }));
+        let findings = validate(&document, &schema);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].path.ends_with("/c/v"));
+    }
+
+    #[test]
+    fn count_keywords_accept_integral_floats() {
+        assert!(fails("[1,2]", &json!({"maxItems": 1.0})));
+        assert!(fails("[]", &json!({"minItems": 1.0})));
+        assert!(fails(r#""ab""#, &json!({"maxLength": 1.0})));
+        assert!(fails(r#""""#, &json!({"minLength": 1.0})));
+        assert!(fails(r#"{"a":1,"b":2}"#, &json!({"maxProperties": 1.0})));
+        assert!(fails("{}", &json!({"minProperties": 1.0})));
+        assert!(fails(
+            "[1,1]",
+            &json!({"contains": {"const": 1}, "maxContains": 1.0})
+        ));
+        assert!(fails(
+            "[1]",
+            &json!({"contains": {"const": 1}, "minContains": 2.0})
+        ));
+        assert!(passes("[1,2]", &json!({"maxItems": 2.0, "minItems": 2.0})));
+        // Not a count: ignored, as before.
+        assert!(passes("[1,2]", &json!({"maxItems": 1.5})));
+    }
+
+    #[test]
+    fn references_decode_percent_and_pointer_escapes() {
+        let schema = json!({
+            "$defs": {"tilde~field": {"type": "integer"}, "slash/field": {"type": "integer"},
+                      "percent%field": {"type": "integer"}, "a b": {"type": "integer"}},
+            "properties": {
+                "tilde": {"$ref": "#/$defs/tilde~0field"},
+                "slash": {"$ref": "#/$defs/slash~1field"},
+                "percent": {"$ref": "#/$defs/percent%25field"},
+                "space": {"$ref": "#/$defs/a%20b"}
+            }
+        });
+        for key in ["tilde", "slash", "percent", "space"] {
+            let findings = validate(&json!({ key: "x" }), &schema);
+            assert_eq!(findings.len(), 1, "{key}: {findings:?}");
+            assert_eq!(findings[0].severity, Severity::Error, "{key}");
+            assert_eq!(validate(&json!({ key: 1 }), &schema), [], "{key}");
+        }
+    }
+
+    #[test]
+    fn distinct_large_integers_hash_apart() {
+        let near_max = |i: u64| Value::from(u64::MAX - i);
+        assert_ne!(hash_value(&near_max(0)), hash_value(&near_max(1)));
+        assert_eq!(hash_value(&json!(3)), hash_value(&json!(3.0)));
+        assert_eq!(hash_value(&json!(-0.0)), hash_value(&json!(0)));
+        let items = Value::Array((0..20_000).map(near_max).collect());
+        assert_eq!(validate(&items, &json!({"uniqueItems": true})), []);
+    }
+
+    /// Ported from the official JSON Schema test suite (`unevaluatedProperties`
+    /// and `unevaluatedItems`, the "nested unevaluated..." cases).
+    #[test]
+    fn nested_unevaluated_keywords_mark_what_they_accept() {
+        let cases = [
+            json!({"type": "object", "properties": {"foo": {"type": "string"}},
+                "allOf": [{"unevaluatedProperties": true}],
+                "unevaluatedProperties": {"type": "string", "maxLength": 2}}),
+            json!({"type": "object", "properties": {"foo": {"type": "string"}},
+                "allOf": [{"unevaluatedProperties": true}], "unevaluatedProperties": false}),
+            json!({"type": "object",
+                "allOf": [{"properties": {"foo": {"type": "string"}}, "unevaluatedProperties": true}],
+                "unevaluatedProperties": false}),
+        ];
+        for schema in &cases {
+            assert!(passes(r#"{"foo":"foo"}"#, schema), "{schema}");
+            assert!(passes(r#"{"foo":"foo","bar":"bar"}"#, schema), "{schema}");
+        }
+        let items = json!({"allOf": [{"prefixItems": [{"type": "string"}]}, {"unevaluatedItems": true}],
+            "unevaluatedItems": false});
+        assert!(passes(r#"["foo"]"#, &items));
+        assert!(passes(r#"["foo", 42, true]"#, &items));
+        // The inner keyword rejecting is still a failure.
+        let inner_false = json!({"properties": {"foo": true},
+            "allOf": [{"unevaluatedProperties": false}], "unevaluatedProperties": true});
+        assert!(fails(r#"{"foo":"foo"}"#, &inner_false));
+    }
+
+    #[test]
+    fn multiple_of_survives_a_quotient_that_overflows() {
+        let schema = json!({"type": "integer", "multipleOf": 0.123456789});
+        assert!(fails("1e308", &schema));
+        assert!(passes("1e308", &json!({"multipleOf": 1e300})));
+        assert!(passes("7.5", &json!({"multipleOf": 2.5})));
+    }
+
+    #[test]
+    fn a_panic_on_the_large_stack_is_an_error_and_the_worker_survives() {
+        let borrowed = String::from("borrowed");
+        assert_eq!(on_large_stack(|| borrowed.len()), Ok(8));
+        let name = || std::thread::current().name().map(str::to_owned);
+        let worker = on_large_stack(name).expect("runs");
+        let failed: Result<(), _> = on_large_stack(|| panic!("inside the worker"));
+        assert_eq!(failed, Err(VALIDATION_THREAD_FAILED));
+        // Same worker, still serving; and another thread gets its own.
+        assert_eq!(on_large_stack(name), Ok(worker.clone()));
+        assert_ne!(name(), worker);
+        let other = std::thread::spawn(move || on_large_stack(|| std::thread::current().id()))
+            .join()
+            .expect("joins")
+            .expect("runs");
+        assert_ne!(Ok(other), on_large_stack(|| std::thread::current().id()));
+    }
+
+    /// The caller is released by the reply sender going away, so a slow
+    /// destructor in the borrowed work has to finish first on every path.
+    #[test]
+    fn the_work_is_gone_before_the_reply_sender_on_every_path() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SlowDrop<'a>(&'a AtomicBool);
+        impl Drop for SlowDrop<'_> {
+            fn drop(&mut self) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for path in ["dropped unrun", "run", "panics"] {
+            let gone = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let (reply, result) = std::sync::mpsc::sync_channel::<()>(1);
+                let probe = SlowDrop(&gone);
+                let job = reply_last(
+                    move || {
+                        let _probe = &probe;
+                        assert!(path != "panics", "inside the job");
+                    },
+                    reply,
+                );
+                scope.spawn(move || {
+                    if path == "dropped unrun" {
+                        drop(job);
+                    } else {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    }
+                });
+                let _ = result.recv();
+                assert!(gone.load(Ordering::SeqCst), "released early: {path}");
+            });
+        }
+    }
+
+    #[test]
     fn validates_a_clean_document() {
         let doc = json!({
             "nome": "Carlos Souza",
@@ -2006,6 +4102,10 @@ mod tests {
     #[test]
     fn unique_items_and_budget_keywords() {
         assert!(fails("[1, 2, 1]", &json!({"uniqueItems": true})));
+        // Duplicates are only an error when the schema asks for uniqueness.
+        assert!(passes("[1, 2, 1]", &json!({})));
+        assert!(passes("[1, 2, 1]", &json!({"uniqueItems": false})));
+        assert!(passes("[[1, 1]]", &json!({"items": {"type": "array"}})));
         assert!(passes("[1, 2, 3]", &json!({"uniqueItems": true})));
         assert!(fails("[1, 2]", &json!({"minItems": 3})));
         assert!(fails("[1, 2, 3, 4]", &json!({"maxItems": 3})));
@@ -2168,16 +4268,443 @@ mod tests {
             "$ref": "#/$defs/loopA"
         });
         let findings = validate(&json!(1), &schema);
-        assert!(!findings.iter().any(|f| f.severity == Severity::Error));
-        assert!(findings.iter().any(|f| f.severity == Severity::Warning));
+        // A cycle that never reaches the document is reported, not skipped.
+        assert_eq!(findings.len(), 1);
+        assert!(has_errors(&findings));
     }
 
     #[test]
-    fn unresolved_ref_is_a_warning() {
-        let schema = json!({"$ref": "#/$defs/missing"});
+    fn unresolvable_references_fail_closed() {
+        for schema in [
+            json!({"$ref": "#/$defs/missing"}),
+            json!({"$ref": "#no-such-anchor"}),
+            json!({"$ref": "http://example.com/remote.json"}),
+            json!({"$dynamicRef": "#/$defs/missing"}),
+            // Neither `not` nor a passing alternative may hide it.
+            json!({"not": {"$ref": "#/$defs/missing"}}),
+            json!({"anyOf": [{"$ref": "#/$defs/missing"}, true]}),
+        ] {
+            let findings = validate(&json!(1), &schema);
+            assert!(has_errors(&findings), "{schema}: {findings:?}");
+            assert!(
+                findings.iter().any(
+                    |f| f.severity == Severity::Error && f.message.contains("does not resolve")
+                ),
+                "{schema}: {findings:?}"
+            );
+        }
+        // A reference that is never followed is not an error.
+        let unused = json!({"$defs": {"x": {"$ref": "#/$defs/missing"}}, "type": "integer"});
+        assert_eq!(validate(&json!(1), &unused), []);
+    }
+
+    #[test]
+    fn references_resolve_against_base_uris() {
+        let schema = json!({
+            "$id": "http://example.com/dir/root.json",
+            "properties": {
+                "a": {"$ref": "item.json"},
+                "b": {"$ref": "folder/inner.json#/$defs/n"},
+                "c": {"$ref": "http://example.com/dir/root.json#/$defs/s"},
+                "d": {"$ref": "/abs.json"},
+                "e": {"$ref": "urn:example:thing#/$defs/i"}
+            },
+            "$defs": {
+                "item": {"$id": "item.json", "type": "integer"},
+                "folder": {"$id": "folder/inner.json", "$defs": {"n": {"type": "null"}}},
+                "s": {"type": "string"},
+                "abs": {"$id": "http://example.com/abs.json", "type": "boolean"},
+                "urn": {"$id": "urn:example:thing", "$defs": {"i": {"$ref": "#/$defs/j"}, "j": {"type": "array"}}}
+            }
+        });
+        let valid = json!({"a": 1, "b": null, "c": "x", "d": true, "e": []});
+        assert_eq!(validate(&valid, &schema), []);
+        for (key, wrong) in [
+            ("a", json!("x")),
+            ("b", json!(1)),
+            ("c", json!(1)),
+            ("d", json!(1)),
+            ("e", json!(1)),
+        ] {
+            let mut document = valid.clone();
+            document[key] = wrong;
+            let findings = validate(&document, &schema);
+            assert_eq!(findings.len(), 1, "{key}: {findings:?}");
+            assert_eq!(findings[0].severity, Severity::Error, "{key}");
+        }
+    }
+
+    #[test]
+    fn anchors_are_scoped_to_the_resource_that_declares_them() {
+        let schema = json!({
+            "$id": "http://example.com/root",
+            "$ref": "child#a",
+            "$defs": {"A": {"$id": "child", "allOf": [
+                {"$id": "other", "$anchor": "a", "type": "number"},
+                {"$anchor": "a", "type": "string"}
+            ]}}
+        });
+        assert!(passes(r#""x""#, &schema));
+        assert!(fails("1", &schema));
+    }
+
+    #[test]
+    fn supplied_resources_resolve_remote_references() {
+        let schema = json!({
+            "$id": "http://example.com/main.json",
+            "properties": {"n": {"$ref": "defs.json#/$defs/positive"}, "t": {"$ref": "tree.json"}}
+        });
+        let defs = json!({"$defs": {"positive": {"type": "integer", "minimum": 1}}});
+        let tree = json!({
+            "type": "object",
+            "properties": {"kids": {"items": {"$ref": "#"}}, "v": {"$ref": "defs.json#/$defs/positive"}}
+        });
+        let resources = [
+            ("http://example.com/defs.json", &defs),
+            ("http://example.com/tree.json", &tree),
+        ];
+        let good = json!({"n": 1, "t": {"v": 2, "kids": [{"v": 3}, {"kids": []}]}});
+        assert_eq!(validate_with_resources(&good, &schema, &resources), []);
+        let bad = json!({"n": 1, "t": {"kids": [{"v": 0}]}});
+        let findings = validate_with_resources(&bad, &schema, &resources);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].path, "$/t/kids/0/v");
+        // Without the documents the same references do not resolve.
+        assert!(has_errors(&validate(&good, &schema)));
+    }
+
+    #[test]
+    fn dynamic_references_resolve_through_the_dynamic_scope() {
+        let schema = json!({
+            "$id": "https://example.com/root",
+            "$ref": "list",
+            "$defs": {
+                "foo": {"$dynamicAnchor": "items", "type": "string"},
+                "list": {"$id": "list", "type": "array", "items": {"$dynamicRef": "#items"},
+                         "$defs": {"items": {"$dynamicAnchor": "items"}}}
+            }
+        });
+        assert!(passes(r#"["a", "b"]"#, &schema));
+        assert!(fails(r#"["a", 1]"#, &schema));
+        // `unevaluatedProperties` sees what the dynamic target evaluated.
+        let schema = json!({
+            "$id": "https://example.com/derived",
+            "$ref": "./base",
+            "$defs": {
+                "derived": {"$dynamicAnchor": "addons", "properties": {"bar": {"type": "string"}}},
+                "base": {"$id": "./base", "unevaluatedProperties": false,
+                         "properties": {"foo": {"type": "string"}}, "$dynamicRef": "#addons",
+                         "$defs": {"default": {"$dynamicAnchor": "addons"}}}
+            }
+        });
+        assert!(passes(r#"{"foo": "a", "bar": "b"}"#, &schema));
+        assert!(fails(r#"{"foo": "a", "bar": "b", "baz": "c"}"#, &schema));
+    }
+
+    #[test]
+    fn remembered_results_are_not_reused_across_dynamic_scopes() {
+        // `list` lies on a cycle, so its result on an array is remembered.
+        // The two `anyOf` branches apply it to the same array under different
+        // dynamic scopes, where `#item` means a string or a number.
+        let schema = json!({
+            "$id": "https://example.com/root",
+            "anyOf": [{"$ref": "strings"}, {"$ref": "numbers"}],
+            "$defs": {
+                "list": {"$id": "list", "type": "array",
+                         "items": {"anyOf": [{"$dynamicRef": "#item"}, {"$ref": "list"}]},
+                         "$defs": {"item": {"$dynamicAnchor": "item", "not": true}}},
+                "strings": {"$id": "strings", "$ref": "list",
+                            "$defs": {"item": {"$dynamicAnchor": "item", "type": "string"}}},
+                "numbers": {"$id": "numbers", "$ref": "list",
+                            "$defs": {"item": {"$dynamicAnchor": "item", "type": "number"}}}
+            }
+        });
+        let outcome = run(&json!([1, [2]]), &schema, None);
+        assert_eq!(outcome.findings, []);
+        assert!(outcome.remembered > 0);
+        assert!(passes(r#"["a", ["b"]]"#, &schema));
+        assert!(fails(r#"[1, ["b"]]"#, &schema));
+        assert!(fails("[true]", &schema));
+    }
+
+    #[test]
+    fn uri_text_stays_a_small_multiple_of_the_schema() {
+        // A long base under many relative `$id`s: each URI repeats the base.
+        let schema_with_base = |base: String| {
+            let mut defs = Map::new();
+            for i in 0..2_000 {
+                defs.insert(
+                    format!("d{i}"),
+                    json!({"$id": format!("d{i}.json"), "type": "integer"}),
+                );
+            }
+            json!({"$id": base, "$defs": defs, "$ref": "d0.json"})
+        };
+        let schema = schema_with_base(format!("https://example.com/{}/", "a".repeat(10_000)));
+        let text = text_bytes(&schema);
+        let held = Registry::build(&schema, &[]).map_or(0, |registry| {
+            registry
+                .resources
+                .iter()
+                .map(|resource| resource.uri.len())
+                .sum::<usize>()
+        });
+        assert!(
+            held <= URI_BYTES_PER_SCHEMA_BYTE * text + URI_BYTES_ALLOWANCE,
+            "{held} URI bytes held for {text} bytes of schema text"
+        );
         let findings = validate(&json!(1), &schema);
-        assert!(findings.iter().any(|f| f.severity == Severity::Warning));
-        assert!(!findings.iter().any(|f| f.severity == Severity::Error));
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("URI text"));
+        // The same shape with an ordinary base validates.
+        let schema = schema_with_base("https://example.com/schemas/".to_owned());
+        assert_eq!(validate(&json!(1), &schema), []);
+        assert!(has_errors(&validate(&json!("x"), &schema)));
+    }
+
+    #[test]
+    fn fragment_references_are_charged_by_their_fragment() {
+        // Many short fragment references under a long base are ordinary.
+        let long_base =
+            |length: usize| format!("https://e.com/{}s.json", "seg/".repeat((length - 14) / 4));
+        let anchors = json!({
+            "$id": long_base(100),
+            "$defs": {"a": {"$anchor": "a", "type": "integer"}},
+            "anyOf": vec![json!({"$ref": "#a"}); 200_000]
+        });
+        let pointers = json!({
+            "$id": long_base(250),
+            "$defs": {"a": {"type": "integer"}},
+            "anyOf": vec![json!({"$ref": "#/$defs/a"}); 200_000]
+        });
+        for schema in [&anchors, &pointers] {
+            assert_eq!(validate(&json!(1), schema), []);
+            assert!(has_errors(&validate(&json!("x"), schema)));
+        }
+    }
+
+    #[test]
+    fn a_draft_07_root_id_beside_ref_still_names_the_document() {
+        let schema = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "$id": "http://e.com/root.json",
+            "$ref": "#/definitions/A",
+            "definitions": {
+                "A": {"properties": {"self": {"$ref": "http://e.com/root.json#/definitions/B"}}},
+                "B": {"type": "integer"}
+            }
+        });
+        assert!(passes(r#"{"self": 1}"#, &schema));
+        assert!(fails(r#"{"self": "x"}"#, &schema));
+    }
+
+    /// `r0` applies `r1`..`rn`, each declaring the same `$dynamicAnchor` and
+    /// referring to a tree whose children are `$dynamicRef`s to it.
+    fn dynamic_fan_out(resources: usize) -> Value {
+        let mut defs = Map::new();
+        for i in 1..=resources {
+            defs.insert(
+                format!("r{i}"),
+                json!({"$id": format!("https://e.com/r{i}"), "$dynamicAnchor": "node",
+                       "$ref": "https://e.com/tree"}),
+            );
+        }
+        defs.insert(
+            "tree".to_owned(),
+            json!({"$id": "https://e.com/tree", "$dynamicAnchor": "node", "type": "object",
+                   "properties": {"c": {"$dynamicRef": "#node"}}}),
+        );
+        let all_of: Vec<Value> = (1..=resources)
+            .map(|i| json!({"$ref": format!("r{i}")}))
+            .collect();
+        json!({"$id": "https://e.com/r0", "$dynamicAnchor": "node", "allOf": all_of, "$defs": defs})
+    }
+
+    #[test]
+    fn dynamic_fan_out_stays_linear() {
+        let tree = |depth: usize| (0..depth).fold(json!({}), |inner, _| json!({"c": inner}));
+        let six = run(&tree(5), &dynamic_fan_out(6), None);
+        assert_eq!(six.findings, []);
+        let thirty = run(&tree(5), &dynamic_fan_out(30), None);
+        assert_eq!(thirty.findings, []);
+        // Each extra resource costs a constant number of applications.
+        assert!(six.steps < 200, "{} applications", six.steps);
+        assert!(
+            thirty.steps < 6 * six.steps,
+            "{} applications",
+            thirty.steps
+        );
+        let invalid = run(&json!({"c": {"c": 1}}), &dynamic_fan_out(6), None);
+        assert!(has_errors(&invalid.findings));
+        assert!(!stopped(&invalid.findings));
+    }
+
+    #[test]
+    fn identifiers_count_only_in_schema_positions_and_the_first_wins() {
+        let real = json!({"$id": "https://e.com/my.json", "type": "string"});
+        let unknown = json!({"x-unknown": [{"$id": "https://e.com/my.json", "type": "null"}]});
+        for defs in [
+            json!({"real": real.clone(), "unk": unknown.clone()}),
+            json!({"unk": unknown, "real": real}),
+        ] {
+            let schema = json!({"$defs": defs, "$ref": "https://e.com/my.json"});
+            assert!(fails("null", &schema), "{schema}");
+            assert!(passes(r#""s""#, &schema), "{schema}");
+        }
+        // Two real resources with one URI: the first in document order.
+        let a = json!({"$id": "https://e.com/d.json", "type": "string"});
+        let b = json!({"$id": "https://e.com/d.json", "type": "null"});
+        for (defs, null_is_valid) in [
+            (json!({"a": a.clone(), "b": b.clone()}), false),
+            (json!({"b": b, "a": a}), true),
+        ] {
+            let schema = json!({"$defs": defs, "$ref": "https://e.com/d.json"});
+            let findings = validate(&Value::Null, &schema);
+            assert_eq!(!has_errors(&findings), null_is_valid, "{findings:?}");
+            assert!(
+                findings.iter().any(|f| f.severity == Severity::Warning
+                    && f.message.contains("https://e.com/d.json")),
+                "{findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_07_ignores_identifiers_beside_ref() {
+        let schema = |dialect: Option<&str>| {
+            let mut schema = json!({
+                "definitions": {"x": {"type": "integer"},
+                                "inner": {"$id": "http://e.com/inner", "$ref": "#/definitions/x"}},
+                "properties": {"p": {"$ref": "#/definitions/inner"}}
+            });
+            if let Some(dialect) = dialect {
+                schema["$schema"] = json!(dialect);
+            }
+            schema
+        };
+        let draft_07 = schema(Some("http://json-schema.org/draft-07/schema#"));
+        assert!(passes(r#"{"p": 1}"#, &draft_07));
+        assert!(fails(r#"{"p": "x"}"#, &draft_07));
+        // In 2020-12 the `$id` is the base of its sibling `$ref`, which then
+        // names nothing.
+        for dialect in [None, Some("https://json-schema.org/draft/2020-12/schema")] {
+            assert!(fails(r#"{"p": 1}"#, &schema(dialect)), "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn meta_schema_references_warn_and_are_skipped() {
+        for reference in [
+            "http://json-schema.org/draft-07/schema#",
+            "http://json-schema.org/draft-07/schema",
+            "https://json-schema.org/draft/2020-12/schema",
+            "http://json-schema.org/draft-04/schema#/definitions/positiveInteger",
+            "https://json-schema.org/draft/2019-09/meta/core",
+        ] {
+            let findings = validate(&json!({}), &json!({"$ref": reference}));
+            assert!(!has_errors(&findings), "{reference}: {findings:?}");
+            assert!(
+                findings.iter().any(|f| f.severity == Severity::Warning),
+                "{reference}"
+            );
+        }
+        // Anything else still fails closed.
+        for reference in [
+            "https://json-schema.org/draft/2020-12/other",
+            "https://example.com/draft-07/schema",
+        ] {
+            assert!(has_errors(&validate(
+                &json!({}),
+                &json!({"$ref": reference})
+            )));
+        }
+        // A supplied meta-schema is applied.
+        let meta = json!({"type": "object"});
+        let schema = json!({"$ref": "http://json-schema.org/draft-07/schema#"});
+        let resources = [("http://json-schema.org/draft-07/schema", &meta)];
+        assert_eq!(validate_with_resources(&json!({}), &schema, &resources), []);
+        assert!(has_errors(&validate_with_resources(
+            &json!(1),
+            &schema,
+            &resources
+        )));
+    }
+
+    #[test]
+    fn the_shape_of_dynamic_references_is_linear() {
+        // 200 `$dynamicRef`s, each able to reach any of 201 anchors.
+        let mut defs = Map::new();
+        for i in 0..200 {
+            defs.insert(
+                format!("r{i}"),
+                json!({"$id": format!("r{i}"), "$dynamicAnchor": "x"}),
+            );
+        }
+        let sites: Vec<Value> = (0..200).map(|_| json!({"$dynamicRef": "#x"})).collect();
+        let schema = json!({"$id": "https://example.com/root", "$dynamicAnchor": "x",
+            "allOf": sites, "$defs": defs});
+        let registry = Registry::build(&schema, &[]).expect("within the URI budget");
+        let shape = schema_shape(&schema, &registry);
+        let (values, _) = measure(&schema);
+        assert!(
+            shape.edges < 2 * values as usize,
+            "{} edges for {values} values",
+            shape.edges
+        );
+        // Every anchor is still reachable from a `$dynamicRef`.
+        assert!(shape.cyclic.len() > 200);
+    }
+
+    #[test]
+    fn dynamic_and_static_reference_cycles_are_stopped() {
+        // `$ref` leads to a `$dynamicRef` that leads back to the root, which
+        // never descends into the document.
+        let schema = json!({
+            "$id": "https://example.com/loop",
+            "$dynamicAnchor": "loop",
+            "allOf": [{"$ref": "#/$defs/a"}, {"$ref": "#/$defs/a"}],
+            "$defs": {"a": {"$dynamicRef": "#loop"}}
+        });
+        let Outcome {
+            findings, steps, ..
+        } = run(&json!([1]), &schema, None);
+        assert!(steps < 20, "{steps} applications");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("without end"));
+        // Here only the dynamic scope closes the cycle: `#loop` names a leaf
+        // in `inner`, but `outer`, outermost in scope, declares it too.
+        let schema = json!({
+            "$id": "https://example.com/outer",
+            "$dynamicAnchor": "loop",
+            "$ref": "inner",
+            "$defs": {"inner": {
+                "$id": "inner",
+                "allOf": [{"$dynamicRef": "#loop"}, {"$dynamicRef": "#loop"}],
+                "$defs": {"leaf": {"$dynamicAnchor": "loop", "type": "integer"}}
+            }}
+        });
+        let Outcome {
+            findings, steps, ..
+        } = run(&json!(1), &schema, None);
+        assert!(steps < 20, "{steps} applications");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("without end"));
+        // A cycle that does descend is fine and stays linear.
+        let schema = json!({
+            "$id": "https://example.com/tree",
+            "$dynamicAnchor": "node",
+            "properties": {"kids": {"items": {"$ref": "#/$defs/kid"}}, "v": {"type": "integer"}},
+            "$defs": {"kid": {"$dynamicRef": "#node"}}
+        });
+        let tree = (0..30).fold(json!({"v": 1}), |inner, _| json!({"v": 1, "kids": [inner]}));
+        let outcome = run(&tree, &schema, None);
+        assert_eq!(outcome.findings, []);
+        assert!(outcome.steps < 1_000, "{} applications", outcome.steps);
+        let tree = (0..30).fold(
+            json!({"v": "x"}),
+            |inner, _| json!({"v": 1, "kids": [inner]}),
+        );
+        assert_eq!(errors(&tree.to_string(), &schema).len(), 1);
     }
 
     #[test]
@@ -2252,8 +4779,8 @@ mod tests {
 
     #[test]
     fn flags_unsupported_and_unknown_keywords() {
-        let dynamic = validate(&json!(1), &json!({"$dynamicRef": "#recursive"}));
-        assert!(dynamic.iter().any(|f| f.severity == Severity::Warning));
+        let recursive = validate(&json!(1), &json!({"$recursiveRef": "#"}));
+        assert!(recursive.iter().any(|f| f.severity == Severity::Warning));
         let unknown = validate(&json!(1), &json!({"madeUpKeyword": 1}));
         assert!(unknown.iter().any(|f| f.severity == Severity::Warning));
     }

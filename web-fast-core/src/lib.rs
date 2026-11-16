@@ -9,12 +9,12 @@
 //! source digest and stable document-order evidence suitable for downstream
 //! provenance and Arrow pipelines.
 
-use scraper::{ElementRef, Html};
-use std::collections::HashMap;
+use scraper::ElementRef;
 use std::io::Read;
 
 mod decoding;
 mod dom;
+mod nesting;
 use dom::{DomIndex, TextMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -47,6 +47,15 @@ pub enum WebParseError {
     /// Extracted text exceeded the configured byte limit.
     #[error("HTML text exceeds the configured byte limit")]
     TextLimitExceeded,
+    /// Tree construction exceeded the supported nesting depth.
+    #[error("HTML element nesting exceeds the supported depth")]
+    NestingLimitExceeded,
+    /// Expanded table spans exceeded the supported cell limit.
+    #[error("HTML table spans cover more cells than the supported limit")]
+    TableSpanLimitExceeded,
+    /// Structural paths exceeded their separate size budget.
+    #[error("HTML structural paths exceed the supported total size")]
+    DomPathLimitExceeded,
     /// Reading a local source failed.
     #[error("failed to read HTML source: {0}")]
     Io(#[from] std::io::Error),
@@ -54,6 +63,15 @@ pub enum WebParseError {
     #[error("failed to encode HTML as Arrow IPC: {0}")]
     Arrow(String),
 }
+
+/// Hard ceiling on element nesting during HTML tree construction.
+pub const MAX_NESTING_DEPTH: usize = 512;
+/// Aggregate limit on cells introduced by table spans.
+pub const MAX_TABLE_SPAN_CELLS: usize = 1_000_000;
+const MAX_COLSPAN: usize = 1_000;
+const MAX_ROWSPAN: usize = 65_534;
+/// Aggregate limit on structural path bytes.
+pub const MAX_DOM_PATH_BYTES: usize = 256 * 1024 * 1024;
 
 /// Resource limits and decoding policy for one parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +98,7 @@ impl Default for ParseOptions {
             max_input_bytes: 32 * 1024 * 1024,
             max_nodes: 250_000,
             max_dom_nodes: 1_000_000,
-            max_dom_depth: 256,
+            max_dom_depth: MAX_NESTING_DEPTH,
             max_text_bytes: 32 * 1024 * 1024,
             encoding_label: None,
         }
@@ -294,7 +312,21 @@ fn parse_html_inner(
     supplied_base_url: Option<&str>,
     options: &ParseOptions,
 ) -> Result<WebDocument, WebParseError> {
-    let document = Html::parse_document(html);
+    let document = nesting::parse_document_within(
+        html,
+        options.max_dom_depth.min(MAX_NESTING_DEPTH),
+        options.max_dom_nodes,
+    )
+    .map_err(|stopped| match stopped {
+        nesting::Stopped::TooDeep => {
+            if options.max_dom_depth < MAX_NESTING_DEPTH {
+                WebParseError::DepthLimitExceeded
+            } else {
+                WebParseError::NestingLimitExceeded
+            }
+        }
+        nesting::Stopped::TooManyElements => WebParseError::NodeLimitExceeded,
+    })?;
     let index = DomIndex::new(&document, options)?;
     let mut budget = Budget::new(options.max_nodes, options.max_text_bytes);
     if supplied_base_url.is_some_and(|value| value.len() > options.max_text_bytes) {
@@ -326,8 +358,7 @@ fn parse_html_inner(
     let mut links = Vec::new();
     let mut images = Vec::new();
     let mut tables: Vec<WebTable> = Vec::new();
-    let mut table_indices = HashMap::new();
-    let mut row_indices = HashMap::new();
+    let mut ignored_spans = 0usize;
     let mut json_ld = Vec::new();
     let mut json_data = Vec::new();
     let mut discovery_links = Vec::new();
@@ -533,41 +564,19 @@ fn parse_html_inner(
             }
             "table" => {
                 budget.add_node()?;
-                table_indices.insert(element.id(), tables.len());
+                let parts = own_table_parts(element, &index);
+                let caption = parts
+                    .caption
+                    .map(|caption| index.text(caption, TextMode::Normalized, true, &mut budget))
+                    .transpose()?
+                    .filter(|text| !text.is_empty());
+                let rows = table_rows(&parts.rows, &mut budget, &mut ignored_spans, &index)?;
                 tables.push(WebTable {
                     ordinal: ordinal(tables.len())?,
                     dom_path: index.path(element, &mut budget)?,
-                    caption: None,
-                    rows: Vec::new(),
+                    caption,
+                    rows,
                 });
-            }
-            "caption" => {
-                if let Some(&table) = info.table.and_then(|id| table_indices.get(&id)) {
-                    if tables[table].caption.is_none() {
-                        let value = index.text(element, TextMode::Normalized, true, &mut budget)?;
-                        if !value.is_empty() {
-                            tables[table].caption = Some(value);
-                        }
-                    }
-                }
-            }
-            "tr" => {
-                if let Some(&table) = info.table.and_then(|id| table_indices.get(&id)) {
-                    budget.add_node()?;
-                    row_indices.insert(element.id(), (table, tables[table].rows.len()));
-                    tables[table].rows.push(Vec::new());
-                }
-            }
-            "td" | "th" => {
-                if let Some(&(table, row)) = info.row.and_then(|id| row_indices.get(&id)) {
-                    budget.add_node()?;
-                    tables[table].rows[row].push(index.text(
-                        element,
-                        TextMode::Normalized,
-                        true,
-                        &mut budget,
-                    )?);
-                }
             }
             _ => {}
         }
@@ -581,11 +590,14 @@ fn parse_html_inner(
     } else {
         vec![format!("invalid_json_ld:{invalid_json_ld}")]
     };
+    if ignored_spans > 0 {
+        diagnostics.push(format!("ignored_table_spans:{ignored_spans}"));
+    }
     if invalid_json_data > 0 {
         diagnostics.push(format!("invalid_embedded_json:{invalid_json_data}"));
     }
     Ok(WebDocument {
-        source_sha256: format!("{:x}", Sha256::digest(source_bytes)),
+        source_sha256: lower_hex(&Sha256::digest(source_bytes)),
         base_url,
         title,
         language,
@@ -667,6 +679,185 @@ fn attr_eq(element: ElementRef<'_>, name: &str, expected: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
+/// A cell from an earlier row that still covers columns of the current one.
+struct RowSpan {
+    column: usize,
+    width: usize,
+    rows_left: usize,
+}
+
+/// Reads a `rowspan`/`colspan` attribute the way browsers do.
+///
+/// The value is the run of digits at the start, after optional whitespace
+/// and one `+`; what follows is ignored, so `2px` and `2.5` are 2. A missing
+/// attribute is 1. A value with no leading digits, or outside 1 to
+/// `maximum`, is treated as 1 and counted in `ignored`, so a hostile span
+/// neither expands the table nor passes unnoticed. `rowspan="0"` (to the end
+/// of the row group, per HTML) is returned as `usize::MAX`.
+fn span_attr(cell: ElementRef<'_>, name: &str, maximum: usize, ignored: &mut usize) -> usize {
+    let Some(raw) = cell.value().attr(name) else {
+        return 1;
+    };
+    let trimmed = raw.trim_start();
+    let unsigned = trimmed.strip_prefix('+').unwrap_or(trimmed);
+    let digits = unsigned
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(unsigned, |end| &unsigned[..end]);
+    match digits.parse::<usize>() {
+        Ok(0) if name == "rowspan" => usize::MAX,
+        Ok(value) if (1..=maximum).contains(&value) => value,
+        _ => {
+            *ignored += 1;
+            1
+        }
+    }
+}
+
+/// Lays a table's rows out on a grid, honoring `rowspan` and `colspan`.
+///
+/// `rowspan` only ever covers rows that exist: a span that outlives the
+/// table's last row is dropped, so it cannot create rows. Every empty cell a
+/// span adds is charged to the document-wide [`MAX_TABLE_SPAN_CELLS`].
+fn table_rows(
+    rows: &[ElementRef<'_>],
+    budget: &mut Budget,
+    ignored_spans: &mut usize,
+    index: &DomIndex<'_>,
+) -> Result<Vec<Vec<String>>, WebParseError> {
+    // Spans carried down from earlier rows: sorted by column, never overlapping.
+    let mut active: Vec<RowSpan> = Vec::new();
+    let mut grid = Vec::new();
+    let mut group = None;
+    for row in rows {
+        budget.add_node()?;
+        // A cell cannot span past its row group (`thead`/`tbody`/`tfoot`).
+        let row_group = row.parent().map(|parent| parent.id());
+        if row_group != group {
+            active.clear();
+            group = row_group;
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut carried: Vec<RowSpan> = Vec::new();
+        let mut next_active = 0usize;
+        let cells = row.children().filter_map(ElementRef::wrap).filter(|cell| {
+            matches!(cell.value().name(), "th" | "td")
+                && !index.info[&cell.id()].hidden
+                && !index.info[&cell.id()].inert
+        });
+        for cell in cells {
+            // Columns covered from above come before the next real cell.
+            while let Some(span) = active.get(next_active).filter(|s| s.column <= out.len()) {
+                cover(span, &mut out, &mut carried, budget)?;
+                next_active += 1;
+            }
+            budget.add_node()?;
+            let text = index.text(cell, TextMode::Normalized, true, budget)?;
+            let width = span_attr(cell, "colspan", MAX_COLSPAN, ignored_spans);
+            let height = span_attr(cell, "rowspan", MAX_ROWSPAN, ignored_spans);
+            let column = out.len();
+            out.push(text);
+            add_empty_cells(&mut out, width - 1, budget)?;
+            // The cell keeps its full width even where it runs into columns
+            // covered from above, as in a browser. Those spans are absorbed:
+            // their columns are already emitted, and the merged span is what
+            // carries down.
+            let mut rows_left = height - 1;
+            while let Some(span) = active.get(next_active).filter(|s| s.column < out.len()) {
+                let end = span.column + span.width;
+                let missing = end.saturating_sub(out.len());
+                add_empty_cells(&mut out, missing, budget)?;
+                rows_left = rows_left.max(span.rows_left - 1);
+                next_active += 1;
+            }
+            if rows_left > 0 {
+                carried.push(RowSpan {
+                    column,
+                    width: out.len() - column,
+                    rows_left,
+                });
+            }
+        }
+        for span in &active[next_active..] {
+            let gap = span.column.saturating_sub(out.len());
+            add_empty_cells(&mut out, gap, budget)?;
+            cover(span, &mut out, &mut carried, budget)?;
+        }
+        active = carried;
+        if !out.is_empty() {
+            grid.push(out);
+        }
+    }
+    Ok(grid)
+}
+
+/// Emits the empty cells of one span carried into the current row.
+fn cover(
+    span: &RowSpan,
+    out: &mut Vec<String>,
+    carried: &mut Vec<RowSpan>,
+    budget: &mut Budget,
+) -> Result<(), WebParseError> {
+    let column = out.len();
+    add_empty_cells(out, span.width, budget)?;
+    if span.rows_left > 1 {
+        carried.push(RowSpan {
+            column,
+            width: span.width,
+            rows_left: span.rows_left - 1,
+        });
+    }
+    Ok(())
+}
+
+fn add_empty_cells(
+    out: &mut Vec<String>,
+    count: usize,
+    budget: &mut Budget,
+) -> Result<(), WebParseError> {
+    budget.add_span_cells(count)?;
+    out.extend(std::iter::repeat_with(String::new).take(count));
+    Ok(())
+}
+
+/// The caption and rows that belong to one table, in document order.
+struct TableParts<'a> {
+    caption: Option<ElementRef<'a>>,
+    rows: Vec<ElementRef<'a>>,
+}
+
+/// Collects a table's own caption and rows without entering nested tables.
+///
+/// A nested table is reported as its own [`WebTable`], so its rows are not
+/// repeated in every enclosing table. Each node is visited once per table it
+/// directly belongs to, which keeps the walk linear in the document size.
+fn own_table_parts<'a>(table: ElementRef<'a>, index: &DomIndex<'a>) -> TableParts<'a> {
+    let mut parts = TableParts {
+        caption: None,
+        rows: Vec::new(),
+    };
+    // Explicit stack, pushed in reverse so nodes pop in document order.
+    let mut pending = table.children().rev().collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        let Some(element) = ElementRef::wrap(node) else {
+            continue;
+        };
+        if index.info[&element.id()].hidden || index.info[&element.id()].inert {
+            continue;
+        }
+        match element.value().name() {
+            "table" => {}
+            "tr" => parts.rows.push(element),
+            "caption" => {
+                parts.caption.get_or_insert(element);
+            }
+            // Cells are only read as children of a row.
+            "th" | "td" => {}
+            _ => pending.extend(node.children().rev()),
+        }
+    }
+    parts
+}
+
 fn owned_attr(
     element: ElementRef<'_>,
     name: &str,
@@ -709,6 +900,8 @@ fn ordinal(value: usize) -> Result<u32, WebParseError> {
 }
 
 struct Budget {
+    span_cells: usize,
+    path_bytes: usize,
     nodes: usize,
     text_bytes: usize,
     max_nodes: usize,
@@ -718,6 +911,8 @@ struct Budget {
 impl Budget {
     fn new(max_nodes: usize, max_text_bytes: usize) -> Self {
         Self {
+            span_cells: 0,
+            path_bytes: 0,
             nodes: 0,
             text_bytes: 0,
             max_nodes,
@@ -732,6 +927,22 @@ impl Budget {
             .ok_or(WebParseError::NodeLimitExceeded)?;
         if self.nodes > self.max_nodes {
             return Err(WebParseError::NodeLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn add_path(&mut self, segment: &str) -> Result<(), WebParseError> {
+        self.path_bytes = self.path_bytes.saturating_add(segment.len());
+        if self.path_bytes > MAX_DOM_PATH_BYTES {
+            return Err(WebParseError::DomPathLimitExceeded);
+        }
+        self.add_text(segment)
+    }
+
+    fn add_span_cells(&mut self, count: usize) -> Result<(), WebParseError> {
+        self.span_cells = self.span_cells.saturating_add(count);
+        if self.span_cells > MAX_TABLE_SPAN_CELLS {
+            return Err(WebParseError::TableSpanLimitExceeded);
         }
         Ok(())
     }
@@ -769,4 +980,18 @@ pub(crate) fn block_kind_name(kind: BlockKind) -> &'static str {
         BlockKind::TableHeader => "table_header",
         BlockKind::TableCell => "table_cell",
     }
+}
+
+/// Lower-case hexadecimal of `bytes`, two digits per byte.
+///
+/// The digest type of `sha2` 0.11 has no `LowerHex` implementation, so the
+/// digest is written out here; the text is the same as `{:x}` gave before.
+fn lower_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        text.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    text
 }

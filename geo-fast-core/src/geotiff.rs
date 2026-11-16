@@ -4,17 +4,23 @@
 //!   - ModelPixelScaleTag    (34264)
 //!   - ModelTiepointTag      (33922)
 //!   - ModelTransformationTag (34264 / 34264 — alias; actually 33920 for the full matrix)
-//!   - GeoKeyDirectoryTag    (34735) + GeoDoubleParamsTag (34736) + GeoAsciiParamsTag (34737)
+//!   - GeoKeyDirectoryTag    (34735), for the keys whose value is stored in the
+//!     directory itself
+//!   - GeoDoubleParamsTag (34736) and GeoAsciiParamsTag (34737), for the keys
+//!     whose value is stored there: read only by
+//!     [`parse_geotiff_geokey_params`], and leniently
 //!
 //! Returns [`GeoTiffMetadata`] and, optionally, raster band data as `Vec<f32>`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use tiff::decoder::{Decoder, DecodingResult};
+use tiff::decoder::ifd::Value;
+use tiff::decoder::{ChunkType, Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
-use tiff::ColorType;
+use tiff::{ColorType, TiffError};
 
 use crate::error::GeoError;
 use crate::types::BBox;
@@ -29,8 +35,51 @@ const TAG_GEO_ASCII_PARAMS: u16 = 34737;
 
 // GeoKey IDs
 const GEOKEY_MODEL_TYPE: u16 = 1024;
+const GEOKEY_RASTER_TYPE: u16 = 1025;
 const GEOKEY_GEOGRAPHIC_TYPE: u16 = 2048;
 const GEOKEY_PROJECTED_CS_TYPE: u16 = 3072;
+const GEOKEY_CITATION: u16 = 1026;
+const GEOKEY_GEOGRAPHIC_CITATION: u16 = 2049;
+const GEOKEY_SEMI_MAJOR_AXIS: u16 = 2057;
+const GEOKEY_SEMI_MINOR_AXIS: u16 = 2058;
+const GEOKEY_INVERSE_FLATTENING: u16 = 2059;
+const GEOKEY_PROJECTED_CITATION: u16 = 3073;
+
+/// `GTModelTypeGeoKey` value for a geographic (latitude-longitude) CRS.
+///
+/// The GeoTIFF specification defines 1 = projected, 2 = geographic,
+/// 3 = geocentric.
+const MODEL_TYPE_GEOGRAPHIC: u32 = 2;
+
+/// `GTRasterTypeGeoKey` value for a raster whose coordinates name pixel
+/// centres (`RasterPixelIsPoint`).
+///
+/// The other value, 1 and the default, is `RasterPixelIsArea`: raster
+/// coordinates name pixel corners, (0, 0) being the raster's upper-left.
+const RASTER_PIXEL_IS_POINT: u32 = 2;
+
+/// TIFF `Compression` tag value for uncompressed data.
+const COMPRESSION_NONE: u16 = 1;
+
+/// Most decoded bytes one byte of an uncompressed TIFF can produce.
+///
+/// The decoder allocates the whole output raster from the width and height in
+/// the header before it reads a strip, so those fields must be weighed against
+/// the size of the input. Uncompressed samples are stored as they are decoded,
+/// except that the decoder gives every sample at least one byte: packed 1-bit
+/// samples grow eightfold.
+const UNCOMPRESSED_EXPANSION: usize = 8;
+
+/// Most decoded bytes one byte of a compressed TIFF can produce.
+///
+/// No codec the `tiff` crate decodes expands further than 4096:1. PackBits
+/// reaches 64:1, Deflate 1032:1, JPEG about 1400:1 (one bit per block of a
+/// DC-only scan), and LZW about 2560:1 (a 12-bit code naming a string of at
+/// most 3838 bytes); 4096 is the next power of two. Sub-byte samples add the
+/// factor of [`UNCOMPRESSED_EXPANSION`]. Lowering this rejects valid, highly
+/// compressible rasters such as constant masks; raising it only lets a small
+/// file claim a larger buffer.
+const COMPRESSED_EXPANSION: usize = 4096 * UNCOMPRESSED_EXPANSION;
 
 /// Summary of georeferencing information extracted from a GeoTIFF.
 #[derive(Debug, Clone)]
@@ -41,7 +90,14 @@ pub struct GeoTiffMetadata {
     pub height: u32,
     /// Number of bands (samples per pixel).
     pub band_count: u16,
-    /// Geographic bounding box (EPSG:4326 when projection is known).
+    /// Bounding box in degrees of longitude and latitude.
+    ///
+    /// Set only when the raster's CRS is geographic ([`Self::is_geographic`])
+    /// and its tags locate it. The corners of a projected raster are in the
+    /// units of its projection, usually metres; a [`BBox`] holds degrees and
+    /// nothing here reprojects, so for a projected raster this is `None`.
+    /// [`Self::upper_left`] and [`Self::lower_right`] give the corners in the
+    /// raster's own CRS either way.
     pub bbox: Option<BBox>,
     /// Pixel size in projection units (x, y).
     pub pixel_scale: Option<(f64, f64)>,
@@ -58,14 +114,40 @@ pub struct GeoTiffMetadata {
 }
 
 impl GeoTiffMetadata {
-    /// Computes the upper-left world coordinate from tiepoints + pixel scale.
+    /// Returns the world coordinate of the raster's upper-left corner.
+    ///
+    /// The coordinate is in the raster's own CRS and comes from the first
+    /// tiepoint. A tiepoint ties a pixel to a world coordinate, and that
+    /// pixel need not be the corner, so the pixel scale carries the
+    /// coordinate back to pixel (0, 0). Returns `None` when there is no
+    /// tiepoint, or when the tiepoint is not at the corner and there is no
+    /// pixel scale to carry it there.
+    ///
+    /// The corner is the outer edge of the first pixel in either raster
+    /// type. In a [`Self::pixel_is_point`] raster the tiepoint ties a pixel
+    /// centre, so the corner lies half a pixel further out and is `None`
+    /// without a pixel scale.
     pub fn upper_left(&self) -> Option<(f64, f64)> {
-        let tp = self.tiepoints.first()?;
-        // tp = [pixel_x, pixel_y, pixel_z, world_x, world_y, world_z]
-        Some((tp[3], tp[4]))
+        tiepoint_origin(
+            self.tiepoints.first()?,
+            self.pixel_scale,
+            self.pixel_is_point(),
+        )
     }
 
-    /// Computes the lower-right world coordinate.
+    /// Returns whether raster coordinates name pixel centres.
+    ///
+    /// True when `GTRasterTypeGeoKey` (1025) is 2, `RasterPixelIsPoint`.
+    /// Otherwise, and when the key is absent, the raster is `PixelIsArea`
+    /// and raster coordinates name pixel corners.
+    pub fn pixel_is_point(&self) -> bool {
+        is_pixel_is_point(&self.geokeys)
+    }
+
+    /// Returns the world coordinate of the raster's lower-right corner.
+    ///
+    /// One pixel scale per pixel away from [`Self::upper_left`], in the
+    /// raster's own CRS. Returns `None` without a tiepoint and a pixel scale.
     pub fn lower_right(&self) -> Option<(f64, f64)> {
         let (world_x, world_y) = self.upper_left()?;
         let (sx, sy) = self.pixel_scale?;
@@ -73,6 +155,300 @@ impl GeoTiffMetadata {
         let lr_y = world_y - sy * self.height as f64;
         Some((lr_x, lr_y))
     }
+}
+
+/// Values of the GeoKeys that are stored outside the GeoKey directory.
+///
+/// A key whose value is a double or a string holds, in the directory, only
+/// the position of that value in `GeoDoubleParamsTag` (34736) or
+/// `GeoAsciiParamsTag` (34737); [`GeoTiffMetadata::geokeys`] records that
+/// position. This is the value itself, for each such key that could be
+/// resolved.
+///
+/// A key is left out, and nothing fails, when its parameter tag is missing
+/// or unreadable, when the key has no values, or when it points outside the
+/// tag.
+///
+/// Text that is not ASCII costs more than its own key. `GeoAsciiParamsTag`
+/// is one tag holding every string, and the decoder refuses the whole tag
+/// when any byte of it is not ASCII: a single citation in a legacy encoding
+/// (Latin-1, say) leaves every string key unresolved. The double keys are
+/// in another tag and are still read. Only when a writer stored the text as
+/// BYTE values is each string decoded on its own, and then a string that is
+/// not UTF-8 is the only one left out.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GeoKeyParams {
+    /// Values of the keys stored in `GeoDoubleParamsTag`, by key ID.
+    pub doubles: HashMap<u16, Vec<f64>>,
+    /// Values of the keys stored in `GeoAsciiParamsTag`, by key ID, without
+    /// the `|` that ends each string in the tag.
+    pub strings: HashMap<u16, String>,
+}
+
+impl GeoKeyParams {
+    /// Returns the general citation of the raster (`GTCitationGeoKey`, 1026).
+    pub fn citation(&self) -> Option<&str> {
+        self.string(GEOKEY_CITATION)
+    }
+
+    /// Returns the citation of the geographic CRS (`GeogCitationGeoKey`, 2049).
+    pub fn geographic_citation(&self) -> Option<&str> {
+        self.string(GEOKEY_GEOGRAPHIC_CITATION)
+    }
+
+    /// Returns the citation of the projected CRS (`PCSCitationGeoKey`, 3073).
+    pub fn projected_citation(&self) -> Option<&str> {
+        self.string(GEOKEY_PROJECTED_CITATION)
+    }
+
+    /// Returns the ellipsoid's semi-major axis (`GeogSemiMajorAxisGeoKey`, 2057).
+    ///
+    /// In the CRS's linear unit, usually metres.
+    pub fn semi_major_axis(&self) -> Option<f64> {
+        self.double(GEOKEY_SEMI_MAJOR_AXIS)
+    }
+
+    /// Returns the ellipsoid's semi-minor axis (`GeogSemiMinorAxisGeoKey`, 2058).
+    ///
+    /// In the CRS's linear unit, usually metres.
+    pub fn semi_minor_axis(&self) -> Option<f64> {
+        self.double(GEOKEY_SEMI_MINOR_AXIS)
+    }
+
+    /// Returns the ellipsoid's inverse flattening (`GeogInvFlatteningGeoKey`, 2059).
+    pub fn inverse_flattening(&self) -> Option<f64> {
+        self.double(GEOKEY_INVERSE_FLATTENING)
+    }
+
+    /// Returns the string value of the key `key_id`, if it was resolved.
+    pub fn string(&self, key_id: u16) -> Option<&str> {
+        self.strings.get(&key_id).map(String::as_str)
+    }
+
+    /// Returns the first double value of the key `key_id`, if it was resolved.
+    pub fn double(&self, key_id: u16) -> Option<f64> {
+        self.doubles.get(&key_id)?.first().copied()
+    }
+}
+
+/// Reads the GeoKey values stored in the double and ASCII parameter tags.
+///
+/// See [`GeoKeyParams`] for what is resolved and what is left out.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Io`] when the file cannot be opened, and
+/// [`GeoError::Tiff`] or [`GeoError::InvalidFormat`] when it is not a
+/// readable TIFF or its GeoKey directory cannot be read. A problem with
+/// either parameter tag is not an error.
+pub fn parse_geotiff_geokey_params<P: AsRef<Path>>(path: P) -> Result<GeoKeyParams, GeoError> {
+    let file = std::fs::File::open(path.as_ref()).map_err(GeoError::Io)?;
+    parse_geotiff_geokey_params_reader(BufReader::new(file))
+}
+
+/// Reads the GeoKey values in the parameter tags from any `Read + Seek`.
+///
+/// # Errors
+///
+/// As [`parse_geotiff_geokey_params`], without the file to open.
+pub fn parse_geotiff_geokey_params_reader<R: Read + Seek>(
+    mut reader: R,
+) -> Result<GeoKeyParams, GeoError> {
+    let start = reader.stream_position().map_err(GeoError::Io)?;
+    let input_len = reader.seek(SeekFrom::End(0)).map_err(GeoError::Io)?;
+    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
+    let mut decoder = open_tag_decoder(reader)?;
+    let entries = read_geokey_entries(&mut decoder)?;
+
+    // Each tag is read only if a key points into it, and a tag that cannot
+    // be read is the same as one that is not there.
+    let points_into = |tag_id: u16| entries.iter().any(|entry| entry[1] == tag_id);
+    let doubles: Option<Vec<f64>> = points_into(TAG_GEO_DOUBLE_PARAMS)
+        .then(|| decoder.find_tag(tag(TAG_GEO_DOUBLE_PARAMS)).ok().flatten())
+        .flatten()
+        .and_then(|value| value.into_f64_vec().ok());
+    let ascii: Option<Vec<u8>> = if points_into(TAG_GEO_ASCII_PARAMS) {
+        match decoder.find_tag(tag(TAG_GEO_ASCII_PARAMS)) {
+            Ok(value) => value.and_then(tag_bytes),
+            // The decoder refuses an ASCII tag with a byte above 0x7F in it,
+            // and with the tag every string in it. Writers do put Latin-1
+            // there (a citation with an accent), so the bytes are read as
+            // they are stored and decoded string by string below.
+            Err(_) => read_raw_text_tag(&mut decoder, (start, input_len), TAG_GEO_ASCII_PARAMS)
+                .ok()
+                .flatten(),
+        }
+    } else {
+        None
+    };
+
+    let mut params = GeoKeyParams::default();
+    for [key_id, location, count, offset] in entries {
+        // A key of no values has no value to give.
+        if count == 0 {
+            continue;
+        }
+        let range = usize::from(offset)..usize::from(offset) + usize::from(count);
+        match location {
+            TAG_GEO_DOUBLE_PARAMS => {
+                if let Some(values) = doubles.as_deref().and_then(|all| all.get(range)) {
+                    params.doubles.insert(key_id, values.to_vec());
+                }
+            }
+            TAG_GEO_ASCII_PARAMS => {
+                let text = ascii
+                    .as_deref()
+                    .and_then(|all| all.get(range))
+                    .map(decode_text);
+                if let Some(text) = text.as_deref() {
+                    // One `|` ends a string in the tag, standing in for the
+                    // NUL that ends the tag itself; any `|` before it is
+                    // part of the string.
+                    let text = text.strip_suffix('\0').unwrap_or(text);
+                    let text = text.strip_suffix('|').unwrap_or(text);
+                    params.strings.insert(key_id, text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(params)
+}
+
+/// Decodes the bytes of one string of a text tag.
+///
+/// UTF-8 where the bytes are UTF-8, which covers ASCII. Any other bytes are
+/// read as Latin-1 (ISO 8859-1), in which every byte is the character of the
+/// same number, so the fallback cannot fail.
+fn decode_text(bytes: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Cow::Borrowed(text),
+        Err(_) => Cow::Owned(bytes.iter().copied().map(char::from).collect()),
+    }
+}
+
+/// Reads the stored bytes of a one-byte-per-value tag of the first directory.
+///
+/// For a text tag the decoder will not hand over: see the caller. The walk
+/// is that of [`check_directory_fits`], made through the decoder's own
+/// reader, for a TIFF of `input_len` bytes that starts at `start`. `None`
+/// when the directory has no such tag, when its values are wider than a
+/// byte, or when it declares more bytes than the file has.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Io`] when the header, the directory or the value
+/// cannot be read.
+fn read_raw_text_tag<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    (start, input_len): (u64, u64),
+    wanted: u16,
+) -> Result<Option<Vec<u8>>, GeoError> {
+    // The decoder reads integers in the file's byte order; the order itself
+    // is the first byte of the file, `I` or `M`.
+    decoder.goto_offset_u64(start).map_err(GeoError::Io)?;
+    let big_endian = decoder.read_byte().map_err(GeoError::Io)? == b'M';
+    decoder.read_byte().map_err(GeoError::Io)?;
+    let bigtiff = match decoder.read_short().map_err(GeoError::Io)? {
+        42 => false,
+        43 => {
+            // Offset size and a reserved word.
+            decoder.read_long().map_err(GeoError::Io)?;
+            true
+        }
+        _ => return Ok(None),
+    };
+    let word = |decoder: &mut Decoder<R>| {
+        if bigtiff {
+            decoder.read_long8()
+        } else {
+            decoder.read_long().map(u64::from)
+        }
+        .map_err(GeoError::Io)
+    };
+    let directory = word(decoder)?;
+    decoder.goto_offset_u64(directory).map_err(GeoError::Io)?;
+    let entries = if bigtiff {
+        decoder.read_long8().map_err(GeoError::Io)?
+    } else {
+        u64::from(decoder.read_short().map_err(GeoError::Io)?)
+    };
+    // Every pass reads at least twelve bytes or fails, so a count that
+    // exceeds the file ends in an error.
+    for _ in 0..entries {
+        let tag = decoder.read_short().map_err(GeoError::Io)?;
+        let field_type = decoder.read_short().map_err(GeoError::Io)?;
+        let Some(value_size) = field_type_size(field_type) else {
+            // As the decoder does: eight more bytes, in BigTIFF too.
+            decoder.read_long8().map_err(GeoError::Io)?;
+            continue;
+        };
+        let count = word(decoder)?;
+        // The value itself when it fits in the field, or else its offset.
+        let mut field = [0u8; 8];
+        let field_len = if bigtiff { 8 } else { 4 };
+        for byte in &mut field[..field_len] {
+            *byte = decoder.read_byte().map_err(GeoError::Io)?;
+        }
+        if tag != wanted {
+            continue;
+        }
+        if value_size != 1 || count > input_len {
+            return Ok(None);
+        }
+        // No more than the length of an input that was read; where `usize`
+        // cannot hold that there is no tag to return.
+        let Ok(len) = usize::try_from(count) else {
+            return Ok(None);
+        };
+        if len <= field_len {
+            return Ok(Some(field[..len].to_vec()));
+        }
+        let [a, b, c, d, ..] = field;
+        let offset = match (bigtiff, big_endian) {
+            (true, true) => u64::from_be_bytes(field),
+            (true, false) => u64::from_le_bytes(field),
+            (false, true) => u64::from(u32::from_be_bytes([a, b, c, d])),
+            (false, false) => u64::from(u32::from_le_bytes([a, b, c, d])),
+        };
+        if offset.checked_add(count).is_none_or(|end| end > input_len) {
+            return Ok(None);
+        }
+        decoder.goto_offset_u64(offset).map_err(GeoError::Io)?;
+        let mut bytes = Vec::with_capacity(len);
+        for _ in 0..len {
+            bytes.push(decoder.read_byte().map_err(GeoError::Io)?);
+        }
+        return Ok(Some(bytes));
+    }
+    Ok(None)
+}
+
+/// The bytes of a tag holding text.
+///
+/// The text is ASCII by its field type, but some writers store it as BYTE
+/// values, which the decoder returns as a list of integers. `None` for any
+/// other kind of value.
+fn tag_bytes(value: Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Ascii(text) => {
+            // The decoder drops the NUL that ends the tag; a key's count may
+            // include it, so it is put back.
+            let mut bytes = text.into_bytes();
+            bytes.push(0);
+            Some(bytes)
+        }
+        other => other
+            .into_u64_vec()
+            .ok()?
+            .into_iter()
+            .map(|byte| u8::try_from(byte).ok())
+            .collect(),
+    }
+}
+
+fn is_pixel_is_point(geokeys: &HashMap<u16, u32>) -> bool {
+    geokeys.get(&GEOKEY_RASTER_TYPE) == Some(&RASTER_PIXEL_IS_POINT)
 }
 
 /// Parse GeoTIFF metadata from a file path.
@@ -86,7 +462,7 @@ pub fn parse_geotiff_metadata<P: AsRef<Path>>(path: P) -> Result<GeoTiffMetadata
 pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
     reader: R,
 ) -> Result<GeoTiffMetadata, GeoError> {
-    let mut decoder = Decoder::new(reader).map_err(|e| GeoError::Tiff(e.to_string()))?;
+    let mut decoder = open_tag_decoder(reader)?;
 
     let (width, height) = decoder
         .dimensions()
@@ -106,7 +482,13 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
     };
 
     // ── Read raw GeoTIFF tags ────────────────────────────────────────────────
-    let pixel_scale = read_doubles_tag(&mut decoder, TAG_MODEL_PIXEL_SCALE)?.map(|v| (v[0], v[1]));
+    // The tag holds (x, y, z) scales; one with fewer than two values gives no
+    // usable scale and is treated like an absent tag.
+    let pixel_scale =
+        read_doubles_tag(&mut decoder, TAG_MODEL_PIXEL_SCALE)?.and_then(|v| match v.as_slice() {
+            [x, y, ..] => Some((*x, *y)),
+            _ => None,
+        });
 
     let raw_tiepoints = read_doubles_tag(&mut decoder, TAG_MODEL_TIEPOINT)?.unwrap_or_default();
     let tiepoints: Vec<[f64; 6]> = raw_tiepoints.as_chunks::<6>().0.to_vec();
@@ -123,11 +505,12 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
         });
 
     // ── GeoKey directory ────────────────────────────────────────────────────
-    let geo_double_params =
-        read_doubles_tag(&mut decoder, TAG_GEO_DOUBLE_PARAMS)?.unwrap_or_default();
-    let geo_ascii_params = read_ascii_tag(&mut decoder, TAG_GEO_ASCII_PARAMS)?.unwrap_or_default();
-
-    let geokeys = read_geokey_directory(&mut decoder, &geo_double_params, &geo_ascii_params)?;
+    // Only keys stored in the directory itself are used. The double and
+    // ASCII parameter tags hold the values of the other keys (citations,
+    // ellipsoid axes), which nothing here reads; they are left alone so that
+    // a citation in some legacy encoding cannot fail the parse.
+    // `parse_geotiff_geokey_params_reader` resolves those keys separately.
+    let geokeys = read_geokey_directory(&mut decoder)?;
 
     let epsg_code = geokeys
         .get(&GEOKEY_PROJECTED_CS_TYPE)
@@ -138,17 +521,25 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
     let is_geographic = geokeys
         .get(&GEOKEY_MODEL_TYPE)
         .copied()
-        .map(|v| v == 1) // 1 = ModelTypeGeographic, 2 = ModelTypeProjected
+        .map(|v| v == MODEL_TYPE_GEOGRAPHIC)
         .unwrap_or(false);
 
     // ── Derive bounding box ─────────────────────────────────────────────────
-    let bbox = derive_bbox(
-        &tiepoints,
-        pixel_scale,
-        width,
-        height,
-        &transformation_matrix,
-    );
+    // A `BBox` is in degrees. Only a geographic raster has corners in
+    // degrees; a projected one would put metres in the longitude and
+    // latitude fields.
+    let bbox = if is_geographic {
+        derive_bbox(
+            &tiepoints,
+            pixel_scale,
+            width,
+            height,
+            &transformation_matrix,
+            is_pixel_is_point(&geokeys),
+        )
+    } else {
+        None
+    };
 
     Ok(GeoTiffMetadata {
         width,
@@ -166,143 +557,858 @@ pub fn parse_geotiff_metadata_reader<R: Read + Seek>(
 
 /// Parse GeoTIFF and return raster data as one `Vec<f32>` per band.
 ///
+/// Unsigned 8- and 16-bit samples are scaled to `0.0..=1.0` by their full
+/// range. Every other sample type (signed 8-, 16-, 32- and 64-bit integers,
+/// unsigned 32- and 64-bit integers, 32- and 64-bit floats) keeps its value,
+/// rounded to the nearest `f32` where `f32` cannot hold it exactly.
+///
+/// # Precision
+///
+/// An `f32` holds every integer up to 2^24 (16,777,216) in magnitude and no
+/// more than 24 significant bits of a larger one. A 32- or 64-bit integer
+/// sample beyond that range comes back as the nearest `f32`: 2^40 + 1 reads
+/// as 2^40, and `u64::MAX` as 2^64. Rasters of identifiers or of counts
+/// above 2^24 lose their low bits here, and 64-bit floats likewise keep 24
+/// significant bits.
+///
+/// Bands stored interleaved and bands stored as separate planes
+/// (`PlanarConfiguration` 2) are both read, to the same values.
+///
 /// For large images this can be expensive; callers should check metadata first.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Io`] when the file cannot be opened,
+/// [`GeoError::Tiff`] or [`GeoError::InvalidFormat`] when it is not a TIFF
+/// the decoder can read, and [`GeoError::UnsupportedFormat`] for a raster whose bands would take
+/// more `f32` bytes than the default limit: 512 MiB or four times the size
+/// of the file, whichever is larger. Four bytes out per byte in is an
+/// uncompressed 8-bit raster, so no uncompressed file is refused for its
+/// size; a compressed one is held to 512 MiB (134,217,728 samples across
+/// all bands) unless the file itself is larger than 128 MiB.
+/// [`parse_geotiff_bands_with_limit`] takes the limit from the caller.
 pub fn parse_geotiff_bands<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<f32>>, GeoError> {
     let file = std::fs::File::open(path.as_ref()).map_err(GeoError::Io)?;
-    let reader = BufReader::new(file);
-    let mut decoder = Decoder::new(reader).map_err(|e| GeoError::Tiff(e.to_string()))?;
+    let input_len = file.metadata().map_err(GeoError::Io)?.len();
+    let limit = default_band_limit(input_len, max_band_bytes());
+    read_bands(BufReader::new(file), limit)
+}
+
+/// Parse GeoTIFF bands like [`parse_geotiff_bands`], under a caller's limit.
+///
+/// `max_band_bytes` is the most `f32` band data to return, in bytes: four
+/// per sample, all bands together. It replaces the default limit, and may be
+/// lower or higher. The decoder's own cap on the raster it decodes (256 MiB
+/// of samples as stored) still applies.
+///
+/// # Errors
+///
+/// As [`parse_geotiff_bands`], with [`GeoError::UnsupportedFormat`] for a
+/// raster whose bands would take more than `max_band_bytes`.
+pub fn parse_geotiff_bands_with_limit<P: AsRef<Path>>(
+    path: P,
+    max_band_bytes: usize,
+) -> Result<Vec<Vec<f32>>, GeoError> {
+    let file = std::fs::File::open(path.as_ref()).map_err(GeoError::Io)?;
+    read_bands(BufReader::new(file), max_band_bytes)
+}
+
+/// Bytes of `f32` band data per byte of an uncompressed 8-bit raster.
+const BAND_BYTES_PER_INPUT_BYTE: usize = 4;
+
+/// The default limit on band data for a file of `input_len` bytes.
+///
+/// `floor`, or [`BAND_BYTES_PER_INPUT_BYTE`] times the file if that is more.
+/// The floor alone refused ordinary uncompressed 8-bit imagery (a
+/// 12000×12000 gray or 7000×7000 RGB raster), which claims no more than
+/// four bytes for each byte it is made of. A small file claiming a large
+/// raster gets only the floor.
+fn default_band_limit(input_len: u64, floor: usize) -> usize {
+    usize::try_from(input_len)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(BAND_BYTES_PER_INPUT_BYTE)
+        .max(floor)
+}
+
+/// Bytes of band data returned per byte of raster the decoder may decode.
+///
+/// The decoder caps the raster it decodes (`Limits::decoding_buffer_size`,
+/// 256 MiB by default), but the bands are `f32` whatever the samples were,
+/// so an 8-bit raster at that cap would become four times as large again: a
+/// file of a few hundred kilobytes of constant pixels asked for 1 GiB. Two
+/// is the factor of a 16-bit raster, so every 16-, 32- and 64-bit raster the
+/// decoder accepts still fits, among them a 10980×10980 16-bit satellite
+/// band. An 8-bit raster fits up to half the decoder's cap, 128 MiB of
+/// samples.
+const BAND_BYTES_PER_DECODED_BYTE: usize = 2;
+
+/// Floor of the default limit on the `f32` band data returned.
+///
+/// [`BAND_BYTES_PER_DECODED_BYTE`] times the decoder's own raster cap: 512
+/// MiB, or 134,217,728 samples across all bands.
+fn max_band_bytes() -> usize {
+    Limits::default()
+        .decoding_buffer_size
+        .saturating_mul(BAND_BYTES_PER_DECODED_BYTE)
+}
+
+/// Checks that the bands of a raster fit in `max_band_bytes` as `f32`.
+///
+/// # Errors
+///
+/// Returns [`GeoError::UnsupportedFormat`] when `width` × `height` × `bands`
+/// samples of four bytes each exceed `max_band_bytes` or overflow.
+fn check_band_bytes(
+    width: u32,
+    height: u32,
+    bands: u16,
+    max_band_bytes: usize,
+) -> Result<(), GeoError> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(u64::from(bands)))
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64));
+    let limit = u64::try_from(max_band_bytes).unwrap_or(u64::MAX);
+    match bytes {
+        Some(bytes) if bytes <= limit => Ok(()),
+        _ => Err(GeoError::UnsupportedFormat(format!(
+            "GeoTIFF raster of {width}x{height} pixels in {bands} bands needs more than \
+             the {max_band_bytes} bytes of band data this reader returns"
+        ))),
+    }
+}
+
+/// Reads the bands of a TIFF, returning at most `max_band_bytes` of them.
+///
+/// The size is checked from the header, before anything is decoded.
+fn read_bands<R: Read + Seek>(reader: R, max_band_bytes: usize) -> Result<Vec<Vec<f32>>, GeoError> {
+    let (mut decoder, decoding_budget) = open_decoder_with_budget(reader)?;
 
     let (width, height) = decoder
         .dimensions()
         .map_err(|e| GeoError::Tiff(e.to_string()))?;
-    let n_pixels = (width * height) as usize;
+    let n_pixels = pixel_count(width, height)?;
+    let sample_bytes = check_sample_bits(&mut decoder)?;
+    let (bands, planar) = band_layout(&mut decoder)?;
+    check_band_bytes(width, height, bands, max_band_bytes)?;
+    check_uncompressed_chunks(&mut decoder, (width, height), bands, planar, sample_bytes)?;
+    if planar {
+        return read_planar_bands(&mut decoder, (width, height), bands, decoding_budget);
+    }
 
     let result = decoder
         .read_image()
         .map_err(|e| GeoError::Tiff(e.to_string()))?;
 
     match result {
-        DecodingResult::U8(data) => {
-            // Interleaved RGB(A) → split into bands
-            let samples = if data.len() == n_pixels {
-                1
-            } else {
-                data.len() / n_pixels
-            };
-            let mut bands: Vec<Vec<f32>> =
-                (0..samples).map(|_| Vec::with_capacity(n_pixels)).collect();
-            for (i, &v) in data.iter().enumerate() {
-                bands[i % samples].push(v as f32 / 255.0);
-            }
-            Ok(bands)
-        }
-        DecodingResult::U16(data) => {
-            let samples = if data.len() == n_pixels {
-                1
-            } else {
-                data.len() / n_pixels
-            };
-            let mut bands: Vec<Vec<f32>> =
-                (0..samples).map(|_| Vec::with_capacity(n_pixels)).collect();
-            for (i, &v) in data.iter().enumerate() {
-                bands[i % samples].push(v as f32 / 65535.0);
-            }
-            Ok(bands)
-        }
+        // Interleaved RGB(A) → split into bands
+        DecodingResult::U8(data) => split_bands(&data, n_pixels, unit_u8),
+        DecodingResult::U16(data) => split_bands(&data, n_pixels, unit_u16),
         DecodingResult::F32(data) => {
-            // Single band float
-            Ok(vec![data])
-        }
-        DecodingResult::F64(data) => Ok(vec![data.iter().map(|&v| v as f32).collect()]),
-        DecodingResult::I32(data) => {
-            let samples = if data.len() == n_pixels {
-                1
+            if data.len() == n_pixels {
+                // One band: the decoded raster is the band.
+                Ok(vec![data])
             } else {
-                data.len() / n_pixels
-            };
-            let mut bands: Vec<Vec<f32>> =
-                (0..samples).map(|_| Vec::with_capacity(n_pixels)).collect();
-            for (i, &v) in data.iter().enumerate() {
-                bands[i % samples].push(v as f32);
+                split_bands(&data, n_pixels, |v| v)
             }
-            Ok(bands)
         }
-        DecodingResult::U32(data) => {
-            let samples = if data.len() == n_pixels {
-                1
-            } else {
-                data.len() / n_pixels
-            };
-            let mut bands: Vec<Vec<f32>> =
-                (0..samples).map(|_| Vec::with_capacity(n_pixels)).collect();
-            for (i, &v) in data.iter().enumerate() {
-                bands[i % samples].push(v as f32);
-            }
-            Ok(bands)
-        }
-        _ => Err(GeoError::UnsupportedFormat(
-            "Unsupported pixel type in GeoTIFF".into(),
-        )),
+        DecodingResult::F64(data) => split_bands(&data, n_pixels, |v| v as f32),
+        // Signed and 32-bit samples keep their values: they are measurements
+        // (an elevation in metres, a count), not intensities with a full
+        // scale to normalise by.
+        DecodingResult::I8(data) => split_bands(&data, n_pixels, f32::from),
+        DecodingResult::I16(data) => split_bands(&data, n_pixels, f32::from),
+        DecodingResult::I32(data) => split_bands(&data, n_pixels, |v| v as f32),
+        DecodingResult::U32(data) => split_bands(&data, n_pixels, |v| v as f32),
+        // 64-bit integers keep their values too, as far as `f32` holds
+        // them: see `parse_geotiff_bands`.
+        DecodingResult::U64(data) => split_bands(&data, n_pixels, |v| v as f32),
+        DecodingResult::I64(data) => split_bands(&data, n_pixels, |v| v as f32),
     }
+}
+
+/// An unsigned 8-bit sample scaled to `0.0..=1.0`.
+fn unit_u8(sample: u8) -> f32 {
+    f32::from(sample) / 255.0
+}
+
+/// An unsigned 16-bit sample scaled to `0.0..=1.0`.
+fn unit_u16(sample: u16) -> f32 {
+    f32::from(sample) / 65535.0
+}
+
+/// The samples of one decoded chunk as `f32`, converted as [`read_bands`]
+/// converts the samples of a whole raster.
+fn chunk_to_f32(decoded: DecodingResult) -> Vec<f32> {
+    match decoded {
+        DecodingResult::U8(data) => data.into_iter().map(unit_u8).collect(),
+        DecodingResult::U16(data) => data.into_iter().map(unit_u16).collect(),
+        DecodingResult::F32(data) => data,
+        DecodingResult::F64(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::I8(data) => data.into_iter().map(f32::from).collect(),
+        DecodingResult::I16(data) => data.into_iter().map(f32::from).collect(),
+        DecodingResult::I32(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::U32(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::U64(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::I64(data) => data.into_iter().map(|v| v as f32).collect(),
+    }
+}
+
+/// Reads a raster stored one plane per band (`PlanarConfiguration` 2).
+///
+/// The decoder's `read_image` reads the first plane only, so each plane is
+/// read here chunk by chunk (strips or tiles) and placed in its band. The
+/// chunks of a plane follow those of the plane before it. Chunk geometry is
+/// taken from the tags and checked, not from the decoder's own accessors,
+/// which panic on a chunk they do not expect.
+///
+/// `decoding_budget` is the most bytes of samples, as stored, the raster may
+/// decode to: the same bound the decoder applies to an interleaved raster.
+///
+/// # Errors
+///
+/// Returns [`GeoError::InvalidFormat`] for a chunk with fewer samples than
+/// its place in the raster needs, and [`GeoError::Tiff`] when a chunk is
+/// missing or cannot be decoded or the raster is larger than
+/// `decoding_budget`. A strip or tile size of zero is an error too, in
+/// practice [`GeoError::Tiff`]: the decoder refuses it before the check
+/// here is reached.
+fn read_planar_bands<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    (width, height): (u32, u32),
+    bands: u16,
+    decoding_budget: usize,
+) -> Result<Vec<Vec<f32>>, GeoError> {
+    let tiff_error = |e: TiffError| GeoError::Tiff(e.to_string());
+    let n_pixels = pixel_count(width, height)?;
+    if n_pixels == 0 {
+        return Ok(vec![Vec::new(); usize::from(bands)]);
+    }
+
+    let bits = decoder
+        .find_tag_unsigned_vec::<u16>(Tag::BitsPerSample)
+        .map_err(tiff_error)?
+        .and_then(|bits| bits.into_iter().max())
+        .unwrap_or(1);
+    let stored_bytes = n_pixels
+        .checked_mul(usize::from(bands))
+        .and_then(|samples| samples.checked_mul(usize::from(bits.div_ceil(8))));
+    if stored_bytes.is_none_or(|bytes| bytes > decoding_budget) {
+        return Err(GeoError::Tiff(format!(
+            "GeoTIFF raster of {width}x{height} pixels in {bands} planes of {bits}-bit samples \
+             is larger than the {decoding_budget} bytes a file of this size may decode to"
+        )));
+    }
+
+    let (chunk_width, chunk_height) = chunk_geometry(decoder, (width, height))?;
+    let chunks_across = width.div_ceil(chunk_width);
+    let chunks_per_plane = chunks_across
+        .checked_mul(height.div_ceil(chunk_height))
+        .filter(|per_plane| per_plane.checked_mul(u32::from(bands)).is_some())
+        .ok_or_else(|| {
+            GeoError::InvalidFormat("GeoTIFF declares more chunks than can be counted".into())
+        })?;
+
+    // `u32` to `usize` is lossless wherever `pixel_count` succeeded.
+    let width = width as usize;
+    let mut planes = Vec::with_capacity(usize::from(bands));
+    for plane in 0..u32::from(bands) {
+        let mut band: Vec<f32> = Vec::new();
+        for chunk in 0..chunks_per_plane {
+            let decoded = decoder
+                .read_chunk(plane * chunks_per_plane + chunk)
+                .map_err(tiff_error)?;
+            let samples = chunk_to_f32(decoded);
+            // Allocated once a chunk of the plane has been read, so a file
+            // without the plane does not cost a band.
+            if band.is_empty() {
+                band = vec![0.0; n_pixels];
+            }
+            let x0 = (chunk % chunks_across) * chunk_width;
+            let y0 = (chunk / chunks_across) * chunk_height;
+            // The chunk as it lies in the raster: a tile at the right or
+            // bottom edge is cut to it. The decoder cuts the columns of a
+            // tile itself, and the rows of one in the first plane only.
+            let columns = chunk_width.min(width as u32 - x0) as usize;
+            let rows = chunk_height.min(height - y0) as usize;
+            if samples.len() < columns * rows {
+                return Err(GeoError::InvalidFormat(format!(
+                    "TIFF chunk decoded {} samples for {columns}x{rows} pixels",
+                    samples.len()
+                )));
+            }
+            for (row, line) in samples.chunks_exact(columns).take(rows).enumerate() {
+                let start = (y0 as usize + row) * width + x0 as usize;
+                band[start..start + columns].copy_from_slice(line);
+            }
+        }
+        planes.push(band);
+    }
+    Ok(planes)
+}
+
+/// TIFF `PlanarConfiguration` tag value for one plane of samples per band.
+///
+/// The other value, 1 and the default, interleaves the samples of a pixel.
+const PLANAR_CONFIGURATION_SEPARATE: u16 = 2;
+
+/// Number of bands in the raster, and whether each is stored as its own plane.
+///
+/// The count is the `SamplesPerPixel` tag, 1 when absent. A raster of one
+/// band is never planar: its one plane is the interleaved raster.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Tiff`] when either tag cannot be read.
+fn band_layout<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<(u16, bool), GeoError> {
+    let samples = decoder
+        .find_tag_unsigned::<u16>(Tag::SamplesPerPixel)
+        .map_err(|e| GeoError::Tiff(e.to_string()))?
+        .unwrap_or(1);
+    let planar_configuration = decoder
+        .find_tag_unsigned::<u16>(Tag::PlanarConfiguration)
+        .map_err(|e| GeoError::Tiff(e.to_string()))?;
+    let planar = samples > 1 && planar_configuration == Some(PLANAR_CONFIGURATION_SEPARATE);
+    Ok((samples, planar))
+}
+
+/// Refuses samples that are not a whole number of bytes, and returns the
+/// bytes of the widest sample.
+///
+/// The decoder read 1-, 2- and 4-bit samples one byte to a sample from a
+/// bitstream that packs several samples into each byte, so the packed bytes
+/// came back as pixel values, followed by whatever the file held after the
+/// strip. Samples of 10 or 12 bits are packed across bytes the same way.
+/// Until such samples are unpacked they are refused. `BitsPerSample`
+/// defaults to 1 when absent, as TIFF specifies.
+///
+/// # Errors
+///
+/// Returns [`GeoError::UnsupportedFormat`] for a sample whose width is not a
+/// multiple of 8 bits, and [`GeoError::Tiff`] when the tag cannot be read.
+fn check_sample_bits<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<u16, GeoError> {
+    let bits = decoder
+        .find_tag_unsigned_vec::<u16>(Tag::BitsPerSample)
+        .map_err(|e| GeoError::Tiff(e.to_string()))?
+        .unwrap_or_else(|| vec![1]);
+    if let Some(packed) = bits
+        .iter()
+        .copied()
+        .find(|&bits| bits == 0 || bits % 8 != 0)
+    {
+        return Err(GeoError::UnsupportedFormat(format!(
+            "GeoTIFF samples of {packed} bits are bit-packed, which this reader does not unpack"
+        )));
+    }
+    Ok(bits.iter().copied().max().unwrap_or(8) / 8)
+}
+
+/// The width and height in pixels of one strip or tile, from the tags.
+///
+/// A strip spans the raster's width and `RowsPerStrip` rows, which defaults
+/// to the whole raster; a tile is `TileWidth` by `TileLength`.
+///
+/// # Errors
+///
+/// Returns [`GeoError::InvalidFormat`] for a chunk with no width or height,
+/// and [`GeoError::Tiff`] when a tag cannot be read.
+fn chunk_geometry<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    (width, height): (u32, u32),
+) -> Result<(u32, u32), GeoError> {
+    let tiff_error = |e: TiffError| GeoError::Tiff(e.to_string());
+    let (chunk_width, chunk_height) = match decoder.get_chunk_type() {
+        ChunkType::Tile => (
+            decoder
+                .find_tag_unsigned::<u32>(Tag::TileWidth)
+                .map_err(tiff_error)?
+                .unwrap_or(0),
+            decoder
+                .find_tag_unsigned::<u32>(Tag::TileLength)
+                .map_err(tiff_error)?
+                .unwrap_or(0),
+        ),
+        ChunkType::Strip => (
+            width,
+            decoder
+                .find_tag_unsigned::<u32>(Tag::RowsPerStrip)
+                .map_err(tiff_error)?
+                .unwrap_or(height)
+                .min(height),
+        ),
+    };
+    // Not reached from any file tried: the `tiff` decoder refuses a
+    // RowsPerStrip, TileWidth or TileLength of zero when it reads the tags.
+    // The check stays so that the divisions callers make cannot divide by
+    // zero should a later version of the decoder let one through.
+    if chunk_width == 0 || chunk_height == 0 {
+        return Err(GeoError::InvalidFormat(format!(
+            "GeoTIFF declares strips or tiles of {chunk_width}x{chunk_height} pixels"
+        )));
+    }
+    Ok((chunk_width, chunk_height))
+}
+
+/// Refuses an uncompressed raster with a strip or tile that stores fewer
+/// bytes than its pixels take.
+///
+/// The decoder reads an uncompressed chunk from its offset without stopping
+/// at the chunk's byte count, so a short chunk was filled from whatever
+/// follows it in the file. A sparse chunk (offset and byte count zero, which
+/// GDAL writes for a block with no data) was filled from the file's own
+/// header. Compressed chunks are bounded by their decoders and are not
+/// checked here.
+///
+/// A strip holds the raster's width by its rows, the last strip of a plane
+/// only the rows that remain; a tile is always stored whole. Each chunk
+/// holds every band of its pixels, or one band when the bands are planar.
+///
+/// # Errors
+///
+/// Returns [`GeoError::InvalidFormat`] for a short chunk, and
+/// [`GeoError::Tiff`] when a tag cannot be read.
+fn check_uncompressed_chunks<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    (width, height): (u32, u32),
+    bands: u16,
+    planar: bool,
+    sample_bytes: u16,
+) -> Result<(), GeoError> {
+    // A tag that cannot be read here is the decoder's to report.
+    let compression = decoder.find_tag_unsigned::<u16>(Tag::Compression);
+    if !matches!(compression, Ok(None | Some(COMPRESSION_NONE))) || width == 0 || height == 0 {
+        return Ok(());
+    }
+    let (chunk_width, chunk_height) = chunk_geometry(decoder, (width, height))?;
+    let (kind, counts_tag) = match decoder.get_chunk_type() {
+        ChunkType::Tile => ("tile", Tag::TileByteCounts),
+        ChunkType::Strip => ("strip", Tag::StripByteCounts),
+    };
+    let Some(counts) = decoder
+        .find_tag_unsigned_vec::<u64>(counts_tag)
+        .map_err(|e| GeoError::Tiff(e.to_string()))?
+    else {
+        return Ok(());
+    };
+
+    let rows_of_chunks = height.div_ceil(chunk_height);
+    let chunks_per_plane = u64::from(width.div_ceil(chunk_width)) * u64::from(rows_of_chunks);
+    let samples_per_pixel = if planar { 1 } else { u64::from(bands) };
+    for (index, &count) in counts.iter().enumerate() {
+        let index = index as u64;
+        let rows = match decoder.get_chunk_type() {
+            ChunkType::Tile => chunk_height,
+            ChunkType::Strip => {
+                // Strips of a plane run top to bottom; `index` counts on
+                // through the planes after the first.
+                let strip = (index % chunks_per_plane.max(1)) as u32;
+                chunk_height.min(height.saturating_sub(strip.saturating_mul(chunk_height)))
+            }
+        };
+        let needed = u64::from(chunk_width)
+            .saturating_mul(u64::from(rows))
+            .saturating_mul(samples_per_pixel)
+            .saturating_mul(u64::from(sample_bytes));
+        if count < needed {
+            let sparse = if count == 0 { " (a sparse block)" } else { "" };
+            return Err(GeoError::InvalidFormat(format!(
+                "GeoTIFF {kind} {index} stores {count} bytes{sparse}, but its uncompressed \
+                 pixels take {needed}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Opens a TIFF decoder whose allocation limits follow the size of the input.
+///
+/// The `tiff` crate's default limits are constants (256 MiB of decoded
+/// raster), so a file of a few hundred bytes could have the whole buffer
+/// allocated from its header alone. Here the limits are also capped by what
+/// `reader` can hold: see [`COMPRESSED_EXPANSION`].
+///
+/// These limits are sized for decoding the raster. The decoder applies the
+/// same field to the arrays it builds for tag values, where it is too tight:
+/// a caller that reads tags and no pixels uses [`open_tag_decoder`].
+pub(crate) fn open_decoder<R: Read + Seek>(reader: R) -> Result<Decoder<R>, GeoError> {
+    open_decoder_with_budget(reader).map(|(decoder, _)| decoder)
+}
+
+/// As [`open_decoder`], also returning the decoder's limit on the raster.
+///
+/// The limit is `Limits::decoding_buffer_size`, in bytes of samples as
+/// stored, which the decoder does not give back once it has it.
+fn open_decoder_with_budget<R: Read + Seek>(reader: R) -> Result<(Decoder<R>, usize), GeoError> {
+    let (mut decoder, input_len) = open_checked(reader)?;
+
+    // Absent means uncompressed; a tag that cannot be read gets the looser bound.
+    let uncompressed = matches!(
+        decoder.find_tag_unsigned::<u16>(Tag::Compression),
+        Ok(None | Some(COMPRESSION_NONE))
+    );
+    let expansion = if uncompressed {
+        UNCOMPRESSED_EXPANSION
+    } else {
+        COMPRESSED_EXPANSION
+    };
+    let decoded = input_len.saturating_mul(expansion);
+
+    let mut limits = Limits::default();
+    limits.decoding_buffer_size = limits.decoding_buffer_size.min(decoded);
+    limits.intermediate_buffer_size = limits.intermediate_buffer_size.min(decoded);
+    // Tag values are stored as they are, so none is larger than the input.
+    limits.ifd_value_size = limits.ifd_value_size.min(input_len);
+    let budget = limits.decoding_buffer_size;
+    Ok((decoder.with_limits(limits), budget))
+}
+
+/// Opens a TIFF decoder for reading tag values, not pixels.
+///
+/// The decoder turns a tag's array into one [`Value`] per element and
+/// refuses an array of more than `decoding_buffer_size / size_of::<Value>()`
+/// elements. An element takes at least one byte of the file, so a tag that
+/// fits in the file has at most `input_len` elements: allowing
+/// `size_of::<Value>()` bytes per input byte admits every such tag, and still
+/// ties the allocation to the size of the input. The raster limits of
+/// [`open_decoder`] allow 8 bytes per input byte of an uncompressed file,
+/// which is a quarter of that: under them a GeoKey directory that took up
+/// more than a quarter of a small file's bytes could not be read.
+fn open_tag_decoder<R: Read + Seek>(reader: R) -> Result<Decoder<R>, GeoError> {
+    let (decoder, input_len) = open_checked(reader)?;
+
+    let mut limits = Limits::default();
+    limits.decoding_buffer_size = limits
+        .decoding_buffer_size
+        .min(input_len.saturating_mul(std::mem::size_of::<Value>()));
+    // No strip or tile is decoded through this decoder.
+    limits.intermediate_buffer_size = limits.intermediate_buffer_size.min(input_len);
+    limits.ifd_value_size = limits.ifd_value_size.min(input_len);
+    Ok(decoder.with_limits(limits))
+}
+
+/// Opens a TIFF decoder after checking its first directory against the file.
+///
+/// Returns the decoder, still under the `tiff` crate's default limits, and
+/// the length of the input in bytes.
+fn open_checked<R: Read + Seek>(mut reader: R) -> Result<(Decoder<R>, usize), GeoError> {
+    let start = reader.stream_position().map_err(GeoError::Io)?;
+    let input_len = reader.seek(SeekFrom::End(0)).map_err(GeoError::Io)?;
+    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
+    check_directory_fits(&mut reader, input_len)?;
+    reader.seek(SeekFrom::Start(start)).map_err(GeoError::Io)?;
+    let input_len = usize::try_from(input_len).unwrap_or(usize::MAX);
+
+    let decoder = Decoder::new(reader).map_err(|e| GeoError::Tiff(e.to_string()))?;
+    Ok((decoder, input_len))
+}
+
+/// Reads the fixed-width integers of a TIFF header and directory.
+struct FieldReader<'a, R> {
+    reader: &'a mut R,
+    big_endian: bool,
+}
+
+impl<R: Read> FieldReader<'_, R> {
+    fn bytes<const N: usize>(&mut self) -> Result<[u8; N], GeoError> {
+        let mut bytes = [0u8; N];
+        self.reader
+            .read_exact(&mut bytes)
+            .map_err(|e| GeoError::Tiff(format!("TIFF header or directory is truncated: {e}")))?;
+        Ok(bytes)
+    }
+
+    fn u16(&mut self) -> Result<u16, GeoError> {
+        let bytes = self.bytes()?;
+        Ok(if self.big_endian {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        })
+    }
+
+    fn u32(&mut self) -> Result<u32, GeoError> {
+        let bytes = self.bytes()?;
+        Ok(if self.big_endian {
+            u32::from_be_bytes(bytes)
+        } else {
+            u32::from_le_bytes(bytes)
+        })
+    }
+
+    fn u64(&mut self) -> Result<u64, GeoError> {
+        let bytes = self.bytes()?;
+        Ok(if self.big_endian {
+            u64::from_be_bytes(bytes)
+        } else {
+            u64::from_le_bytes(bytes)
+        })
+    }
+
+    /// A directory offset or value count: 64-bit in BigTIFF, else 32-bit.
+    fn word(&mut self, bigtiff: bool) -> Result<u64, GeoError> {
+        if bigtiff {
+            self.u64()
+        } else {
+            self.u32().map(u64::from)
+        }
+    }
+}
+
+/// Size in bytes of one value of a TIFF field type the decoder reads.
+fn field_type_size(field_type: u16) -> Option<u64> {
+    match field_type {
+        // BYTE, ASCII, SBYTE, UNDEFINED
+        1 | 2 | 6 | 7 => Some(1),
+        // SHORT, SSHORT
+        3 | 8 => Some(2),
+        // LONG, SLONG, FLOAT, IFD
+        4 | 9 | 11 | 13 => Some(4),
+        // RATIONAL, SRATIONAL, DOUBLE, LONG8, SLONG8, IFD8
+        5 | 10 | 12 | 16 | 17 | 18 => Some(8),
+        _ => None,
+    }
+}
+
+/// Rejects a TIFF whose first directory declares a tag value larger than the
+/// file itself.
+///
+/// `Decoder::new` reads the first directory under the `tiff` crate's default
+/// limits, and for each value it decodes it reserves memory from the entry's
+/// declared count: a 200-byte file with one inflated count field is given up
+/// to 256 MiB before any limit set through `with_limits` exists. A value is
+/// stored in the file, so a count that needs more bytes than the file has is
+/// malformed, and checking that first bounds those reservations by the input.
+///
+/// The walk mirrors the decoder's own: same header, same first directory,
+/// same entry layout. Leaves `reader` at an unspecified position.
+fn check_directory_fits<R: Read + Seek>(reader: &mut R, input_len: u64) -> Result<(), GeoError> {
+    let mut fields = FieldReader {
+        reader,
+        big_endian: false,
+    };
+    fields.big_endian = match &fields.bytes::<2>()? {
+        b"II" => false,
+        b"MM" => true,
+        // Not a TIFF; the decoder reports that.
+        _ => return Ok(()),
+    };
+    let bigtiff = match fields.u16()? {
+        42 => false,
+        43 => {
+            // Offset size and a reserved word; the decoder validates both.
+            fields.u32()?;
+            true
+        }
+        _ => return Ok(()),
+    };
+
+    let directory = fields.word(bigtiff)?;
+    fields
+        .reader
+        .seek(SeekFrom::Start(directory))
+        .map_err(GeoError::Io)?;
+    let entries = if bigtiff {
+        fields.u64()?
+    } else {
+        u64::from(fields.u16()?)
+    };
+    // Every pass reads at least twelve bytes or fails, so a count that
+    // exceeds the file ends in the truncation error.
+    for _ in 0..entries {
+        let tag = fields.u16()?;
+        let field_type = fields.u16()?;
+        let Some(value_size) = field_type_size(field_type) else {
+            // The decoder skips an entry of unknown type by reading eight
+            // more bytes, in BigTIFF too; stay in step with it.
+            fields.u64()?;
+            continue;
+        };
+        let count = fields.word(bigtiff)?;
+        let _value_or_offset = fields.word(bigtiff)?;
+        if count
+            .checked_mul(value_size)
+            .is_none_or(|bytes| bytes > input_len)
+        {
+            return Err(GeoError::InvalidFormat(format!(
+                "TIFF tag {tag} declares {count} values of {value_size} bytes each \
+                 in a {input_len} byte file"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Number of pixels in a `width`×`height` raster.
+///
+/// The product of two `u32` always fits in `u64`; it is an error only where
+/// `usize` cannot hold it.
+pub(crate) fn pixel_count(width: u32, height: u32) -> Result<usize, GeoError> {
+    usize::try_from(u64::from(width) * u64::from(height)).map_err(|_| {
+        GeoError::InvalidFormat(format!(
+            "Raster dimensions {width}x{height} exceed addressable memory"
+        ))
+    })
+}
+
+/// Splits pixel-interleaved samples into one `Vec<f32>` per band.
+///
+/// The band count is the number of samples the decoder returned per pixel.
+fn split_bands<T: Copy>(
+    data: &[T],
+    n_pixels: usize,
+    to_f32: impl Fn(T) -> f32,
+) -> Result<Vec<Vec<f32>>, GeoError> {
+    let samples = if data.len() == n_pixels {
+        1
+    } else {
+        data.len().checked_div(n_pixels).unwrap_or(0)
+    };
+    if samples == 0 {
+        return Err(GeoError::InvalidFormat(format!(
+            "TIFF decoded {} samples for {n_pixels} pixels",
+            data.len()
+        )));
+    }
+    // `samples * n_pixels <= data.len()`, so the bands together are no larger
+    // than the decoded raster they are split from.
+    let mut bands: Vec<Vec<f32>> = (0..samples).map(|_| Vec::with_capacity(n_pixels)).collect();
+    for (i, &v) in data.iter().enumerate() {
+        bands[i % samples].push(to_f32(v));
+    }
+    Ok(bands)
 }
 
 // ── Tag reading helpers ──────────────────────────────────────────────────────
 
+/// The decoder's key for a tag number.
+///
+/// The `tiff` crate files the GeoTIFF tags under named variants, so a lookup
+/// with `Tag::Unknown(number)` never finds them.
+fn tag(tag_id: u16) -> Tag {
+    Tag::from_u16_exhaustive(tag_id)
+}
+
+/// Reads the value of an optional GeoTIFF tag.
+///
+/// Returns `Ok(None)` only when the image has no such tag. A tag that is
+/// present but cannot be read (its data lies outside the file, or exceeds
+/// the decoder's limits) is an error: reporting it as absent would hand back
+/// a raster that silently lost its georeferencing.
+fn find_geo_tag<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    tag_id: u16,
+) -> Result<Option<Value>, GeoError> {
+    decoder
+        .find_tag(tag(tag_id))
+        .map_err(|e| unreadable_tag(tag_id, &e))
+}
+
+fn unreadable_tag(tag_id: u16, error: &TiffError) -> GeoError {
+    GeoError::Tiff(format!("GeoTIFF tag {tag_id} cannot be read: {error}"))
+}
+
+/// Reads an optional GeoTIFF tag whose values are doubles.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Tiff`] when the tag is present but unreadable, or
+/// holds values of another type. A missing tag is `Ok(None)`.
 fn read_doubles_tag<R: Read + Seek>(
     decoder: &mut Decoder<R>,
     tag_id: u16,
 ) -> Result<Option<Vec<f64>>, GeoError> {
-    let tag = Tag::Unknown(tag_id);
-    match decoder.get_tag_f64_vec(tag) {
-        Ok(v) => Ok(Some(v)),
-        // Tag not present in this image — not an error
-        Err(_) => Ok(None),
-    }
+    find_geo_tag(decoder, tag_id)?
+        .map(|value| value.into_f64_vec().map_err(|e| unreadable_tag(tag_id, &e)))
+        .transpose()
 }
 
-fn read_ascii_tag<R: Read + Seek>(
-    decoder: &mut Decoder<R>,
-    tag_id: u16,
-) -> Result<Option<String>, GeoError> {
-    let tag = Tag::Unknown(tag_id);
-    match decoder.get_tag_ascii_string(tag) {
-        Ok(s) => Ok(Some(s)),
-        Err(_) => Ok(None),
-    }
-}
-
+/// Reads the GeoKey directory into a key→value map.
+///
+/// The value is the entry's `ValueOffset`: the value itself for a key stored
+/// in the directory, and the position of the value in its parameter tag for
+/// any other key. `GTRasterTypeGeoKey` is in the map only when it is stored
+/// in the directory.
+///
+/// # Errors
+///
+/// As [`read_geokey_entries`].
 fn read_geokey_directory<R: Read + Seek>(
     decoder: &mut Decoder<R>,
-    _double_params: &[f64],
-    _ascii_params: &str,
 ) -> Result<HashMap<u16, u32>, GeoError> {
-    let tag = Tag::Unknown(TAG_GEO_KEY_DIRECTORY);
-    let raw: Vec<u16> = match decoder.get_tag_u16_vec(tag) {
-        Ok(v) => v,
-        // Tag absent — not a GeoTIFF, but still a valid TIFF
-        Err(_) => return Ok(HashMap::new()),
+    Ok(read_geokey_entries(decoder)?
+        .into_iter()
+        // The raster type is a SHORT stored in the directory. An entry that
+        // puts it in a parameter tag is malformed, and its `ValueOffset` is a
+        // position there, not a raster type: `pixel_is_point` must not read
+        // it as one, so the key is left out.
+        .filter(|&[key_id, tiff_tag_location, ..]| {
+            key_id != GEOKEY_RASTER_TYPE || tiff_tag_location == 0
+        })
+        .map(|[key_id, _tiff_tag_location, _count, value_offset]| (key_id, u32::from(value_offset)))
+        .collect())
+}
+
+/// Reads the `[KeyID, TIFFTagLocation, Count, ValueOffset]` entries of the
+/// GeoKey directory.
+///
+/// # Errors
+///
+/// Returns [`GeoError::Tiff`] when the directory tag is present but
+/// unreadable, or is not an array of unsigned integers. A TIFF without the
+/// tag is not a GeoTIFF and yields no entries.
+fn read_geokey_entries<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+) -> Result<Vec<[u16; 4]>, GeoError> {
+    // Tag absent: not a GeoTIFF, but still a valid TIFF.
+    let Some(value) = find_geo_tag(decoder, TAG_GEO_KEY_DIRECTORY)? else {
+        return Ok(Vec::new());
     };
+    let raw: Vec<u16> = value
+        .into_u16_vec()
+        .map_err(|e| unreadable_tag(TAG_GEO_KEY_DIRECTORY, &e))?;
 
     // Directory header: [KeyDirectoryVersion, KeyRevision, MinorRevision, NumberOfKeys]
-    if raw.len() < 4 {
-        return Ok(HashMap::new());
-    }
-    let n_keys = raw[3] as usize;
-    let mut keys = HashMap::with_capacity(n_keys);
+    // followed by one [KeyID, TIFFTagLocation, Count, ValueOffset] entry per key.
+    let Some((header, entries)) = raw.split_at_checked(4) else {
+        return Ok(Vec::new());
+    };
+    // The directory cannot hold more keys than it has entries for.
+    let n_keys = usize::from(header[3]).min(entries.len() / 4);
+    Ok(entries
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .take(n_keys)
+        .copied()
+        .collect())
+}
 
-    for i in 0..n_keys {
-        let base = 4 + i * 4;
-        if base + 3 >= raw.len() {
-            break;
-        }
-        let key_id = raw[base];
-        let _tiff_tag_location = raw[base + 1]; // 0 = short, else double/ascii tag
-        let _count = raw[base + 2];
-        let value_offset = raw[base + 3];
-        // For SHORT values (tiff_tag_location == 0), value_offset IS the value
-        keys.insert(key_id, value_offset as u32);
+/// World coordinate of pixel (0, 0), from one tiepoint and the pixel scale.
+///
+/// `tiepoint` is `[I, J, K, X, Y, Z]`: raster position (`I`, `J`) lies at
+/// world position (`X`, `Y`). World Y decreases as `J` grows. A tiepoint at
+/// the corner itself needs no scale; any other one cannot be carried to the
+/// corner without it.
+///
+/// With `pixel_is_point`, (`I`, `J`) is the centre of a pixel: half a pixel
+/// right of and below the corner that the same numbers name in a
+/// `PixelIsArea` raster.
+fn tiepoint_origin(
+    tiepoint: &[f64; 6],
+    pixel_scale: Option<(f64, f64)>,
+    pixel_is_point: bool,
+) -> Option<(f64, f64)> {
+    let [i, j, _, x, y, _] = *tiepoint;
+    let (i, j) = if pixel_is_point {
+        (i + 0.5, j + 0.5)
+    } else {
+        (i, j)
+    };
+    if i == 0.0 && j == 0.0 {
+        return Some((x, y));
     }
-    Ok(keys)
+    let (sx, sy) = pixel_scale?;
+    Some((x - i * sx, y + j * sy))
 }
 
 fn derive_bbox(
@@ -311,28 +1417,34 @@ fn derive_bbox(
     width: u32,
     height: u32,
     transform: &Option<[f64; 16]>,
+    pixel_is_point: bool,
 ) -> Option<BBox> {
     // Try transformation matrix first
     if let Some(m) = transform {
         // Row-major 4×4 affine: world_x = m[0]*px + m[1]*py + m[3]
         //                        world_y = m[4]*px + m[5]*py + m[7]
-        let ul_x = m[3];
-        let ul_y = m[7];
-        let lr_x = m[0] * width as f64 + m[1] * height as f64 + m[3];
-        let lr_y = m[4] * width as f64 + m[5] * height as f64 + m[7];
-        return Some(BBox::new(
-            ul_x.min(lr_x),
-            lr_y.min(ul_y),
-            ul_x.max(lr_x),
-            lr_y.max(ul_y),
-        ));
+        // The matrix may rotate or shear the raster, and then the extremes
+        // are not at the upper-left and lower-right corners: take all four.
+        // In a PixelIsPoint raster the matrix maps pixel centres, so the
+        // outer edge starts half a pixel before (0, 0).
+        let edge = if pixel_is_point { -0.5 } else { 0.0 };
+        let (w, h) = (f64::from(width) + edge, f64::from(height) + edge);
+        let corners = [(edge, edge), (w, edge), (edge, h), (w, h)]
+            .map(|(px, py)| (m[0] * px + m[1] * py + m[3], m[4] * px + m[5] * py + m[7]));
+        let (first_x, first_y) = corners[0];
+        let mut bbox = BBox::new(first_x, first_y, first_x, first_y);
+        for (x, y) in corners {
+            bbox.min_lon = bbox.min_lon.min(x);
+            bbox.max_lon = bbox.max_lon.max(x);
+            bbox.min_lat = bbox.min_lat.min(y);
+            bbox.max_lat = bbox.max_lat.max(y);
+        }
+        return Some(bbox);
     }
 
     // Fall back to tiepoint + pixel scale
-    let tp = tiepoints.first()?;
     let (sx, sy) = pixel_scale?;
-    let ul_x = tp[3] - tp[0] * sx;
-    let ul_y = tp[4] + tp[1] * sy;
+    let (ul_x, ul_y) = tiepoint_origin(tiepoints.first()?, pixel_scale, pixel_is_point)?;
     let lr_x = ul_x + sx * width as f64;
     let lr_y = ul_y - sy * height as f64;
 
@@ -346,15 +1458,1350 @@ fn derive_bbox(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use tiff::encoder::{colortype, TiffEncoder};
+
     use super::*;
+
+    /// GeoKey directory of a raster in UTM zone 33N (EPSG:32633), projected.
+    const UTM_33N_KEYS: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32633];
+    /// GeoKey directory of a raster in WGS 84 (EPSG:4326), geographic.
+    const WGS84_KEYS: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326];
+
+    /// The georeferencing tags of a test GeoTIFF; `None` leaves a tag out.
+    #[derive(Default)]
+    struct GeoTags<'a> {
+        pixel_scale: Option<[f64; 3]>,
+        tiepoint: Option<[f64; 6]>,
+        transformation: Option<[f64; 16]>,
+        geokeys: Option<&'a [u16]>,
+    }
+
+    /// Encodes a `width`×`height` 8-bit gray GeoTIFF carrying `tags`.
+    fn geotiff(width: u32, height: u32, tags: &GeoTags<'_>) -> Vec<u8> {
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder
+                .new_image::<colortype::Gray8>(width, height)
+                .expect("image");
+            let directory = image.encoder();
+            if let Some(scale) = &tags.pixel_scale {
+                directory
+                    .write_tag(Tag::ModelPixelScaleTag, &scale[..])
+                    .expect("pixel scale");
+            }
+            if let Some(tiepoint) = &tags.tiepoint {
+                directory
+                    .write_tag(Tag::ModelTiepointTag, &tiepoint[..])
+                    .expect("tiepoint");
+            }
+            if let Some(matrix) = &tags.transformation {
+                directory
+                    .write_tag(Tag::ModelTransformationTag, &matrix[..])
+                    .expect("transformation");
+            }
+            if let Some(geokeys) = tags.geokeys {
+                directory
+                    .write_tag(Tag::GeoKeyDirectoryTag, geokeys)
+                    .expect("geokeys");
+            }
+            let pixels = vec![0u8; pixel_count(width, height).expect("pixel count")];
+            image.write_data(&pixels).expect("pixels");
+        }
+        file.into_inner()
+    }
+
+    fn metadata(bytes: Vec<u8>) -> GeoTiffMetadata {
+        parse_geotiff_metadata_reader(Cursor::new(bytes)).expect("GeoTIFF metadata")
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn assert_bbox(bbox: &BBox, min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) {
+        assert_close(bbox.min_lon, min_lon);
+        assert_close(bbox.min_lat, min_lat);
+        assert_close(bbox.max_lon, max_lon);
+        assert_close(bbox.max_lat, max_lat);
+    }
+
+    /// A UTM raster used to report `min_lon: 500000.0, min_lat: 4648276.0`:
+    /// metres in fields that hold degrees.
+    #[test]
+    fn projected_raster_has_no_degree_bbox() {
+        let projected = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([30.0, 30.0, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, 500_000.0, 4_649_776.0, 0.0]),
+                geokeys: Some(&UTM_33N_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        assert_eq!(projected.epsg_code, Some(32633));
+        assert!(!projected.is_geographic);
+        assert_eq!(projected.bbox, None);
+        // The corners are still available, in the projection's own units.
+        assert_eq!(projected.upper_left(), Some((500_000.0, 4_649_776.0)));
+        assert_eq!(projected.lower_right(), Some((503_000.0, 4_648_276.0)));
+    }
+
+    #[test]
+    fn geographic_raster_keeps_its_degree_bbox() {
+        let geographic = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                geokeys: Some(&WGS84_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        assert_eq!(geographic.epsg_code, Some(4326));
+        assert!(geographic.is_geographic);
+        let bbox = geographic.bbox.expect("bbox of a geographic raster");
+        assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
+    }
+
+    /// `upper_left` returned the tiepoint's world coordinate as it stood, so
+    /// a raster tied at its centre reported its centre as its corner, and
+    /// disagreed with `bbox`, which did account for the tiepoint's pixel.
+    #[test]
+    fn corners_account_for_a_tiepoint_away_from_the_origin() {
+        let centred = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([50.0, 25.0, 0.0, -47.5, -15.25, 0.0]),
+                geokeys: Some(&WGS84_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        let (ul_x, ul_y) = centred.upper_left().expect("upper left");
+        let (lr_x, lr_y) = centred.lower_right().expect("lower right");
+        assert_close(ul_x, -48.0);
+        assert_close(ul_y, -15.0);
+        assert_close(lr_x, -47.0);
+        assert_close(lr_y, -15.5);
+        // The corners and the bbox describe the same rectangle.
+        let bbox = centred.bbox.expect("bbox of a geographic raster");
+        assert_bbox(&bbox, ul_x, lr_y, lr_x, ul_y);
+    }
+
+    #[test]
+    fn corner_of_an_off_origin_tiepoint_needs_the_pixel_scale() {
+        let at_origin = [0.0, 0.0, 0.0, -48.0, -15.0, 0.0];
+        assert_eq!(
+            tiepoint_origin(&at_origin, None, false),
+            Some((-48.0, -15.0))
+        );
+        let off_origin = [50.0, 25.0, 0.0, -47.5, -15.25, 0.0];
+        assert_eq!(tiepoint_origin(&off_origin, None, false), None);
+        // A pixel centre is never the corner: it needs the scale as well.
+        assert_eq!(tiepoint_origin(&at_origin, None, true), None);
+        assert_eq!(
+            tiepoint_origin(&at_origin, Some((0.5, 0.25)), true),
+            Some((-48.25, -14.875))
+        );
+    }
+
+    /// A 4×4 `ModelTransformation` that scales by `scale` and rotates by
+    /// `degrees`, with pixel (0, 0) at (`x`, `y`).
+    fn rotation(degrees: f64, scale: f64, x: f64, y: f64) -> [f64; 16] {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let (c, s) = (cos * scale, sin * scale);
+        [
+            c, s, 0.0, x, s, -c, 0.0, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]
+    }
+
+    /// Only the upper-left and lower-right corners were used. On a raster
+    /// rotated by 30° the other two are the northernmost and southernmost
+    /// points, so the box was too short: 4649776..4649843 for a raster that
+    /// spans 4649343..4650276.
+    #[test]
+    fn rotated_transformation_bbox_covers_all_four_corners() {
+        let matrix = rotation(30.0, 10.0, 500_000.0, 4_649_776.0);
+        let (c, s) = (matrix[0], matrix[1]);
+        let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix), false).expect("bbox");
+        // Corners: UL (0, 0), UR (100, 0), LL (0, 50), LR (100, 50).
+        assert_bbox(
+            &bbox,
+            500_000.0,
+            4_649_776.0 - 50.0 * c,
+            500_000.0 + 100.0 * c + 50.0 * s,
+            4_649_776.0 + 100.0 * s,
+        );
+        assert_close(bbox.min_lat, 4_649_342.987_298_108);
+        assert_close(bbox.max_lat, 4_650_276.0);
+    }
+
+    #[test]
+    fn rotated_geographic_raster_reports_its_full_extent() {
+        let rotated = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                transformation: Some(rotation(30.0, 0.01, -48.0, -15.0)),
+                geokeys: Some(&WGS84_KEYS),
+                ..GeoTags::default()
+            },
+        ));
+        let bbox = rotated.bbox.expect("bbox of a geographic raster");
+        let (c, s) = (30f64.to_radians().cos() * 0.01, 0.005);
+        assert_bbox(
+            &bbox,
+            -48.0,
+            -15.0 - 50.0 * c,
+            -48.0 + 100.0 * c + 50.0 * s,
+            -15.0 + 100.0 * s,
+        );
+    }
+
+    /// An axis-aligned matrix is the common case and is unchanged.
+    #[test]
+    fn unrotated_transformation_bbox_is_unchanged() {
+        let matrix = rotation(0.0, 0.01, -48.0, -15.0);
+        let bbox = derive_bbox(&[], None, 100, 50, &Some(matrix), false).expect("bbox");
+        assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
+    }
+
+    /// A GeoKey directory of `extra` keys beyond the model type and the
+    /// geographic CRS, for a file whose directory outweighs its pixels.
+    ///
+    /// The extra keys take IDs from the private range (32768 and up), which
+    /// no key this parser interprets falls in.
+    fn long_geokey_directory(extra: u16) -> Vec<u16> {
+        let mut keys = vec![1, 1, 0, extra + 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        for index in 0..extra {
+            keys.extend_from_slice(&[32768 + index, 0, 1, 1]);
+        }
+        keys
+    }
+
+    /// Tag arrays were read under the raster's limit of 8 bytes per input
+    /// byte, which the decoder divides by its 32-byte value type: a
+    /// directory of more than a quarter of the file's bytes was refused, and
+    /// the refusal was then taken for a missing tag. A 642-byte file with 42
+    /// keys came back with no keys, no EPSG code and `is_geographic: false`.
+    #[test]
+    fn geokey_directory_larger_than_the_pixels_is_read_in_full() {
+        // Measured before the fix on 2×2 files: 30 extra keys (132 values,
+        // 562 bytes) were read and 40 extra keys (172 values, 642 bytes)
+        // were lost. 4000 keys make the directory nearly the whole file.
+        for extra in [8u16, 30, 40, 60, 500, 4000] {
+            let keys = long_geokey_directory(extra);
+            let parsed = metadata(geotiff(
+                2,
+                2,
+                &GeoTags {
+                    pixel_scale: Some([0.01, 0.01, 0.0]),
+                    tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                    geokeys: Some(&keys),
+                    ..GeoTags::default()
+                },
+            ));
+            assert_eq!(parsed.geokeys.len(), usize::from(extra) + 2, "{extra}");
+            assert_eq!(parsed.epsg_code, Some(4326), "{extra}");
+            assert!(parsed.is_geographic, "{extra}");
+            assert!(parsed.bbox.is_some(), "{extra}");
+        }
+    }
+
+    /// Any error from reading a georeferencing tag used to mean "no such
+    /// tag", so a damaged tag produced a raster without georeferencing and
+    /// no error. Only a tag that is not there may do that.
+    #[test]
+    fn unreadable_georeferencing_tag_is_an_error_not_a_missing_tag() {
+        // A pixel scale written as text, not as doubles.
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::ModelPixelScaleTag, "0.01 0.01 0")
+                .expect("pixel scale");
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, &WGS84_KEYS[..])
+                .expect("geokeys");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let error = parse_geotiff_metadata_reader(Cursor::new(file.into_inner()))
+            .expect_err("a mistyped pixel scale is an error");
+        assert!(
+            matches!(&error, GeoError::Tiff(message) if message.contains("33550")),
+            "{error}"
+        );
+
+        // A GeoKey directory of doubles, not of unsigned integers.
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            image
+                .encoder()
+                .write_tag(Tag::GeoKeyDirectoryTag, &[1.0f64, 1.0, 0.0, 0.0][..])
+                .expect("geokeys");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let error = parse_geotiff_metadata_reader(Cursor::new(file.into_inner()))
+            .expect_err("a mistyped GeoKey directory is an error");
+        assert!(
+            matches!(&error, GeoError::Tiff(message) if message.contains("34735")),
+            "{error}"
+        );
+    }
+
+    /// A TIFF with no georeferencing tags at all is still a valid TIFF.
+    #[test]
+    fn missing_georeferencing_tags_are_not_an_error() {
+        let plain = metadata(geotiff(2, 2, &GeoTags::default()));
+        assert_eq!(plain.pixel_scale, None);
+        assert!(plain.tiepoints.is_empty());
+        assert_eq!(plain.transformation_matrix, None);
+        assert!(plain.geokeys.is_empty());
+        assert_eq!(plain.epsg_code, None);
+        assert_eq!(plain.bbox, None);
+    }
+
+    /// A citation that is not UTF-8 lives in a tag this parser does not
+    /// read, so it cannot fail the parse.
+    #[test]
+    fn non_utf8_citation_does_not_fail_the_parse() {
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, &WGS84_KEYS[..])
+                .expect("geokeys");
+            // "Córrego Alegre|" in Latin-1, as BYTE values under the ASCII
+            // parameters tag's number.
+            directory
+                .write_tag(Tag::GeoAsciiParamsTag, &b"C\xF3rrego Alegre|"[..])
+                .expect("citation");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let parsed = metadata(file.into_inner());
+        assert_eq!(parsed.epsg_code, Some(4326));
+    }
+
+    /// Without a GeoKey directory nothing says the coordinates are degrees.
+    #[test]
+    fn raster_without_a_model_type_has_no_degree_bbox() {
+        let untyped = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                ..GeoTags::default()
+            },
+        ));
+        assert!(!untyped.is_geographic);
+        assert_eq!(untyped.bbox, None);
+    }
 
     #[test]
     fn test_bbox_derives_from_tiepoint_scale() {
         let tiepoints = vec![[0.0, 0.0, 0.0, -45.0, -10.0, 0.0]];
-        let bbox = derive_bbox(&tiepoints, Some((0.001, 0.001)), 1000, 1000, &None).unwrap();
+        let bbox = derive_bbox(&tiepoints, Some((0.001, 0.001)), 1000, 1000, &None, false).unwrap();
         assert!((bbox.min_lon - (-45.0)).abs() < 1e-9);
         assert!((bbox.max_lon - (-44.0)).abs() < 1e-9);
         assert!((bbox.min_lat - (-11.0)).abs() < 1e-9);
         assert!((bbox.max_lat - (-10.0)).abs() < 1e-9);
+    }
+
+    /// Encodes a `width`×`height` raster of colour type `C` holding `pixels`.
+    fn raster<C>(width: u32, height: u32, pixels: &[C::Inner]) -> Vec<u8>
+    where
+        C: colortype::ColorType,
+        [C::Inner]: tiff::encoder::TiffValue,
+    {
+        let mut file = Cursor::new(Vec::new());
+        TiffEncoder::new(&mut file)
+            .expect("encoder")
+            .write_image::<C>(width, height, pixels)
+            .expect("image");
+        file.into_inner()
+    }
+
+    /// Reads the bands of an encoded raster through the public, by-path API.
+    fn bands_of(bytes: &[u8]) -> Result<Vec<Vec<f32>>, GeoError> {
+        let file = tempfile::NamedTempFile::new().expect("temporary file");
+        std::fs::write(file.path(), bytes).expect("write raster");
+        parse_geotiff_bands(file.path())
+    }
+
+    /// Signed 8- and 16-bit rasters were refused with "Unsupported pixel type
+    /// in GeoTIFF". Elevation models are commonly 16-bit signed.
+    #[test]
+    fn signed_integer_rasters_are_read_as_their_values() {
+        let elevation = [-32768i16, -120, 0, 8848];
+        assert_eq!(
+            bands_of(&raster::<colortype::GrayI16>(2, 2, &elevation)).expect("i16"),
+            vec![vec![-32768.0, -120.0, 0.0, 8848.0]]
+        );
+        assert_eq!(
+            bands_of(&raster::<colortype::GrayI8>(2, 2, &[-128i8, -1, 0, 127])).expect("i8"),
+            vec![vec![-128.0, -1.0, 0.0, 127.0]]
+        );
+    }
+
+    /// 32-bit integers already had arms; they are pinned here beside the
+    /// narrower types they now sit with.
+    #[test]
+    fn wide_integer_rasters_are_read_as_their_values() {
+        assert_eq!(
+            bands_of(&raster::<colortype::GrayI32>(2, 1, &[-70_000i32, 70_000])).expect("i32"),
+            vec![vec![-70_000.0, 70_000.0]]
+        );
+        assert_eq!(
+            bands_of(&raster::<colortype::Gray32>(2, 1, &[0u32, 3_000_000_000])).expect("u32"),
+            vec![vec![0.0, 3_000_000_000.0]]
+        );
+    }
+
+    /// 64-bit integer rasters were refused as an unsupported pixel type.
+    /// They keep their values, exactly up to 2^24 and rounded to the nearest
+    /// `f32` beyond it.
+    #[test]
+    fn sixty_four_bit_integer_rasters_are_read_as_their_values() {
+        assert_eq!(
+            bands_of(&raster::<colortype::Gray64>(
+                3,
+                1,
+                &[0u64, 16_777_216, u64::MAX]
+            ))
+            .expect("u64"),
+            vec![vec![0.0, 16_777_216.0, u64::MAX as f32]]
+        );
+        assert_eq!(
+            bands_of(&raster::<colortype::GrayI64>(
+                3,
+                1,
+                &[-5i64, 1 << 40, i64::MIN]
+            ))
+            .expect("i64"),
+            vec![vec![-5.0, (1u64 << 40) as f32, i64::MIN as f32]]
+        );
+        // Several bands, interleaved.
+        assert_eq!(
+            bands_of(&raster::<colortype::RGB64>(2, 1, &[1u64, 2, 3, 4, 5, 6])).expect("rgb"),
+            vec![vec![1.0, 4.0], vec![2.0, 5.0], vec![3.0, 6.0]]
+        );
+    }
+
+    /// A three-band float raster came back as one "band" of all twelve
+    /// interleaved samples.
+    #[test]
+    fn multi_band_float_raster_is_split_into_its_bands() {
+        let pixels = [
+            1.0f32, 10.0, 100.0, 2.0, 20.0, 200.0, 3.0, 30.0, 300.0, 4.0, 40.0, 400.0,
+        ];
+        assert_eq!(
+            bands_of(&raster::<colortype::RGB32Float>(2, 2, &pixels)).expect("f32"),
+            vec![
+                vec![1.0, 2.0, 3.0, 4.0],
+                vec![10.0, 20.0, 30.0, 40.0],
+                vec![100.0, 200.0, 300.0, 400.0],
+            ]
+        );
+        let pixels = [1.0f64, 10.0, 100.0, 2.0, 20.0, 200.0];
+        assert_eq!(
+            bands_of(&raster::<colortype::RGB64Float>(2, 1, &pixels)).expect("f64"),
+            vec![vec![1.0, 2.0], vec![10.0, 20.0], vec![100.0, 200.0]]
+        );
+        // One band stays one band.
+        assert_eq!(
+            bands_of(&raster::<colortype::Gray32Float>(2, 1, &[0.5f32, -0.5])).expect("gray"),
+            vec![vec![0.5, -0.5]]
+        );
+    }
+
+    /// A 2×2 8-bit RGB TIFF stored one plane per band (`PlanarConfiguration`
+    /// 2): three strips of four samples. The encoder cannot write one.
+    fn planar_rgb() -> Vec<u8> {
+        const SHORT: u16 = 3;
+        const LONG: u16 = 4;
+        let mut file = Vec::new();
+        file.extend_from_slice(b"II");
+        file.extend_from_slice(&42u16.to_le_bytes());
+        file.extend_from_slice(&50u32.to_le_bytes()); // directory offset
+        file.extend_from_slice(&[1, 2, 3, 4, 10, 20, 30, 40, 100, 110, 120, 130]); // at 8
+        for bits in [8u16; 3] {
+            file.extend_from_slice(&bits.to_le_bytes()); // at 20
+        }
+        for strip_offset in [8u32, 12, 16] {
+            file.extend_from_slice(&strip_offset.to_le_bytes()); // at 26
+        }
+        for strip_bytes in [4u32; 3] {
+            file.extend_from_slice(&strip_bytes.to_le_bytes()); // at 38
+        }
+        // (tag, type, count, value or offset), in tag order.
+        let entries: [(u16, u16, u32, u32); 10] = [
+            (256, SHORT, 1, 2),  // ImageWidth
+            (257, SHORT, 1, 2),  // ImageLength
+            (258, SHORT, 3, 20), // BitsPerSample
+            (259, SHORT, 1, 1),  // Compression: none
+            (262, SHORT, 1, 2),  // PhotometricInterpretation: RGB
+            (273, LONG, 3, 26),  // StripOffsets
+            (277, SHORT, 1, 3),  // SamplesPerPixel
+            (278, SHORT, 1, 2),  // RowsPerStrip
+            (279, LONG, 3, 38),  // StripByteCounts
+            (284, SHORT, 1, 2),  // PlanarConfiguration: separate planes
+        ];
+        file.extend_from_slice(&10u16.to_le_bytes());
+        for (tag, field_type, count, value) in entries {
+            file.extend_from_slice(&tag.to_le_bytes());
+            file.extend_from_slice(&field_type.to_le_bytes());
+            file.extend_from_slice(&count.to_le_bytes());
+            file.extend_from_slice(&value.to_le_bytes());
+        }
+        file.extend_from_slice(&0u32.to_le_bytes()); // no next directory
+        file
+    }
+
+    /// How a test raster's planes are cut into chunks.
+    #[derive(Clone, Copy)]
+    enum Chunks {
+        /// Strips of this many rows.
+        Strips(u32),
+        /// Tiles of this width and height, padded to full size.
+        Tiles(u32, u32),
+    }
+
+    /// A little-endian RGB TIFF stored one plane per band
+    /// (`PlanarConfiguration` 2), which the encoder cannot write.
+    ///
+    /// `planes` holds the sample bytes of each plane, row by row; the file
+    /// declares `bands` of them. `sample_format` is the TIFF `SampleFormat`:
+    /// 1 unsigned, 2 signed, 3 floating point.
+    fn planar_tiff(
+        (width, height): (u32, u32),
+        (sample_bytes, sample_format): (usize, u16),
+        bands: u16,
+        planes: &[Vec<u8>],
+        chunks: Chunks,
+    ) -> Vec<u8> {
+        const SHORT: u16 = 3;
+        const LONG: u16 = 4;
+        let (w, h) = (width as usize, height as usize);
+        let mut file = Vec::new();
+        file.extend_from_slice(b"II");
+        file.extend_from_slice(&42u16.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes()); // directory offset, set below
+        let mut offsets = Vec::new();
+        let mut counts = Vec::new();
+        for plane in planes {
+            let row = |y: usize, x0: usize, x1: usize| {
+                &plane[(y * w + x0) * sample_bytes..(y * w + x1) * sample_bytes]
+            };
+            let mut chunk_list: Vec<Vec<u8>> = Vec::new();
+            match chunks {
+                Chunks::Strips(rows) => {
+                    for y0 in (0..h).step_by(rows as usize) {
+                        let y1 = (y0 + rows as usize).min(h);
+                        chunk_list.push((y0..y1).flat_map(|y| row(y, 0, w).to_vec()).collect());
+                    }
+                }
+                Chunks::Tiles(tile_w, tile_h) => {
+                    let (tile_w, tile_h) = (tile_w as usize, tile_h as usize);
+                    for y0 in (0..h).step_by(tile_h) {
+                        for x0 in (0..w).step_by(tile_w) {
+                            // Padding is 0xEE: it must not reach a band.
+                            let mut tile = vec![0xEEu8; tile_w * tile_h * sample_bytes];
+                            for y in y0..(y0 + tile_h).min(h) {
+                                let line = row(y, x0, (x0 + tile_w).min(w));
+                                let at = (y - y0) * tile_w * sample_bytes;
+                                tile[at..at + line.len()].copy_from_slice(line);
+                            }
+                            chunk_list.push(tile);
+                        }
+                    }
+                }
+            }
+            for chunk in chunk_list {
+                offsets.push(file.len() as u32);
+                counts.push(chunk.len() as u32);
+                file.extend_from_slice(&chunk);
+            }
+        }
+        let array = |file: &mut Vec<u8>, values: Vec<Vec<u8>>| {
+            let at = file.len() as u32;
+            for value in values {
+                file.extend_from_slice(&value);
+            }
+            at
+        };
+        let per_band = |value: u16| vec![value.to_le_bytes().to_vec(); usize::from(bands)];
+        let longs = |values: &[u32]| -> Vec<Vec<u8>> {
+            values.iter().map(|v| v.to_le_bytes().to_vec()).collect()
+        };
+        let bits_at = array(&mut file, per_band(sample_bytes as u16 * 8));
+        let format_at = array(&mut file, per_band(sample_format));
+        let offsets_at = array(&mut file, longs(&offsets));
+        let counts_at = array(&mut file, longs(&counts));
+        let n_chunks = offsets.len() as u32;
+        let bands_long = u32::from(bands);
+        // (tag, type, count, value or offset)
+        let mut entries: Vec<(u16, u16, u32, u32)> = vec![
+            (256, LONG, 1, width),
+            (257, LONG, 1, height),
+            (258, SHORT, bands_long, bits_at),
+            (259, SHORT, 1, 1), // no compression
+            (262, SHORT, 1, 2), // RGB
+            (277, SHORT, 1, bands_long),
+            (284, SHORT, 1, 2), // separate planes
+            (339, SHORT, bands_long, format_at),
+        ];
+        match chunks {
+            Chunks::Strips(rows) => entries.extend([
+                (273, LONG, n_chunks, offsets_at),
+                (278, LONG, 1, rows),
+                (279, LONG, n_chunks, counts_at),
+            ]),
+            Chunks::Tiles(tile_w, tile_h) => entries.extend([
+                (322, LONG, 1, tile_w),
+                (323, LONG, 1, tile_h),
+                (324, LONG, n_chunks, offsets_at),
+                (325, LONG, n_chunks, counts_at),
+            ]),
+        }
+        entries.sort_unstable();
+        let directory = file.len() as u32;
+        file[4..8].copy_from_slice(&directory.to_le_bytes());
+        file.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, field_type, count, value) in entries {
+            file.extend_from_slice(&tag.to_le_bytes());
+            file.extend_from_slice(&field_type.to_le_bytes());
+            file.extend_from_slice(&count.to_le_bytes());
+            file.extend_from_slice(&value.to_le_bytes());
+        }
+        file.extend_from_slice(&0u32.to_le_bytes()); // no next directory
+        file
+    }
+
+    /// The sample of plane `plane` at pixel `index`: small enough for `i8`.
+    fn planar_sample(plane: usize, index: usize) -> u8 {
+        (plane * 40 + index % 37) as u8
+    }
+
+    /// Checks a 20×18 three-band planar raster of one sample type, in strips
+    /// with a short last strip and in tiles the raster does not fill.
+    fn assert_planar_bands(
+        sample: (usize, u16),
+        encode: impl Fn(u8) -> Vec<u8>,
+        expected: impl Fn(u8) -> f32,
+    ) {
+        let (width, height) = (20u32, 18u32);
+        let n_pixels = (width * height) as usize;
+        let planes: Vec<Vec<u8>> = (0..3)
+            .map(|plane| {
+                (0..n_pixels)
+                    .flat_map(|index| encode(planar_sample(plane, index)))
+                    .collect()
+            })
+            .collect();
+        let want: Vec<Vec<f32>> = (0..3)
+            .map(|plane| {
+                (0..n_pixels)
+                    .map(|index| expected(planar_sample(plane, index)))
+                    .collect()
+            })
+            .collect();
+        for chunks in [Chunks::Strips(4), Chunks::Strips(18), Chunks::Tiles(16, 16)] {
+            let bytes = planar_tiff((width, height), sample, 3, &planes, chunks);
+            assert_eq!(bands_of(&bytes).expect("planar bands"), want);
+        }
+    }
+
+    /// Rasters stored one plane per band were refused; every sample type
+    /// read from interleaved rasters is read from planar ones, to the same
+    /// values.
+    #[test]
+    fn planar_rasters_of_every_sample_type_are_read_band_by_band() {
+        let v = f32::from;
+        assert_planar_bands((1, 1), |s| vec![s], |s| v(s) / 255.0);
+        assert_planar_bands(
+            (2, 1),
+            |s| (u16::from(s) * 257).to_le_bytes().to_vec(),
+            |s| v(s) / 255.0,
+        );
+        assert_planar_bands((1, 2), |s| vec![s], v);
+        assert_planar_bands(
+            (2, 2),
+            |s| (-i16::from(s)).to_le_bytes().to_vec(),
+            |s| -v(s),
+        );
+        assert_planar_bands((4, 1), |s| u32::from(s).to_le_bytes().to_vec(), v);
+        assert_planar_bands(
+            (4, 2),
+            |s| (-i32::from(s)).to_le_bytes().to_vec(),
+            |s| -v(s),
+        );
+        assert_planar_bands(
+            (4, 3),
+            |s| (v(s) + 0.5).to_le_bytes().to_vec(),
+            |s| v(s) + 0.5,
+        );
+        assert_planar_bands(
+            (8, 3),
+            |s| (f64::from(s) + 0.25).to_le_bytes().to_vec(),
+            |s| v(s) + 0.25,
+        );
+    }
+
+    /// A planar file with fewer planes than it declares is an error, not a
+    /// panic and not a raster short of a band.
+    #[test]
+    fn planar_raster_missing_a_plane_is_an_error() {
+        let planes = vec![vec![7u8; 20 * 18]; 2];
+        for chunks in [Chunks::Strips(4), Chunks::Tiles(16, 16)] {
+            let bytes = planar_tiff((20, 18), (1, 1), 3, &planes, chunks);
+            assert!(bands_of(&bytes).is_err());
+        }
+    }
+
+    /// Of a raster stored one plane per band the decoder reads the first
+    /// plane only, so a three-band raster once came back as a single band
+    /// and was then refused. All three bands are read.
+    #[test]
+    fn planar_multi_band_raster_is_read_not_cut_to_one_band() {
+        let bytes = planar_rgb();
+        // What the decoder hands back: the four samples of the first plane.
+        let decoded = open_decoder(Cursor::new(bytes.clone()))
+            .expect("decoder")
+            .read_image()
+            .expect("first plane");
+        assert!(matches!(decoded, DecodingResult::U8(plane) if plane == [1, 2, 3, 4]));
+
+        let unit = |samples: [u8; 4]| samples.map(|s| f32::from(s) / 255.0).to_vec();
+        assert_eq!(
+            bands_of(&bytes).expect("planar RGB"),
+            vec![
+                unit([1, 2, 3, 4]),
+                unit([10, 20, 30, 40]),
+                unit([100, 110, 120, 130])
+            ]
+        );
+    }
+
+    /// The decoder caps the raster it decodes at 256 MiB, but nothing capped
+    /// the `f32` bands made from it: a small, highly compressed 8-bit file
+    /// decoding to that cap went on to allocate four times as much.
+    #[test]
+    fn bands_larger_than_the_output_limit_are_refused_before_decoding() {
+        // 4×4 RGB: 48 samples, 192 bytes as f32.
+        let rgb = raster::<colortype::RGB8>(4, 4, &[7u8; 48]);
+        let bands = read_bands(Cursor::new(rgb.clone()), 192).expect("at the limit");
+        assert_eq!(bands.len(), 3);
+        assert!(bands.iter().all(|band| band.len() == 16));
+        let error = read_bands(Cursor::new(rgb), 191).expect_err("one byte over");
+        assert!(
+            matches!(&error, GeoError::UnsupportedFormat(message)
+                if message.contains("4x4") && message.contains("3 bands") && message.contains("191")),
+            "{error}"
+        );
+        // A float raster is as large decoded as returned, and is held to
+        // the same limit.
+        let float = raster::<colortype::Gray32Float>(2, 2, &[0.5f32; 4]);
+        assert!(read_bands(Cursor::new(float.clone()), 16).is_ok());
+        assert!(read_bands(Cursor::new(float), 15).is_err());
+    }
+
+    #[test]
+    fn output_limit_admits_every_16_bit_raster_the_decoder_accepts() {
+        let limit = max_band_bytes();
+        assert_eq!(limit, 512 * 1024 * 1024);
+        // A 10980×10980 16-bit satellite band: 230 MiB decoded, 460 MiB out.
+        assert!(check_band_bytes(10_980, 10_980, 1, limit).is_ok());
+        // The largest single band, and one row more.
+        assert!(check_band_bytes(16_384, 8_192, 1, limit).is_ok());
+        assert!(check_band_bytes(16_384, 8_193, 1, limit).is_err());
+        // The bands count: three of 8192×8192 are 768 MiB.
+        assert!(check_band_bytes(8_192, 8_192, 2, limit).is_ok());
+        assert!(check_band_bytes(8_192, 8_192, 3, limit).is_err());
+        // Dimensions whose product overflows are refused, not wrapped.
+        assert!(check_band_bytes(u32::MAX, u32::MAX, u16::MAX, usize::MAX).is_err());
+    }
+
+    /// GeoKey directory of a WGS 84 raster whose raster coordinates name
+    /// pixel centres (`GTRasterTypeGeoKey` = 2, `RasterPixelIsPoint`).
+    const WGS84_POINT_KEYS: [u16; 16] =
+        [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 2, 2048, 0, 1, 4326];
+
+    /// In a `PixelIsPoint` raster the tiepoint ties the centre of its pixel,
+    /// not that pixel's corner, so the raster reaches half a pixel further
+    /// up and left. The raster type was not looked at: the box and both
+    /// corners were half a pixel off, here -48.0 where the edge is -48.005.
+    #[test]
+    fn pixel_is_point_raster_extends_half_a_pixel_past_its_tiepoint() {
+        let tags = |geokeys| GeoTags {
+            pixel_scale: Some([0.01, 0.01, 0.0]),
+            tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+            geokeys: Some(geokeys),
+            ..GeoTags::default()
+        };
+
+        let area = metadata(geotiff(100, 50, &tags(&WGS84_KEYS)));
+        assert_eq!(area.upper_left(), Some((-48.0, -15.0)));
+        let bbox = area.bbox.expect("bbox of an area raster");
+        assert_bbox(&bbox, -48.0, -15.5, -47.0, -15.0);
+
+        let point = metadata(geotiff(100, 50, &tags(&WGS84_POINT_KEYS)));
+        let (ul_x, ul_y) = point.upper_left().expect("upper left");
+        let (lr_x, lr_y) = point.lower_right().expect("lower right");
+        assert_close(ul_x, -48.005);
+        assert_close(ul_y, -14.995);
+        assert_close(lr_x, -47.005);
+        assert_close(lr_y, -15.495);
+        let bbox = point.bbox.expect("bbox of a point raster");
+        assert_bbox(&bbox, -48.005, -15.495, -47.005, -14.995);
+        assert!(point.pixel_is_point());
+        assert!(!area.pixel_is_point());
+    }
+
+    /// The same half pixel applies when a matrix locates the raster.
+    #[test]
+    fn pixel_is_point_shifts_a_transformation_matrix_bbox_too() {
+        let tags = |geokeys| GeoTags {
+            transformation: Some(rotation(0.0, 0.01, -48.0, -15.0)),
+            geokeys: Some(geokeys),
+            ..GeoTags::default()
+        };
+        let area = metadata(geotiff(100, 50, &tags(&WGS84_KEYS)));
+        assert_bbox(&area.bbox.expect("area"), -48.0, -15.5, -47.0, -15.0);
+        let point = metadata(geotiff(100, 50, &tags(&WGS84_POINT_KEYS)));
+        assert_bbox(
+            &point.bbox.expect("point"),
+            -48.005,
+            -15.495,
+            -47.005,
+            -14.995,
+        );
+    }
+
+    /// Encodes a 2×2 GeoTIFF with `geokeys` and, when given, the double and
+    /// ASCII parameter tags.
+    fn geotiff_with_params(
+        geokeys: &[u16],
+        doubles: Option<&[f64]>,
+        ascii: Option<&str>,
+    ) -> Vec<u8> {
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, geokeys)
+                .expect("geokeys");
+            if let Some(doubles) = doubles {
+                directory
+                    .write_tag(Tag::GeoDoubleParamsTag, doubles)
+                    .expect("double parameters");
+            }
+            if let Some(ascii) = ascii {
+                directory
+                    .write_tag(Tag::GeoAsciiParamsTag, ascii)
+                    .expect("ASCII parameters");
+            }
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        file.into_inner()
+    }
+
+    /// A geographic raster with a user-defined ellipsoid: two citations in
+    /// the ASCII parameters, and the axes in the double parameters.
+    const PARAM_KEYS: [u16; 28] = [
+        1, 1, 0, 6, //
+        1024, 0, 1, 2, // model type, in the directory
+        1026, 34737, 12, 0, // "My citation|"
+        2049, 34737, 7, 12, // "WGS 84|"
+        2057, 34736, 1, 0, // semi-major axis
+        2058, 34736, 1, 2, // semi-minor axis
+        2059, 34736, 1, 1, // inverse flattening
+    ];
+    const PARAM_DOUBLES: [f64; 3] = [6_378_137.0, 298.257_223_563, 6_356_752.314_245];
+    const PARAM_ASCII: &str = "My citation|WGS 84|";
+
+    /// A key whose value lives in a parameter tag was only ever recorded as
+    /// its position there: semi-major axis "0", inverse flattening "1".
+    #[test]
+    fn geokeys_in_the_parameter_tags_are_resolved() {
+        let bytes = geotiff_with_params(&PARAM_KEYS, Some(&PARAM_DOUBLES), Some(PARAM_ASCII));
+        let params =
+            parse_geotiff_geokey_params_reader(Cursor::new(bytes.clone())).expect("params");
+        assert_eq!(params.citation(), Some("My citation"));
+        assert_eq!(params.geographic_citation(), Some("WGS 84"));
+        assert_eq!(params.projected_citation(), None);
+        assert_eq!(params.semi_major_axis(), Some(6_378_137.0));
+        assert_eq!(params.semi_minor_axis(), Some(6_356_752.314_245));
+        assert_eq!(params.inverse_flattening(), Some(298.257_223_563));
+        assert_eq!(params.strings.len(), 2);
+        assert_eq!(params.doubles.len(), 3);
+
+        // The metadata's own map is what it was: positions for these keys.
+        let parsed = metadata(bytes);
+        assert_eq!(parsed.geokeys.len(), 6);
+        assert_eq!(parsed.geokeys[&1024], 2);
+        assert_eq!(parsed.geokeys[&2049], 12);
+        assert_eq!(parsed.geokeys[&2057], 0);
+        assert_eq!(parsed.geokeys[&2059], 1);
+    }
+
+    /// Nothing about a parameter tag fails the file; the keys that cannot be
+    /// resolved are left out.
+    #[test]
+    fn unusable_parameter_tags_leave_their_keys_unresolved() {
+        let params = |bytes: Vec<u8>| {
+            parse_geotiff_geokey_params_reader(Cursor::new(bytes)).expect("lenient read")
+        };
+
+        // Neither tag is in the file.
+        assert_eq!(
+            params(geotiff_with_params(&PARAM_KEYS, None, None)),
+            GeoKeyParams::default()
+        );
+        // No GeoKey directory at all.
+        assert_eq!(
+            params(geotiff(2, 2, &GeoTags::default())),
+            GeoKeyParams::default()
+        );
+
+        // The double parameters are text and the ASCII parameters doubles.
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, &PARAM_KEYS[..])
+                .expect("geokeys");
+            directory
+                .write_tag(Tag::GeoDoubleParamsTag, "6378137 298.257223563")
+                .expect("mistyped doubles");
+            directory
+                .write_tag(Tag::GeoAsciiParamsTag, &PARAM_DOUBLES[..])
+                .expect("mistyped text");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        assert_eq!(params(file.into_inner()), GeoKeyParams::default());
+
+        // Keys that point past the end of their tag: the citation is cut to
+        // "My cit", so the second string and the third double are outside.
+        let short = params(geotiff_with_params(
+            &PARAM_KEYS,
+            Some(&PARAM_DOUBLES[..2]),
+            Some("My cit"),
+        ));
+        assert_eq!(short.citation(), None);
+        assert_eq!(short.geographic_citation(), None);
+        assert_eq!(short.semi_major_axis(), Some(6_378_137.0));
+        assert_eq!(short.semi_minor_axis(), None);
+        assert_eq!(short.inverse_flattening(), Some(298.257_223_563));
+    }
+
+    /// One Latin-1 byte in an ASCII-typed tag: the decoder refuses the tag,
+    /// which left every string key unresolved, not only the citation with
+    /// the byte in it. The tag is read as Latin-1 instead.
+    #[test]
+    fn non_ascii_byte_in_the_ascii_parameters_is_read_as_latin_1() {
+        let mut bytes = geotiff_with_params(&PARAM_KEYS, Some(&PARAM_DOUBLES), Some(PARAM_ASCII));
+        let at = bytes
+            .windows(PARAM_ASCII.len())
+            .position(|window| window == PARAM_ASCII.as_bytes())
+            .expect("the tag's text in the file");
+        bytes[at + 1] = 0xFD; // "M\u{fd} citation" in Latin-1
+        let params =
+            parse_geotiff_geokey_params_reader(Cursor::new(bytes.clone())).expect("params");
+        assert_eq!(params.citation(), Some("M\u{fd} citation"));
+        assert_eq!(params.geographic_citation(), Some("WGS 84"));
+        assert_eq!(params.strings.len(), 2);
+        assert_eq!(params.doubles.len(), 3);
+        assert_eq!(params.semi_major_axis(), Some(6_378_137.0));
+        let parsed = metadata(bytes);
+        assert!(parsed.is_geographic);
+        assert_eq!(parsed.geokeys.len(), 6);
+    }
+
+    /// The same in a big-endian file, where the tag is found by a walk of
+    /// the directory in the other byte order, and for a tag short enough to
+    /// be stored in the directory entry itself.
+    #[test]
+    fn latin_1_ascii_parameters_are_found_in_any_directory_layout() {
+        const ASCII: u16 = 2;
+        const SHORT: u16 = 3;
+        // A 1x1 gray big-endian TIFF: one pixel at 8, eight GeoKey shorts
+        // at 10, a seven-byte citation at 26, the directory at 34.
+        let directory = |inline: bool| {
+            let mut file = Vec::new();
+            file.extend_from_slice(b"MM");
+            file.extend_from_slice(&42u16.to_be_bytes());
+            file.extend_from_slice(&34u32.to_be_bytes());
+            file.extend_from_slice(&[0, 0]); // the pixel, and padding
+            let text: &[u8] = if inline { b"\xC5b|\0" } else { b"\xC5ngstr|\0" };
+            for key in [1u16, 1, 0, 1, 1026, 34737, text.len() as u16 - 1, 0] {
+                file.extend_from_slice(&key.to_be_bytes());
+            }
+            file.extend_from_slice(b"\xC5ngstr|\0"); // 8 bytes at 26
+            let mut entries: Vec<(u16, u16, u32, [u8; 4])> = vec![
+                (256, SHORT, 1, [0, 1, 0, 0]),
+                (257, SHORT, 1, [0, 1, 0, 0]),
+                (258, SHORT, 1, [0, 8, 0, 0]),
+                (259, SHORT, 1, [0, 1, 0, 0]),
+                (262, SHORT, 1, [0, 1, 0, 0]),
+                (273, SHORT, 1, [0, 8, 0, 0]),
+                (278, SHORT, 1, [0, 1, 0, 0]),
+                (279, SHORT, 1, [0, 1, 0, 0]),
+                (34735, SHORT, 8, 10u32.to_be_bytes()),
+            ];
+            entries.push(if inline {
+                (34737, ASCII, 4, [0xC5, b'b', b'|', 0])
+            } else {
+                (34737, ASCII, 8, 26u32.to_be_bytes())
+            });
+            file.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+            for (tag, field_type, count, value) in entries {
+                file.extend_from_slice(&tag.to_be_bytes());
+                file.extend_from_slice(&field_type.to_be_bytes());
+                file.extend_from_slice(&count.to_be_bytes());
+                file.extend_from_slice(&value);
+            }
+            file.extend_from_slice(&0u32.to_be_bytes());
+            file
+        };
+        let citation = |inline: bool| {
+            parse_geotiff_geokey_params_reader(Cursor::new(directory(inline)))
+                .expect("params")
+                .citation()
+                .map(str::to_string)
+        };
+        assert_eq!(citation(false).as_deref(), Some("\u{c5}ngstr"));
+        assert_eq!(citation(true).as_deref(), Some("\u{c5}b"));
+    }
+
+    /// When the text is stored as BYTE values each string is decoded on its
+    /// own: a citation that is not UTF-8 was left unresolved, and is read as
+    /// Latin-1; the one beside it is read as before.
+    #[test]
+    fn non_utf8_citation_stored_as_bytes_is_read_as_latin_1() {
+        let keys: [u16; 16] = [
+            1, 1, 0, 3, //
+            1024, 0, 1, 2, //
+            1026, 34737, 15, 0, // "C\u{f3}rrego Alegre|" in Latin-1
+            2049, 34737, 7, 15, // "WGS 84|"
+        ];
+        let mut file = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut file).expect("encoder");
+            let mut image = encoder.new_image::<colortype::Gray8>(2, 2).expect("image");
+            let directory = image.encoder();
+            directory
+                .write_tag(Tag::GeoKeyDirectoryTag, &keys[..])
+                .expect("geokeys");
+            directory
+                .write_tag(Tag::GeoAsciiParamsTag, &b"C\xF3rrego Alegre|WGS 84|"[..])
+                .expect("citation");
+            image.write_data(&[0u8; 4]).expect("pixels");
+        }
+        let bytes = file.into_inner();
+        let params =
+            parse_geotiff_geokey_params_reader(Cursor::new(bytes.clone())).expect("params");
+        assert_eq!(params.citation(), Some("C\u{f3}rrego Alegre"));
+        assert_eq!(params.geographic_citation(), Some("WGS 84"));
+        assert!(metadata(bytes).is_geographic);
+    }
+
+    /// A `width`×`height` 8-bit gray TIFF, Deflate-compressed, whose one
+    /// strip is eleven bytes: a small file claiming a large raster.
+    fn small_file_claiming(width: u32, height: u32) -> Vec<u8> {
+        const SHORT: u16 = 3;
+        const LONG: u16 = 4;
+        let strip = [0x78, 0x9c, 0x63, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0, 0];
+        let mut file = Vec::new();
+        file.extend_from_slice(b"II");
+        file.extend_from_slice(&42u16.to_le_bytes());
+        file.extend_from_slice(&20u32.to_le_bytes()); // directory offset
+        file.extend_from_slice(&strip); // at 8
+        file.push(0); // pad to 20
+        let entries: [(u16, u16, u32, u32); 8] = [
+            (256, LONG, 1, width),
+            (257, LONG, 1, height),
+            (258, SHORT, 1, 8),     // BitsPerSample
+            (259, SHORT, 1, 8),     // Compression: Deflate
+            (262, SHORT, 1, 1),     // PhotometricInterpretation: black is zero
+            (273, LONG, 1, 8),      // StripOffsets
+            (278, LONG, 1, height), // RowsPerStrip
+            (279, LONG, 1, 11),     // StripByteCounts
+        ];
+        file.extend_from_slice(&8u16.to_le_bytes());
+        for (tag, field_type, count, value) in entries {
+            file.extend_from_slice(&tag.to_le_bytes());
+            file.extend_from_slice(&field_type.to_le_bytes());
+            file.extend_from_slice(&count.to_le_bytes());
+            file.extend_from_slice(&value.to_le_bytes());
+        }
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file
+    }
+
+    /// The flat 512 MiB limit refused ordinary uncompressed 8-bit imagery
+    /// that had always loaded: 12000×12000 gray is 549 MiB of bands.
+    #[test]
+    fn default_limit_admits_any_uncompressed_8_bit_raster() {
+        let floor = max_band_bytes();
+        // Header and tags aside, an uncompressed 8-bit file is its samples.
+        let gray = default_band_limit(12_000 * 12_000, floor);
+        assert!(check_band_bytes(12_000, 12_000, 1, floor).is_err());
+        assert!(check_band_bytes(12_000, 12_000, 1, gray).is_ok());
+        let rgb = default_band_limit(7_000 * 7_000 * 3, floor);
+        assert!(check_band_bytes(7_000, 7_000, 3, floor).is_err());
+        assert!(check_band_bytes(7_000, 7_000, 3, rgb).is_ok());
+        // A small file gets the floor and no more.
+        assert_eq!(default_band_limit(118, floor), floor);
+        assert_eq!(default_band_limit(u64::MAX, floor), usize::MAX);
+
+        // On a real file, with no floor at all: four bytes per input byte
+        // is enough for an uncompressed 8-bit raster.
+        let rgb = raster::<colortype::RGB8>(4, 4, &[7u8; 48]);
+        let limit = default_band_limit(rgb.len() as u64, 0);
+        assert_eq!(read_bands(Cursor::new(rgb), limit).expect("bands").len(), 3);
+    }
+
+    #[test]
+    fn small_compressed_file_claiming_a_huge_raster_is_refused_by_default() {
+        // 20000×20000 samples from a 120-byte file: 1.5 GiB of bands.
+        let bytes = small_file_claiming(20_000, 20_000);
+        assert!(bytes.len() < 200);
+        let error = bands_of(&bytes).expect_err("over the default limit");
+        assert!(
+            matches!(&error, GeoError::UnsupportedFormat(message)
+                if message.contains("20000x20000")),
+            "{error}"
+        );
+        // The same file with a claim under the limit gets past the check
+        // and as far as the decoder, which finds the strip too short.
+        let small = bands_of(&small_file_claiming(4, 4)).expect_err("short strip");
+        assert!(matches!(small, GeoError::Tiff(_)), "{small}");
+    }
+
+    #[test]
+    fn caller_limit_replaces_the_default_in_both_directions() {
+        let file = tempfile::NamedTempFile::new().expect("temporary file");
+        // 4×4 RGB: 192 bytes of bands. The default admits it.
+        std::fs::write(file.path(), raster::<colortype::RGB8>(4, 4, &[7u8; 48])).expect("write");
+        assert!(parse_geotiff_bands(file.path()).is_ok());
+        assert!(parse_geotiff_bands_with_limit(file.path(), 192).is_ok());
+        let error = parse_geotiff_bands_with_limit(file.path(), 191).expect_err("lowered");
+        assert!(matches!(error, GeoError::UnsupportedFormat(_)), "{error}");
+
+        // 16384×8193 is one row over the default. A higher limit lets the
+        // header check pass; the eleven-byte strip then fails to fill it,
+        // or the decoder's own cap refuses it, but not the band limit.
+        std::fs::write(file.path(), small_file_claiming(16_384, 8_193)).expect("write");
+        let error = parse_geotiff_bands(file.path()).expect_err("default");
+        assert!(matches!(error, GeoError::UnsupportedFormat(_)), "{error}");
+        let raised = parse_geotiff_bands_with_limit(file.path(), usize::MAX);
+        assert!(
+            !matches!(raised, Err(GeoError::UnsupportedFormat(_))),
+            "{raised:?}"
+        );
+    }
+
+    #[test]
+    fn geokey_parameter_edge_cases() {
+        let keys: [u16; 32] = [
+            1, 1, 0, 7, //
+            1024, 0, 1, 2, //
+            1026, 34737, 4, 0, // "A||" and its terminator: the value is "A|"
+            2049, 34737, 0, 4, // no values
+            3073, 34737, 8, 4, // "WGS 84|" and the NUL that ends the tag
+            2057, 34736, 0, 0, // no values
+            2058, 34736, 2, 0, // two values
+            2059, 34736, 1, 2, // one past the end
+        ];
+        let bytes = geotiff_with_params(&keys, Some(&[1.0, 2.0]), Some("A|||WGS 84|"));
+        let params = parse_geotiff_geokey_params_reader(Cursor::new(bytes)).expect("params");
+        // Exactly one `|` is the terminator.
+        assert_eq!(params.citation(), Some("A||"));
+        // A count of zero is no value, not an empty one.
+        assert_eq!(params.geographic_citation(), None);
+        assert_eq!(params.semi_major_axis(), None);
+        // A count that takes in the tag's own NUL still resolves.
+        assert_eq!(params.projected_citation(), Some("WGS 84"));
+        assert_eq!(params.doubles.get(&2058), Some(&vec![1.0, 2.0]));
+        assert_eq!(params.inverse_flattening(), None);
+    }
+
+    /// A raster type that claims to live in the double parameters is not a
+    /// raster type: its `ValueOffset` of 2 is a position, and must not turn
+    /// the raster into `PixelIsPoint`.
+    #[test]
+    fn raster_type_outside_the_directory_is_not_trusted() {
+        let keys: [u16; 16] = [
+            1, 1, 0, 3, 1024, 0, 1, 2, 1025, 34736, 1, 2, 2048, 0, 1, 4326,
+        ];
+        let parsed = metadata(geotiff(
+            100,
+            50,
+            &GeoTags {
+                pixel_scale: Some([0.01, 0.01, 0.0]),
+                tiepoint: Some([0.0, 0.0, 0.0, -48.0, -15.0, 0.0]),
+                geokeys: Some(&keys),
+                ..GeoTags::default()
+            },
+        ));
+        assert!(!parsed.pixel_is_point());
+        assert_eq!(parsed.upper_left(), Some((-48.0, -15.0)));
+        assert_bbox(&parsed.bbox.expect("bbox"), -48.0, -15.5, -47.0, -15.0);
+        assert_eq!(parsed.epsg_code, Some(4326));
+    }
+
+    /// One IFD entry: `tag`, TIFF `kind` (3 SHORT, 4 LONG), `count`, and the
+    /// value or the offset of the values.
+    fn ifd_entry(file: &mut Vec<u8>, tag: u16, kind: u16, count: u32, value: u32) {
+        file.extend_from_slice(&tag.to_le_bytes());
+        file.extend_from_slice(&kind.to_le_bytes());
+        file.extend_from_slice(&count.to_le_bytes());
+        file.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// A strip's stored bytes, and the `(offset, count)` it declares instead
+    /// of its own, if any.
+    type Strip<'a> = (&'a [u8], Option<(u32, u32)>);
+
+    /// An uncompressed little-endian gray TIFF of `bits`-bit samples, built
+    /// by hand so that its strips can be declared shorter than they are.
+    ///
+    /// Each strip's bytes are stored before the directory, so a read that
+    /// runs past a strip lands in the file's own structure, as it does in a
+    /// real file. A strip is declared at its own offset and length unless
+    /// `(offset, count)` is given.
+    fn gray_tiff(
+        (width, height): (u16, u16),
+        bits: u16,
+        rows_per_strip: u16,
+        strips: &[Strip<'_>],
+    ) -> Vec<u8> {
+        let mut file = b"II*\0\0\0\0\0".to_vec();
+        let (mut offsets, mut counts) = (Vec::new(), Vec::new());
+        for (data, declared) in strips {
+            let at = u32::try_from(file.len()).expect("small file");
+            file.extend_from_slice(data);
+            let (offset, count) =
+                declared.unwrap_or((at, u32::try_from(data.len()).expect("small strip")));
+            offsets.push(offset);
+            counts.push(count);
+        }
+        if file.len() % 2 == 1 {
+            file.push(0);
+        }
+        let ifd = u32::try_from(file.len()).expect("small file");
+        file[4..8].copy_from_slice(&ifd.to_le_bytes());
+        const ENTRIES: u16 = 9;
+        let arrays_at = ifd + 2 + 12 * u32::from(ENTRIES) + 4;
+        let mut arrays = Vec::new();
+        let mut longs = |values: &[u32]| -> u32 {
+            if let [value] = values {
+                return *value;
+            }
+            let at = arrays_at + u32::try_from(arrays.len()).expect("small file");
+            for value in values {
+                arrays.extend_from_slice(&value.to_le_bytes());
+            }
+            at
+        };
+        let offsets_field = longs(&offsets);
+        let counts_field = longs(&counts);
+        let strip_count = u32::try_from(strips.len()).expect("few strips");
+        file.extend_from_slice(&ENTRIES.to_le_bytes());
+        ifd_entry(&mut file, 256, 3, 1, u32::from(width));
+        ifd_entry(&mut file, 257, 3, 1, u32::from(height));
+        ifd_entry(&mut file, 258, 3, 1, u32::from(bits));
+        ifd_entry(&mut file, 259, 3, 1, 1);
+        ifd_entry(&mut file, 262, 3, 1, 1);
+        ifd_entry(&mut file, 273, 4, strip_count, offsets_field);
+        ifd_entry(&mut file, 277, 3, 1, 1);
+        ifd_entry(&mut file, 278, 3, 1, u32::from(rows_per_strip));
+        ifd_entry(&mut file, 279, 4, strip_count, counts_field);
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&arrays);
+        file
+    }
+
+    /// 1-bit samples were read one byte to a sample, so the packed bytes and
+    /// the directory after them came back as pixel values.
+    #[test]
+    fn samples_packed_below_a_byte_are_refused_by_name() {
+        let packed = gray_tiff((8, 2), 1, 2, &[(&[0b1010_1010, 0b0101_0101], None)]);
+        let error = bands_of(&packed).expect_err("1-bit samples are refused");
+        assert!(
+            matches!(&error, GeoError::UnsupportedFormat(m) if m.contains("1 bits are bit-packed")),
+            "{error}"
+        );
+        // 12-bit samples are packed across bytes, two to three bytes.
+        let twelve = gray_tiff((4, 1), 12, 1, &[(&[0; 6], None)]);
+        let error = bands_of(&twelve).expect_err("12-bit samples are refused");
+        assert!(
+            matches!(&error, GeoError::UnsupportedFormat(m) if m.contains("12 bits are bit-packed")),
+            "{error}"
+        );
+    }
+
+    /// An uncompressed strip shorter than its pixels was filled from the
+    /// bytes after it, here the file's directory.
+    #[test]
+    fn an_uncompressed_strip_shorter_than_its_pixels_is_refused() {
+        let short = gray_tiff((4, 4), 8, 4, &[(&[7; 8], None)]);
+        let error = bands_of(&short).expect_err("a short strip is refused");
+        assert!(
+            matches!(&error, GeoError::InvalidFormat(m)
+                if m.contains("strip 0 stores 8 bytes") && m.contains("take 16")),
+            "{error}"
+        );
+    }
+
+    /// A sparse strip (offset and count zero, as GDAL writes for an empty
+    /// block) was filled from the file's own header.
+    #[test]
+    fn a_sparse_uncompressed_strip_is_refused() {
+        let sparse = gray_tiff((4, 4), 8, 4, &[(&[], Some((0, 0)))]);
+        let error = bands_of(&sparse).expect_err("a sparse strip is refused");
+        assert!(
+            matches!(&error, GeoError::InvalidFormat(m) if m.contains("sparse")),
+            "{error}"
+        );
+    }
+
+    /// Strips holding exactly their pixels still read, the last one with
+    /// only the rows that remain.
+    #[test]
+    fn exact_uncompressed_strips_still_read() {
+        let rows: Vec<u8> = (1..=15).collect();
+        let exact = gray_tiff(
+            (3, 5),
+            8,
+            2,
+            &[
+                (&rows[..6], None),
+                (&rows[6..12], None),
+                (&rows[12..], None),
+            ],
+        );
+        let expected: Vec<f32> = rows.iter().map(|&v| unit_u8(v)).collect();
+        assert_eq!(bands_of(&exact).expect("exact strips"), vec![expected]);
     }
 }

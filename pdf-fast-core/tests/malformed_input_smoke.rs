@@ -1,0 +1,1616 @@
+//! Malformed PDFs must be rejected with an error, never a panic, a stack
+//! overflow, or an allocation the input cannot justify.
+//!
+//! Three kinds of test live here:
+//!
+//! - **Mutation runs** feed fixed-seed mutations of realistic documents to the
+//!   parser and then to the extraction API, because most of the code that reads
+//!   a malformed file runs after the parse has succeeded.
+//! - **Layered mutation runs** mutate a payload *before* it is compressed and
+//!   embedded. A mutation inside a Flate stream only breaks the checksum, so
+//!   the content interpreter, CMap parser, object-stream expander and font
+//!   readers behind it would otherwise never see a malformed byte.
+//! - **Explicit regressions** for inputs random mutation almost never builds:
+//!   deep nesting, reference cycles, and small inputs that expand without bound.
+//!
+//! Everything is deterministic: fixed seeds and fixed iteration counts. Two
+//! environment variables exist for local investigation only and change nothing
+//! when unset: `PDF_SMOKE_SCALE` multiplies every iteration count, and
+//! `PDF_SMOKE_DUMP` names a file that receives each document just before it is
+//! parsed, so the input behind an abort or a hang can be recovered.
+
+#[path = "../../tools/mutation_smoke.rs"]
+mod smoke;
+
+use std::io::Write;
+use std::sync::{Mutex, MutexGuard};
+
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use pdf_fast_core::cff::CffFont;
+use pdf_fast_core::tessellation::TessellationOptions;
+use pdf_fast_core::truetype::TrueTypeFont;
+use pdf_fast_core::{lzw, ParseOptions, PdfDocument};
+
+#[global_allocator]
+static ALLOCATOR: smoke::CappedAllocator = smoke::CappedAllocator;
+
+const TRUETYPE_FIXTURE: &[u8] = include_bytes!("fixtures/DejaVuSans-subset.ttf");
+const OPENTYPE_FIXTURE: &[u8] = include_bytes!("fixtures/Cabin-subset.otf");
+
+/// Serializes the tests in this binary.
+///
+/// The shared harness swaps the process-wide panic hook, and the capped
+/// allocator counts live bytes for the whole process. Run in parallel, one
+/// test's panic report is swallowed by another's hook and the transient
+/// buffers of several tests add up toward a cap none of them reaches alone.
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Iteration count for a mutation run, scaled by `PDF_SMOKE_SCALE` when set.
+///
+/// The counts in this file keep the whole binary to about a minute in an
+/// unoptimized build, because it runs on every pull request and on three
+/// operating systems. A layered run builds, compresses and parses a document
+/// per iteration, so it is the costly kind. For a deeper sweep, run with
+/// `PDF_SMOKE_SCALE=8` or more.
+fn iterations(base: usize) -> usize {
+    let scale = std::env::var("PDF_SMOKE_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    base * scale
+}
+
+// ── Seed construction ───────────────────────────────────────────────────────
+
+fn zlib(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes).expect("compress seed");
+    encoder.finish().expect("finish seed compression")
+}
+
+/// LZW-encodes `bytes` as literal codes only.
+///
+/// A clear code every 200 symbols keeps the decoder's table below 512 entries,
+/// so every code stays nine bits wide and no table has to be tracked here.
+fn lzw_encode(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pending = 0u32;
+    let mut pending_bits = 0u32;
+    let mut push = |code: u32, out: &mut Vec<u8>| {
+        pending = (pending << 9) | code;
+        pending_bits += 9;
+        while pending_bits >= 8 {
+            pending_bits -= 8;
+            out.push((pending >> pending_bits) as u8);
+        }
+    };
+    for chunk in bytes.chunks(200) {
+        push(256, &mut out);
+        for byte in chunk {
+            push(u32::from(*byte), &mut out);
+        }
+    }
+    push(257, &mut out);
+    // Flush the last partial byte.
+    push(0, &mut out);
+    out
+}
+
+/// Applies the PNG "Up" predictor to rows of `columns` bytes.
+///
+/// The data is padded with spaces to a whole number of rows, which a content
+/// stream ignores.
+fn png_up_rows(bytes: &[u8], columns: usize) -> Vec<u8> {
+    let mut padded = bytes.to_vec();
+    while !padded.len().is_multiple_of(columns) {
+        padded.push(b' ');
+    }
+    let mut out = Vec::with_capacity(padded.len() + padded.len() / columns);
+    let mut previous = vec![0u8; columns];
+    for row in padded.chunks(columns) {
+        out.push(2);
+        for (byte, above) in row.iter().zip(&previous) {
+            out.push(byte.wrapping_sub(*above));
+        }
+        previous.copy_from_slice(row);
+    }
+    out
+}
+
+fn ascii85(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(4) {
+        let mut group = [0u8; 4];
+        group[..chunk.len()].copy_from_slice(chunk);
+        let mut value = u32::from_be_bytes(group);
+        let mut digits = [0u8; 5];
+        for digit in digits.iter_mut().rev() {
+            *digit = (value % 85) as u8 + b'!';
+            value /= 85;
+        }
+        out.extend_from_slice(&digits[..chunk.len() + 1]);
+    }
+    out.extend_from_slice(b"~>");
+    out
+}
+
+fn ascii_hex(bytes: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = bytes
+        .iter()
+        .flat_map(|byte| format!("{byte:02X}").into_bytes())
+        .collect();
+    out.push(b'>');
+    out
+}
+
+/// Run-length encodes `bytes` as literal runs.
+fn run_length(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(128) {
+        out.push((chunk.len() - 1) as u8);
+        out.extend_from_slice(chunk);
+    }
+    out.push(128);
+    out
+}
+
+/// Numbers `objects` from 1 and wraps them in a header, xref table and trailer.
+fn pdf(objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Info << /Title (T \\(nested\\) \\101) \
+             /Author <FEFF00E9> >> >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn stream(dict: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = format!("<< {dict} /Length {} >>\nstream\n", body.len()).into_bytes();
+    out.extend_from_slice(body);
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+/// The payloads a layered mutation run replaces, in plaintext.
+#[derive(Clone)]
+struct Payloads {
+    content: Vec<u8>,
+    table_content: Vec<u8>,
+    cmap: Vec<u8>,
+    object_stream: Vec<u8>,
+    char_proc: Vec<u8>,
+    form: Vec<u8>,
+    inner_form: Vec<u8>,
+    truetype: Vec<u8>,
+    opentype: Vec<u8>,
+    predictor_rows: Vec<u8>,
+}
+
+impl Payloads {
+    fn seed() -> Self {
+        let mut content = Vec::new();
+        content.extend_from_slice(
+            b"q 1 0 0 1 0 0 cm 0.2 0.4 0.6 rg 0.1 G 0 0 0 1 k 0.3 0.3 0.3 sc /G1 gs\n\
+              BT /F1 12 Tf 14 TL 1 Tc 2 Tw 90 Tz 1 Ts 0 Tr 20 180 Td \
+              (Hello \\(World\\) \\101\\n) Tj [(AB) -120 (C) 3 <4445>] TJ T* (x) ' 1 2 (y) \" \
+              /F2 10 Tf 1 0 0 1 20 150 Tm <00410042004600480043> Tj \
+              /F3 10 Tf (AB) Tj /F4 10 Tf (ab) Tj /F5 10 Tf 0 -14 TD (AB) Tj ET\n\
+              0 0 m 100 0 l 100 50 l 0 50 l h S 10 10 80 30 re f \
+              10 10 m 20 20 30 30 40 10 c 50 50 60 60 v 70 70 80 80 y B* W n \
+              [3 2] 0 d 2 w 1 J 1 j 4 M\n\
+              BI /W 2 /H 2 /BPC 8 /CS /G ID \x01\x02\x03\x04 EI\n\
+              BI /W 4 /H 1 /BPC 8 /CS /RGB /F /AHx ID 00ff00ff00ff00ff00ff00ff> EI\n\
+              /Fm1 Do /Im1 Do /Im2 Do /Im3 Do Q\n\
+              99999999999999999999999999999999999999999999 0 m 1e5 -.5 l S\n",
+        );
+        let table_content = b"0.5 w 20 20 m 180 20 l S 20 60 m 180 60 l S 20 100 m 180 100 l S \
+              20 20 m 20 100 l S 100 20 m 100 100 l S 180 20 m 180 100 l S\n\
+              20 110 160 40 re S 20 110 80 40 re S\n\
+              BT /F1 9 Tf 30 30 Td (r1c1) Tj 80 0 Td (r1c2) Tj -80 40 Td (r2c1) Tj \
+              80 0 Td (r2c2) Tj 0 60 Td (above) Tj ET\n"
+            .to_vec();
+        let cmap = b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+              /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+              2 begincodespacerange\n<00> <FF>\n<0000> <FFFF>\nendcodespacerange\n\
+              4 beginbfchar\n<41> <0041>\n<0041> <0041>\n<0042> <00660069>\n\
+              <0048> <D83DDE00>\nendbfchar\n\
+              2 beginbfrange\n<0043> <0045> <0043>\n<0046> <0047> [<0046> <00470047>]\n\
+              endbfrange\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n"
+            .to_vec();
+        let first_object = b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >> ";
+        let second_object = b"[ 278 278 355 (s) <41> /N true null 1.5 -2 3 0 R ]";
+        let header = format!("40 0 41 {} ", first_object.len());
+        let mut object_stream = header.clone().into_bytes();
+        object_stream.extend_from_slice(first_object);
+        object_stream.extend_from_slice(second_object);
+        Self {
+            content,
+            table_content,
+            cmap,
+            object_stream,
+            char_proc: b"500 0 0 0 400 700 d1 0 0 m 400 0 l 400 700 l h f \
+                         BT /F4 1 Tf (a) Tj ET 0 0 400 400 re f"
+                .to_vec(),
+            form: b"q 0.5 0 0 0.5 10 10 cm /Fm2 Do BT /F1 8 Tf (form) Tj ET \
+                    0 0 20 20 re S Q"
+                .to_vec(),
+            inner_form: b"0 0 10 10 re S BT /F1 5 Tf (inner) Tj ET".to_vec(),
+            truetype: TRUETYPE_FIXTURE.to_vec(),
+            opentype: OPENTYPE_FIXTURE.to_vec(),
+            predictor_rows: png_up_rows(b"BT /F1 9 Tf 20 20 Td (predicted text) Tj ET", 8),
+        }
+    }
+
+    /// The seed with its two Form XObjects drawing each other.
+    ///
+    /// Kept apart from [`Self::seed`] because every interpreter refuses a
+    /// form cycle with an error, which would end each page before the rest of
+    /// its content was read.
+    fn with_form_cycle() -> Self {
+        let mut payloads = Self::seed();
+        payloads.form = b"q /Fm2 Do /Fm1 Do BT /F1 8 Tf (form) Tj ET Q".to_vec();
+        payloads.inner_form = b"/Fm1 Do 0 0 10 10 re S".to_vec();
+        payloads
+    }
+}
+
+/// A document that reaches every reader in the crate.
+///
+/// Objects, in order: catalog; a page tree whose `/Kids` lists itself (a
+/// cycle); two pages with inherited resources; Flate, LZW, ASCII85, ASCIIHex
+/// and RunLength streams, with PNG and TIFF predictors; a Type1 font with
+/// `/Differences` and an indirect `/Widths`; a Type0/CID font with a ToUnicode
+/// CMap (bfchar, bfrange and bfrange-array forms); embedded TrueType and
+/// OpenType/CFF programs; a Type 3 font whose glyph draws text in itself;
+/// nested Form XObjects; Flate-predicted, CCITT and DCT
+/// images; an object stream; and a cross-reference stream with `/W`.
+fn document(payloads: &Payloads) -> Vec<u8> {
+    let object_stream_first = payloads
+        .object_stream
+        .iter()
+        .position(|byte| *byte == b'<')
+        .unwrap_or(0);
+    // 46 objects, four bytes each (type, two offset bytes, generation).
+    let xref_rows: Vec<u8> = (0..46u16)
+        .flat_map(|index| [1u8, (index >> 8) as u8, index as u8, 0u8])
+        .collect();
+    let objects: Vec<Vec<u8>> = vec![
+        // 1
+        b"<< /Type /Catalog /Pages 2 0 R /Outlines 30 0 R /Metadata 31 0 R >>".to_vec(),
+        // 2: the page tree root lists itself as a kid.
+        b"<< /Type /Pages /Kids [3 0 R 20 0 R 2 0 R 32 0 R] /Count 3 \
+          /MediaBox [0 0 200 200] /Resources 4 0 R /Rotate 0 >>"
+            .to_vec(),
+        // 3
+        b"<< /Type /Page /Parent 2 0 R /Contents [5 0 R 6 0 R 29 0 R] /Rotate 90 \
+          /CropBox [0 0 200 200] >>"
+            .to_vec(),
+        // 4
+        b"<< /Font << /F1 7 0 R /F2 10 0 R /F3 14 0 R /F4 17 0 R /F5 33 0 R >> \
+          /XObject << /Fm1 21 0 R /Im1 23 0 R /Im2 24 0 R /Im3 28 0 R >> \
+          /ExtGState << /G1 << /LW 2 /CA 0.5 >> >> /ProcSet [/PDF /Text] >>"
+            .to_vec(),
+        // 5: Flate content.
+        stream("/Filter /FlateDecode", &zlib(&payloads.content)),
+        // 6: Flate content behind a PNG predictor.
+        stream(
+            "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 8 >>",
+            &zlib(&payloads.predictor_rows),
+        ),
+        // 7
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding \
+          /BaseEncoding /WinAnsiEncoding /Differences 34 0 R >> /ToUnicode 8 0 R \
+          /FirstChar 32 /LastChar 34 /Widths 9 0 R >>"
+            .to_vec(),
+        // 8
+        stream("/Filter /FlateDecode", &zlib(&payloads.cmap)),
+        // 9
+        b"[ 278 278 355 ]".to_vec(),
+        // 10
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /DejaVuSans /Encoding /Identity-H \
+          /DescendantFonts [11 0 R] /ToUnicode 8 0 R >>"
+            .to_vec(),
+        // 11
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /DejaVuSans \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 12 0 R /DW 1000 /W [0 [500 600] 65 70 700] /CIDToGIDMap /Identity >>"
+            .to_vec(),
+        // 12
+        b"<< /Type /FontDescriptor /FontName /DejaVuSans /Flags 32 \
+          /FontBBox [-1021 -463 1793 1232] /ItalicAngle 0 /Ascent 1556 /Descent -492 \
+          /CapHeight 1493 /StemV 80 /FontFile2 13 0 R >>"
+            .to_vec(),
+        // 13
+        stream(
+            &format!("/Length1 {}", payloads.truetype.len()),
+            &payloads.truetype,
+        ),
+        // 14
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Cabin-Regular /FirstChar 65 /LastChar 66 \
+          /Widths [500 500] /FontDescriptor 15 0 R /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        // 15
+        b"<< /Type /FontDescriptor /FontName /Cabin-Regular /Flags 32 \
+          /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 900 /Descent -200 \
+          /CapHeight 700 /StemV 80 /FontFile3 16 0 R >>"
+            .to_vec(),
+        // 16
+        stream("/Subtype /OpenType", &payloads.opentype),
+        // 17: a Type 3 font whose glyph `b` shows text in the same font.
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 700] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 18 0 R /b 19 0 R >> \
+          /Encoding << /Type /Encoding /Differences [97 /a /b] >> /FirstChar 97 /LastChar 98 \
+          /Widths [500 500] /Resources << /Font << /F4 17 0 R /F1 7 0 R >> >> >>"
+            .to_vec(),
+        // 18
+        stream("", b"500 0 d0 0 0 m 400 0 l 400 700 l 0 700 l h f"),
+        // 19
+        stream("", &payloads.char_proc),
+        // 20
+        b"<< /Type /Page /Parent 2 0 R /Contents 22 0 R >>".to_vec(),
+        // 21: a form that draws a second form.
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Matrix [1 0 0 1 5 5] \
+             /Resources << /XObject << /Fm1 21 0 R /Fm2 25 0 R >> /Font << /F1 7 0 R >> >>",
+            &payloads.form,
+        ),
+        // 22: table rules and cell text, ASCII85 over Flate.
+        stream(
+            "/Filter [/ASCII85Decode /FlateDecode]",
+            &ascii85(&zlib(&payloads.table_content)),
+        ),
+        // 23: an image behind a PNG "optimum" predictor.
+        stream(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 \
+             /ColorSpace /DeviceRGB /Filter /FlateDecode \
+             /DecodeParms << /Predictor 15 /Colors 3 /Columns 2 /BitsPerComponent 8 >>",
+            &zlib(&[0, 1, 2, 3, 4, 5, 6, 1, 7, 8, 9, 10, 11, 12]),
+        ),
+        // 24: a CCITT Group 4 image, four all-white rows then end-of-block.
+        stream(
+            "/Type /XObject /Subtype /Image /Width 16 /Height 4 /BitsPerComponent 1 \
+             /ImageMask true /Filter /CCITTFaxDecode \
+             /DecodeParms << /K -1 /Columns 16 /Rows 4 /BlackIs1 false >>",
+            &[0xF0, 0x01, 0x00, 0x10],
+        ),
+        // 25
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 50 50] \
+             /Resources << /XObject << /Fm1 21 0 R >> >>",
+            &payloads.inner_form,
+        ),
+        // 26: an object stream holding objects 40 and 41.
+        stream(
+            &format!("/Type /ObjStm /N 2 /First {object_stream_first} /Filter /FlateDecode"),
+            &zlib(&payloads.object_stream),
+        ),
+        // 27: a cross-reference stream with `/W` and a predictor.
+        stream(
+            "/Type /XRef /Size 46 /W [1 2 1] /Index [0 46] /Root 1 0 R /Filter /FlateDecode \
+             /DecodeParms << /Predictor 12 /Columns 4 >>",
+            &zlib(&png_up_rows(&xref_rows, 4)),
+        ),
+        // 28: a DCT image, which the parser passes through undecoded.
+        stream(
+            "/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 \
+             /ColorSpace /DeviceGray /Filter /DCTDecode",
+            b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xFF\xD9",
+        ),
+        // 29: LZW content behind a TIFF predictor, one row wide.
+        stream(
+            &format!(
+                "/Filter /LZWDecode /DecodeParms << /Predictor 2 /Columns {} /Colors 1 \
+                 /BitsPerComponent 8 /EarlyChange 1 >>",
+                LZW_CONTENT.len()
+            ),
+            &lzw_encode(&tiff_predict(LZW_CONTENT)),
+        ),
+        // 30
+        b"<< /Type /Outlines /Count 0 >>".to_vec(),
+        // 31: ASCIIHex over RunLength.
+        stream(
+            "/Type /Metadata /Subtype /XML /Filter [/ASCIIHexDecode /RunLengthDecode]",
+            &ascii_hex(&run_length(b"<x:xmpmeta>BT (meta) Tj ET</x:xmpmeta>")),
+        ),
+        // 32: an intermediate node with a deeper kid.
+        b"<< /Type /Pages /Parent 2 0 R /Kids [35 0 R 2 0 R] /Count 1 >>".to_vec(),
+        // 33: a simple TrueType font sharing the embedded program.
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /DejaVuSans /FirstChar 65 /LastChar 66 \
+          /Widths [1401 1367] /FontDescriptor 12 0 R /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        // 34
+        b"[ 65 /Alpha /fi 200 /emdash /uni00E9 /g123 ]".to_vec(),
+        // 35
+        b"<< /Type /Page /Parent 32 0 R /MediaBox [0 0 100 100] /Contents 36 0 R \
+          /Resources << /Font << /F1 7 0 R >> >> >>"
+            .to_vec(),
+        // 36: unfiltered content, so whole-document mutations reach operators.
+        stream("", &payloads.content),
+    ];
+    pdf(&objects)
+}
+
+const LZW_CONTENT: &[u8] = b"BT /F1 9 Tf 20 40 Td (lzw text) Tj ET";
+
+/// Applies the TIFF horizontal predictor for one-byte samples.
+fn tiff_predict(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut previous = 0u8;
+    for byte in bytes {
+        out.push(byte.wrapping_sub(previous));
+        previous = *byte;
+    }
+    out
+}
+
+/// The thin single-page document the first fuzzing pass used, kept as a seed
+/// because mutations of a small file concentrate on the object syntax.
+fn small_document() -> Vec<u8> {
+    let content =
+        b"q 1 0 0 1 0 0 cm BT /F1 12 Tf 72 720 Td (Hello) Tj [(AB) -120 (C) 3 <4445>] TJ \
+        T* (x) ' ET\n0 0 m 100 0 l 100 50 l 0 50 l h S 10 10 80 30 re f\n\
+        BI /W 2 /H 2 /BPC 8 /CS /G ID \x01\x02\x03\x04 EI Q";
+    pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> \
+          /Contents 4 0 R /Rotate 90 >>"
+            .to_vec(),
+        stream("", content),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding \
+          /FirstChar 32 /LastChar 34 /Widths [278 278 355] >>"
+            .to_vec(),
+    ])
+}
+
+// ── What a consumer does with a document ────────────────────────────────────
+
+/// Options with decode budgets small enough to keep a mutation run fast.
+///
+/// A mutated `/MediaBox` or `/Length` can legitimately ask for a surface or a
+/// stream as large as the budget allows; the default budgets make each such
+/// input cost a quarter of a gigabyte of zeroed memory. The limits are still
+/// far above anything these kilobyte-sized seeds decode to.
+fn tight_options() -> ParseOptions {
+    ParseOptions {
+        max_decoded_stream_len: 8 * 1024 * 1024,
+        max_total_decoded_bytes: 16 * 1024 * 1024,
+        ..ParseOptions::default()
+    }
+}
+
+fn dump(bytes: &[u8]) {
+    if let Some(path) = std::env::var_os("PDF_SMOKE_DUMP") {
+        std::fs::write(path, bytes).expect("write smoke input");
+    }
+}
+
+fn parse(bytes: &[u8], options: ParseOptions) -> Option<PdfDocument> {
+    dump(bytes);
+    PdfDocument::from_slice(bytes, options).ok()
+}
+
+/// Parses `bytes` and calls the text and glyph extraction API.
+fn exercise_text(bytes: &[u8], options: ParseOptions) {
+    let Some(document) = parse(bytes, options) else {
+        return;
+    };
+    let pages = document.pages();
+    let _ = document.semantic_text_runs();
+    let _ = document.layout_blocks();
+    let _ = document.vector_glyph_clusters_checked(0.05);
+    let _ = document.vector_glyph_descriptors_checked(8);
+    let _ = document.vector_glyph_descriptor_lines_checked(8, 2.0, true);
+    let _ = document.vector_glyph_cluster_lines_checked(0.05, 2.0, true);
+    for index in 0..document.objects.len().min(64) {
+        let _ = document.object_bytes(index);
+    }
+    for index in 0..document.streams.len().min(64) {
+        let _ = document.stream_raw_bytes(index);
+        let _ = document.stream_decoded_bytes(index);
+    }
+    #[cfg(feature = "arrow")]
+    {
+        let _ = document.semantic_text_runs_record_batch();
+    }
+    for (index, page) in pages.iter().enumerate().take(4) {
+        let _ = page.page_box();
+        let _ = document.semantic_text_runs_for_page(page);
+        let _ = document.page_vector_text_runs(index);
+        let _ = document.page_vector_text_as_string(index);
+        let _ = document.page_vector_text_as_string_checked(index);
+        let _ = document.page_text_line_boxes(index, 2.0);
+        let _ = document.page_text_line_boxes_with(index, 2.0, true);
+        let _ = document.page_embedded_image(index);
+    }
+}
+
+/// Parses `bytes` and calls the table, path and layout extraction API.
+fn exercise_tables(bytes: &[u8], options: ParseOptions) {
+    let Some(document) = parse(bytes, options) else {
+        return;
+    };
+    let pages = document.pages();
+    #[cfg(feature = "arrow")]
+    {
+        let _ = document.semantic_text_runs_record_batch_parallel();
+        let _ = document.table_layout_record_batch(1.0);
+        let _ = document.table_record_batch(1.0);
+    }
+    for (index, page) in pages.iter().enumerate().take(4) {
+        let _ = document.page_tables(index, 1.0);
+        let _ = document.page_table_grid(index, 1.0);
+        let _ = document.page_table_layout(index, 1.0);
+        let _ = document.page_table_text_assignments(index, 1.0);
+        let _ = document.page_line_segments(index);
+        let _ = document.page_image_placements(index);
+        let _ = document.reading_order_blocks(page, TessellationOptions::default());
+        let _ = document.tessellate_page(index, TessellationOptions::default());
+        #[cfg(feature = "arrow")]
+        {
+            let _ = document.page_table_layout_record_batch(index, 1.0);
+            let _ = document.page_table_record_batch(index, 1.0);
+        }
+    }
+}
+
+/// Parses `bytes` and calls the image and rasterization API.
+///
+/// The full-interpreter entry points (`page_rasterized_png_interpreted` and
+/// the `interpreted` flag of `raster_glyph_descriptor_lines_with`) are left
+/// out on purpose. They hand the document to a third-party interpreter that
+/// recurses without a depth limit, and a parser cannot bound what another
+/// parser makes of a malformed file.
+#[cfg(feature = "rasterize")]
+fn exercise_raster(bytes: &[u8], options: ParseOptions) {
+    use pdf_fast_core::BitmapComponentOptions;
+
+    let Some(document) = parse(bytes, options) else {
+        return;
+    };
+    let pages = document.pages();
+    for index in 0..pages.len().min(3) {
+        let _ = document.page_rasterized_png(index, 18.0);
+        let _ = document.page_bitmap_components(index, BitmapComponentOptions::default());
+        let _ = document.raster_glyph_descriptor_lines_with(index, 18.0, 8, 128, 2.0, true, false);
+        #[cfg(feature = "arrow")]
+        {
+            let _ = document.page_multimodal_record_batch(index);
+        }
+    }
+}
+
+#[cfg(not(feature = "rasterize"))]
+fn exercise_raster(_bytes: &[u8], _options: ParseOptions) {}
+
+/// Walks every glyph of a TrueType program.
+fn exercise_truetype(bytes: &[u8]) {
+    let Some(font) = TrueTypeFont::parse(bytes) else {
+        return;
+    };
+    let _ = font.units_per_em();
+    for code in 0..512u32 {
+        let _ = font.glyph_index(code);
+        let _ = font.advance_units(code);
+    }
+    for glyph in 0..=u16::MAX {
+        let _ = font.outline(glyph);
+    }
+}
+
+/// Walks every glyph of a CFF program, bare or wrapped in an `OTTO` sfnt.
+fn exercise_cff(bytes: &[u8]) {
+    let table = cff_table(bytes).unwrap_or(bytes);
+    let Some(font) = CffFont::parse(table, None) else {
+        return;
+    };
+    let _ = font.units_per_em();
+    let _ = font.glyph_id("A");
+    for glyph in 0..=u16::MAX {
+        if font.glyph_name(glyph).is_none() && glyph > 1024 {
+            break;
+        }
+        let _ = font.outline(glyph);
+        let _ = font.advance_units(glyph);
+    }
+}
+
+/// The `CFF ` table of an `OTTO` sfnt, when `bytes` is one.
+fn cff_table(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.get(..4)? != b"OTTO" {
+        return None;
+    }
+    let tables = u16::from_be_bytes([*bytes.get(4)?, *bytes.get(5)?]) as usize;
+    for index in 0..tables {
+        let record = bytes.get(12 + index * 16..28 + index * 16)?;
+        if &record[..4] == b"CFF " {
+            let offset = u32::from_be_bytes([record[8], record[9], record[10], record[11]]);
+            let length = u32::from_be_bytes([record[12], record[13], record[14], record[15]]);
+            let end = (offset as usize).checked_add(length as usize)?;
+            return bytes.get(offset as usize..end);
+        }
+    }
+    None
+}
+
+// ── Mutation runs ───────────────────────────────────────────────────────────
+
+/// Whole-document seeds: every reader, the form cycle, and a small file.
+fn document_seeds() -> Vec<Vec<u8>> {
+    vec![
+        document(&Payloads::seed()),
+        document(&Payloads::with_form_cycle()),
+        small_document(),
+    ]
+}
+
+#[test]
+fn mutated_documents_never_panic_in_parsing_or_text_extraction() {
+    let _serial = serial();
+    smoke::assert_no_panics(
+        "pdf-fast-core document text",
+        &document_seeds(),
+        iterations(600),
+        |bytes| exercise_text(bytes, ParseOptions::default()),
+    );
+}
+
+#[test]
+fn mutated_documents_never_panic_in_table_or_layout_extraction() {
+    let _serial = serial();
+    smoke::assert_no_panics(
+        "pdf-fast-core document tables",
+        &document_seeds(),
+        iterations(300),
+        |bytes| exercise_tables(bytes, ParseOptions::default()),
+    );
+}
+
+#[test]
+fn mutated_documents_never_panic_in_rasterization() {
+    let _serial = serial();
+    // No form cycle here: see `exercise_raster`.
+    let seeds = [document(&Payloads::seed()), small_document()];
+    smoke::assert_no_panics(
+        "pdf-fast-core document raster",
+        &seeds,
+        iterations(300),
+        |bytes| exercise_raster(bytes, tight_options()),
+    );
+}
+
+/// One layered run: mutate a plaintext payload, embed it, parse the document.
+fn layered_run(name: &str, seed: Vec<u8>, count: usize, place: fn(&mut Payloads, Vec<u8>)) {
+    let base = Payloads::seed();
+    smoke::assert_no_panics(name, &[seed], iterations(count), |bytes| {
+        let mut payloads = base.clone();
+        place(&mut payloads, bytes.to_vec());
+        let document = document(&payloads);
+        exercise_text(&document, tight_options());
+        exercise_tables(&document, tight_options());
+    });
+}
+
+#[test]
+fn mutated_content_streams_never_panic_behind_their_filters() {
+    let _serial = serial();
+    let seed = Payloads::seed();
+    layered_run(
+        "pdf-fast-core content",
+        seed.content.clone(),
+        45,
+        |payloads, bytes| payloads.content = bytes,
+    );
+    layered_run(
+        "pdf-fast-core table content",
+        seed.table_content.clone(),
+        30,
+        |payloads, bytes| payloads.table_content = bytes,
+    );
+    layered_run(
+        "pdf-fast-core form content",
+        seed.form.clone(),
+        20,
+        |payloads, bytes| payloads.form = bytes,
+    );
+    layered_run(
+        "pdf-fast-core inner form content",
+        seed.inner_form.clone(),
+        15,
+        |payloads, bytes| payloads.inner_form = bytes,
+    );
+    layered_run(
+        "pdf-fast-core char proc",
+        seed.char_proc.clone(),
+        20,
+        |payloads, bytes| payloads.char_proc = bytes,
+    );
+    layered_run(
+        "pdf-fast-core predictor rows",
+        seed.predictor_rows.clone(),
+        20,
+        |payloads, bytes| payloads.predictor_rows = bytes,
+    );
+}
+
+#[test]
+fn mutated_content_streams_never_panic_in_rasterization() {
+    let _serial = serial();
+    let base = Payloads::seed();
+    smoke::assert_no_panics(
+        "pdf-fast-core content raster",
+        &[base.content.clone(), base.table_content.clone()],
+        iterations(150),
+        |bytes| {
+            let mut payloads = base.clone();
+            payloads.content = bytes.to_vec();
+            exercise_raster(&document(&payloads), tight_options());
+        },
+    );
+}
+
+#[test]
+fn mutated_cmaps_and_object_streams_never_panic_behind_their_filters() {
+    let _serial = serial();
+    let seed = Payloads::seed();
+    layered_run(
+        "pdf-fast-core cmap",
+        seed.cmap.clone(),
+        45,
+        |payloads, bytes| payloads.cmap = bytes,
+    );
+    layered_run(
+        "pdf-fast-core object stream",
+        seed.object_stream.clone(),
+        45,
+        |payloads, bytes| payloads.object_stream = bytes,
+    );
+}
+
+#[test]
+fn mutated_font_programs_never_panic() {
+    let _serial = serial();
+    smoke::assert_no_panics(
+        "pdf-fast-core truetype",
+        &[TRUETYPE_FIXTURE.to_vec()],
+        iterations(100),
+        exercise_truetype,
+    );
+    smoke::assert_no_panics(
+        "pdf-fast-core cff",
+        &[OPENTYPE_FIXTURE.to_vec()],
+        iterations(200),
+        exercise_cff,
+    );
+    // The same programs embedded, so the font dictionary plumbing and the
+    // glyph placement that consumes the outlines run too.
+    layered_run(
+        "pdf-fast-core embedded truetype",
+        TRUETYPE_FIXTURE.to_vec(),
+        300,
+        |payloads, bytes| payloads.truetype = bytes,
+    );
+    layered_run(
+        "pdf-fast-core embedded opentype",
+        OPENTYPE_FIXTURE.to_vec(),
+        300,
+        |payloads, bytes| payloads.opentype = bytes,
+    );
+}
+
+#[test]
+fn mutated_filter_payloads_never_panic() {
+    let _serial = serial();
+    let text = b"BT /F1 9 Tf 20 40 Td (lzw text lzw text lzw text) Tj ET";
+    smoke::assert_no_panics(
+        "pdf-fast-core lzw",
+        &[lzw_encode(text)],
+        iterations(20_000),
+        |bytes| {
+            let _ = lzw::decode_lzw_limited(bytes, 1, 1 << 20);
+            let _ = lzw::decode_lzw_limited(bytes, 0, 1 << 20);
+        },
+    );
+    smoke::assert_no_panics(
+        "pdf-fast-core predictor",
+        &[png_up_rows(text, 8), tiff_predict(text)],
+        iterations(4_000),
+        |bytes| {
+            // The first three bytes pick the parameters, so the mutations
+            // reach every predictor, sample depth and row shape.
+            let predictor =
+                [2u8, 10, 11, 12, 13, 14, 15, 3][bytes.first().copied().unwrap_or(0) as usize % 8];
+            let columns = bytes.get(1).copied().unwrap_or(8) as usize;
+            let colors = bytes.get(2).copied().unwrap_or(1) as usize % 6;
+            for bits in [1usize, 2, 4, 8, 16, 3] {
+                let _ = lzw::apply_predictor(bytes, predictor, columns, colors, bits);
+                let _ = lzw::apply_predictor(bytes, predictor, 8, 1, bits);
+            }
+            let _ = lzw::apply_predictor(bytes, predictor, usize::MAX, usize::MAX, 16);
+        },
+    );
+}
+
+// ── Explicit regressions ────────────────────────────────────────────────────
+
+/// A stray delimiter inside an array used to parse as an empty bareword that
+/// consumed nothing, so the array loop pushed values until memory ran out.
+#[test]
+fn a_stray_delimiter_in_an_array_does_not_loop() {
+    let _serial = serial();
+    for delimiter in [&b")"[..], b">", b"{", b"}"] {
+        for (open, close) in [
+            (&b"[ "[..], &b" ]"[..]),
+            (b"<< /A [ ", b" ] >>"),
+            (b"<< /A ", b" >>"),
+            (b"[ 1 ", b" ]"),
+        ] {
+            let mut document = b"%PDF-1.7\n1 0 obj\n".to_vec();
+            document.extend_from_slice(open);
+            document.extend_from_slice(delimiter);
+            document.extend_from_slice(close);
+            document.extend_from_slice(b"\nendobj\n");
+            exercise_text(&document, ParseOptions::default());
+        }
+    }
+}
+
+/// Arrays and dictionaries nested far past any real document must be refused
+/// by a depth limit, not followed until the stack overflows.
+#[test]
+fn deeply_nested_values_are_bounded_on_a_small_stack() {
+    let _serial = serial();
+    for (open, close) in [
+        (&b"["[..], &b"]"[..]),
+        (b"<< /A ", b" >>"),
+        (b"[ << /A ", b" >> ]"),
+    ] {
+        // Unterminated, as the fuzzer found it, and properly closed.
+        for closed in [false, true] {
+            let mut document = b"%PDF-1.7\n1 0 obj\n".to_vec();
+            if closed {
+                document.extend(smoke::nested(open, b"1", close, 200_000));
+                document.extend_from_slice(b"\nendobj\n");
+            } else {
+                document.extend(smoke::nested(open, b"", b"", 200_000));
+            }
+            smoke::run_on_small_stack(move || {
+                exercise_text(&document, ParseOptions::default());
+            });
+        }
+    }
+}
+
+/// The same nesting inside a content stream, which has its own tokenizer.
+#[test]
+fn deeply_nested_content_arrays_are_bounded_on_a_small_stack() {
+    let _serial = serial();
+    let mut payloads = Payloads::seed();
+    payloads.content = smoke::nested(b"[", b"(x)", b"]", 200_000);
+    payloads.content.extend_from_slice(b" TJ");
+    let document = document(&payloads);
+    smoke::run_on_small_stack(move || {
+        exercise_text(&document, tight_options());
+        exercise_tables(&document, tight_options());
+    });
+}
+
+/// A content stream of nothing but `q`. The table extractor kept one saved
+/// matrix per `q` with no limit, 24 bytes for every two bytes of content, so
+/// this 72 MB stream asked for more than the allocator's 1 GiB cap.
+#[test]
+fn a_run_of_saved_states_does_not_grow_the_table_extractor() {
+    let _serial = serial();
+    let mut payloads = Payloads::seed();
+    payloads.table_content = b"q ".repeat(36_000_000);
+    let document = document(&payloads);
+    // On the harness's small stack, so the test behaves the same on every
+    // platform whatever stack its test threads get.
+    smoke::run_on_small_stack(move || {
+        exercise_tables(&document, ParseOptions::default());
+    });
+}
+
+// ── Cross-reference chain cost ──────────────────────────────────────────────
+
+/// A one-page document with a classic table; returns the bytes and where the
+/// table starts.
+fn one_revision() -> (Vec<u8>, usize) {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (number, body) in [
+        (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"),
+    ] {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let table = out.len();
+    out.extend_from_slice(b"xref\n1 3\n");
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
+    (out, table)
+}
+
+/// The most work the cross-reference chain may report for `bytes`: its own
+/// budget of eight units a byte plus a fixed allowance.
+fn chain_work_bound(bytes: &[u8]) -> usize {
+    bytes.len() * 8 + 4096
+}
+
+/// A few kilobytes whose newest section is a cross-reference stream that
+/// inflates to four million one-byte rows. Building a row per byte once
+/// cost over a hundred times the decoded size in heap, a gigabyte from an
+/// 8 KB file, before any limit was consulted.
+#[test]
+fn a_cross_reference_stream_that_inflates_to_millions_of_rows_is_not_read() {
+    let _serial = serial();
+    let rows = 4_000_000usize;
+    let (mut bytes, first) = one_revision();
+    let stream_at = bytes.len();
+    let data = zlib(&vec![0u8; rows]);
+    bytes.extend_from_slice(
+        format!(
+            "30 0 obj\n<< /Type /XRef /Size {rows} /W [0 0 1] /Index [0 {rows}] /Root 1 0 R \
+             /Prev {first} /Filter /FlateDecode /Length {} >>\nstream\n",
+            data.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&data);
+    bytes.extend_from_slice(
+        format!("\nendstream\nendobj\nstartxref\n{stream_at}\n%%EOF\n").as_bytes(),
+    );
+    for keep_decoded_streams in [true, false] {
+        let options = ParseOptions {
+            keep_decoded_streams,
+            ..ParseOptions::default()
+        };
+        let document = PdfDocument::from_slice(&bytes, options).expect("parses");
+        assert_eq!(document.pages().len(), 1);
+        let work = document.xref_chain_work();
+        assert!(
+            work <= chain_work_bound(&bytes) && work < rows / 100,
+            "{work} units of work for a {} byte file",
+            bytes.len()
+        );
+    }
+}
+
+/// 2,040 tiny sections, each sending `/XRefStm` to an `xref` keyword hidden
+/// in a comment inside one shared run of entries. Entering a table there
+/// re-read the run once per section: five seconds for a 280 KB file.
+#[test]
+fn sections_cannot_re_read_one_run_of_entries_through_a_hidden_keyword() {
+    let _serial = serial();
+    let (mut bytes, first) = one_revision();
+    let points = 2_040usize;
+    let mut entry_points = Vec::new();
+    for _ in 0..points {
+        bytes.push(b'%');
+        entry_points.push(bytes.len());
+        bytes.extend_from_slice(b"xref 0 4294967295\n");
+        for _ in 0..20 {
+            bytes.extend_from_slice(b"0 0n\n");
+        }
+    }
+    bytes.extend_from_slice(b"trailer\n<< >>\n");
+    let section = |point: usize, next: usize| {
+        format!("xref\ntrailer\n<< /Root 1 0 R /XRefStm {point:>10} /Prev {next:>10} >>\n")
+    };
+    let width = section(0, 0).len();
+    let base = bytes.len();
+    for (index, point) in entry_points.iter().enumerate() {
+        let next = if index + 1 == points {
+            first
+        } else {
+            base + (index + 1) * width
+        };
+        bytes.extend_from_slice(section(*point, next).as_bytes());
+    }
+    bytes.extend_from_slice(format!("startxref\n{base}\n%%EOF\n").as_bytes());
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+    assert_eq!(document.pages().len(), 1);
+    let work = document.xref_chain_work();
+    // Every entry in the file read once is 2,040 x 20; re-reading the run
+    // from each entry point was about a thousand times that.
+    assert!(
+        work <= chain_work_bound(&bytes) && work < points * 20 * 8,
+        "{work} units of work for a {} byte file",
+        bytes.len()
+    );
+}
+
+/// Only the work budget stops this one. Six cross-reference streams, each
+/// under the decode cap and each all rows for object numbers the file does
+/// not have, hang off a small newest table by `/Prev`. No single section is
+/// refused; together they are more rows than the budget allows.
+#[test]
+fn many_cross_reference_streams_under_the_decode_cap_spend_the_budget() {
+    let _serial = serial();
+    let rows = 8_192usize;
+    let (mut bytes, first) = one_revision();
+    let data = zlib(&vec![0u8; rows]);
+    let mut previous = first;
+    for number in 30..36 {
+        let at = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "{number} 0 obj\n<< /Type /XRef /Size 9 /W [0 0 1] /Index [1000 {rows}] \
+                 /Prev {previous} /Filter /FlateDecode /Length {} >>\nstream\n",
+                data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        previous = at;
+    }
+    let table = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 9 /Root 1 0 R /Prev {previous} >>\n\
+             startxref\n{table}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    assert!(
+        bytes.len() * 4 + 4096 > rows,
+        "each stream is under the decode cap"
+    );
+    assert!(
+        6 * rows > chain_work_bound(&bytes),
+        "together they exceed the budget"
+    );
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+    assert_eq!(document.pages().len(), 1);
+    let work = document.xref_chain_work();
+    println!("budget test: {work} units for {} bytes", bytes.len());
+    assert!(
+        work <= chain_work_bound(&bytes) + 64,
+        "{work} units of work for a {} byte file",
+        bytes.len()
+    );
+}
+
+/// Only the "numbers the scan produced" rule stops this one. A well-formed
+/// table lists 100,000 in-use objects the file does not contain. Nothing
+/// may be kept for them.
+#[test]
+fn entries_for_objects_the_scan_never_saw_are_not_kept() {
+    let _serial = serial();
+    let (mut bytes, first) = one_revision();
+    let listed = 100_000usize;
+    let table = bytes.len();
+    bytes.extend_from_slice(format!("xref\n1000 {listed}\n").as_bytes());
+    for _ in 0..listed {
+        bytes.extend_from_slice(b"0000000000 00000 n \n");
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 9 /Root 1 0 R /Prev {first} >>\nstartxref\n{table}\n%%EOF\n")
+            .as_bytes(),
+    );
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("parses");
+    assert_eq!(document.pages().len(), 1);
+    let kept = document.xref_chain_entries();
+    println!(
+        "filter test: {kept} entries kept, {} units for {} bytes",
+        document.xref_chain_work(),
+        bytes.len()
+    );
+    assert!(kept <= 3, "{kept} entries kept for a three-object file");
+}
+
+/// Runs `parse` on a thread with a stack of `stack_bytes`.
+fn run_on_stack<F>(stack_bytes: usize, parse: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(stack_bytes)
+        .spawn(parse)
+        .expect("spawn reduced-stack thread")
+        .join()
+        .expect("parser panicked on a reduced stack");
+}
+
+/// Parses one object nested `levels` turns deep on a `stack_bytes` stack.
+fn parse_nested_object(open: &[u8], close: &[u8], levels: usize, closed: bool, stack_bytes: usize) {
+    let mut document = b"%PDF-1.7\n1 0 obj\n".to_vec();
+    if closed {
+        document.extend(smoke::nested(open, b"1", close, levels));
+        document.extend_from_slice(b"\nendobj\n");
+    } else {
+        // Cut off after the last opening delimiter, as the fuzzer found it.
+        document.extend(smoke::nested(open, b"", b"", levels));
+    }
+    run_on_stack(stack_bytes, move || {
+        exercise_text(&document, ParseOptions::default());
+    });
+}
+
+/// Reads a content stream of arrays nested `levels` deep on a `stack_bytes`
+/// stack.
+fn read_nested_content(levels: usize, closed: bool, stack_bytes: usize) {
+    let close: &[u8] = if closed { b"]" } else { b"" };
+    let mut payloads = Payloads::seed();
+    payloads.content = smoke::nested(b"[", b"(x)", close, levels);
+    payloads.content.extend_from_slice(b" TJ");
+    let document = document(&payloads);
+    run_on_stack(stack_bytes, move || {
+        exercise_text(&document, tight_options());
+        exercise_tables(&document, tight_options());
+    });
+}
+
+/// The shapes the object parser is given, with how many turns of each reach
+/// its 128-level limit: the last shape opens two containers a turn.
+const NESTED_OBJECT_SHAPES: [(&[u8], &[u8], usize); 3] = [
+    (b"[", b"]", 128),
+    (b"<< /A ", b" >>", 128),
+    (b"[ << /A ", b" >> ]", 64),
+];
+
+/// Nesting far past the limits, on half the small stack.
+///
+/// Passing on the small stack says the parsers fit; it does not say by how
+/// much. When both parsers recursed, these inputs needed over three quarters
+/// of that stack in an unoptimized macOS build, which passed here and
+/// overflowed now and then on Windows, where frames are larger. Neither
+/// parser recurses now, and a refused input builds no value: on macOS this
+/// passes on 24 KiB. A quarter of the small stack (64 KiB) was still too
+/// little for an unoptimized Windows build, whose fixed cost is higher, so
+/// the margin asserted is half. A parser that goes back to following input
+/// depth on the call stack fails here on every platform.
+#[test]
+fn refused_nesting_leaves_half_the_small_stack_unused() {
+    let _serial = serial();
+    let stack_bytes = smoke::SMALL_STACK_BYTES / 2;
+    for (open, close, _) in NESTED_OBJECT_SHAPES {
+        for closed in [true, false] {
+            parse_nested_object(open, close, 200_000, closed, stack_bytes);
+        }
+    }
+    for closed in [true, false] {
+        read_nested_content(200_000, closed, stack_bytes);
+    }
+}
+
+/// Nesting at the limits and one level under them, on half the small stack.
+///
+/// These inputs are accepted, so the whole nested value is built and then
+/// walked and dropped, and dropping does recurse once per level. Where the
+/// value sits matters: one inside a page's `/Resources` is also copied on
+/// the way to every reader, and copying once recursed too, at several times
+/// the cost of dropping. So the value is placed there as well as in an
+/// object of its own. Raising either limit shows up here.
+#[test]
+fn nesting_at_the_limit_leaves_half_the_small_stack_unused() {
+    let _serial = serial();
+    let stack_bytes = smoke::SMALL_STACK_BYTES / 2;
+    for (open, close, at_limit) in NESTED_OBJECT_SHAPES {
+        for levels in [at_limit, at_limit - 1] {
+            for closed in [true, false] {
+                parse_nested_object(open, close, levels, closed, stack_bytes);
+            }
+        }
+    }
+    // Two dictionaries enclose the array, so 126 levels reach the limit.
+    for levels in [126, 125] {
+        let mut page =
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Deep ".to_vec();
+        page.extend(smoke::nested(b"[", b"1", b"]", levels));
+        page.extend_from_slice(b" /Font << /F1 5 0 R >> >> >>");
+        let document = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+            page,
+            stream("", b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET 0 0 m 100 0 l S"),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ]);
+        run_on_stack(stack_bytes, move || {
+            exercise_text(&document, ParseOptions::default());
+            exercise_tables(&document, ParseOptions::default());
+        });
+    }
+    // The content tokenizer accepts 128 levels of arrays.
+    for levels in [128, 127] {
+        for closed in [true, false] {
+            read_nested_content(levels, closed, stack_bytes);
+        }
+    }
+}
+
+// ── Type 3 glyph procedures ─────────────────────────────────────────────────
+
+/// A one-page document with Type 3 fonts `/T0`, `/T1`, … and forms `/Fm0`,
+/// `/Fm1`, ….
+///
+/// Each font is given as its glyph procedures, named `a`, `b`, … and shown by
+/// the codes of those letters. The page, every font and every form share one
+/// resource dictionary naming all the fonts, all the forms and a Type 1 font
+/// `/H`, so any stream can select or invoke any of them.
+fn type3_document(content: &[u8], fonts: &[Vec<Vec<u8>>], forms: &[Vec<u8>]) -> Vec<u8> {
+    let first_font = 6;
+    let first_form = first_font + fonts.len();
+    let mut next_procedure = first_form + forms.len();
+    let mut resources = String::from("<< /Font << /H 5 0 R");
+    for index in 0..fonts.len() {
+        resources.push_str(&format!(" /T{index} {} 0 R", first_font + index));
+    }
+    resources.push_str(" >> /XObject <<");
+    for index in 0..forms.len() {
+        resources.push_str(&format!(" /Fm{index} {} 0 R", first_form + index));
+    }
+    resources.push_str(" >> >>");
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        format!("<< /Type /Page /Parent 2 0 R /Resources {resources} /Contents 4 0 R >>")
+            .into_bytes(),
+        stream("", content),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    ];
+    let mut procedures = Vec::new();
+    for glyphs in fonts {
+        let mut names = String::new();
+        let mut char_procs = String::new();
+        for (index, procedure) in glyphs.iter().enumerate() {
+            let name = char::from(b'a' + u8::try_from(index).expect("at most 26 glyphs"));
+            names.push_str(&format!(" /{name}"));
+            char_procs.push_str(&format!(" /{name} {next_procedure} 0 R"));
+            next_procedure += 1;
+            procedures.push(stream("", procedure));
+        }
+        objects.push(
+            format!(
+                "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 700] \
+                 /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs <<{char_procs} >> \
+                 /Encoding << /Type /Encoding /Differences [97{names}] >> \
+                 /FirstChar 97 /LastChar {} /Widths [{}] /Resources {resources} >>",
+                96 + glyphs.len(),
+                "500 ".repeat(glyphs.len()),
+            )
+            .into_bytes(),
+        );
+    }
+    for form in forms {
+        objects.push(stream(
+            &format!("/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources {resources}"),
+            form,
+        ));
+    }
+    objects.extend(procedures);
+    pdf(&objects)
+}
+
+/// A glyph procedure that draws a box.
+const BOX_GLYPH: &[u8] = b"500 0 d0 0 0 m 400 0 l 400 700 l 0 700 l h f";
+
+/// Reads `document` the way a consumer does, on the harness's small stack.
+fn read_on_small_stack(document: Vec<u8>) {
+    smoke::run_on_small_stack(move || {
+        exercise_text(&document, ParseOptions::default());
+    });
+}
+
+/// A glyph whose procedure shows the glyph itself, two glyphs that show each
+/// other, and five that show each other in a ring. The procedure ran again
+/// for every level with nothing to stop it, so each of these overflowed the
+/// stack and aborted the process.
+///
+/// A cycle has to stay inside one font and use no `Tf`: a glyph procedure is
+/// run with no resources, so a font selected inside one selects nothing and a
+/// form invoked inside one is not found.
+#[test]
+fn a_type3_glyph_that_shows_itself_is_not_followed() {
+    let _serial = serial();
+    read_on_small_stack(type3_document(
+        b"BT /T0 10 Tf (a) Tj ET",
+        &[vec![b"500 0 d0 (a) Tj".to_vec()]],
+        &[],
+    ));
+    read_on_small_stack(type3_document(
+        b"BT /T0 10 Tf (a) Tj ET",
+        &[vec![b"500 0 d0 BT (a) Tj ET".to_vec()]],
+        &[],
+    ));
+    read_on_small_stack(type3_document(
+        b"BT /T0 10 Tf (ab) Tj ET",
+        &[vec![
+            b"500 0 d0 (b) Tj".to_vec(),
+            b"500 0 d0 (a) Tj".to_vec(),
+        ]],
+        &[],
+    ));
+    // Five glyphs in a ring, longer than the nesting that is followed.
+    let ring = (*b"bcdea")
+        .map(|next| format!("500 0 d0 ({}) Tj", char::from(next)).into_bytes())
+        .to_vec();
+    read_on_small_stack(type3_document(b"BT /T0 10 Tf (abcde) Tj ET", &[ring], &[]));
+}
+
+/// The deepest path a page can take: as many nested forms as are followed,
+/// the innermost showing a glyph whose procedure shows the next glyph, and so
+/// on through all twenty-six. Glyph nesting is cut off after a few levels, so
+/// this fits in half the small stack; raising either limit shows up here.
+#[test]
+fn nested_forms_and_glyph_procedures_leave_half_the_small_stack_unused() {
+    let _serial = serial();
+    let mut glyphs: Vec<Vec<u8>> = (1..26u8)
+        .map(|next| format!("500 0 d0 ({}) Tj", char::from(b'a' + next)).into_bytes())
+        .collect();
+    glyphs.push(BOX_GLYPH.to_vec());
+    // Eight forms are followed; a ninth would be refused and end the page.
+    let mut forms: Vec<Vec<u8>> = (1..8)
+        .map(|next| format!("q /Fm{next} Do Q").into_bytes())
+        .collect();
+    forms.push(b"BT /T0 10 Tf (a) Tj ET".to_vec());
+    let document = type3_document(b"/Fm0 Do", &[glyphs], &forms);
+    run_on_stack(smoke::SMALL_STACK_BYTES / 2, move || {
+        exercise_text(&document, ParseOptions::default());
+    });
+}
+
+/// Bytes of glyph procedure the reader executes for one pass over
+/// `document`, and whether that pass was refused for exceeding a limit.
+fn glyph_procedure_work(document: &[u8]) -> (u64, bool) {
+    let document = parse(document, ParseOptions::default()).expect("document parses");
+    let before = pdf_fast_core::vector_text::glyph_procedure_bytes_read();
+    let refused = document.vector_glyph_descriptors_checked(8).is_err();
+    let after = pdf_fast_core::vector_text::glyph_procedure_bytes_read();
+    (after - before, refused)
+}
+
+/// The cap on glyph procedure executed inside other glyph procedures.
+const NESTED_GLYPH_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A glyph shown three thousand times whose procedure shows another three
+/// thousand times, three levels deep: twenty-seven billion procedure runs
+/// from ten kilobytes of content. The reader stops at its cap on nested
+/// procedures and says so, having read the cap plus one procedure for each
+/// glyph the page itself shows.
+#[test]
+fn nested_type3_glyph_procedures_do_not_multiply_without_bound() {
+    let _serial = serial();
+    let shown = |glyph: u8| {
+        let mut procedure = b"500 0 d0 (".to_vec();
+        procedure.extend(std::iter::repeat_n(glyph, 3_000));
+        procedure.extend_from_slice(b") Tj");
+        procedure
+    };
+    let mut content = b"BT /T0 10 Tf (".to_vec();
+    content.extend(std::iter::repeat_n(b'a', 3_000));
+    content.extend_from_slice(b") Tj ET");
+    let document = type3_document(
+        &content,
+        &[vec![shown(b'b'), shown(b'c'), BOX_GLYPH.to_vec()]],
+        &[],
+    );
+    let (work, refused) = glyph_procedure_work(&document);
+    assert!(refused, "the nested procedure cap is reported");
+    let page_level = 3_000 * shown(b'b').len() as u64;
+    assert!(
+        work <= NESTED_GLYPH_BYTES + page_level,
+        "read {work} bytes of glyph procedure"
+    );
+}
+
+/// A glyph whose procedure shows itself a hundred thousand times. Each show
+/// is refused, and refusing must not cost the procedure's length: the reader
+/// compared the whole procedure every time, which made this quadratic. The
+/// procedure is read once.
+#[test]
+fn refusing_a_self_showing_glyph_costs_nothing_per_show() {
+    let _serial = serial();
+    let mut procedure = b"500 0 d0 (".to_vec();
+    procedure.extend(std::iter::repeat_n(b'a', 100_000));
+    procedure.extend_from_slice(b") Tj");
+    let length = procedure.len() as u64;
+    let document = type3_document(b"BT /T0 10 Tf (a) Tj ET", &[vec![procedure]], &[]);
+    let (work, refused) = glyph_procedure_work(&document);
+    assert!(!refused, "a cycle is skipped, not an error");
+    assert_eq!(work, length);
+}
+
+/// A box glyph padded to a kilobyte, and a composite glyph that shows it.
+fn composite_font() -> Vec<Vec<u8>> {
+    let mut part = BOX_GLYPH.to_vec();
+    part.resize(1_024, b' ');
+    vec![part, b"500 0 d0 (a) Tj".to_vec()]
+}
+
+/// Pages of five and eight thousand composite glyphs keep every outline. A
+/// cap small enough to stop these dropped the glyphs past it without a word.
+#[test]
+fn a_page_of_composite_type3_glyphs_keeps_every_outline() {
+    let _serial = serial();
+    for shows in [5_000, 8_000] {
+        let mut content = b"BT /T0 10 Tf 72 700 Td (".to_vec();
+        content.extend(std::iter::repeat_n(b'b', shows));
+        content.extend_from_slice(b") Tj ET");
+        let document = type3_document(&content, &[composite_font()], &[]);
+        assert_eq!(text_and_outline_count(&document).1, shows);
+    }
+}
+
+/// Composite glyphs whose part is a megabyte long spend the nested procedure
+/// cap before the honest glyphs after them are reached. The checked reader
+/// reports the limit; it does not hand back a page with glyphs missing.
+/// The unchecked reader returns the glyphs it reached.
+#[test]
+fn a_spent_glyph_procedure_cap_is_an_error_not_missing_glyphs() {
+    let _serial = serial();
+    let mut heavy = BOX_GLYPH.to_vec();
+    heavy.resize(1024 * 1024, b' ');
+    let fonts = vec![vec![heavy, b"500 0 d0 (a) Tj".to_vec()], composite_font()];
+    let mut content = b"BT /T0 10 Tf 72 700 Td (".to_vec();
+    content.extend(std::iter::repeat_n(b'b', 20));
+    content.extend_from_slice(b") Tj /T1 10 Tf (bbbbbbbbbb) Tj ET");
+    let document = type3_document(&content, &fonts, &[]);
+    let document = parse(&document, ParseOptions::default()).expect("document parses");
+    let error = document
+        .vector_glyph_descriptors_checked(8)
+        .expect_err("the cap is reported");
+    assert!(
+        format!("{error:#}").contains("glyph procedures nested"),
+        "{error:#}"
+    );
+    // The reader that reports nothing keeps what it read before the cap,
+    // as it did when there was no cap; it does not hand back an empty page.
+    let pages = document.pages();
+    let page = pages.first().expect("the document has a page");
+    let kept = pdf_fast_core::extract_page_vector_text_runs(&document, page);
+    assert!(!kept.is_empty(), "the unchecked reader dropped the page");
+}
+
+/// What the glyph reader finds in `document`: the semantic text, and how many
+/// glyph outlines it draws.
+fn text_and_outline_count(document: &[u8]) -> (String, usize) {
+    let document = parse(document, ParseOptions::default()).expect("document parses");
+    let text: Vec<String> = document
+        .semantic_text_runs()
+        .into_iter()
+        .map(|run| run.text)
+        .collect();
+    let outlines = document
+        .vector_glyph_descriptors_checked(8)
+        .expect("glyph descriptors")
+        .iter()
+        .map(Vec::len)
+        .sum();
+    (text.join("|"), outlines)
+}
+
+/// Bounding glyph procedures must not change what honest fonts produce: a
+/// Type 3 font of plain outlines, and one whose glyph draws text one level
+/// down, in its own font and after selecting another. The expected values
+/// are what the reader produced before the bound existed.
+#[test]
+fn legitimate_type3_fonts_read_as_before() {
+    let _serial = serial();
+    let plain = type3_document(
+        b"BT /T0 12 Tf 72 700 Td (aab) Tj ET",
+        &[vec![BOX_GLYPH.to_vec(), BOX_GLYPH.to_vec()]],
+        &[],
+    );
+    assert_eq!(text_and_outline_count(&plain), (String::from("aab"), 3));
+    let nested = type3_document(
+        b"BT /T0 12 Tf 72 700 Td (abc) Tj ET",
+        &[vec![
+            BOX_GLYPH.to_vec(),
+            b"500 0 d0 (a) Tj 0 0 m 200 0 l 200 300 l h f".to_vec(),
+            b"500 0 d0 BT /H 8 Tf (x) Tj ET 0 0 m 300 0 l 300 300 l h f".to_vec(),
+        ]],
+        &[],
+    );
+    assert_eq!(text_and_outline_count(&nested), (String::from("abc"), 3));
+}
+
+// ── Seed sanity ─────────────────────────────────────────────────────────────
+
+/// The seed has to reach the readers it claims to; a seed whose streams fail
+/// to decode would leave the mutation runs testing nothing behind them.
+#[test]
+fn the_seed_document_reaches_every_reader() {
+    let _serial = serial();
+    let bytes = document(&Payloads::seed());
+    let document = PdfDocument::from_slice(&bytes, ParseOptions::default()).expect("seed parses");
+
+    // The page tree lists itself as a kid; each page is still found once.
+    let pages = document.pages();
+    assert_eq!(pages.len(), 3, "three pages despite the /Kids cycle");
+
+    // Every filter chain decodes, so the readers behind them see the payloads.
+    for stream in &document.streams {
+        assert!(
+            !matches!(stream.decode_status, pdf_fast_core::DecodeStatus::Failed(_)),
+            "stream {} failed to decode: {:?}",
+            stream.object_number,
+            stream.decode_status
+        );
+    }
+    let text: Vec<String> = document
+        .semantic_text_runs()
+        .into_iter()
+        .map(|run| run.text)
+        .collect();
+    for expected in [
+        "predicted text", // Flate + PNG predictor
+        "lzw text",       // LZW + TIFF predictor
+        "r1c1",           // ASCII85 over Flate
+        "form",           // Form XObject
+        "Afi CDE",        // ToUnicode bfchar and bfrange
+    ] {
+        assert!(
+            text.iter().any(|run| run == expected),
+            "missing {expected:?} in {text:?}"
+        );
+    }
+    // The bfrange-array form and a surrogate pair, through the CID font.
+    assert!(text
+        .iter()
+        .any(|run| run.contains("GG") || run.contains('F')));
+    assert_eq!(document.cmaps.len(), 1);
+    assert_eq!(document.cmaps[0].entries.len(), 6);
+
+    // The object stream was expanded into its two objects.
+    assert!(document
+        .object_by_id(40, 0)
+        .is_some_and(|object| object.dictionary.is_some()));
+    assert_eq!(
+        document
+            .object_by_id(41, 0)
+            .and_then(|object| object.array.as_ref())
+            .map(Vec::len),
+        Some(11)
+    );
+
+    // Path, table, image and glyph extraction all have something to read.
+    assert!(!document.page_tables(0, 1.0).expect("tables").is_empty());
+    assert!(!document.page_line_segments(0).expect("segments").is_empty());
+    assert_eq!(document.page_image_placements(0).expect("images").len(), 3);
+    assert!(!document
+        .page_vector_text_runs(0)
+        .expect("vector runs")
+        .is_empty());
+    assert!(document.page_embedded_image(0).expect("image").is_some());
+    #[cfg(feature = "rasterize")]
+    assert!(document
+        .page_rasterized_png(0, 18.0)
+        .expect("raster")
+        .is_some());
+
+    // Both embedded font programs are readable on their own.
+    assert!(TrueTypeFont::parse(TRUETYPE_FIXTURE).is_some());
+    assert!(cff_table(OPENTYPE_FIXTURE)
+        .and_then(|table| CffFont::parse(table, None))
+        .is_some());
+}

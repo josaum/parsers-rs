@@ -84,7 +84,8 @@ impl Context<'_, '_> {
             .or_else(|| part.ctype.params.get("name"))
             .cloned();
         let explicit_attachment = disposition.disposition == DispositionType::Attachment;
-        let multipart = mime.starts_with("multipart/");
+        let multipart = !part.subparts.is_empty()
+            || (mime.starts_with("multipart") && part.ctype.params.contains_key("boundary"));
         if multipart
             && body_allowed
             && (related_root || (!explicit_attachment && filename.is_none()))
@@ -137,11 +138,16 @@ impl Context<'_, '_> {
                 &mut bytes,
                 self.options.max_inflate.saturating_sub(self.total),
             )?;
-            let body = Body::new(&bytes, &part.ctype, &None);
-            let text = match body {
-                Body::SevenBit(body) | Body::EightBit(body) => body.get_as_string()?,
-                Body::Binary(body) => body.get_as_string()?,
-                _ => unreachable!(),
+            let text = if encoding_rs::Encoding::for_label(part.ctype.charset.as_bytes()).is_none()
+            {
+                crate::decode_unlabeled_bytes(&bytes)
+            } else {
+                let body = Body::new(&bytes, &part.ctype, &None);
+                match body {
+                    Body::SevenBit(body) | Body::EightBit(body) => body.get_as_string()?,
+                    Body::Binary(body) => body.get_as_string()?,
+                    _ => unreachable!(),
+                }
             };
             self.total = self
                 .total

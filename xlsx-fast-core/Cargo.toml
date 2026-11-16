@@ -1,6 +1,6 @@
 [package]
 name = "xlsx-fast-core"
-version = "0.2.6"
+version = "0.2.12"
 edition.workspace = true
 authors.workspace = true
 description = "Excel XLSX, XLS and XLSB parser with shared JSON and Arrow output"
@@ -8,6 +8,9 @@ license.workspace = true
 keywords = ["xlsx", "excel", "ooxml", "parser", "office", "spreadsheet"]
 categories = ["parser-implementations", "encoding"]
 rust-version.workspace = true
+# Benchmarks and the one-shot bench drivers are for this repository, not for
+# users of the crate: they stay out of the published package.
+exclude = ["benches/", "examples/"]
 
 [lib]
 name = "xlsx_fast_core"
@@ -28,12 +31,20 @@ arrow-array = { workspace = true, optional = true }
 arrow-ipc = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-lexical-core = "0.8"
+lexical-core = "1.0"
 ooxml-archive = { path = "../ooxml-archive" }
-quick-xml = "0.36"
+quick-xml = "0.42"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3.10"
-zip = "0.6"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[[bench]]
+name = "parse"
+harness = false
+
+[lints]
+workspace = true

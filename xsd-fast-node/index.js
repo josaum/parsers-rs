@@ -7,4 +7,5 @@ module.exports = {
   validateBytesJson: native.validateBytesJson,
   writeSchemaIpc: native.writeSchemaIpc,
   schemaIpcBytes: native.schemaIpcBytes,
+  allArrowSchemasJson: native.allArrowSchemasJson,
 };

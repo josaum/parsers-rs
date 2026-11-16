@@ -4,11 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "xlsx-fast"
-version = "0.2.6"
+version = "0.2.12"
 description = "Excel (.xlsx, .xls, .xlsb) parser powered by Rust"
 readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.8"
 authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 keywords = [
     "excel",
@@ -24,8 +24,10 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -35,6 +37,12 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Spreadsheet",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+
+[project.urls]
+Homepage = "https://github.com/josaum/parsers-rs"
+Repository = "https://github.com/josaum/parsers-rs/tree/main/xlsx-fast-py"
+Documentation = "https://github.com/josaum/parsers-rs#readme"
+"Bug Tracker" = "https://github.com/josaum/parsers-rs/issues"
 
 [tool.maturin]
 module-name = "xlsx_fast._core"

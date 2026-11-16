@@ -7,8 +7,6 @@ use std::collections::HashMap;
 pub(crate) struct ElementInfo {
     pub hidden: bool,
     pub inert: bool,
-    pub table: Option<NodeId>,
-    pub row: Option<NodeId>,
     position: usize,
 }
 
@@ -48,7 +46,11 @@ impl<'a> DomIndex<'a> {
                         continue;
                     };
                     if stack.len() > options.max_dom_depth {
-                        return Err(WebParseError::DepthLimitExceeded);
+                        return Err(if options.max_dom_depth >= crate::MAX_NESTING_DEPTH {
+                            WebParseError::NestingLimitExceeded
+                        } else {
+                            WebParseError::DepthLimitExceeded
+                        });
                     }
                     let parent = stack.last_mut().unwrap();
                     let name = element.value().name();
@@ -73,8 +75,6 @@ impl<'a> DomIndex<'a> {
                         ElementInfo {
                             hidden,
                             inert,
-                            table,
-                            row,
                             position: *position,
                         },
                     );
@@ -112,7 +112,7 @@ impl<'a> DomIndex<'a> {
                 part.value().name(),
                 self.info[&part.id()].position
             );
-            budget.add_text(&segment)?;
+            budget.add_path(&segment)?;
             path.push_str(&segment);
         }
         Ok(path)

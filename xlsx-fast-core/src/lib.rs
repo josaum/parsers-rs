@@ -49,17 +49,29 @@
 //! │  Output: Workbook struct | Arrow RecordBatch callbacks      │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! # Files on disk
+//!
+//! Functions that take a path memory-map the file. It must not be modified
+//! or truncated, by this process or any other, while it is being read: a
+//! truncated file can make reads of the mapping fault (`SIGBUS` on Unix),
+//! and a modified one can change the bytes under the parser. Functions that
+//! take bytes have no such requirement.
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 #[cfg(feature = "arrow")]
 use ooxml_archive::SharedInflateBudget;
 use ooxml_archive::{
-    parse_relationships, part_dir, rels_path_for_part, resolve_part, OoxmlArchive, PartReader,
+    parse_relationships, part_dir, rels_path_for_part, resolve_part, utf8::LossyUtf8, OoxmlArchive,
+    PartReader,
 };
-use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::escape::resolve_predefined_entity;
+use quick_xml::events::attributes::Attribute;
+use quick_xml::events::{BytesRef, BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, Cursor};
@@ -84,11 +96,189 @@ fn local_name(name: &[u8]) -> &[u8] {
         name
     }
 }
+
+/// Appends the character data `event` carries to `out`.
+///
+/// The reader reports the text of an element in pieces: literal text, CDATA
+/// sections, and one event per entity or character reference. Every caller
+/// that collects text passes all three kinds here, so a reference lands in
+/// the same place as the text around it. Any other event appends nothing.
+///
+/// Decoding is lenient, so one bad character costs that character rather than
+/// the whole workbook: a stray non-UTF-8 byte becomes U+FFFD, and CDATA is
+/// literal character data that is never entity-resolved.
+///
+/// Nothing is allocated here: the hot path of a sheet is the text of its
+/// `<v>` elements, which is appended straight from the reader's buffer.
+fn push_character_data(event: &Event<'_>, out: &mut String) {
+    match event {
+        Event::Text(text) => out.push_str(text),
+        Event::CData(data) => out.push_str(data),
+        Event::GeneralRef(reference) => push_reference(reference, out),
+        _ => {}
+    }
+}
+
+/// Appends what the reference `&name;` stands for to `out`.
+///
+/// The five predefined entities and decimal or hexadecimal character
+/// references resolve to their character. Anything else (an entity this
+/// parser does not know, or a character reference that names no character,
+/// such as `&#0;`) is kept exactly as written, never dropped.
+fn push_reference(reference: &BytesRef<'_>, out: &mut String) {
+    let name: &str = reference;
+    match reference.resolve_char_ref() {
+        Ok(Some(character)) => {
+            out.push(character);
+            return;
+        }
+        Ok(None) => {
+            if let Some(text) = resolve_predefined_entity(name) {
+                out.push_str(text);
+                return;
+            }
+        }
+        Err(_) => {}
+    }
+    out.push('&');
+    out.push_str(name);
+    out.push(';');
+}
+
+/// Makes `reader` as tolerant of character data as this parser needs.
+///
+/// Whitespace is significant in cell text, so nothing is trimmed (trimming
+/// would also delete the spaces around a reference, which arrives as its own
+/// event). A lone `&` that starts no reference is ordinary text in the files
+/// people actually have, not a reason to reject the workbook.
+fn configure_reader<R>(reader: &mut Reader<R>) {
+    let config = reader.config_mut();
+    config.trim_text(false);
+    config.allow_dangling_amp = true;
+}
+
+/// Decodes an attribute value and resolves the references in it.
+///
+/// The value is normalized as XML 1.0 requires: a literal tab, line feed or
+/// carriage return becomes a space (and a CR LF pair one space), while the
+/// same characters written as character references (`&#10;`) are kept.
+///
+/// `tag` is the start or empty tag the attribute was read from, through
+/// `input`. A value in which `input` replaced bytes that are not UTF-8 with
+/// U+FFFD (see [`LossyUtf8`]) is an error, as a value that is not UTF-8
+/// always was. A U+FFFD the part really holds, or a replacement elsewhere in
+/// the part, is not.
+///
+/// # Errors
+///
+/// Fails when the value is not UTF-8, or holds a reference that cannot be
+/// resolved.
+fn attribute_value<'a, R: BufRead>(
+    attribute: &Attribute<'a>,
+    input: &LossyUtf8<R>,
+    tag: &str,
+) -> Result<Cow<'a, str>> {
+    if input.repaired_in(tag.as_bytes(), 1..=2, attribute.value.as_bytes()) {
+        return Err(anyhow!("attribute value is not UTF-8"));
+    }
+    Ok(attribute.normalized_value(XmlVersion::Implicit1_0)?)
+}
+
+/// Reads a part as UTF-8, each ill-formed sequence replaced by U+FFFD.
+///
+/// `limit` is the size the part's raw bytes were held to; the repaired part
+/// may not outgrow it, since repair can triple a part's size.
+fn repairing<R: BufRead>(input: R, limit: usize) -> LossyUtf8<R> {
+    LossyUtf8::with_limit(input, limit as u64)
+}
+
+/// The repair limit for a part read whole, with no part limit in scope.
+fn buffer_limit(xml: &[u8]) -> usize {
+    ooxml_archive::utf8::unknown_limit(xml.len())
+}
+
+/// Byte length of one `ST_Xstring` escape, `_xHHHH_`.
+const XSTRING_ESCAPE_LEN: usize = 7;
+
+/// Returns the UTF-16 code unit of the `_xHHHH_` escape `bytes` starts with.
+fn xstring_code_unit(bytes: &[u8]) -> Option<u16> {
+    let escape = bytes.get(..XSTRING_ESCAPE_LEN)?;
+    if escape[0] != b'_' || escape[1] != b'x' || escape[6] != b'_' {
+        return None;
+    }
+    let mut unit = 0u16;
+    for &digit in &escape[2..6] {
+        unit = (unit << 4) | u16::try_from(char::from(digit).to_digit(16)?).ok()?;
+    }
+    Some(unit)
+}
+
+/// Decodes the `_xHHHH_` escapes of an ECMA-376 `ST_Xstring`.
+///
+/// Excel writes characters XML cannot carry, such as a carriage return, as
+/// `_x000D_`: the UTF-16 code unit in hexadecimal. A literal underscore that
+/// would otherwise start an escape is itself written `_x005F_`, so decoding
+/// runs left to right and never rescans its own output. Two escapes that form
+/// a surrogate pair decode to one character; an unpaired surrogate becomes
+/// U+FFFD.
+fn decode_xstring(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut decoded = String::new();
+    let mut copied = 0;
+    let mut cursor = 0;
+    while let Some(found) = text[cursor..].find("_x") {
+        let start = cursor + found;
+        let Some(unit) = xstring_code_unit(&bytes[start..]) else {
+            cursor = start + 2;
+            continue;
+        };
+        let mut end = start + XSTRING_ESCAPE_LEN;
+        let mut units = [unit, 0];
+        let mut unit_count = 1;
+        if (0xD800..0xDC00).contains(&unit) {
+            if let Some(low) =
+                xstring_code_unit(&bytes[end..]).filter(|low| (0xDC00..0xE000).contains(low))
+            {
+                units[1] = low;
+                unit_count = 2;
+                end += XSTRING_ESCAPE_LEN;
+            }
+        }
+        decoded.push_str(&text[copied..start]);
+        decoded.extend(
+            char::decode_utf16(units[..unit_count].iter().copied())
+                .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER)),
+        );
+        copied = end;
+        cursor = end;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    decoded.push_str(&text[copied..]);
+    Cow::Owned(decoded)
+}
+
+/// Decodes the `ST_Xstring` escapes in `text[from..]` in place.
+///
+/// `from` is where the current `<t>` element's text starts, so an escape is
+/// never assembled from two adjacent elements.
+fn decode_xstring_tail(text: &mut String, from: usize) {
+    let decoded = match decode_xstring(&text[from..]) {
+        Cow::Owned(decoded) => Some(decoded),
+        Cow::Borrowed(_) => None,
+    };
+    if let Some(decoded) = decoded {
+        text.truncate(from);
+        text.push_str(&decoded);
+    }
+}
+
 /// Arrow RecordBatch streaming output (optional feature).
 ///
 /// Exports spreadsheet data as Arrow Record Batch files, suitable for
-/// columnar ETL pipelines and analytics systems. Used by [`xlsx-fast-flight`]
-/// (flight server), [`xlsx-fast-py`] (Python bindings), and integration
+/// columnar ETL pipelines and analytics systems. Used by `xlsx-fast-flight`
+/// (flight server), `xlsx-fast-py` (Python bindings), and integration
 /// tests in sibling parsers.
 #[cfg(feature = "arrow")]
 pub mod arrow;
@@ -223,6 +413,7 @@ impl Cell {
             row: self.row,
             col: self.col,
             formula: self.formula.as_deref(),
+            shared_string: None,
             value: match &self.value {
                 CellValue::Empty => CellValueRef::Empty,
                 CellValue::Bool { v } => CellValueRef::Bool { v: *v },
@@ -355,7 +546,7 @@ pub mod bench_support {
 
         let shared_strings = if let Some(path) = shared_strings_path.as_deref() {
             if let Some(reader) = open_optional_part_reader(&archive, path, options.max_inflate)? {
-                parse_shared_strings_reader(reader)?
+                parse_shared_strings_reader(reader, options.max_inflate)?
             } else {
                 StringTable::default()
             }
@@ -387,7 +578,7 @@ pub mod bench_support {
             let sheet_path = resolve_part(&workbook_dir, target);
             let reader = open_part_reader(&archive, &sheet_path, options.max_inflate)
                 .with_context(|| format!("read sheet: {sheet_path}"))?;
-            let xml_reader = Reader::from_reader(reader);
+            let xml_reader = Reader::from_reader(repairing(reader, options.max_inflate));
             parse_sheet_reader_with(
                 xml_reader,
                 &shared_strings,
@@ -455,6 +646,9 @@ struct CellPartsRef<'a> {
     col: u32,
     formula: Option<&'a str>,
     value: CellValueRef<'a>,
+    /// Index into the shared-string table when `value` is that entry, so a
+    /// caller that keeps cells can share one allocation per entry.
+    shared_string: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -501,6 +695,10 @@ impl StringTable {
     fn get(&self, idx: usize) -> Option<&str> {
         let (start, len) = *self.index.get(idx)?;
         std::str::from_utf8(&self.data[start..start + len]).ok()
+    }
+
+    fn len(&self) -> usize {
+        self.index.len()
     }
 }
 
@@ -633,7 +831,7 @@ fn parse_xlsx_from_archive(archive: XlsxArchive, options: ParseOptions) -> Resul
 
     let shared_strings = if let Some(path) = shared_strings_path.as_deref() {
         if let Some(reader) = open_optional_part_reader(&archive, path, options.max_inflate)? {
-            parse_shared_strings_reader(reader)?
+            parse_shared_strings_reader(reader, options.max_inflate)?
         } else {
             StringTable::default()
         }
@@ -656,6 +854,11 @@ fn parse_xlsx_from_archive(archive: XlsxArchive, options: ParseOptions) -> Resul
     };
 
     let mut sheets = Vec::with_capacity(workbook_info.sheets.len());
+    // One allocation per shared string that is actually used, however many
+    // cells refer to it. Copying the text into every cell instead lets a
+    // small file with one long string and many references to it allocate
+    // their product.
+    let mut shared_values: Vec<Option<Arc<str>>> = vec![None; shared_strings.len()];
 
     for sheet in workbook_info.sheets {
         let target = workbook_rels
@@ -666,7 +869,7 @@ fn parse_xlsx_from_archive(archive: XlsxArchive, options: ParseOptions) -> Resul
         let reader = open_part_reader(&archive, &sheet_path, options.max_inflate)
             .with_context(|| format!("read sheet: {sheet_path}"))?;
         let mut cells = Vec::new();
-        let xml_reader = Reader::from_reader(reader);
+        let xml_reader = Reader::from_reader(repairing(reader, options.max_inflate));
         parse_sheet_reader_with(
             xml_reader,
             &shared_strings,
@@ -675,11 +878,20 @@ fn parse_xlsx_from_archive(archive: XlsxArchive, options: ParseOptions) -> Resul
             &options,
             None,
             |parts| {
+                let shared_slot = parts
+                    .shared_string
+                    .and_then(|index| shared_values.get_mut(index));
+                let value = match (shared_slot, parts.value) {
+                    (Some(slot), CellValueRef::String { v }) => CellValue::String {
+                        v: Arc::clone(slot.get_or_insert_with(|| Arc::from(v))),
+                    },
+                    (_, value) => cell_value_ref_to_owned(value),
+                };
                 cells.push(Cell {
                     row: parts.row,
                     col: parts.col,
                     formula: parts.formula.map(str::to_string),
-                    value: cell_value_ref_to_owned(parts.value),
+                    value,
                 });
                 Ok(())
             },
@@ -783,7 +995,7 @@ pub fn parse_xlsx_to_writer<W: std::io::Write>(
 
     let shared_strings = if let Some(path) = shared_strings_path.as_deref() {
         if let Ok(reader) = open_part_reader(&archive, path, options.max_inflate) {
-            parse_shared_strings_reader(reader)?
+            parse_shared_strings_reader(reader, options.max_inflate)?
         } else {
             StringTable::default()
         }
@@ -822,7 +1034,7 @@ pub fn parse_xlsx_to_writer<W: std::io::Write>(
 
         let reader = open_part_reader(&archive, &sheet_path, options.max_inflate)
             .with_context(|| format!("read sheet: {sheet_path}"))?;
-        let xml_reader = Reader::from_reader(reader);
+        let xml_reader = Reader::from_reader(repairing(reader, options.max_inflate));
         parse_sheet_reader_with(
             xml_reader,
             &shared_strings,
@@ -851,41 +1063,36 @@ pub fn parse_xlsx_to_writer<W: std::io::Write>(
 }
 
 fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = Reader::from_reader(repairing(Cursor::new(xml), buffer_limit(xml)));
+    configure_reader(&mut reader);
     let mut buf = Vec::new();
     let mut info = WorkbookInfo::default();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 let qname = e.name();
-                let name = local_name(qname.as_ref());
+                let name = local_name(qname.as_ref().as_bytes());
                 if name == b"workbookPr" {
-                    for attr in e.attributes().flatten() {
-                        if local_name(attr.key.as_ref()) == b"date1904" {
-                            let value = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .to_string();
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        if local_name(attr.key.as_ref().as_bytes()) == b"date1904" {
+                            let value = attribute_value(&attr, reader.get_ref(), &e)?.to_string();
                             info.date_1904 = value == "1" || value.eq_ignore_ascii_case("true");
                         }
                     }
                 } else if name == b"sheet" {
                     let mut sheet = SheetInfo::default();
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key_raw = attr.key;
-                        let key = local_name(key_raw.as_ref());
+                        let key = local_name(key_raw.as_ref().as_bytes());
                         if key == b"name" {
-                            sheet.name = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .to_string();
+                            sheet.name = attribute_value(&attr, reader.get_ref(), &e)?.to_string();
                         } else if key == b"sheetId" {
-                            let value = attr.decode_and_unescape_value(reader.decoder())?;
+                            let value = attribute_value(&attr, reader.get_ref(), &e)?;
                             sheet.sheet_id =
                                 lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0);
                         } else if key == b"r:id" || key == b"id" {
-                            sheet.rel_id = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .to_string();
+                            sheet.rel_id =
+                                attribute_value(&attr, reader.get_ref(), &e)?.to_string();
                         }
                     }
                     if !sheet.rel_id.is_empty() {
@@ -902,43 +1109,62 @@ fn parse_workbook(xml: &[u8]) -> Result<WorkbookInfo> {
     Ok(info)
 }
 
-fn parse_shared_strings_reader<R: BufRead>(reader: R) -> Result<StringTable> {
-    let mut reader = Reader::from_reader(reader);
-    reader.config_mut().trim_text(false);
+fn parse_shared_strings_reader<R: BufRead>(reader: R, limit: usize) -> Result<StringTable> {
+    let mut reader = Reader::from_reader(repairing(reader, limit));
+    configure_reader(&mut reader);
     let mut buf = Vec::new();
     let mut strings = StringTable::default();
 
     let mut in_si = false;
     let mut in_t = false;
+    // Phonetic runs (`rPh`) hold a reading aid, not cell text.
+    let mut phonetic_depth = 0u32;
+    let mut text_start = 0;
     let mut current = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let qname = e.name();
-                let name = local_name(qname.as_ref());
+                let name = local_name(qname.as_ref().as_bytes());
 
                 if name == b"si" {
                     in_si = true;
+                    in_t = false;
+                    phonetic_depth = 0;
                     current.clear();
-                } else if in_si && name == b"t" {
+                } else if in_si && name == b"rPh" {
+                    phonetic_depth = phonetic_depth.saturating_add(1);
+                } else if in_si && name == b"t" && phonetic_depth == 0 {
                     in_t = true;
+                    text_start = current.len();
                 }
             }
-            Ok(Event::Text(e)) => {
-                if in_si && in_t {
-                    let text = e.unescape()?;
-                    current.push_str(text.as_ref());
+            Ok(Event::Empty(e)) => {
+                // `<si/>` is an empty string that still occupies an index.
+                if !in_si && local_name(e.name().as_ref().as_bytes()) == b"si" {
+                    strings.push("");
+                }
+            }
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
+                if in_t {
+                    push_character_data(&event, &mut current);
                 }
             }
             Ok(Event::End(e)) => {
                 let qname = e.name();
-                let name = local_name(qname.as_ref());
+                let name = local_name(qname.as_ref().as_bytes());
 
                 if name == b"t" {
-                    in_t = false;
+                    if in_t {
+                        in_t = false;
+                        decode_xstring_tail(&mut current, text_start);
+                    }
+                } else if name == b"rPh" {
+                    phonetic_depth = phonetic_depth.saturating_sub(1);
                 } else if name == b"si" {
                     in_si = false;
+                    in_t = false;
                     strings.push(current.as_str());
                     current.clear();
                 }
@@ -954,8 +1180,8 @@ fn parse_shared_strings_reader<R: BufRead>(reader: R) -> Result<StringTable> {
 }
 
 fn parse_styles(xml: &[u8]) -> Result<Styles> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = Reader::from_reader(repairing(Cursor::new(xml), buffer_limit(xml)));
+    configure_reader(&mut reader);
     let mut buf = Vec::new();
 
     let mut num_fmts: HashMap<u32, String> = HashMap::new();
@@ -966,22 +1192,19 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 let qname = e.name();
-                let name = local_name(qname.as_ref());
+                let name = local_name(qname.as_ref().as_bytes());
 
                 if name == b"numFmt" {
                     let mut id = None;
                     let mut code = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes().with_checks(false).flatten() {
                         let key_raw = attr.key;
-                        let key = local_name(key_raw.as_ref());
+                        let key = local_name(key_raw.as_ref().as_bytes());
                         if key == b"numFmtId" {
-                            let value = attr.decode_and_unescape_value(reader.decoder())?;
+                            let value = attribute_value(&attr, reader.get_ref(), &e)?;
                             id = lexical_core::parse::<u32>(value.as_bytes()).ok();
                         } else if key == b"formatCode" {
-                            code = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            code = Some(attribute_value(&attr, reader.get_ref(), &e)?.to_string());
                         }
                     }
                     if let (Some(id), Some(code)) = (id, code) {
@@ -991,9 +1214,9 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
                     in_cell_xfs = true;
                 } else if in_cell_xfs && name == b"xf" {
                     let mut num_fmt_id = None;
-                    for attr in e.attributes().flatten() {
-                        if local_name(attr.key.as_ref()) == b"numFmtId" {
-                            let value = attr.decode_and_unescape_value(reader.decoder())?;
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        if local_name(attr.key.as_ref().as_bytes()) == b"numFmtId" {
+                            let value = attribute_value(&attr, reader.get_ref(), &e)?;
                             num_fmt_id = lexical_core::parse::<u32>(value.as_bytes()).ok();
                         }
                     }
@@ -1004,7 +1227,7 @@ fn parse_styles(xml: &[u8]) -> Result<Styles> {
                 }
             }
             Ok(Event::End(e)) => {
-                if local_name(e.name().as_ref()) == b"cellXfs" {
+                if local_name(e.name().as_ref().as_bytes()) == b"cellXfs" {
                     in_cell_xfs = false;
                 }
             }
@@ -1073,7 +1296,7 @@ fn format_has_date_tokens(code: &str) -> bool {
 }
 
 fn parse_sheet_reader_with<R: std::io::BufRead, F>(
-    mut reader: Reader<R>,
+    mut reader: Reader<LossyUtf8<R>>,
     shared_strings: &StringTable,
     styles: &Styles,
     date_1904: bool,
@@ -1084,7 +1307,7 @@ fn parse_sheet_reader_with<R: std::io::BufRead, F>(
 where
     F: for<'a> FnMut(CellPartsRef<'a>) -> Result<()>,
 {
-    reader.config_mut().trim_text(false);
+    configure_reader(&mut reader);
     let mut buf = Vec::new();
     let mut in_sheet_data = false;
     let mut current_row: u32 = 0;
@@ -1119,15 +1342,20 @@ where
     let mut in_formula = false;
     let mut in_inline_str = false;
     let mut in_inline_t = false;
+    // Phonetic runs (`rPh`) inside an inline string are not cell text.
+    let mut inline_phonetic_depth = 0u32;
+    let mut inline_text_start = 0;
     let mut inline_buf = String::new();
     let mut skip_cell = false;
     let mut skip_row_depth: u32 = 0;
+    // Last valid row seen: a `<row>` without `r` is the one after it.
+    let mut last_row: u32 = 0;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let qname = e.name();
-                let name = local_name(qname.as_ref());
+                let name = local_name(qname.as_ref().as_bytes());
 
                 if skip_row_depth > 0 {
                     if name == b"row" {
@@ -1139,21 +1367,16 @@ where
                 match name {
                     b"sheetData" => in_sheet_data = true,
                     b"row" if in_sheet_data => {
-                        current_row = 0;
+                        current_row = row_index(&e, reader.get_ref(), last_row)?;
                         col_cursor = 0;
-                        for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"r" {
-                                let value = attr.decode_and_unescape_value(reader.decoder())?;
-                                current_row =
-                                    lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0);
-                            }
-                        }
-                        if !(1..=1_048_576).contains(&current_row) {
+                        if !EXCEL_ROWS.contains(&current_row) {
                             row_outside = true;
                             skip_row_depth = 1;
                         } else if has_ranges {
+                            last_row = current_row;
                             row_outside = current_row < row_min || current_row > row_max;
                         } else {
+                            last_row = current_row;
                             row_outside = false;
                         }
                         if row_outside {
@@ -1171,16 +1394,17 @@ where
                         has_formula = false;
                         in_inline_str = false;
                         in_inline_t = false;
+                        inline_phonetic_depth = 0;
                         inline_buf.clear();
                         let mut cell_ref_row: u32 = 0;
                         let mut cell_ref_col: u32 = 0;
                         let mut has_cell_ref = false;
                         let mut invalid_cell_ref = false;
-                        for attr in e.attributes().flatten() {
+                        for attr in e.attributes().with_checks(false).flatten() {
                             let key_raw = attr.key;
-                            let key = local_name(key_raw.as_ref());
+                            let key = local_name(key_raw.as_ref().as_bytes());
                             if key == b"r" {
-                                let value = attr.decode_and_unescape_value(reader.decoder())?;
+                                let value = attribute_value(&attr, reader.get_ref(), &e)?;
                                 if let Some((row, col)) = parse_cell_ref(value.as_ref()) {
                                     cell_ref_row = row;
                                     cell_ref_col = col;
@@ -1189,7 +1413,7 @@ where
                                     invalid_cell_ref = true;
                                 }
                             } else if key == b"t" {
-                                let value = attr.decode_and_unescape_value(reader.decoder())?;
+                                let value = attribute_value(&attr, reader.get_ref(), &e)?;
                                 cell_type = match value.as_ref() {
                                     "s" => CellType::SharedString,
                                     "b" => CellType::Bool,
@@ -1199,7 +1423,7 @@ where
                                     _ => CellType::Number,
                                 };
                             } else if key == b"s" {
-                                let value = attr.decode_and_unescape_value(reader.decoder())?;
+                                let value = attribute_value(&attr, reader.get_ref(), &e)?;
                                 cell_style = lexical_core::parse::<u32>(value.as_bytes()).ok();
                             }
                         }
@@ -1216,11 +1440,11 @@ where
                             cell_col = if cell_ref_col > 0 {
                                 cell_ref_col
                             } else {
-                                col_cursor + 1
+                                col_cursor.saturating_add(1)
                             };
                         } else {
                             cell_row = current_row;
-                            cell_col = col_cursor + 1;
+                            cell_col = col_cursor.saturating_add(1);
                         }
                         col_cursor = cell_col;
                         if has_ranges {
@@ -1253,40 +1477,73 @@ where
                     }
                     b"is" if in_cell => {
                         in_inline_str = true;
+                        inline_phonetic_depth = 0;
                     }
-                    b"t" if in_inline_str => {
+                    b"rPh" if in_inline_str => {
+                        inline_phonetic_depth = inline_phonetic_depth.saturating_add(1);
+                    }
+                    b"t" if in_inline_str && inline_phonetic_depth == 0 => {
                         in_inline_t = true;
+                        inline_text_start = inline_buf.len();
                     }
                     _ => {}
                 }
             }
-            Ok(Event::Empty(_)) => {
+            Ok(Event::Empty(e)) => {
                 if skip_row_depth > 0 {
                     buf.clear();
                     continue;
                 }
+                if in_sheet_data {
+                    let qname = e.name();
+                    match local_name(qname.as_ref().as_bytes()) {
+                        // An empty row still takes its number, so a following
+                        // `<row>` without `r` is counted from it.
+                        b"row" => {
+                            let row = row_index(&e, reader.get_ref(), last_row)?;
+                            if EXCEL_ROWS.contains(&row) {
+                                last_row = row;
+                            }
+                        }
+                        // A valueless cell emits nothing but still occupies
+                        // its column, so a following cell without `r` lands
+                        // in the right place.
+                        b"c" if !in_cell => {
+                            col_cursor = empty_cell_column(&e, reader.get_ref(), col_cursor)?;
+                        }
+                        _ => {}
+                    }
+                }
             }
-            Ok(Event::Text(e)) => {
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
                 if skip_row_depth > 0 || skip_cell {
                     buf.clear();
                     continue;
                 }
-                let text = e.unescape()?;
-                if in_value {
-                    cell_value.push_str(text.as_ref());
+                // Only text that lands in a cell is decoded; the whitespace
+                // between elements is most of a sheet's text events.
+                let target = if in_value {
                     has_value = true;
+                    Some(&mut cell_value)
                 } else if in_formula {
                     if options.include_formulas {
-                        cell_formula.push_str(text.as_ref());
                         has_formula = true;
+                        Some(&mut cell_formula)
+                    } else {
+                        None
                     }
                 } else if in_inline_t {
-                    inline_buf.push_str(text.as_ref());
+                    Some(&mut inline_buf)
+                } else {
+                    None
+                };
+                if let Some(target) = target {
+                    push_character_data(&event, target);
                 }
             }
             Ok(Event::End(e)) => {
                 let qname = e.name();
-                let name = local_name(qname.as_ref());
+                let name = local_name(qname.as_ref().as_bytes());
 
                 if skip_row_depth > 0 {
                     if name == b"row" {
@@ -1300,8 +1557,19 @@ where
                     b"sheetData" => in_sheet_data = false,
                     b"v" => in_value = false,
                     b"f" => in_formula = false,
-                    b"t" => in_inline_t = false,
-                    b"is" => in_inline_str = false,
+                    b"t" => {
+                        if in_inline_t {
+                            in_inline_t = false;
+                            decode_xstring_tail(&mut inline_buf, inline_text_start);
+                        }
+                    }
+                    b"rPh" => {
+                        inline_phonetic_depth = inline_phonetic_depth.saturating_sub(1);
+                    }
+                    b"is" => {
+                        in_inline_str = false;
+                        in_inline_t = false;
+                    }
                     b"c" if in_cell => {
                         if skip_cell {
                             in_cell = false;
@@ -1310,6 +1578,11 @@ where
                         }
                         let raw = if has_value {
                             Some(cell_value.as_str())
+                        } else {
+                            None
+                        };
+                        let shared_string = if inline_buf.is_empty() {
+                            shared_string_index(cell_type, raw)
                         } else {
                             None
                         };
@@ -1352,6 +1625,7 @@ where
                             col: cell_col,
                             formula,
                             value,
+                            shared_string,
                         })?;
                         in_cell = false;
                     }
@@ -1366,6 +1640,55 @@ where
     }
 
     Ok(())
+}
+
+/// Rows a worksheet can address (1-based), per the Excel limits.
+const EXCEL_ROWS: std::ops::RangeInclusive<u32> = 1..=1_048_576;
+
+/// Returns the 1-based row a `<row>` element addresses.
+///
+/// `r` is optional: without it the row is the one after `previous`. A present
+/// but unreadable `r` yields 0, which no worksheet row has.
+fn row_index<R: BufRead>(
+    element: &BytesStart<'_>,
+    input: &LossyUtf8<R>,
+    previous: u32,
+) -> Result<u32> {
+    for attr in element.attributes().with_checks(false).flatten() {
+        if attr.key.as_ref().as_bytes() == b"r" {
+            let value = attribute_value(&attr, input, element)?;
+            return Ok(lexical_core::parse::<u32>(value.as_bytes()).unwrap_or(0));
+        }
+    }
+    Ok(previous.saturating_add(1))
+}
+
+/// Returns the column cursor after a self-closing `<c/>` element.
+///
+/// Mirrors how a cell with content moves the cursor: to its `r` column, to 0
+/// when `r` is unreadable, and one to the right when `r` is absent.
+fn empty_cell_column<R: BufRead>(
+    element: &BytesStart<'_>,
+    input: &LossyUtf8<R>,
+    col_cursor: u32,
+) -> Result<u32> {
+    for attr in element.attributes().with_checks(false).flatten() {
+        if local_name(attr.key.as_ref().as_bytes()) == b"r" {
+            let value = attribute_value(&attr, input, element)?;
+            return Ok(parse_cell_ref(value.as_ref()).map_or(0, |(_, col)| col));
+        }
+    }
+    Ok(col_cursor.saturating_add(1))
+}
+
+/// Returns the shared-string index a `t="s"` cell's `<v>` holds.
+fn shared_string_index(cell_type: CellType, raw_value: Option<&str>) -> Option<usize> {
+    match cell_type {
+        CellType::SharedString => {
+            raw_value.and_then(|v| lexical_core::parse::<usize>(v.as_bytes()).ok())
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1389,8 +1712,7 @@ fn decode_cell_value_ref<'a>(
 
     match cell_type {
         CellType::SharedString => {
-            if let Some(v) = raw_value.and_then(|v| lexical_core::parse::<usize>(v.as_bytes()).ok())
-            {
+            if let Some(v) = shared_string_index(cell_type, raw_value) {
                 if let Some(s) = context.shared_strings.get(v) {
                     return CellValueRef::String { v: s };
                 }
@@ -1438,8 +1760,7 @@ fn decode_cell_value_raw<'a>(
 
     match cell_type {
         CellType::SharedString => {
-            if let Some(v) = raw_value.and_then(|v| lexical_core::parse::<usize>(v.as_bytes()).ok())
-            {
+            if let Some(v) = shared_string_index(cell_type, raw_value) {
                 if let Some(s) = shared_strings.get(v) {
                     return CellValueRef::String { v: s };
                 }
@@ -1482,6 +1803,12 @@ fn excel_serial_to_iso(serial: f64, date_1904: bool) -> Option<String> {
     }
     let mut days = serial.floor() as i64;
     let fraction = serial - serial.floor();
+    let mut seconds = (fraction * 86_400.0).round() as i64;
+    // A time within half a second of midnight rounds up into the next day.
+    if seconds >= 86_400 {
+        seconds -= 86_400;
+        days = days.checked_add(1)?;
+    }
 
     let base_date = if date_1904 {
         NaiveDate::from_ymd_opt(1904, 1, 1)?
@@ -1494,12 +1821,49 @@ fn excel_serial_to_iso(serial: f64, date_1904: bool) -> Option<String> {
         days -= 1; // fix Excel's fake 1900-02-29
     }
 
-    let date = base_date.checked_add_signed(chrono::Duration::days(days))?;
-    let seconds = (fraction * 86_400.0).round() as i64;
-    let time =
-        NaiveTime::from_num_seconds_from_midnight_opt((seconds.rem_euclid(86_400)) as u32, 0)?;
-    let dt = NaiveDateTime::new(date, time);
-    Some(dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+    // `try_days`: a serial far outside the calendar is not a date, and the
+    // infallible constructor panics on it.
+    let date = base_date.checked_add_signed(chrono::Duration::try_days(days)?)?;
+    let time = NaiveTime::from_num_seconds_from_midnight_opt(u32::try_from(seconds).ok()?, 0)?;
+    Some(format_iso_seconds(date, time))
+}
+
+/// Formats a date and time as `%Y-%m-%dT%H:%M:%S`.
+///
+/// The digits are written directly for the years a four-digit field holds,
+/// which is every date a workbook normally carries; the general formatter
+/// costs several times the rest of a date cell's decoding. A year outside
+/// `0..=9999` is signed and widened by that formatter, so it is left to it.
+fn format_iso_seconds(date: NaiveDate, time: NaiveTime) -> String {
+    let year = match u32::try_from(date.year()) {
+        Ok(year) if year <= 9999 => year,
+        _ => {
+            return NaiveDateTime::new(date, time)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string()
+        }
+    };
+    let mut out = String::with_capacity(19);
+    push_decimal(&mut out, year, 4);
+    out.push('-');
+    push_decimal(&mut out, date.month(), 2);
+    out.push('-');
+    push_decimal(&mut out, date.day(), 2);
+    out.push('T');
+    push_decimal(&mut out, time.hour(), 2);
+    out.push(':');
+    push_decimal(&mut out, time.minute(), 2);
+    out.push(':');
+    push_decimal(&mut out, time.second(), 2);
+    out
+}
+
+/// Appends the last `width` decimal digits of `value`, zero-padded.
+fn push_decimal(out: &mut String, value: u32, width: u32) {
+    for place in (0..width).rev() {
+        let digit = (value / 10u32.pow(place)) % 10;
+        out.push(char::from_digit(digit, 10).unwrap_or('0'));
+    }
 }
 
 fn parse_cell_ref(r: &str) -> Option<(u32, u32)> {
@@ -1569,12 +1933,36 @@ fn alpha_index(b: u8) -> Option<u32> {
     }
 }
 
+/// Returns the index of the first ASCII digit (`0`-`9`) in `bytes`.
+///
+/// This is the split point of a cell reference: in `AB12` the column letters
+/// end and the row number starts at index 2. It is the one copy of the
+/// vectorized scan that both the sheet parser and the Flight server's range
+/// queries use. Inputs of 16 bytes or more are scanned 16 bytes at a time
+/// with NEON on aarch64 and SSE2 on x86 (32 at a time with AVX2 when the CPU
+/// has it); shorter inputs, and the tail of longer ones, are scanned byte by
+/// byte. The result is the same as
+/// `bytes.iter().position(u8::is_ascii_digit)` for every input.
+///
+/// Returns `None` when `bytes` holds no ASCII digit.
+///
+/// # Examples
+///
+/// ```
+/// use xlsx_fast_core::find_first_digit;
+///
+/// assert_eq!(find_first_digit(b"AB12"), Some(2));
+/// assert_eq!(find_first_digit(b"$A$1"), Some(3));
+/// assert_eq!(find_first_digit(b"ABC"), None);
+/// ```
 #[inline]
-fn find_first_digit(bytes: &[u8]) -> Option<usize> {
+pub fn find_first_digit(bytes: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "aarch64")]
     {
         if bytes.len() >= 16 {
-            // SAFETY: NEON is baseline on aarch64.
+            // SAFETY: `find_first_digit_neon` needs a CPU with NEON, and NEON
+            // is part of the aarch64 baseline this block is compiled for. It
+            // accepts any slice.
             unsafe {
                 if let Some(idx) = find_first_digit_neon(bytes) {
                     return Some(idx);
@@ -1585,7 +1973,9 @@ fn find_first_digit(bytes: &[u8]) -> Option<usize> {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     {
         if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
-            // SAFETY: we gate on AVX2 support.
+            // SAFETY: `find_first_digit_avx2` needs a CPU with AVX2, which
+            // `is_x86_feature_detected!("avx2")` has just confirmed at run
+            // time. It accepts any slice.
             unsafe {
                 if let Some(idx) = find_first_digit_avx2(bytes) {
                     return Some(idx);
@@ -1595,7 +1985,9 @@ fn find_first_digit(bytes: &[u8]) -> Option<usize> {
         if bytes.len() >= 16
             && (cfg!(target_arch = "x86_64") || std::is_x86_feature_detected!("sse2"))
         {
-            // SAFETY: we gate on SSE2 support.
+            // SAFETY: `find_first_digit_sse2` needs a CPU with SSE2. SSE2 is
+            // part of the x86_64 baseline, and on 32-bit x86 the condition
+            // above has detected it at run time. It accepts any slice.
             unsafe {
                 if let Some(idx) = find_first_digit_sse2(bytes) {
                     return Some(idx);
@@ -1612,6 +2004,13 @@ fn find_first_digit(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// `find_first_digit` for aarch64, 16 bytes at a time with NEON.
+///
+/// # Safety
+///
+/// The CPU must support NEON. Every aarch64 CPU Rust targets does; the
+/// function is `unsafe` only because `#[target_feature]` makes it so. Any
+/// `bytes` is accepted: no read leaves the slice.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
@@ -1624,13 +2023,19 @@ unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
     let upper = arch::vdupq_n_u8(b'9');
 
     while i + 16 <= len {
-        let chunk = arch::vld1q_u8(ptr.add(i));
+        // SAFETY: the loop condition `i + 16 <= len` keeps the 16 bytes
+        // `ptr + i .. ptr + i + 16` inside `bytes`, so both the offset and the
+        // unaligned 16-byte load stay in bounds. `vld1q_u8` has no alignment
+        // requirement.
+        let chunk = unsafe { arch::vld1q_u8(ptr.add(i)) };
         let ge0 = arch::vcgeq_u8(chunk, lower);
         let le9 = arch::vcleq_u8(chunk, upper);
         let mask = arch::vandq_u8(ge0, le9);
         if arch::vmaxvq_u8(mask) != 0 {
             for j in 0..16 {
-                let b = *ptr.add(i + j);
+                // SAFETY: `j < 16` and `i + 16 <= len` from the loop
+                // condition, so `i + j < len` is inside `bytes`.
+                let b = unsafe { *ptr.add(i + j) };
                 if b.is_ascii_digit() {
                     return Some(i + j);
                 }
@@ -1640,7 +2045,8 @@ unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
     }
 
     while i < len {
-        let b = *ptr.add(i);
+        // SAFETY: the loop condition `i < len` keeps `ptr + i` inside `bytes`.
+        let b = unsafe { *ptr.add(i) };
         if b.is_ascii_digit() {
             return Some(i);
         }
@@ -1649,6 +2055,13 @@ unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// `find_first_digit` for x86, 16 bytes at a time with SSE2.
+///
+/// # Safety
+///
+/// The CPU must support SSE2. SSE2 is part of the x86_64 baseline; on 32-bit x86 the caller
+/// must detect it. Any `bytes` is accepted: no read leaves the
+/// slice.
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "sse2")]
 unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
@@ -1664,7 +2077,11 @@ unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
     let upper = arch::_mm_set1_epi8((b'9' + 1) as i8);
 
     while i + 16 <= len {
-        let chunk = arch::_mm_loadu_si128(ptr.add(i) as *const arch::__m128i);
+        // SAFETY: the loop condition `i + 16 <= len` keeps the 16 bytes
+        // `ptr + i .. ptr + i + 16` inside `bytes`, so both the offset and
+        // the load stay in bounds. `_mm_loadu_si128` is the unaligned load, so
+        // the cast pointer needs no alignment.
+        let chunk = unsafe { arch::_mm_loadu_si128(ptr.add(i) as *const arch::__m128i) };
         let ge0 = arch::_mm_cmpgt_epi8(chunk, lower);
         let le9 = arch::_mm_cmplt_epi8(chunk, upper);
         let mask = arch::_mm_and_si128(ge0, le9);
@@ -1677,7 +2094,8 @@ unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
     }
 
     while i < len {
-        let b = *ptr.add(i);
+        // SAFETY: the loop condition `i < len` keeps `ptr + i` inside `bytes`.
+        let b = unsafe { *ptr.add(i) };
         if b.is_ascii_digit() {
             return Some(i);
         }
@@ -1686,6 +2104,13 @@ unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// `find_first_digit` for x86, 32 bytes at a time with AVX2.
+///
+/// # Safety
+///
+/// The CPU must support AVX2, which the caller must detect at run
+/// time (`is_x86_feature_detected!("avx2")`). Any `bytes` is accepted: no read leaves the
+/// slice.
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "avx2")]
 unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
@@ -1701,7 +2126,11 @@ unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
     let upper = arch::_mm256_set1_epi8((b'9' + 1) as i8);
 
     while i + 32 <= len {
-        let chunk = arch::_mm256_loadu_si256(ptr.add(i) as *const arch::__m256i);
+        // SAFETY: the loop condition `i + 32 <= len` keeps the 32 bytes
+        // `ptr + i .. ptr + i + 32` inside `bytes`, so both the offset and
+        // the load stay in bounds. `_mm256_loadu_si256` is the unaligned load, so
+        // the cast pointer needs no alignment.
+        let chunk = unsafe { arch::_mm256_loadu_si256(ptr.add(i) as *const arch::__m256i) };
         let ge0 = arch::_mm256_cmpgt_epi8(chunk, lower);
         let le9 = arch::_mm256_cmpgt_epi8(upper, chunk);
         let mask = arch::_mm256_and_si256(ge0, le9);
@@ -1714,7 +2143,8 @@ unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
     }
 
     while i < len {
-        let b = *ptr.add(i);
+        // SAFETY: the loop condition `i < len` keeps `ptr + i` inside `bytes`.
+        let b = unsafe { *ptr.add(i) };
         if b.is_ascii_digit() {
             return Some(i);
         }
@@ -1725,8 +2155,125 @@ unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_has_date_tokens, parse_cell_ref_bytes};
+    use super::{find_first_digit, format_has_date_tokens, parse_cell_ref_bytes};
+
+    /// The hand-written date formatter must agree with chrono's for every
+    /// year, including the ones it hands back to chrono.
+    #[test]
+    fn format_iso_seconds_matches_the_general_formatter() {
+        use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+        let times = [(0, 0, 0), (0, 0, 9), (9, 5, 59), (12, 30, 0), (23, 59, 59)];
+        let mut checked = 0;
+        for year in (-3..=3)
+            .chain(95..=105)
+            .chain(995..=1005)
+            .chain(1899..=2105)
+            .chain(9995..=10_003)
+        {
+            for (month, day) in [(1, 1), (2, 28), (2, 29), (7, 4), (10, 9), (12, 31)] {
+                let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
+                    continue;
+                };
+                for (hour, minute, second) in times {
+                    let time = NaiveTime::from_hms_opt(hour, minute, second).unwrap();
+                    assert_eq!(
+                        super::format_iso_seconds(date, time),
+                        NaiveDateTime::new(date, time)
+                            .format("%Y-%m-%dT%H:%M:%S")
+                            .to_string()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 5_000);
+    }
     use ooxml_archive::{parse_root_rels, resolve_part};
+
+    /// The vectorized scan must agree with a byte-by-byte scan whatever the
+    /// length, wherever the digit is, and whatever surrounds it. The filler
+    /// bytes include the neighbours of `0`-`9` in ASCII (`/` and `:`) and the
+    /// bytes that differ from a digit only in the high bit.
+    #[test]
+    fn find_first_digit_matches_a_byte_by_byte_scan() {
+        let fillers = [b'A', b'$', b'/', b':', 0x00, 0x7F, 0xB0, 0xB9, 0xFF];
+        let mut checked = 0u32;
+        for len in 0..=80usize {
+            for &filler in &fillers {
+                let mut bytes = vec![filler; len];
+                assert_eq!(
+                    find_first_digit(&bytes),
+                    None,
+                    "len {len} filler {filler:#x}"
+                );
+                for position in 0..len {
+                    for digit in *b"059" {
+                        bytes[position] = digit;
+                        assert_eq!(
+                            find_first_digit(&bytes),
+                            bytes.iter().position(u8::is_ascii_digit),
+                            "len {len} filler {filler:#x} digit at {position}"
+                        );
+                        // A later digit never hides an earlier one.
+                        let saved = bytes[len - 1];
+                        bytes[len - 1] = b'7';
+                        assert_eq!(
+                            find_first_digit(&bytes),
+                            bytes.iter().position(u8::is_ascii_digit)
+                        );
+                        bytes[len - 1] = saved;
+                        bytes[position] = filler;
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 80_000, "checked {checked} inputs");
+    }
+
+    /// Calls each vectorized scan directly. `find_first_digit` falls back to
+    /// a scalar scan when the vector function returns `None`, so a vector
+    /// path that missed a digit would be invisible through it. Small enough
+    /// for Miri: `cargo +nightly miri test -p xlsx-fast-core --lib vector_digit_scans`.
+    #[test]
+    fn vector_digit_scans_find_the_digit_at_every_position() {
+        type Scan = (&'static str, unsafe fn(&[u8]) -> Option<usize>);
+        let mut scans: Vec<Scan> = Vec::new();
+        #[cfg(target_arch = "aarch64")]
+        scans.push(("neon", super::find_first_digit_neon));
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        {
+            // The same conditions under which `find_first_digit` calls them.
+            if cfg!(target_arch = "x86_64") || std::is_x86_feature_detected!("sse2") {
+                scans.push(("sse2", super::find_first_digit_sse2));
+            }
+            if std::is_x86_feature_detected!("avx2") {
+                scans.push(("avx2", super::find_first_digit_avx2));
+            }
+        }
+        for (name, scan) in scans {
+            // `/` and `:` are the neighbours of the digits in ASCII; 0xB5 is
+            // a digit with the high bit set.
+            for filler in [b'/', b':', 0xB5] {
+                for len in 0..=70usize {
+                    let mut bytes = vec![filler; len];
+                    // SAFETY: each scan needs only its CPU feature, and
+                    // `scans` holds a function only when that feature is
+                    // present (NEON is baseline on aarch64; SSE2 and AVX2 were
+                    // detected above). Every scan accepts any slice.
+                    assert_eq!(unsafe { scan(&bytes) }, None, "{name}: len {len}");
+                    for position in 0..len {
+                        bytes[position] = b"059"[position % 3];
+                        // SAFETY: as above: the feature is present and any
+                        // slice is accepted.
+                        let found = unsafe { scan(&bytes) };
+                        assert_eq!(found, Some(position), "{name}: len {len}");
+                        bytes[position] = filler;
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_cell_ref_basic() {

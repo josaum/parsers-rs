@@ -190,3 +190,18 @@ def test_a_parse_does_not_hold_the_gil() -> None:
     duration, stall = longest_main_thread_stall(lambda: ontology_fast.prefixes(body))
     assert duration > 0.02, f"document too small to measure: {duration:.4f}s"
     assert stall < duration / 2, f"main thread stalled {stall:.4f}s of a {duration:.4f}s parse"
+
+
+def test_the_wheel_ships_type_information_that_matches_the_module() -> None:
+    import inspect
+    from pathlib import Path
+
+    assert (Path(ontology_fast.__file__).parent / "py.typed").is_file()
+    functions = {
+        name for name in ontology_fast.__all__ if inspect.isfunction(getattr(ontology_fast, name))
+    }
+    assert functions == {"parse_triples", "parse_terms", "prefixes", "query"}
+    for name in functions:
+        function = getattr(ontology_fast, name)
+        annotated = set(function.__annotations__)
+        assert annotated == set(inspect.signature(function).parameters) | {"return"}, name

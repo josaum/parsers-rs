@@ -1,6 +1,6 @@
 [package]
 name = "ontology-fast-py"
-version = "0.1.1"
+version = "0.1.7"
 edition.workspace = true
 authors.workspace = true
 description = "Python bindings for ontology-fast-core (canonical Turtle reader and indexed triple view)"
@@ -17,4 +17,7 @@ ontology-fast-core = { path = "../ontology-fast-core" }
 pyo3 = { workspace = true }
 
 [build-dependencies]
-pyo3-build-config = "0.28.3"
+pyo3-build-config = "0.29.3"
+
+[lints]
+workspace = true

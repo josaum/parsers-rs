@@ -22,9 +22,12 @@ Usage::
     ipc = schema_ipc_bytes("/path/to/schema.xsd", "example")
 """
 
+from __future__ import annotations
+
 import json
 
 from ._core import (
+    all_arrow_schemas_json_py,
     describe_element_bytes_json_py,
     describe_element_json_py,
     list_elements_bytes_py,
@@ -124,7 +127,11 @@ def validate_bytes(
     Returns a list of ``{"severity": "Error"|"Warning", "path": "...", "message": "..."}`` dicts.
     """
     payload = validate_bytes_json_py(
-        schema_path, xml_bytes, max_errors, check_facets, check_cardinality
+        schema_path,
+        xml_bytes,
+        max_errors=max_errors,
+        check_facets=check_facets,
+        check_cardinality=check_cardinality,
     )
     return json.loads(payload)
 
@@ -145,7 +152,31 @@ def schema_ipc_bytes(
 
 
 
+def all_arrow_schemas(
+    schema_path: str,
+    max_depth: int = 8,
+    map_dates: bool = True,
+    include_attributes: bool = True,
+    max_includes: int = 64,
+) -> dict[str, list[dict]]:
+    """Return the Arrow field description of every global element, by name.
+
+    Each value has the shape `describe_element` returns. Raises
+    `RuntimeError` when any element's schema cannot be derived, rather than
+    leaving that element out.
+    """
+    payload = all_arrow_schemas_json_py(
+                  schema_path,
+                  max_depth=max_depth,
+                  map_dates=map_dates,
+                  include_attributes=include_attributes,
+                  max_includes=max_includes,
+              )
+    return json.loads(payload)
+
+
 __all__ = [
+    "all_arrow_schemas",
     "describe_element",
     "describe_element_bytes",
     "list_elements",

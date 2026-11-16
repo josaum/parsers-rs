@@ -57,6 +57,23 @@ pub struct OutlinePoint {
     pub on_curve: bool,
 }
 
+/// Most points one glyph outline may hold, components included.
+///
+/// `maxp` declares `maxPoints` and `maxCompositePoints` as 16-bit counts, so
+/// no valid glyph has more. Without the bound a composite glyph whose
+/// components are themselves composites multiplies its points at every level:
+/// a few kilobytes of `glyf` can describe billions of them.
+const MAX_OUTLINE_POINTS: usize = 1 << 16;
+
+/// State carried through one glyph's component tree.
+#[derive(Default)]
+struct OutlineWalk {
+    /// Composite glyphs on the path to the one being read, to refuse cycles.
+    visiting: Vec<u16>,
+    /// Points emitted so far, bounded by [`MAX_OUTLINE_POINTS`].
+    points: usize,
+}
+
 /// A parsed TrueType program.
 #[derive(Debug, Clone)]
 pub struct TrueTypeFont {
@@ -238,8 +255,8 @@ impl TrueTypeFont {
     /// which a malformed font can contain, is refused rather than followed.
     pub fn outline(&self, glyph_index: u16) -> Option<GlyphOutline> {
         let mut outline = GlyphOutline::default();
-        let mut visiting = Vec::new();
-        self.append_glyph(glyph_index, Affine::IDENTITY, &mut outline, &mut visiting)?;
+        let mut walk = OutlineWalk::default();
+        self.append_glyph(glyph_index, Affine::IDENTITY, &mut outline, &mut walk)?;
         if outline.contours.is_empty() {
             // A glyph with no contours is legitimate — `space` is one — but it
             // carries no shape, so the caller gets `None` rather than an empty
@@ -270,9 +287,9 @@ impl TrueTypeFont {
         glyph_index: u16,
         transform: Affine,
         out: &mut GlyphOutline,
-        visiting: &mut Vec<u16>,
+        walk: &mut OutlineWalk,
     ) -> Option<()> {
-        if visiting.contains(&glyph_index) || visiting.len() > 8 {
+        if walk.visiting.contains(&glyph_index) || walk.visiting.len() > 8 {
             return None;
         }
         let (start, end) = self.glyph_range(glyph_index)?;
@@ -282,11 +299,11 @@ impl TrueTypeFont {
         }
         let number_of_contours = i16::from_be_bytes([glyph[0], glyph[1]]);
         if number_of_contours >= 0 {
-            self.append_simple(glyph, number_of_contours as usize, transform, out)
+            self.append_simple(glyph, number_of_contours as usize, transform, out, walk)
         } else {
-            visiting.push(glyph_index);
-            let result = self.append_composite(glyph, transform, out, visiting);
-            visiting.pop();
+            walk.visiting.push(glyph_index);
+            let result = self.append_composite(glyph, transform, out, walk);
+            walk.visiting.pop();
             result
         }
     }
@@ -297,6 +314,7 @@ impl TrueTypeFont {
         contour_count: usize,
         transform: Affine,
         out: &mut GlyphOutline,
+        walk: &mut OutlineWalk,
     ) -> Option<()> {
         // Ten bytes of header, then the contour end points.
         let ends_at = 10 + contour_count * 2;
@@ -309,6 +327,10 @@ impl TrueTypeFont {
             ends.push(u16::from_be_bytes([glyph[at], glyph[at + 1]]) as usize);
         }
         let point_count = *ends.last()? + 1;
+        walk.points = walk.points.checked_add(point_count)?;
+        if walk.points > MAX_OUTLINE_POINTS {
+            return None;
+        }
         let instruction_length = u16::from_be_bytes([glyph[ends_at], glyph[ends_at + 1]]) as usize;
         let flags_at = ends_at + 2 + instruction_length;
         if flags_at > glyph.len() {
@@ -316,7 +338,10 @@ impl TrueTypeFont {
         }
 
         // Flags are run-length encoded: bit 3 repeats the flag.
-        let mut flags = Vec::with_capacity(point_count);
+        // A flag byte can repeat, so the count is not bounded by the glyph's
+        // length; the capacity is, and the vectors grow only as flags decode.
+        let capacity = point_count.min(glyph.len());
+        let mut flags = Vec::with_capacity(capacity);
         let mut cursor = flags_at;
         while flags.len() < point_count {
             let flag = *glyph.get(cursor)?;
@@ -335,7 +360,7 @@ impl TrueTypeFont {
         }
 
         // Coordinates are deltas, with per-axis flag-selected widths.
-        let mut xs = Vec::with_capacity(point_count);
+        let mut xs = Vec::with_capacity(capacity);
         let mut x = 0i32;
         for flag in &flags {
             let delta = if flag & 0x02 != 0 {
@@ -354,10 +379,11 @@ impl TrueTypeFont {
                 cursor += 2;
                 value
             };
-            x += delta;
+            // 65536 deltas of 16 bits each can pass `i32::MAX`.
+            x = x.saturating_add(delta);
             xs.push(x);
         }
-        let mut ys = Vec::with_capacity(point_count);
+        let mut ys = Vec::with_capacity(capacity);
         let mut y = 0i32;
         for flag in &flags {
             let delta = if flag & 0x04 != 0 {
@@ -376,7 +402,7 @@ impl TrueTypeFont {
                 cursor += 2;
                 value
             };
-            y += delta;
+            y = y.saturating_add(delta);
             ys.push(y);
         }
 
@@ -411,7 +437,7 @@ impl TrueTypeFont {
         glyph: &[u8],
         transform: Affine,
         out: &mut GlyphOutline,
-        visiting: &mut Vec<u16>,
+        walk: &mut OutlineWalk,
     ) -> Option<()> {
         let mut cursor = 10usize;
         loop {
@@ -488,7 +514,7 @@ impl TrueTypeFont {
                 cursor += 8;
             }
 
-            self.append_glyph(component_index, transform.then(component), out, visiting)?;
+            self.append_glyph(component_index, transform.then(component), out, walk)?;
 
             if flags & 0x0020 == 0 {
                 // MORE_COMPONENTS clear: this was the last one.

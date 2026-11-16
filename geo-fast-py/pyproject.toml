@@ -4,11 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "geo-fast"
-version = "0.2.1"
+version = "0.2.7"
 description = "GIS helpers (GeoJSON/shapefile/WKT, STRtree, geodesic) powered by Rust"
 readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.8"
 authors = [{ name = "Dionisio Chiuratto Agourakis" }]
 keywords = [
     "gis",
@@ -23,8 +23,10 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -34,6 +36,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: GIS",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+
+[project.urls]
+Homepage = "https://github.com/josaum/parsers-rs"
+Repository = "https://github.com/josaum/parsers-rs/tree/main/geo-fast-py"
+Documentation = "https://github.com/josaum/parsers-rs#readme"
+"Bug Tracker" = "https://github.com/josaum/parsers-rs/issues"
 
 [tool.maturin]
 module-name = "geo_fast._core"

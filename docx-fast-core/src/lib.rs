@@ -49,19 +49,30 @@
 //! The parser uses a state machine (`DocxBodyParser`) to handle nested
 //! XML structures. Tables can contain paragraphs, which can contain
 //! runs, which can contain text, comments, and revisions.
+//!
+//! # Files on disk
+//!
+//! Functions that take a path memory-map the file. It must not be modified
+//! or truncated, by this process or any other, while it is being read: a
+//! truncated file can make reads of the mapping fault (`SIGBUS` on Unix),
+//! and a modified one can change the bytes under the parser. Functions that
+//! take bytes have no such requirement.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::DateTime;
+use ooxml_archive::utf8::LossyUtf8;
 use ooxml_archive::{
-    parse_relationships, part_dir, relationship_matches, relationship_target, rels_path_for_part,
-    resolve_part, source_part_from_rels, OoxmlArchive, PartReader, RelEntry, Relationships,
+    parse_relationships, parse_simple_props, part_dir, relationship_matches, relationship_target,
+    rels_path_for_part, resolve_part, source_part_from_rels, OoxmlArchive, PartReader, RelEntry,
+    Relationships,
 };
-use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::events::{BytesRef, BytesText, Event};
+use quick_xml::{Reader, XmlVersion};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, Cursor};
+use std::io::{BufRead, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -69,6 +80,7 @@ use std::sync::Arc;
 /// Apache Arrow export helpers for shredding `.docx` documents into typed
 /// table streams (metadata, paragraphs, runs, images, tables, comments, etc.).
 pub mod arrow;
+mod symbol;
 
 // The GLiNER extractor and the API embedder that were declared here are
 // consumer integrations: they depend on one product's SDK and belong in that
@@ -112,6 +124,38 @@ impl Default for ParseOptions {
     }
 }
 
+/// The entries of `map` in key order.
+///
+/// A `HashMap` iterates in an order that changes from one process to the
+/// next, so anything written from one (JSON, NDJSON, Arrow rows) goes
+/// through here: the same input must give the same bytes every time.
+pub(crate) fn sorted_entries<V>(map: &HashMap<String, V>) -> Vec<(&String, &V)> {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    entries
+}
+
+/// Serializes a map with its keys in order; see [`sorted_entries`].
+fn serialize_sorted_map<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    V: Serialize,
+{
+    serializer.collect_map(sorted_entries(map))
+}
+
+/// [`serialize_sorted_map`] for a field that borrows its map.
+fn serialize_sorted_map_ref<S, V>(
+    map: &&HashMap<String, V>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    V: Serialize,
+{
+    serialize_sorted_map(map, serializer)
+}
+
 /// Document metadata from core, app, and custom properties.
 ///
 /// Corresponds to `docProps/core.xml`, `docProps/app.xml`, and
@@ -119,10 +163,13 @@ impl Default for ParseOptions {
 #[derive(Debug, Serialize, Default)]
 pub struct Metadata {
     /// Dublin Core properties (title, creator, subject, etc.).
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub core: HashMap<String, String>,
     /// Application properties (Application, AppVersion, etc.).
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub app: HashMap<String, String>,
     /// Custom document properties defined by the user.
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub custom: HashMap<String, String>,
 }
 
@@ -134,6 +181,7 @@ pub struct DocxDocument {
     /// Document metadata (title, author, etc.).
     pub metadata: Metadata,
     /// Document settings (compatibility, proofing, etc.).
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub settings: HashMap<String, String>,
     /// Page count if available in app properties.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -515,46 +563,58 @@ struct HeaderFooterRef {
     ref_type: Option<String>,
 }
 
-fn parse_header_footer_refs<R: BufRead>(reader: R) -> Result<Vec<HeaderFooterRef>> {
-    let mut reader = Reader::from_reader(reader);
-    reader.config_mut().trim_text(false);
+/// Reads one `headerReference` or `footerReference` element.
+///
+/// Returns `None` for any other element, and for a reference without a
+/// relationship id.
+fn header_footer_ref(
+    e: &quick_xml::events::BytesStart<'_>,
+    name: &[u8],
+) -> Result<Option<HeaderFooterRef>> {
+    if name != b"headerReference" && name != b"footerReference" {
+        return Ok(None);
+    }
+    let mut rel_id = None;
+    let mut ref_type = None;
+    for attr in e.attributes().with_checks(false).flatten() {
+        let key_raw = attr.key.as_ref().as_bytes();
+        let key = local_name(key_raw);
+        if key_raw == b"r:id" || key == b"id" {
+            rel_id = Some(attribute_string(&attr));
+        } else if key == b"type" {
+            ref_type = Some(attribute_string(&attr));
+        }
+    }
+    let kind = if name == b"headerReference" {
+        "header"
+    } else {
+        "footer"
+    };
+    Ok(rel_id.map(|rel_id| HeaderFooterRef {
+        kind: kind.to_string(),
+        rel_id,
+        ref_type,
+    }))
+}
+
+/// Finds the header and footer references of a document part in a pass of
+/// its own.
+///
+/// The usual route collects them while the body is parsed
+/// ([`parse_document_blocks_with_refs`]). This pass is what that route falls
+/// back to, and its error is the one a malformed document reports.
+fn parse_header_footer_refs<R: BufRead>(reader: R, limit: usize) -> Result<Vec<HeaderFooterRef>> {
+    PASS_COUNTS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
+    let mut reader = xml_reader(utf8_stream(reader, limit)?);
     let mut buf = Vec::new();
     let mut refs = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
-                if name == b"headerReference" || name == b"footerReference" {
-                    let mut rel_id = None;
-                    let mut ref_type = None;
-                    for attr in e.attributes().flatten() {
-                        let key_raw = attr.key.as_ref();
-                        let key = local_name(key_raw);
-                        if key_raw == b"r:id" || key == b"id" {
-                            rel_id = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
-                        } else if key == b"type" {
-                            ref_type = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
-                        }
-                    }
-                    if let Some(rel_id) = rel_id {
-                        let kind = if name == b"headerReference" {
-                            "header"
-                        } else {
-                            "footer"
-                        };
-                        refs.push(HeaderFooterRef {
-                            kind: kind.to_string(),
-                            rel_id,
-                            ref_type,
-                        });
-                    }
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
+                if let Some(reference) = header_footer_ref(&e, name)? {
+                    refs.push(reference);
                 }
             }
             Ok(Event::Eof) => break,
@@ -613,17 +673,24 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
 
     let document_dir = part_dir(&document_path);
     let document_rels_path = rels_path_for_part(&document_path);
+    // The part the relationships were read from, so that nothing reads it a
+    // second time: every read counts against `max_inflate`.
+    let mut document_rels_part = None;
+    let fallback_rels_part;
     let document_rels = if archive.has_part(&document_rels_path) {
         let xml = read_part_bytes(&archive, &document_rels_path, options.max_inflate)
             .with_context(|| format!("read document rels: {document_rels_path}"))?;
-        parse_relationships(&xml)?
+        document_rels_part = Some(document_rels_path.as_str());
+        parse_relationships(&utf8_xml(&xml))?
     } else {
         // Compatibility fallback for malformed names seen in legacy producers.
         let fallback = document_rels_path.replace("document.xml.rels", "document.xm.rels");
         if fallback != document_rels_path && archive.has_part(&fallback) {
             let xml = read_part_bytes(&archive, &fallback, options.max_inflate)
                 .with_context(|| format!("read document rels fallback: {fallback}"))?;
-            parse_relationships(&xml)?
+            fallback_rels_part = fallback;
+            document_rels_part = Some(fallback_rels_part.as_str());
+            parse_relationships(&utf8_xml(&xml))?
         } else {
             Relationships::default()
         }
@@ -642,14 +709,14 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
     let comments_ext_path = relationship_target(&document_rels, REL_COMMENTS_EXT)
         .map(|t| resolve_part(&document_dir, t));
 
-    let styles = if let Some(path) = styles_path.as_deref() {
+    let (styles, style_fonts) = if let Some(path) = styles_path.as_deref() {
         if let Some(xml) = read_optional_part_bytes(&archive, path, options.max_inflate)? {
-            parse_styles(&xml)?
+            (parse_styles(&xml)?, parse_style_fonts(&xml)?)
         } else {
-            Vec::new()
+            (Vec::new(), StyleFonts::default())
         }
     } else {
-        Vec::new()
+        (Vec::new(), StyleFonts::default())
     };
 
     let numbering = if let Some(path) = numbering_path.as_deref() {
@@ -664,7 +731,7 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
 
     let footnotes = if let Some(path) = footnotes_path.as_deref() {
         if let Some(xml) = read_optional_part_bytes(&archive, path, options.max_inflate)? {
-            parse_notes(&xml, b"footnote", &styles)?
+            parse_notes(&xml, b"footnote", &styles, &style_fonts)?
         } else {
             Vec::new()
         }
@@ -674,7 +741,7 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
 
     let endnotes = if let Some(path) = endnotes_path.as_deref() {
         if let Some(xml) = read_optional_part_bytes(&archive, path, options.max_inflate)? {
-            parse_notes(&xml, b"endnote", &styles)?
+            parse_notes(&xml, b"endnote", &styles, &style_fonts)?
         } else {
             Vec::new()
         }
@@ -685,7 +752,7 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
     let mut comments = if options.extract_comments {
         if let Some(path) = comments_path.as_deref() {
             if let Some(xml) = read_optional_part_bytes(&archive, path, options.max_inflate)? {
-                parse_comments(&xml, &styles)?
+                parse_comments(&xml, &styles, &style_fonts)?
             } else {
                 Vec::new()
             }
@@ -711,17 +778,61 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         .get("Pages")
         .and_then(|v| v.parse::<u32>().ok());
     let images = if options.extract_images {
-        collect_images(&archive, options.max_inflate)?
+        let known = document_rels_part.map(|part| (part, &document_rels));
+        collect_images(&archive, options.max_inflate, known)?
     } else {
         Vec::new()
     };
 
     let mut fields = Vec::new();
     let mut revisions = Vec::new();
+    // The document part is needed twice, for the header and footer
+    // references and for the body. It is read once: a second read would
+    // count it against `max_inflate` a second time.
+    let document_xml = read_part_bytes(&archive, &document_path, options.max_inflate)
+        .with_context(|| format!("read document: {document_path}"))?;
+    let document_xml = utf8_xml(&document_xml);
+    // The references are needed before the body, because headers and footers
+    // are parsed first and number their fields first. Finding them used to
+    // take a pass of its own over the whole document part. Instead the body
+    // is parsed now, collecting the references on the way, into vectors of
+    // its own, and is moved behind the headers and footers afterwards (see
+    // [`shift_field_ids`] for what that does to field numbers).
+    //
+    // A body that does not parse is not parsed again. The order used to be
+    // reference search, headers and footers, body, and the error reported
+    // must stay the first one that order meets:
+    //
+    // - ill-formed XML, or a reference that cannot be read, stops the
+    //   reference search at the same place it stopped the body, so that
+    //   error is known already ([`BodyFailure::ReferenceSearch`]);
+    // - any other failure belongs to the body alone. The reference search
+    //   and the headers and footers are then run to see whether one of them
+    //   fails first, and if none does the body's error is returned
+    //   (`body_error` below).
+    let mut body_ahead = None;
+    let mut body_error = None;
     let header_footer_refs = if options.extract_headers {
-        let reader = open_part_reader(&archive, &document_path, options.max_inflate)
-            .with_context(|| format!("read document for header/footer refs: {document_path}"))?;
-        parse_header_footer_refs(reader)?
+        let mut body_fields = Vec::new();
+        let mut body_revisions = Vec::new();
+        match parse_document_blocks_with_refs(
+            Cursor::new(&*document_xml),
+            options.max_inflate,
+            &styles,
+            &style_fonts,
+            &mut body_fields,
+            &mut body_revisions,
+        ) {
+            Ok((blocks, refs)) => {
+                body_ahead = Some((blocks, body_fields, body_revisions));
+                refs
+            }
+            Err(BodyFailure::ReferenceSearch(error)) => return Err(error),
+            Err(BodyFailure::Body(error)) => {
+                body_error = Some(error);
+                parse_header_footer_refs(Cursor::new(&*document_xml), options.max_inflate)?
+            }
+        }
     } else {
         Vec::new()
     };
@@ -731,7 +842,14 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         if let Some(target) = document_rels.by_id.get(&reference.rel_id) {
             let part = resolve_part(&document_dir, target);
             if let Some(reader) = open_optional_part_reader(&archive, &part, options.max_inflate)? {
-                let blocks = parse_document_blocks(reader, &styles, &mut fields, &mut revisions)?;
+                let blocks = parse_document_blocks(
+                    reader,
+                    options.max_inflate,
+                    &styles,
+                    &style_fonts,
+                    &mut fields,
+                    &mut revisions,
+                )?;
                 let entry = HeaderFooter {
                     kind: reference.kind,
                     ref_type: reference.ref_type,
@@ -747,9 +865,33 @@ fn parse_docx_from_archive(archive: DocxArchive, options: ParseOptions) -> Resul
         }
     }
 
-    let document_reader = open_part_reader(&archive, &document_path, options.max_inflate)
-        .with_context(|| format!("read document: {document_path}"))?;
-    let blocks = parse_document_blocks(document_reader, &styles, &mut fields, &mut revisions)?;
+    if let Some(error) = body_error {
+        return Err(error);
+    }
+    let blocks = match body_ahead {
+        Some((mut blocks, mut body_fields, body_revisions)) => {
+            // Field numbers stay within `u32` however many fields there are:
+            // the parser itself numbers them with the same width.
+            let earlier = fields.len() as u32;
+            if earlier > 0 {
+                for field in &mut body_fields {
+                    field.id = field.id.wrapping_add(earlier);
+                }
+                shift_field_ids(&mut blocks, earlier);
+            }
+            fields.append(&mut body_fields);
+            revisions.extend(body_revisions);
+            blocks
+        }
+        None => parse_document_blocks(
+            Cursor::new(&*document_xml),
+            options.max_inflate,
+            &styles,
+            &style_fonts,
+            &mut fields,
+            &mut revisions,
+        )?,
+    };
 
     let mut toc = Vec::new();
     collect_toc(&blocks, &mut toc);
@@ -915,6 +1057,7 @@ struct NdjsonHeader<'a> {
     #[serde(rename = "kind")]
     kind: &'static str,
     metadata: &'a Metadata,
+    #[serde(serialize_with = "serialize_sorted_map_ref")]
     settings: &'a HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     page_count: Option<u32>,
@@ -998,7 +1141,7 @@ pub fn extract_docx_images(
     out_dir: impl AsRef<Path>,
 ) -> Result<Vec<PathBuf>> {
     let archive = open_archive(path.as_ref())?;
-    let images = collect_images(&archive, 256 * 1024 * 1024)?;
+    let images = collect_images(&archive, 256 * 1024 * 1024, None)?;
     let mut out_paths = Vec::new();
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
@@ -1023,10 +1166,10 @@ fn parse_metadata(archive: &DocxArchive, max_inflate: usize) -> Result<Metadata>
     let mut metadata = Metadata::default();
 
     if let Ok(xml) = read_part_bytes(archive, "docProps/core.xml", max_inflate) {
-        metadata.core = parse_simple_props(&xml)?;
+        metadata.core = parse_simple_props(&utf8_xml(&xml))?;
     }
     if let Ok(xml) = read_part_bytes(archive, "docProps/app.xml", max_inflate) {
-        metadata.app = parse_simple_props(&xml)?;
+        metadata.app = parse_simple_props(&utf8_xml(&xml))?;
     }
     if let Ok(xml) = read_part_bytes(archive, "docProps/custom.xml", max_inflate) {
         metadata.custom = parse_custom_props(&xml)?;
@@ -1041,25 +1184,22 @@ fn parse_settings(archive: &DocxArchive, max_inflate: usize) -> Result<HashMap<S
     let Some(xml) = read_optional_part_bytes(archive, "word/settings.xml", max_inflate)? else {
         return Ok(HashMap::new());
     };
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = part_xml_reader(&xml);
     let mut buf = Vec::new();
     let mut settings = HashMap::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if name == b"settings" {
                     continue;
                 }
                 let mut value = None;
                 let mut attrs = Vec::new();
-                for attr in e.attributes().flatten() {
-                    let key = local_name(attr.key.as_ref());
-                    let val = attr
-                        .decode_and_unescape_value(reader.decoder())?
-                        .to_string();
+                for attr in e.attributes().with_checks(false).flatten() {
+                    let key = local_name(attr.key.as_ref().as_bytes());
+                    let val = attribute_string(&attr);
                     if key == b"val" {
                         value = Some(val.clone());
                     }
@@ -1085,77 +1225,79 @@ fn parse_settings(archive: &DocxArchive, max_inflate: usize) -> Result<HashMap<S
     Ok(settings)
 }
 
-fn parse_simple_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
-    let mut buf = Vec::new();
-    let mut out = HashMap::new();
-    let mut current_key: Option<String> = None;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let key = local_name(&raw);
-                current_key = Some(String::from_utf8_lossy(key).to_string());
-            }
-            Ok(Event::Text(e)) => {
-                if let Some(key) = current_key.take() {
-                    let value = e.unescape()?.to_string();
-                    if !value.is_empty() {
-                        out.insert(key, normalize_datetime(&value));
-                    }
-                }
-            }
-            Ok(Event::End(_)) => {
-                current_key = None;
-            }
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(anyhow!("parse props: {err}")),
-            _ => {}
+/// Stores the character data collected for `key`, if there is any.
+///
+/// A value can arrive in several pieces (text, a reference, a CDATA
+/// section), so it is collected until something other than character data
+/// ends it. The first run of character data after the key is the value;
+/// taking the key stops later runs from replacing it.
+///
+/// A run of nothing but whitespace is the layout of the file, not a value,
+/// in two cases: when another element opens right after it
+/// (`before_element`), which is the indentation between two elements and
+/// leaves the key open for the value element that follows; and when it
+/// holds a line break, which is the indentation inside an element that has
+/// no content. Spaces that fill an element up to its end tag are a value.
+fn store_property(
+    out: &mut HashMap<String, String>,
+    key: &mut Option<String>,
+    value: &mut String,
+    before_element: bool,
+) {
+    let is_whitespace = value
+        .chars()
+        .all(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'));
+    let is_layout = is_whitespace && (before_element || value.contains(['\r', '\n']));
+    if !value.is_empty() && !is_layout {
+        if let Some(key) = key.take() {
+            out.insert(key, normalize_datetime(value));
         }
-        buf.clear();
     }
-    Ok(out)
+    value.clear();
 }
 
+/// Reads `docProps/custom.xml`.
+///
+/// A property is a `property` element; its name is the `name` attribute and
+/// its value the text of the value element inside it.
 fn parse_custom_props(xml: &[u8]) -> Result<HashMap<String, String>> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut out = HashMap::new();
     let mut current_name: Option<String> = None;
+    let mut value = String::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                if local_name(&raw) == b"property" {
-                    for attr in e.attributes().flatten() {
-                        if local_name(attr.key.as_ref()) == b"name" {
-                            current_name = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
+                if current_name.is_some() {
+                    value.push_str(&character_data(&event).unwrap_or_default());
+                }
+            }
+            Ok(event) => {
+                let before_element = matches!(event, Event::Start(_) | Event::Empty(_));
+                store_property(&mut out, &mut current_name, &mut value, before_element);
+                match event {
+                    Event::Start(e) => {
+                        let raw = e.name().as_ref().as_bytes().to_vec();
+                        if local_name(&raw) == b"property" {
+                            for attr in e.attributes().with_checks(false).flatten() {
+                                if local_name(attr.key.as_ref().as_bytes()) == b"name" {
+                                    current_name = Some(attribute_string(&attr));
+                                }
+                            }
                         }
                     }
-                }
-            }
-            Ok(Event::Text(e)) => {
-                if let Some(name) = current_name.take() {
-                    let value = e.unescape()?.to_string();
-                    if !value.is_empty() {
-                        out.insert(name, normalize_datetime(&value));
+                    Event::End(e) => {
+                        let raw = e.name().as_ref().as_bytes().to_vec();
+                        if local_name(&raw) == b"property" {
+                            current_name = None;
+                        }
                     }
+                    Event::Eof => break,
+                    _ => {}
                 }
             }
-            Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                if local_name(&raw) == b"property" {
-                    current_name = None;
-                }
-            }
-            Ok(Event::Eof) => break,
             Err(err) => return Err(anyhow!("parse custom props: {err}")),
-            _ => {}
         }
         buf.clear();
     }
@@ -1170,16 +1312,15 @@ fn normalize_datetime(value: &str) -> String {
 }
 
 fn parse_styles(xml: &[u8]) -> Result<Vec<Style>> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut styles = Vec::new();
     let mut current: Option<Style> = None;
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if name == b"style" {
                     let mut style = Style {
                         id: String::new(),
@@ -1192,49 +1333,42 @@ fn parse_styles(xml: &[u8]) -> Result<Vec<Style>> {
                         is_default: false,
                         is_qformat: false,
                     };
-                    for attr in e.attributes().flatten() {
-                        let key = local_name(attr.key.as_ref());
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let key = local_name(attr.key.as_ref().as_bytes());
                         if key == b"styleId" {
-                            style.id = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .to_string();
+                            style.id = attribute_string(&attr);
                         } else if key == b"type" {
-                            style.style_type = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            style.style_type = Some(attribute_string(&attr));
                         } else if key == b"default" {
-                            let val = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .to_string();
+                            let val = attribute_string(&attr);
                             style.is_default = val == "1" || val.eq_ignore_ascii_case("true");
                         }
                     }
                     current = Some(style);
                 } else if let Some(style) = current.as_mut() {
                     if name == b"name" {
-                        if let Some(val) = attr_value(&reader, &e, b"val")? {
+                        if let Some(val) = attr_value(&e, b"val")? {
                             style.name = Some(val);
                         }
                     } else if name == b"basedOn" {
-                        style.based_on = attr_value(&reader, &e, b"val")?;
+                        style.based_on = attr_value(&e, b"val")?;
                     } else if name == b"next" {
-                        style.next = attr_value(&reader, &e, b"val")?;
+                        style.next = attr_value(&e, b"val")?;
                     } else if name == b"uiPriority" {
-                        if let Some(val) = attr_value(&reader, &e, b"val")? {
+                        if let Some(val) = attr_value(&e, b"val")? {
                             style.ui_priority = val.parse::<u8>().ok();
                         }
                     } else if name == b"qFormat" {
                         style.is_qformat = true;
                     } else if name == b"outlineLvl" {
-                        if let Some(val) = attr_value(&reader, &e, b"val")? {
+                        if let Some(val) = attr_value(&e, b"val")? {
                             style.outline_level = val.parse::<u8>().ok();
                         }
                     }
                 }
             }
             Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
+                let raw = e.name().as_ref().as_bytes().to_vec();
                 if local_name(&raw) == b"style" {
                     if let Some(style) = current.take() {
                         styles.push(style);
@@ -1250,9 +1384,217 @@ fn parse_styles(xml: &[u8]) -> Result<Vec<Style>> {
     Ok(styles)
 }
 
+/// Most `basedOn` links followed from one style.
+///
+/// Real style sheets nest a handful of levels. The limit is what stops a
+/// file whose styles are based on each other in a circle.
+const MAX_STYLE_CHAIN: usize = 64;
+
+/// The fonts a run inherits from its styles.
+///
+/// Kept apart from [`Style`], which is part of the output and does not carry
+/// fonts.
+#[derive(Debug, Default)]
+struct StyleFonts {
+    /// The fonts of each style, with those of the styles it is based on
+    /// already filled in. A style that names no font anywhere in its chain
+    /// has no entry.
+    by_id: HashMap<String, symbol::FontChoice>,
+    /// The fonts of the default paragraph style, which a paragraph without a
+    /// `w:pStyle` uses.
+    default_paragraph: symbol::FontChoice,
+    /// The fonts of the default table style, which a table without a
+    /// `w:tblStyle` uses.
+    default_table: symbol::FontChoice,
+    /// The fonts of `w:docDefaults` (`w:rPrDefault`), behind every style.
+    defaults: symbol::FontChoice,
+}
+
+impl StyleFonts {
+    /// Whether neither a style nor the document defaults name a font, so
+    /// only a run's own font matters.
+    fn is_empty(&self) -> bool {
+        self.by_id.is_empty() && self.defaults.is_inherit()
+    }
+
+    fn of(&self, style_id: &str) -> symbol::FontChoice {
+        self.by_id.get(style_id).copied().unwrap_or_default()
+    }
+
+    /// The fonts in effect for a run, nearest formatting first: the run's
+    /// own, its character style, the paragraph's style, the style of the
+    /// table the run is in, then the document defaults (ECMA-376 part 1,
+    /// 17.7.2).
+    ///
+    /// `table_style` is `None` outside a table, and inside one the table's
+    /// `w:tblStyle`, itself `None` for a table that names no style.
+    fn effective(
+        &self,
+        run: symbol::FontChoice,
+        run_style: Option<&str>,
+        paragraph_style: Option<&str>,
+        table_style: Option<Option<&str>>,
+    ) -> symbol::FontChoice {
+        let character = run_style.map(|id| self.of(id)).unwrap_or_default();
+        let paragraph = match paragraph_style {
+            Some(id) => self.of(id),
+            None => self.default_paragraph,
+        };
+        let table = match table_style {
+            Some(Some(id)) => self.of(id),
+            Some(None) => self.default_table,
+            None => symbol::FontChoice::default(),
+        };
+        run.or(character).or(paragraph).or(table).or(self.defaults)
+    }
+}
+
+/// Reads the `w:rFonts` attributes this crate tells fonts apart by.
+///
+/// Each script class has a named font (`w:ascii`) and a theme font
+/// (`w:asciiTheme`). When the theme attribute is present it is the one in
+/// use and the named font is ignored (ECMA-376 part 1, 17.3.2.26). A theme
+/// font is an ordinary text font, never one of the symbol fonts.
+fn font_choice(e: &quick_xml::events::BytesStart<'_>) -> Result<symbol::FontChoice> {
+    let slot = |key: &[u8], theme_key: &[u8]| -> Result<symbol::FontSlot> {
+        if attr_value(e, theme_key)?.is_some() {
+            return Ok(symbol::FontSlot::Plain);
+        }
+        Ok(symbol::FontSlot::from_name(attr_value(e, key)?.as_deref()))
+    };
+    Ok(symbol::FontChoice {
+        ascii: slot(b"ascii", b"asciiTheme")?,
+        high_ansi: slot(b"hAnsi", b"hAnsiTheme")?,
+        complex_script: slot(b"cs", b"cstheme")?,
+    })
+}
+
+/// Reads the fonts each style gives its runs from `styles.xml`.
+fn parse_style_fonts(xml: &[u8]) -> Result<StyleFonts> {
+    struct Declared {
+        based_on: Option<String>,
+        fonts: symbol::FontChoice,
+    }
+
+    let mut reader = part_xml_reader(xml);
+    let mut buf = Vec::new();
+    let mut declared: HashMap<String, Declared> = HashMap::new();
+    let mut default_paragraph: Option<String> = None;
+    let mut default_table: Option<String> = None;
+    let mut defaults = symbol::FontChoice::default();
+    let mut in_doc_defaults = false;
+    let mut current: Option<(String, Declared)> = None;
+    let mut in_rpr = false;
+    // Inside `w:tblStylePr`: formatting for part of a table, not the style's.
+    let mut in_table_part = false;
+    loop {
+        let event = reader.read_event_into(&mut buf);
+        match &event {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let is_start = matches!(event, Ok(Event::Start(_)));
+                let raw = e.name().as_ref().as_bytes().to_vec();
+                match local_name(&raw) {
+                    b"style" => {
+                        let id = attr_value(e, b"styleId")?.unwrap_or_default();
+                        let is_default = attr_value(e, b"default")?
+                            .is_some_and(|val| val == "1" || val.eq_ignore_ascii_case("true"));
+                        let kind = attr_value(e, b"type")?;
+                        let is_paragraph = kind.as_deref() == Some("paragraph");
+                        if is_default && is_paragraph && default_paragraph.is_none() {
+                            default_paragraph = Some(id.clone());
+                        }
+                        if is_default && kind.as_deref() == Some("table") && default_table.is_none()
+                        {
+                            default_table = Some(id.clone());
+                        }
+                        let style = Declared {
+                            based_on: None,
+                            fonts: symbol::FontChoice::default(),
+                        };
+                        if is_start {
+                            current = Some((id, style));
+                        } else {
+                            declared.entry(id).or_insert(style);
+                        }
+                        in_rpr = false;
+                        in_table_part = false;
+                    }
+                    b"basedOn" => {
+                        if let Some((_, style)) = current.as_mut() {
+                            style.based_on = attr_value(e, b"val")?;
+                        }
+                    }
+                    b"rPr" if is_start => in_rpr = true,
+                    b"tblStylePr" if is_start => in_table_part = true,
+                    b"docDefaults" if is_start => in_doc_defaults = true,
+                    b"rFonts" if in_rpr && !in_table_part => {
+                        if let Some((_, style)) = current.as_mut() {
+                            style.fonts = font_choice(e)?;
+                        } else if in_doc_defaults {
+                            defaults = font_choice(e)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let raw = e.name().as_ref().as_bytes().to_vec();
+                match local_name(&raw) {
+                    b"style" => {
+                        if let Some((id, style)) = current.take() {
+                            declared.entry(id).or_insert(style);
+                        }
+                    }
+                    b"rPr" => in_rpr = false,
+                    b"tblStylePr" => in_table_part = false,
+                    b"docDefaults" => in_doc_defaults = false,
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => return Err(anyhow!("parse style fonts: {err}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    let resolve = |id: &str| {
+        let mut fonts = symbol::FontChoice::default();
+        let mut next = Some(id);
+        for _ in 0..MAX_STYLE_CHAIN {
+            let Some(style) = next.and_then(|id| declared.get(id)) else {
+                break;
+            };
+            fonts = fonts.or(style.fonts);
+            next = style.based_on.as_deref();
+        }
+        fonts
+    };
+    let mut by_id = HashMap::new();
+    for id in declared.keys() {
+        let fonts = resolve(id);
+        if !fonts.is_inherit() {
+            by_id.insert(id.clone(), fonts);
+        }
+    }
+    let default_paragraph = default_paragraph
+        .as_deref()
+        .map(|id| by_id.get(id).copied().unwrap_or_default())
+        .unwrap_or_default();
+    let default_table = default_table
+        .as_deref()
+        .map(|id| by_id.get(id).copied().unwrap_or_default())
+        .unwrap_or_default();
+    Ok(StyleFonts {
+        by_id,
+        default_paragraph,
+        default_table,
+        defaults,
+    })
+}
+
 fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut numbering = Numbering::default();
     let mut current_abs: Option<AbstractNum> = None;
@@ -1262,11 +1604,11 @@ fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if name == b"abstractNum" {
                     let mut id = 0u32;
-                    if let Some(val) = attr_value(&reader, &e, b"abstractNumId")? {
+                    if let Some(val) = attr_value(&e, b"abstractNumId")? {
                         id = val.parse::<u32>().unwrap_or(0);
                     }
                     current_abs = Some(AbstractNum {
@@ -1275,7 +1617,7 @@ fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
                     });
                 } else if name == b"lvl" {
                     let mut level = 0u8;
-                    if let Some(val) = attr_value(&reader, &e, b"ilvl")? {
+                    if let Some(val) = attr_value(&e, b"ilvl")? {
                         level = val.parse::<u8>().unwrap_or(0);
                     }
                     current_level = Some(NumLevel {
@@ -1286,21 +1628,21 @@ fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
                     });
                 } else if name == b"numFmt" {
                     if let Some(level) = current_level.as_mut() {
-                        level.format = attr_value(&reader, &e, b"val")?;
+                        level.format = attr_value(&e, b"val")?;
                     }
                 } else if name == b"lvlText" {
                     if let Some(level) = current_level.as_mut() {
-                        level.text = attr_value(&reader, &e, b"val")?;
+                        level.text = attr_value(&e, b"val")?;
                     }
                 } else if name == b"start" {
                     if let Some(level) = current_level.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"val")? {
+                        if let Some(val) = attr_value(&e, b"val")? {
                             level.start = val.parse::<u32>().ok();
                         }
                     }
                 } else if name == b"num" {
                     let mut id = 0u32;
-                    if let Some(val) = attr_value(&reader, &e, b"numId")? {
+                    if let Some(val) = attr_value(&e, b"numId")? {
                         id = val.parse::<u32>().unwrap_or(0);
                     }
                     current_num = Some(Num {
@@ -1309,15 +1651,15 @@ fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
                     });
                 } else if name == b"abstractNumId" {
                     if let Some(num) = current_num.as_mut() {
-                        if let Some(val) = attr_value(&reader, &e, b"val")? {
+                        if let Some(val) = attr_value(&e, b"val")? {
                             num.abstract_id = val.parse::<u32>().ok();
                         }
                     }
                 }
             }
             Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if name == b"lvl" {
                     if let Some(level) = current_level.take() {
                         if let Some(abs) = current_abs.as_mut() {
@@ -1344,26 +1686,30 @@ fn parse_numbering(xml: &[u8]) -> Result<Numbering> {
     Ok(numbering)
 }
 
-fn parse_notes(xml: &[u8], tag: &[u8], styles: &[Style]) -> Result<Vec<Note>> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+fn parse_notes(
+    xml: &[u8],
+    tag: &[u8],
+    styles: &[Style],
+    style_fonts: &StyleFonts,
+) -> Result<Vec<Note>> {
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut notes = Vec::new();
     let mut current_id: Option<i32> = None;
     let mut fields = Vec::new();
     let mut revisions = Vec::new();
-    let mut parser = DocxBodyParser::new(styles, &mut fields, &mut revisions);
+    let mut parser = DocxBodyParser::new(styles, style_fonts, &mut fields, &mut revisions);
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if name == tag {
-                    let note_type = attr_value(&reader, &e, b"type")?;
+                    let note_type = attr_value(&e, b"type")?;
                     let is_user_note = note_type.as_deref().is_none_or(|value| value == "normal");
                     current_id = if is_user_note {
-                        attr_value(&reader, &e, b"id")?.and_then(|value| value.parse::<i32>().ok())
+                        attr_value(&e, b"id")?.and_then(|value| value.parse::<i32>().ok())
                     } else {
                         None
                     };
@@ -1371,24 +1717,34 @@ fn parse_notes(xml: &[u8], tag: &[u8], styles: &[Style]) -> Result<Vec<Note>> {
                         parser.reset();
                     }
                 } else if current_id.is_some() {
-                    parser.handle_start(&reader, &e, name)?;
+                    parser.handle_start(&e, name)?;
                 }
             }
             Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if current_id.is_some() {
-                    parser.handle_empty(&reader, &e, name)?;
+                    parser.handle_empty(&e, name)?;
                 }
             }
             Ok(Event::Text(e)) => {
                 if current_id.is_some() {
-                    parser.handle_text(e.unescape()?.as_bytes());
+                    parser.handle_text(e.as_bytes());
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if current_id.is_some() {
+                    parser.handle_text(reference_string(&e).as_bytes());
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if current_id.is_some() {
+                    parser.handle_text(e.as_bytes());
                 }
             }
             Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if name == tag {
                     if let Some(id) = current_id {
                         let blocks = parser.finish();
@@ -1409,21 +1765,20 @@ fn parse_notes(xml: &[u8], tag: &[u8], styles: &[Style]) -> Result<Vec<Note>> {
     Ok(notes)
 }
 
-fn parse_comments(xml: &[u8], styles: &[Style]) -> Result<Vec<Comment>> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+fn parse_comments(xml: &[u8], styles: &[Style], style_fonts: &StyleFonts) -> Result<Vec<Comment>> {
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     let mut comments = Vec::new();
     let mut current: Option<Comment> = None;
     let mut tmp_fields = Vec::new();
     let mut tmp_revisions = Vec::new();
-    let mut parser = DocxBodyParser::new(styles, &mut tmp_fields, &mut tmp_revisions);
+    let mut parser = DocxBodyParser::new(styles, style_fonts, &mut tmp_fields, &mut tmp_revisions);
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if name == b"comment" {
                     let mut comment = Comment {
                         id: 0,
@@ -1433,56 +1788,51 @@ fn parse_comments(xml: &[u8], styles: &[Style]) -> Result<Vec<Comment>> {
                         parent_id: None,
                         blocks: Vec::new(),
                     };
-                    for attr in e.attributes().flatten() {
-                        let key = local_name(attr.key.as_ref());
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let key = local_name(attr.key.as_ref().as_bytes());
                         if key == b"id" {
-                            comment.id = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .parse::<i32>()
-                                .unwrap_or(0);
+                            comment.id = attribute_string(&attr).parse::<i32>().unwrap_or(0);
                         } else if key == b"author" {
-                            comment.author = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            comment.author = Some(attribute_string(&attr));
                         } else if key == b"initials" {
-                            comment.initials = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            comment.initials = Some(attribute_string(&attr));
                         } else if key == b"date" {
-                            comment.date = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            comment.date = Some(attribute_string(&attr));
                         } else if key == b"parentId" {
-                            comment.parent_id = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .parse::<i32>()
-                                .ok();
+                            comment.parent_id = attribute_string(&attr).parse::<i32>().ok();
                         }
                     }
                     parser.reset();
                     current = Some(comment);
                 } else if current.is_some() {
-                    parser.handle_start(&reader, &e, name)?;
+                    parser.handle_start(&e, name)?;
                 }
             }
             Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if current.is_some() {
-                    parser.handle_empty(&reader, &e, name)?;
+                    parser.handle_empty(&e, name)?;
                 }
             }
             Ok(Event::Text(e)) => {
                 if current.is_some() {
-                    parser.handle_text(e.unescape()?.as_bytes());
+                    parser.handle_text(e.as_bytes());
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if current.is_some() {
+                    parser.handle_text(reference_string(&e).as_bytes());
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if current.is_some() {
+                    parser.handle_text(e.as_bytes());
                 }
             }
             Ok(Event::End(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if name == b"comment" {
                     if let Some(mut comment) = current.take() {
                         comment.blocks = parser.finish();
@@ -1503,28 +1853,21 @@ fn parse_comments(xml: &[u8], styles: &[Style]) -> Result<Vec<Comment>> {
 }
 
 fn apply_extended_comments(comments: &mut [Comment], xml: &[u8]) -> Result<()> {
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = part_xml_reader(xml);
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
+                let raw = e.name().as_ref().as_bytes().to_vec();
                 if local_name(&raw) == b"comment" {
                     let mut current_id: Option<i32> = None;
                     let mut parent_id: Option<i32> = None;
-                    for attr in e.attributes().flatten() {
-                        let key = local_name(attr.key.as_ref());
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let key = local_name(attr.key.as_ref().as_bytes());
                         if key == b"id" {
-                            current_id = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .parse::<i32>()
-                                .ok();
+                            current_id = attribute_string(&attr).parse::<i32>().ok();
                         } else if key == b"parentId" {
-                            parent_id = attr
-                                .decode_and_unescape_value(reader.decoder())?
-                                .parse::<i32>()
-                                .ok();
+                            parent_id = attribute_string(&attr).parse::<i32>().ok();
                         }
                     }
                     if let (Some(id), Some(parent)) = (current_id, parent_id) {
@@ -1546,14 +1889,98 @@ fn apply_extended_comments(comments: &mut [Comment], xml: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Parses the blocks of a document, header or footer part.
+///
+/// `limit` is the size limit the part was read under; see [`utf8_stream`].
 fn parse_document_blocks<R: BufRead>(
     reader: R,
+    limit: usize,
     styles: &[Style],
+    style_fonts: &StyleFonts,
     fields_out: &mut Vec<Field>,
     revisions_out: &mut Vec<Revision>,
 ) -> Result<Vec<Block>> {
-    let mut parser = DocxBodyParser::new(styles, fields_out, revisions_out);
-    parser.parse(reader)
+    let mut parser = DocxBodyParser::new(styles, style_fonts, fields_out, revisions_out);
+    parser.parse(reader, limit)
+}
+
+/// Adds `by` to the field number of every run in `blocks`, tables included.
+///
+/// A field's number is one more than the count of fields already finished
+/// when it begins, counted across the parts in the order they are parsed.
+/// (So a field nested in another shares the outer one's number, and a field
+/// that is never closed numbers its runs without a `Field` to match; both are
+/// kept as they are.) Every number in the body is therefore higher by exactly
+/// the count of fields finished before the body, and blocks parsed ahead of
+/// the parts that come first in that order are moved into place by adding
+/// that count.
+fn shift_field_ids(blocks: &mut [Block], by: u32) {
+    for block in blocks {
+        match block {
+            Block::Paragraph(paragraph) => {
+                for run in &mut paragraph.runs {
+                    if let Some(id) = run.field_id.as_mut() {
+                        *id = id.wrapping_add(by);
+                    }
+                }
+            }
+            Block::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        shift_field_ids(&mut cell.blocks, by);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// [`parse_document_blocks`] for the document part, also returning the header
+/// and footer references met on the way, in document order.
+///
+/// # Errors
+///
+/// Says which of the two jobs failed; see [`BodyFailure`].
+fn parse_document_blocks_with_refs<R: BufRead>(
+    reader: R,
+    limit: usize,
+    styles: &[Style],
+    style_fonts: &StyleFonts,
+    fields_out: &mut Vec<Field>,
+    revisions_out: &mut Vec<Revision>,
+) -> std::result::Result<(Vec<Block>, Vec<HeaderFooterRef>), BodyFailure> {
+    let mut parser = DocxBodyParser::new(styles, style_fonts, fields_out, revisions_out);
+    parser.section_refs = Some(Vec::new());
+    match parser.parse(reader, limit) {
+        Ok(blocks) => Ok((blocks, parser.section_refs.take().unwrap_or_default())),
+        Err(error) => Err(match parser.reference_search_error.take() {
+            Some(search_error) => BodyFailure::ReferenceSearch(search_error),
+            None => BodyFailure::Body(error),
+        }),
+    }
+}
+
+/// Why [`parse_document_blocks_with_refs`] failed.
+enum BodyFailure {
+    /// The document is ill-formed, or a header or footer reference cannot be
+    /// read. [`parse_header_footer_refs`] stops at the same place, and this
+    /// is the error it reports there.
+    ReferenceSearch(anyhow::Error),
+    /// Anything only the body parser objects to. The reference search may
+    /// still fail further on in the document.
+    Body(anyhow::Error),
+}
+
+thread_local! {
+    static PASS_COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// How many block-parser runs and how many header/footer reference searches
+/// this thread has started, for tests that pin the amount of work a parse
+/// does rather than its time.
+#[doc(hidden)]
+pub fn pass_counts() -> (u64, u64) {
+    PASS_COUNTS.with(std::cell::Cell::get)
 }
 
 fn collect_toc(blocks: &[Block], out: &mut Vec<TocEntry>) {
@@ -1587,34 +2014,49 @@ fn collect_toc(blocks: &[Block], out: &mut Vec<TocEntry>) {
     }
 }
 
-fn collect_images(archive: &DocxArchive, max_inflate: usize) -> Result<Vec<ImageRef>> {
+/// Lists the images every relationships part of the package points at.
+///
+/// `known` is a relationships part the caller has already read and parsed;
+/// it is used as it is, not read again.
+fn collect_images(
+    archive: &DocxArchive,
+    max_inflate: usize,
+    known: Option<(&str, &Relationships)>,
+) -> Result<Vec<ImageRef>> {
     let content_types = parse_content_types(archive, max_inflate)?;
     let mut images = Vec::new();
     for path in archive.part_names() {
         if !path.ends_with(".rels") {
             continue;
         }
-        let xml = read_part_bytes(archive, path, max_inflate)
-            .with_context(|| format!("read DOCX relationships part: {path}"))?;
+        let read_here;
+        let rels = match known {
+            Some((known_path, rels)) if known_path == path => rels,
+            _ => {
+                let xml = read_part_bytes(archive, path, max_inflate)
+                    .with_context(|| format!("read DOCX relationships part: {path}"))?;
+                read_here = parse_relationships(&utf8_xml(&xml))?;
+                &read_here
+            }
+        };
         {
-            let rels = parse_relationships(&xml)?;
             let source_part = source_part_from_rels(path).unwrap_or_else(|| path.to_string());
             for RelEntry {
                 id,
                 rel_type,
                 target,
-            } in rels.entries
+            } in &rels.entries
             {
-                if !relationship_matches(&rel_type, REL_IMAGE) {
+                if !relationship_matches(rel_type, REL_IMAGE) {
                     continue;
                 }
-                let target_path = resolve_part(&part_dir(&source_part), &target);
+                let target_path = resolve_part(&part_dir(&source_part), target);
                 let content_type = content_types
                     .get(&target_path)
                     .cloned()
                     .or_else(|| guess_content_type(&target_path));
                 images.push(ImageRef {
-                    id,
+                    id: id.clone(),
                     source_part: source_part.clone(),
                     target: target_path,
                     content_type,
@@ -1639,31 +2081,24 @@ fn parse_content_types(
     let Some(xml) = read_optional_part_bytes(archive, "[Content_Types].xml", max_inflate)? else {
         return Ok(HashMap::new());
     };
-    let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(false);
+    let mut reader = part_xml_reader(&xml);
     let mut buf = Vec::new();
     let mut map = HashMap::new();
     let mut defaults: HashMap<String, String> = HashMap::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let raw = e.name().as_ref().to_vec();
-                let name = local_name(&raw);
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
                 if name == b"Default" {
                     let mut ext = None;
                     let mut ct = None;
-                    for attr in e.attributes().flatten() {
-                        let key = local_name(attr.key.as_ref());
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let key = local_name(attr.key.as_ref().as_bytes());
                         if key == b"Extension" {
-                            ext = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            ext = Some(attribute_string(&attr));
                         } else if key == b"ContentType" {
-                            ct = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            ct = Some(attribute_string(&attr));
                         }
                     }
                     if let (Some(ext), Some(ct)) = (ext, ct) {
@@ -1672,18 +2107,12 @@ fn parse_content_types(
                 } else if name == b"Override" {
                     let mut part_name = None;
                     let mut ct = None;
-                    for attr in e.attributes().flatten() {
-                        let key = local_name(attr.key.as_ref());
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let key = local_name(attr.key.as_ref().as_bytes());
                         if key == b"PartName" {
-                            part_name = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            part_name = Some(attribute_string(&attr));
                         } else if key == b"ContentType" {
-                            ct = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .to_string(),
-                            );
+                            ct = Some(attribute_string(&attr));
                         }
                     }
                     if let (Some(part_name), Some(ct)) = (part_name, ct) {
@@ -1730,21 +2159,273 @@ fn guess_content_type(path: &str) -> Option<String> {
     }
 }
 
-fn attr_value<R: BufRead>(
-    reader: &Reader<R>,
-    e: &quick_xml::events::BytesStart<'_>,
-    key: &[u8],
-) -> Result<Option<String>> {
-    for attr in e.attributes().flatten() {
-        if local_name(attr.key.as_ref()) == key {
-            return Ok(Some(
-                attr.decode_and_unescape_value(reader.decoder())?
-                    .to_string(),
-            ));
+/// Reads one attribute value, never failing on what it holds.
+///
+/// A well-formed value is read as an XML processor reports it: references
+/// resolved and literal white space normalized. A value that is not
+/// well-formed (an unknown entity, a character reference to no character, a
+/// bare `&`, a byte that is not UTF-8) is read by
+/// [`lenient_attribute_value`], so one bad character in an attribute costs
+/// that character, as it does in text, and not the whole document.
+fn attribute_string(attr: &quick_xml::events::attributes::Attribute<'_>) -> String {
+    match attr.normalized_value(XmlVersion::Implicit1_0) {
+        Ok(value) => value.into_owned(),
+        Err(_) => lenient_attribute_value(attr.value.as_bytes()),
+    }
+}
+
+/// Reads an attribute value that is not well-formed.
+///
+/// Every reference that can be resolved is resolved and literal white space
+/// is normalized, as for a well-formed value. A reference that cannot be
+/// resolved, and a bare `&`, are kept as written; a byte that is not UTF-8
+/// becomes U+FFFD.
+fn lenient_attribute_value(raw: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(raw);
+    let mut out = String::with_capacity(raw.len());
+    let mut rest: &str = &raw;
+    while let Some(ch) = rest.chars().next() {
+        let mut consumed = ch.len_utf8();
+        match ch {
+            '\t' | '\n' => out.push(' '),
+            '\r' => {
+                out.push(' ');
+                if rest[consumed..].starts_with('\n') {
+                    consumed += 1;
+                }
+            }
+            '&' => {
+                let resolved = rest[1..].find(';').and_then(|end| {
+                    let name = &rest[1..=end];
+                    resolve_reference_name(name).map(|text| (text, end + 2))
+                });
+                match resolved {
+                    Some((text, length)) => {
+                        out.push_str(&text);
+                        consumed = length;
+                    }
+                    None => out.push('&'),
+                }
+            }
+            other => out.push(other),
+        }
+        rest = &rest[consumed..];
+    }
+    out
+}
+
+/// The text a reference named `name` (what stands between `&` and `;`)
+/// resolves to, `None` when it names nothing.
+fn resolve_reference_name(name: &str) -> Option<String> {
+    if let Some(number) = name.strip_prefix('#') {
+        let code = match number.strip_prefix('x') {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => number.parse::<u32>().ok()?,
+        };
+        return char::from_u32(code)
+            .filter(|ch| *ch != '\0')
+            .map(String::from);
+    }
+    quick_xml::escape::resolve_xml_entity(name).map(str::to_owned)
+}
+
+fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Result<Option<String>> {
+    for attr in e.attributes().with_checks(false).flatten() {
+        if local_name(attr.key.as_ref().as_bytes()) == key {
+            return Ok(Some(attribute_string(&attr)));
         }
     }
     Ok(None)
 }
+
+/// Byte order of a UTF-16 part, `None` when the part is not UTF-16.
+///
+/// A byte order mark decides. Without one, the part has to open with an XML
+/// declaration, so "<?" with a zero byte on one side of each character is
+/// the only other form (XML 1.0, appendix F).
+fn utf16_big_endian(start: &[u8]) -> Option<bool> {
+    match start {
+        [0xFE, 0xFF, ..] | [0x00, b'<', 0x00, b'?', ..] => Some(true),
+        [0xFF, 0xFE, ..] | [b'<', 0x00, b'?', 0x00, ..] => Some(false),
+        _ => None,
+    }
+}
+
+/// Transcodes a UTF-16 part to UTF-8.
+///
+/// An unpaired surrogate or a trailing odd byte becomes U+FFFD. The byte
+/// order mark and the XML declaration are dropped: the declaration names an
+/// encoding the bytes no longer have.
+///
+/// The result is built once, in a buffer of exactly the size it needs, so
+/// the part is held twice at most: as stored and as UTF-8. UTF-8 needs at
+/// most three bytes for a two-byte UTF-16 unit, so the result is never more
+/// than one and a half times the stored part, whose size the archive has
+/// already checked against the inflate limit.
+fn utf16_to_utf8(xml: &[u8], big_endian: bool) -> Vec<u8> {
+    let chars = || {
+        let units = xml.chunks(2).map(move |pair| match *pair {
+            [first, second] if big_endian => u16::from_be_bytes([first, second]),
+            [first, second] => u16::from_le_bytes([first, second]),
+            // Half a code unit at the end of the part: not a character.
+            _ => 0xDC00,
+        });
+        char::decode_utf16(units).map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+    };
+    let mut text = String::with_capacity(chars().map(char::len_utf8).sum());
+    text.extend(chars().skip_while(|ch| *ch == '\u{FEFF}'));
+    if text.starts_with("<?xml") {
+        if let Some(end) = text.find("?>") {
+            text.drain(..end + 2);
+        }
+    }
+    text.into_bytes()
+}
+
+/// Returns a part as UTF-8, transcoding it when it is UTF-16.
+fn utf8_xml(xml: &[u8]) -> Cow<'_, [u8]> {
+    match utf16_big_endian(xml) {
+        Some(big_endian) => Cow::Owned(utf16_to_utf8(xml, big_endian)),
+        None => Cow::Borrowed(xml),
+    }
+}
+
+/// Makes the XML reader for a part held in memory.
+///
+/// A UTF-16 part is transcoded, and a byte that is not UTF-8 reads as
+/// U+FFFD, so one bad character costs that character rather than the part.
+/// A UTF-8 part is read in place, never copied. Repair may not grow the part
+/// past [`ooxml_archive::utf8::unknown_limit`]: a part that only outgrows
+/// that by being repaired fails to read.
+fn part_xml_reader(xml: &[u8]) -> Reader<LossyUtf8<Cursor<Cow<'_, [u8]>>>> {
+    // The limit is taken after UTF-16 is transcoded, so valid text is never
+    // refused for growing in transcoding.
+    let xml = utf8_xml(xml);
+    let limit = u64::try_from(ooxml_archive::utf8::unknown_limit(xml.len())).unwrap_or(u64::MAX);
+    xml_reader(LossyUtf8::with_limit(Cursor::new(xml), limit))
+}
+
+/// A part being read: as stored, with each byte that is not UTF-8 read as
+/// U+FFFD, or transcoded from UTF-16 first.
+#[derive(Debug)]
+enum Utf8Stream<R> {
+    Stored(LossyUtf8<R>),
+    Transcoded(Cursor<Vec<u8>>),
+}
+
+impl<R: BufRead> Read for Utf8Stream<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stored(reader) => reader.read(buf),
+            Self::Transcoded(reader) => reader.read(buf),
+        }
+    }
+}
+
+impl<R: BufRead> BufRead for Utf8Stream<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        match self {
+            Self::Stored(reader) => reader.fill_buf(),
+            Self::Transcoded(reader) => reader.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, amount: usize) {
+        match self {
+            Self::Stored(reader) => reader.consume(amount),
+            Self::Transcoded(reader) => reader.consume(amount),
+        }
+    }
+}
+
+/// Wraps a part reader so that a UTF-16 part is read as UTF-8.
+///
+/// The encoding is decided from the bytes already buffered, so a UTF-8 part
+/// keeps streaming, with each byte that is not UTF-8 read as U+FFFD. A
+/// UTF-16 part is read whole, within whatever size limit `reader` enforces,
+/// and transcoded.
+///
+/// `limit` is the size limit the part was read under: a UTF-8 part that only
+/// outgrows it by being repaired fails to read, instead of being read at up
+/// to three times the size the limit allows.
+fn utf8_stream<R: BufRead>(mut reader: R, limit: usize) -> Result<Utf8Stream<R>> {
+    let Some(big_endian) = utf16_big_endian(reader.fill_buf()?) else {
+        let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+        return Ok(Utf8Stream::Stored(LossyUtf8::with_limit(reader, limit)));
+    };
+    let mut xml = Vec::new();
+    reader.read_to_end(&mut xml)?;
+    Ok(Utf8Stream::Transcoded(Cursor::new(utf16_to_utf8(
+        &xml, big_endian,
+    ))))
+}
+
+/// Makes the XML reader every part goes through.
+///
+/// Text is kept exactly as written: no trimming, so the spaces around a
+/// reference survive, and a bare `&` is ordinary text instead of an error
+/// that would cost the whole part.
+fn xml_reader<R: BufRead>(source: R) -> Reader<R> {
+    let mut reader = Reader::from_reader(source);
+    let config = reader.config_mut();
+    config.trim_text(false);
+    config.allow_dangling_amp = true;
+    reader
+}
+
+/// Decodes a text event leniently.
+///
+/// A stray non-UTF-8 byte becomes U+FFFD, so one bad character costs that
+/// character rather than the whole document. References are not part of a
+/// text event; see [`reference_string`].
+fn text_event_string(event: &BytesText<'_>) -> String {
+    event.to_string()
+}
+
+/// Resolves an entity or character reference to the text it stands for.
+///
+/// The five entities XML predefines and decimal or hexadecimal character
+/// references resolve to their character. Anything else, an unknown entity
+/// or a character reference that names no character, is kept as written
+/// (`&name;`) rather than dropped.
+fn reference_string(reference: &BytesRef<'_>) -> String {
+    let name: &str = reference;
+    match reference.resolve_char_ref() {
+        Ok(Some(ch)) => ch.to_string(),
+        Ok(None) => match quick_xml::escape::resolve_xml_entity(name) {
+            Some(text) => text.to_string(),
+            None => format!("&{name};"),
+        },
+        Err(_) => format!("&{name};"),
+    }
+}
+
+/// Returns the character data of a text, CDATA or reference event, `None`
+/// for any other.
+///
+/// Text is decoded like [`text_event_string`] and a reference is resolved
+/// like [`reference_string`]; CDATA is literal character data, decoded but
+/// never entity-unescaped.
+fn character_data(event: &Event<'_>) -> Option<String> {
+    match event {
+        Event::Text(text) => Some(text_event_string(text)),
+        Event::CData(data) => Some(data.to_string()),
+        Event::GeneralRef(reference) => Some(reference_string(reference)),
+        _ => None,
+    }
+}
+
+/// Deepest nesting of tables inside tables the reader accepts.
+///
+/// Nested tables are the one place a parsed document is a tree, and every
+/// consumer of that tree recurses once per level: dropping it, collecting the
+/// table of contents, serializing it, shredding it into Arrow tables. In a
+/// debug build on a 256 KiB thread stack the JSON serializer is the first to
+/// overflow, between 64 and 80 levels; 32 leaves it less than half of that
+/// stack. Real documents nest a handful of levels. Raising this needs the
+/// measurement redone: `tests/malformed_input_smoke.rs` walks a document at
+/// exactly this depth on such a stack.
+const MAX_TABLE_DEPTH: usize = 32;
 
 fn local_name(name: &[u8]) -> &[u8] {
     match name.iter().position(|b| *b == b':') {
@@ -1756,9 +2437,16 @@ fn local_name(name: &[u8]) -> &[u8] {
 #[derive(Debug)]
 struct DocxBodyParser<'a> {
     styles_by_id: HashMap<String, StyleRef>,
+    style_fonts: &'a StyleFonts,
     fields_out: &'a mut Vec<Field>,
     revisions_out: &'a mut Vec<Revision>,
     revision_ids: HashSet<String>,
+    /// Header and footer references met so far, when the caller wants them.
+    section_refs: Option<Vec<HeaderFooterRef>>,
+    /// Set when a parse that collects references fails the way
+    /// [`parse_header_footer_refs`] would at the same place: the error that
+    /// search reports.
+    reference_search_error: Option<anyhow::Error>,
     containers: Vec<Container>,
     current_paragraph: Option<ParagraphBuilder>,
     current_run: Option<RunBuilder>,
@@ -1766,9 +2454,19 @@ struct DocxBodyParser<'a> {
     current_comment_ids: Vec<i32>,
     pending_comment_refs: Vec<i32>,
     current_revision_stack: Vec<RevisionInfo>,
+    /// Table containers currently on `containers`, kept under
+    /// [`MAX_TABLE_DEPTH`].
+    open_tables: usize,
+    /// The `w:tblStyle` of each open table, innermost last; `None` for a
+    /// table that names no style.
+    table_styles: Vec<Option<String>>,
     in_ppr: bool,
     in_rpr: bool,
     in_numpr: bool,
+    /// How many `w:rPrChange` / `w:pPrChange` elements are open. They hold
+    /// the properties a run or paragraph had before a tracked formatting
+    /// change, which say nothing about how it is formatted now.
+    old_properties_depth: usize,
     in_text: bool,
     in_instr: bool,
 }
@@ -1823,6 +2521,12 @@ struct RunBuilder {
     revision: Option<RevisionRef>,
     comment_ids: Vec<i32>,
     note_references: Vec<NoteReference>,
+    /// The run's own `w:rFonts`.
+    fonts: symbol::FontChoice,
+    /// The symbol fonts in effect for the run, worked out from `fonts` and
+    /// the run's styles when its first text arrives. Characters those fonts
+    /// give a meaning to are font codes, not text.
+    symbol_fonts: Option<symbol::SymbolFonts>,
 }
 
 #[derive(Debug)]
@@ -1844,6 +2548,7 @@ struct RevisionInfo {
 impl<'a> DocxBodyParser<'a> {
     fn new(
         styles: &[Style],
+        style_fonts: &'a StyleFonts,
         fields_out: &'a mut Vec<Field>,
         revisions_out: &'a mut Vec<Revision>,
     ) -> Self {
@@ -1859,9 +2564,12 @@ impl<'a> DocxBodyParser<'a> {
         }
         Self {
             styles_by_id,
+            style_fonts,
             fields_out,
             revisions_out,
             revision_ids: HashSet::new(),
+            section_refs: None,
+            reference_search_error: None,
             containers: vec![Container::Doc(Vec::new())],
             current_paragraph: None,
             current_run: None,
@@ -1869,9 +2577,12 @@ impl<'a> DocxBodyParser<'a> {
             current_comment_ids: Vec::new(),
             pending_comment_refs: Vec::new(),
             current_revision_stack: Vec::new(),
+            open_tables: 0,
+            table_styles: Vec::new(),
             in_ppr: false,
             in_rpr: false,
             in_numpr: false,
+            old_properties_depth: 0,
             in_text: false,
             in_instr: false,
         }
@@ -1885,39 +2596,59 @@ impl<'a> DocxBodyParser<'a> {
         self.current_comment_ids.clear();
         self.pending_comment_refs.clear();
         self.current_revision_stack.clear();
+        self.open_tables = 0;
+        self.table_styles.clear();
         self.in_ppr = false;
         self.in_rpr = false;
         self.in_numpr = false;
+        self.old_properties_depth = 0;
         self.in_text = false;
         self.in_instr = false;
     }
 
-    fn parse<R: BufRead>(&mut self, reader: R) -> Result<Vec<Block>> {
-        let mut reader = Reader::from_reader(reader);
-        reader.config_mut().trim_text(false);
+    fn parse<R: BufRead>(&mut self, reader: R, limit: usize) -> Result<Vec<Block>> {
+        PASS_COUNTS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
+        let mut reader = xml_reader(utf8_stream(reader, limit)?);
         let mut buf = Vec::new();
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
-                    let raw = e.name().as_ref().to_vec();
-                    let name = local_name(&raw);
-                    self.handle_start(&reader, &e, name)?;
+                    let qname = e.name();
+                    let name = local_name(qname.as_ref().as_bytes());
+                    self.note_section_ref(&e, name)?;
+                    self.handle_start(&e, name)?;
                 }
                 Ok(Event::Empty(e)) => {
-                    let raw = e.name().as_ref().to_vec();
-                    let name = local_name(&raw);
-                    self.handle_empty(&reader, &e, name)?;
+                    let qname = e.name();
+                    let name = local_name(qname.as_ref().as_bytes());
+                    self.note_section_ref(&e, name)?;
+                    self.handle_empty(&e, name)?;
                 }
                 Ok(Event::Text(e)) => {
-                    self.handle_text(e.unescape()?.as_bytes());
+                    self.handle_text(e.as_bytes());
+                }
+                // A reference arrives on its own, between the pieces of text
+                // around it, and is text like them.
+                Ok(Event::GeneralRef(e)) => {
+                    self.handle_text(reference_string(&e).as_bytes());
+                }
+                // CDATA is literal character data: no entity unescaping.
+                Ok(Event::CData(e)) => {
+                    self.handle_text(e.as_bytes());
                 }
                 Ok(Event::End(e)) => {
-                    let raw = e.name().as_ref().to_vec();
-                    let name = local_name(&raw);
+                    let qname = e.name();
+                    let name = local_name(qname.as_ref().as_bytes());
                     self.handle_end(name)?;
                 }
                 Ok(Event::Eof) => break,
-                Err(err) => return Err(anyhow!("parse document: {err}")),
+                Err(err) => {
+                    if self.section_refs.is_some() {
+                        self.reference_search_error =
+                            Some(anyhow!("parse header/footer refs: {err}"));
+                    }
+                    return Err(anyhow!("parse document: {err}"));
+                }
                 _ => {}
             }
             buf.clear();
@@ -1925,21 +2656,50 @@ impl<'a> DocxBodyParser<'a> {
         Ok(self.finish())
     }
 
-    fn handle_start<R: BufRead>(
+    /// Records `e` if it is a header or footer reference and the caller
+    /// asked for them. It is seen here, before anything is skipped, so the
+    /// list matches what [`parse_header_footer_refs`] finds.
+    fn note_section_ref(
         &mut self,
-        reader: &Reader<R>,
         e: &quick_xml::events::BytesStart<'_>,
         name: &[u8],
     ) -> Result<()> {
+        if let Some(refs) = self.section_refs.as_mut() {
+            match header_footer_ref(e, name) {
+                Ok(Some(reference)) => refs.push(reference),
+                Ok(None) => {}
+                // The error is kept twice because it cannot be cloned: once
+                // as this parse's own failure, once as what the reference
+                // search would say.
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    self.reference_search_error = Some(error);
+                    return Err(anyhow!(message));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_start(&mut self, e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Result<()> {
+        if matches!(name, b"rPrChange" | b"pPrChange" | b"tblPrChange") {
+            self.old_properties_depth += 1;
+            return Ok(());
+        }
+        // Old properties are skipped, except for the mark that a paragraph
+        // mark was itself inserted or deleted: that is a tracked change and
+        // stays in the list of revisions.
+        if self.old_properties_depth > 0
+            && !matches!(name, b"ins" | b"del" | b"moveFrom" | b"moveTo")
+        {
+            return Ok(());
+        }
         match name {
             b"p" => {
                 let mut paragraph = ParagraphBuilder::default();
-                for attr in e.attributes().flatten() {
-                    if local_name(attr.key.as_ref()) == b"paraId" {
-                        paragraph.id = Some(
-                            attr.decode_and_unescape_value(reader.decoder())?
-                                .to_string(),
-                        );
+                for attr in e.attributes().with_checks(false).flatten() {
+                    if local_name(attr.key.as_ref().as_bytes()) == b"paraId" {
+                        paragraph.id = Some(attribute_string(&attr));
                     }
                 }
                 self.current_paragraph = Some(paragraph);
@@ -1971,81 +2731,105 @@ impl<'a> DocxBodyParser<'a> {
             b"instrText" => {
                 self.in_instr = true;
             }
-            b"tab" => {
+            b"tab" | b"ptab" => {
                 self.push_text("\t");
             }
             b"br" | b"cr" => {
                 self.push_text("\n");
             }
+            // The output is plain text for matching, so a non-breaking hyphen
+            // is an ordinary hyphen: "non-breaking", not "nonbreaking".
+            b"noBreakHyphen" => {
+                self.push_text("-");
+            }
+            // A soft hyphen is only a line-break opportunity; the word is
+            // written without it.
+            b"softHyphen" => {}
+            b"sym" => {
+                let font = attr_value(e, b"font")?;
+                if let Some(ch) = attr_value(e, b"char")?
+                    .and_then(|code| symbol::sym_char(font.as_deref(), &code))
+                {
+                    self.push_text(ch.encode_utf8(&mut [0; 4]));
+                }
+            }
+            b"rFonts" if self.in_rpr => {
+                let fonts = font_choice(e)?;
+                if let Some(r) = self.current_run.as_mut() {
+                    r.fonts = fonts;
+                    r.symbol_fonts = None;
+                }
+            }
             b"pPr" => self.in_ppr = true,
             b"rPr" => self.in_rpr = true,
             b"numPr" => self.in_numpr = true,
             b"pStyle" if self.in_ppr => {
-                if let Some(val) = attr_value(reader, e, b"val")? {
+                if let Some(val) = attr_value(e, b"val")? {
                     if let Some(p) = self.current_paragraph.as_mut() {
                         p.style_id = Some(val);
                     }
                 }
             }
             b"outlineLvl" if self.in_ppr => {
-                if let Some(val) = attr_value(reader, e, b"val")? {
+                if let Some(val) = attr_value(e, b"val")? {
                     if let Some(p) = self.current_paragraph.as_mut() {
                         p.outline_level = val.parse::<u8>().ok();
                     }
                 }
             }
             b"numId" if self.in_numpr => {
-                if let Some(val) = attr_value(reader, e, b"val")? {
+                if let Some(val) = attr_value(e, b"val")? {
                     if let Some(p) = self.current_paragraph.as_mut() {
                         p.num_id = val.parse::<u32>().ok();
                     }
                 }
             }
             b"ilvl" if self.in_numpr => {
-                if let Some(val) = attr_value(reader, e, b"val")? {
+                if let Some(val) = attr_value(e, b"val")? {
                     if let Some(p) = self.current_paragraph.as_mut() {
                         p.num_level = val.parse::<u8>().ok();
                     }
                 }
             }
             b"rStyle" if self.in_rpr => {
-                if let Some(val) = attr_value(reader, e, b"val")? {
+                if let Some(val) = attr_value(e, b"val")? {
                     if let Some(r) = self.current_run.as_mut() {
                         r.style_id = Some(val);
+                        r.symbol_fonts = None;
                     }
                 }
             }
             b"b" if self.in_rpr => {
                 if let Some(r) = self.current_run.as_mut() {
-                    r.bold = parse_bool_attr(reader, e)?;
+                    r.bold = parse_bool_attr(e)?;
                 }
             }
             b"i" if self.in_rpr => {
                 if let Some(r) = self.current_run.as_mut() {
-                    r.italic = parse_bool_attr(reader, e)?;
+                    r.italic = parse_bool_attr(e)?;
                 }
             }
             b"u" if self.in_rpr => {
                 if let Some(r) = self.current_run.as_mut() {
-                    r.underline = parse_bool_attr(reader, e)?;
+                    r.underline = parse_bool_attr(e)?;
                 }
             }
             b"commentRangeStart" => {
-                if let Some(val) = attr_value(reader, e, b"id")? {
+                if let Some(val) = attr_value(e, b"id")? {
                     if let Ok(id) = val.parse::<i32>() {
                         self.current_comment_ids.push(id);
                     }
                 }
             }
             b"commentRangeEnd" => {
-                if let Some(val) = attr_value(reader, e, b"id")? {
+                if let Some(val) = attr_value(e, b"id")? {
                     if let Ok(id) = val.parse::<i32>() {
                         self.current_comment_ids.retain(|v| *v != id);
                     }
                 }
             }
             b"commentReference" => {
-                if let Some(val) = attr_value(reader, e, b"id")? {
+                if let Some(val) = attr_value(e, b"id")? {
                     if let Ok(id) = val.parse::<i32>() {
                         if let Some(run) = self.current_run.as_mut() {
                             run.comment_ids.push(id);
@@ -2056,8 +2840,7 @@ impl<'a> DocxBodyParser<'a> {
                 }
             }
             b"footnoteReference" | b"endnoteReference" => {
-                if let Some(id) =
-                    attr_value(reader, e, b"id")?.and_then(|value| value.parse::<i32>().ok())
+                if let Some(id) = attr_value(e, b"id")?.and_then(|value| value.parse::<i32>().ok())
                 {
                     if let Some(run) = self.current_run.as_mut() {
                         run.note_references.push(NoteReference {
@@ -2079,22 +2862,14 @@ impl<'a> DocxBodyParser<'a> {
                     author: None,
                     date: None,
                 };
-                for attr in e.attributes().flatten() {
-                    let key = local_name(attr.key.as_ref());
+                for attr in e.attributes().with_checks(false).flatten() {
+                    let key = local_name(attr.key.as_ref().as_bytes());
                     if key == b"id" {
-                        info.id = attr
-                            .decode_and_unescape_value(reader.decoder())?
-                            .to_string();
+                        info.id = attribute_string(&attr);
                     } else if key == b"author" {
-                        info.author = Some(
-                            attr.decode_and_unescape_value(reader.decoder())?
-                                .to_string(),
-                        );
+                        info.author = Some(attribute_string(&attr));
                     } else if key == b"date" {
-                        info.date = Some(
-                            attr.decode_and_unescape_value(reader.decoder())?
-                                .to_string(),
-                        );
+                        info.date = Some(attribute_string(&attr));
                     }
                 }
                 if !info.id.is_empty() && self.revision_ids.insert(info.id.clone()) {
@@ -2108,7 +2883,7 @@ impl<'a> DocxBodyParser<'a> {
                 self.current_revision_stack.push(info);
             }
             b"fldChar" => {
-                if let Some(val) = attr_value(reader, e, b"fldCharType")? {
+                if let Some(val) = attr_value(e, b"fldCharType")? {
                     if val == "begin" {
                         let id = (self.fields_out.len() + 1) as u32;
                         self.current_field_stack.push(FieldBuilder {
@@ -2130,7 +2905,7 @@ impl<'a> DocxBodyParser<'a> {
             }
             b"fldSimple" => {
                 let id = (self.fields_out.len() + 1) as u32;
-                let instr = attr_value(reader, e, b"instr")?.unwrap_or_default();
+                let instr = attr_value(e, b"instr")?.unwrap_or_default();
                 self.current_field_stack.push(FieldBuilder {
                     id,
                     instr,
@@ -2139,8 +2914,20 @@ impl<'a> DocxBodyParser<'a> {
                 });
             }
             b"tbl" => {
+                if self.open_tables >= MAX_TABLE_DEPTH {
+                    return Err(anyhow!(
+                        "tables nested more than {MAX_TABLE_DEPTH} deep are not supported"
+                    ));
+                }
+                self.open_tables += 1;
+                self.table_styles.push(None);
                 self.containers
                     .push(Container::Table(TableBuilder::default()));
+            }
+            b"tblStyle" => {
+                if let Some(style) = self.table_styles.last_mut() {
+                    *style = attr_value(e, b"val")?;
+                }
             }
             b"tr" => {
                 self.containers
@@ -2155,19 +2942,20 @@ impl<'a> DocxBodyParser<'a> {
         Ok(())
     }
 
-    fn handle_empty<R: BufRead>(
-        &mut self,
-        reader: &Reader<R>,
-        e: &quick_xml::events::BytesStart<'_>,
-        name: &[u8],
-    ) -> Result<()> {
+    fn handle_empty(&mut self, e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Result<()> {
         // Treat empty tags as start+end for our purposes.
-        self.handle_start(reader, e, name)?;
+        self.handle_start(e, name)?;
         self.handle_end(name)
     }
 
     fn handle_text(&mut self, text: &[u8]) {
-        let value = String::from_utf8_lossy(text);
+        let mut value = String::from_utf8_lossy(text);
+        if self.in_text {
+            let fonts = self.run_symbol_fonts();
+            if !fonts.is_empty() {
+                value = fonts.map_run_text(&value).into();
+            }
+        }
         if self.in_instr {
             if let Some(field) = self.current_field_stack.last_mut() {
                 field.instr.push_str(&value);
@@ -2187,7 +2975,51 @@ impl<'a> DocxBodyParser<'a> {
         }
     }
 
+    /// The symbol fonts in effect for the current run.
+    ///
+    /// Run properties come before the run's text, so the answer is worked
+    /// out once, at the first text, and kept for the rest of the run.
+    fn run_symbol_fonts(&mut self) -> symbol::SymbolFonts {
+        let Some(run) = self.current_run.as_mut() else {
+            return symbol::SymbolFonts::default();
+        };
+        if let Some(fonts) = run.symbol_fonts {
+            return fonts;
+        }
+        let fonts = if self.style_fonts.is_empty() {
+            run.fonts.symbol_fonts()
+        } else {
+            let paragraph_style = self
+                .current_paragraph
+                .as_ref()
+                .and_then(|paragraph| paragraph.style_id.as_deref());
+            let table_style = self.table_styles.last().map(Option::as_deref);
+            self.style_fonts
+                .effective(
+                    run.fonts,
+                    run.style_id.as_deref(),
+                    paragraph_style,
+                    table_style,
+                )
+                .symbol_fonts()
+        };
+        run.symbol_fonts = Some(fonts);
+        fonts
+    }
+
     fn handle_end(&mut self, name: &[u8]) -> Result<()> {
+        if matches!(name, b"rPrChange" | b"pPrChange" | b"tblPrChange") {
+            self.old_properties_depth = self.old_properties_depth.saturating_sub(1);
+            return Ok(());
+        }
+        // Old properties are skipped, except for the mark that a paragraph
+        // mark was itself inserted or deleted: that is a tracked change and
+        // stays in the list of revisions.
+        if self.old_properties_depth > 0
+            && !matches!(name, b"ins" | b"del" | b"moveFrom" | b"moveTo")
+        {
+            return Ok(());
+        }
         match name {
             b"p" => {
                 self.flush_run();
@@ -2216,7 +3048,7 @@ impl<'a> DocxBodyParser<'a> {
                 }
             }
             b"tc" => {
-                if let Some(Container::Cell(cell)) = self.containers.pop() {
+                if let Some(Container::Cell(cell)) = self.pop_container() {
                     if let Some(Container::Row(row)) = self.containers.last_mut() {
                         row.cells.push(TableCell {
                             blocks: cell.blocks,
@@ -2225,14 +3057,15 @@ impl<'a> DocxBodyParser<'a> {
                 }
             }
             b"tr" => {
-                if let Some(Container::Row(row)) = self.containers.pop() {
+                if let Some(Container::Row(row)) = self.pop_container() {
                     if let Some(Container::Table(table)) = self.containers.last_mut() {
                         table.rows.push(TableRow { cells: row.cells });
                     }
                 }
             }
             b"tbl" => {
-                if let Some(Container::Table(table)) = self.containers.pop() {
+                self.table_styles.pop();
+                if let Some(Container::Table(table)) = self.pop_container() {
                     let block = Block::Table(Table { rows: table.rows });
                     self.push_block(block);
                 }
@@ -2240,6 +3073,15 @@ impl<'a> DocxBodyParser<'a> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Pops the innermost container, keeping the open-table count in step.
+    fn pop_container(&mut self) -> Option<Container> {
+        let container = self.containers.pop();
+        if matches!(container, Some(Container::Table(_))) {
+            self.open_tables = self.open_tables.saturating_sub(1);
+        }
+        container
     }
 
     fn push_text(&mut self, value: &str) {
@@ -2323,7 +3165,7 @@ impl<'a> DocxBodyParser<'a> {
 
     fn finish(&mut self) -> Vec<Block> {
         while self.containers.len() > 1 {
-            if let Some(container) = self.containers.pop() {
+            if let Some(container) = self.pop_container() {
                 match container {
                     Container::Cell(cell) => {
                         if let Some(Container::Row(row)) = self.containers.last_mut() {
@@ -2367,11 +3209,8 @@ impl<'a> DocxBodyParser<'a> {
     }
 }
 
-fn parse_bool_attr<R: BufRead>(
-    reader: &Reader<R>,
-    e: &quick_xml::events::BytesStart<'_>,
-) -> Result<bool> {
-    if let Some(val) = attr_value(reader, e, b"val")? {
+fn parse_bool_attr(e: &quick_xml::events::BytesStart<'_>) -> Result<bool> {
+    if let Some(val) = attr_value(e, b"val")? {
         Ok(val == "1" || val.eq_ignore_ascii_case("true"))
     } else {
         Ok(true)
@@ -2380,6 +3219,7 @@ fn parse_bool_attr<R: BufRead>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use ooxml_archive::{parse_root_rels, rels_path_for_part, resolve_part};
 
     #[test]
@@ -2409,5 +3249,127 @@ mod tests {
             resolve_part("word", "../docProps/core.xml"),
             "docProps/core.xml"
         );
+    }
+
+    fn body_paragraphs(inner: &str) -> Vec<String> {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{inner}</w:body></w:document>"#
+        );
+        paragraphs_of(xml.into_bytes())
+    }
+
+    fn paragraphs_of(xml: Vec<u8>) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut revisions = Vec::new();
+        parse_document_blocks(
+            Cursor::new(xml),
+            ooxml_archive::DEFAULT_MAX_INFLATE,
+            &[],
+            &StyleFonts::default(),
+            &mut fields,
+            &mut revisions,
+        )
+        .expect("document parses")
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Paragraph(paragraph) => Some(paragraph.text),
+            _ => None,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn sym_elements_contribute_their_character() {
+        assert_eq!(
+            body_paragraphs(
+                r#"<w:p><w:r><w:t>x </w:t><w:sym w:font="Symbol" w:char="F0B3"/><w:t> y</w:t></w:r></w:p>"#
+            ),
+            ["x ≥ y"]
+        );
+        // A font without a mapping table: the stored code point is kept,
+        // never dropped.
+        assert_eq!(
+            body_paragraphs(
+                r#"<w:p><w:r><w:t>ok</w:t><w:sym w:font="Cambria Math" w:char="F0FC"/><w:t>end</w:t></w:r></w:p>"#
+            ),
+            ["ok\u{F0FC}end"]
+        );
+    }
+
+    #[test]
+    fn symbol_font_run_text_maps_private_use_characters() {
+        assert_eq!(
+            body_paragraphs(concat!(
+                r#"<w:p><w:r><w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol"/></w:rPr>"#,
+                "<w:t>\u{F061}\u{F062}</w:t></w:r>",
+                "<w:r><w:t>\u{F061} plain</w:t></w:r></w:p>",
+            )),
+            ["αβ\u{F061} plain"]
+        );
+    }
+
+    #[test]
+    fn hyphen_and_tab_elements_become_text() {
+        assert_eq!(
+            body_paragraphs(concat!(
+                "<w:p><w:r><w:t>non</w:t><w:noBreakHyphen/><w:t>breaking co</w:t>",
+                "<w:softHyphen/><w:t>op a</w:t><w:ptab w:alignment=\"right\"/><w:t>b</w:t>",
+                "<w:tab/><w:t>c</w:t></w:r></w:p>",
+            )),
+            ["non-breaking coop a\tb\tc"]
+        );
+    }
+
+    #[test]
+    fn cdata_text_is_kept_literally() {
+        assert_eq!(
+            body_paragraphs("<w:p><w:r><w:t><![CDATA[café <raw> &amp;]]></w:t></w:r></w:p>"),
+            ["café <raw> &amp;"]
+        );
+    }
+
+    #[test]
+    fn entities_and_unicode_text_round_trip() {
+        assert_eq!(
+            body_paragraphs(concat!(
+                "<w:p><w:r><w:t xml:space=\"preserve\"> a &amp; b &lt;c&gt; &#233; &#x1F600; ",
+                "caf\u{e9}\u{a0}日本語 e\u{301} </w:t></w:r></w:p>",
+            )),
+            [" a & b <c> é 😀 café\u{a0}日本語 e\u{301} "]
+        );
+    }
+
+    #[test]
+    fn one_invalid_byte_costs_one_character_not_the_document() {
+        let mut xml = br#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>caf@ ok &amp; fine</w:t></w:r></w:p></w:body></w:document>"#.to_vec();
+        let at = xml.iter().position(|byte| *byte == b'@').unwrap();
+        xml[at] = 0xE9;
+        assert_eq!(paragraphs_of(xml), ["caf\u{fffd} ok & fine"]);
+    }
+
+    #[test]
+    fn notes_and_comments_share_the_text_handling() {
+        let notes = parse_notes(
+            br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="2"><w:p><w:r><w:t><![CDATA[a<b]]></w:t><w:noBreakHyphen/><w:sym w:font="Symbol" w:char="F061"/></w:r></w:p></w:footnote></w:footnotes>"#,
+            b"footnote",
+            &[],
+            &StyleFonts::default(),
+        )
+        .unwrap();
+        let Block::Paragraph(paragraph) = &notes[0].blocks[0] else {
+            panic!("footnote holds a paragraph");
+        };
+        assert_eq!(paragraph.text, "a<b-α");
+
+        let comments = parse_comments(
+            br#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1"><w:p><w:r><w:t><![CDATA[x&y]]></w:t><w:sym w:font="Symbol" w:char="F062"/></w:r></w:p></w:comment></w:comments>"#,
+            &[],
+            &StyleFonts::default(),
+        )
+        .unwrap();
+        let Block::Paragraph(paragraph) = &comments[0].blocks[0] else {
+            panic!("comment holds a paragraph");
+        };
+        assert_eq!(paragraph.text, "x&yβ");
     }
 }

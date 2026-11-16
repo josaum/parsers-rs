@@ -1,6 +1,6 @@
 [package]
 name = "xlsx-fast-node"
-version = "0.2.6"
+version = "0.2.12"
 edition.workspace = true
 authors.workspace = true
 description = "Node.js bindings for xlsx-fast-core"
@@ -20,3 +20,6 @@ serde_json = { workspace = true }
 
 [build-dependencies]
 napi-build = { workspace = true }
+
+[lints]
+workspace = true

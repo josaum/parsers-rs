@@ -96,7 +96,6 @@ impl ThermalParser {
         //  44..48  : height
 
         let raw_offset = Self::read_le_u32(fff, 32) as usize;
-        let raw_length = Self::read_le_u32(fff, 36) as usize;
         let width = Self::read_le_u32(fff, 40);
         let height = Self::read_le_u32(fff, 44);
 
@@ -113,8 +112,6 @@ impl ThermalParser {
         } else {
             (width, height)
         };
-
-        let pixel_count = (width * height) as usize;
 
         // Try to read Planck constants from the FFF record (offsets 48..88)
         let planck = if fff.len() >= 88 {
@@ -151,23 +148,25 @@ impl ThermalParser {
             1.0
         };
 
-        // Extract raw 16-bit radiometric data
-        let raw_start = fff_offset + raw_offset;
-        let raw_end = raw_start + raw_length;
-        let expected_bytes = pixel_count * 2;
-
-        let raw_slice = if (raw_end <= data.len() && raw_length >= expected_bytes)
-            || fff_offset + raw_offset + expected_bytes <= data.len()
-        {
-            &data[raw_start..raw_start + expected_bytes]
-        } else {
-            return Err(GeoError::InvalidFormat(format!(
-                "FLIR raw data out of bounds: need {} bytes at offset {}, file has {} bytes",
-                expected_bytes,
-                raw_start,
-                data.len()
-            )));
-        };
+        // Extract raw 16-bit radiometric data: two bytes per pixel, starting
+        // `raw_offset` bytes into the record. The dimensions and the offset
+        // come from the record header, so the range they describe is computed
+        // with checked arithmetic and must lie inside the file; the record's
+        // own length field (36..40) adds nothing to that test.
+        let raw_slice = crate::geotiff::pixel_count(width, height)
+            .ok()
+            .and_then(|pixels| pixels.checked_mul(2))
+            .zip(fff_offset.checked_add(raw_offset))
+            .and_then(|(expected_bytes, raw_start)| {
+                data.get(raw_start..raw_start.checked_add(expected_bytes)?)
+            })
+            .ok_or_else(|| {
+                GeoError::InvalidFormat(format!(
+                    "FLIR raw data out of bounds: need {width}x{height} 16-bit samples at \
+                     offset {raw_offset} of the FFF record, file has {} bytes",
+                    data.len()
+                ))
+            })?;
 
         // Decode LE u16 values
         let raw_values: Vec<u16> = raw_slice
@@ -205,11 +204,10 @@ impl ThermalParser {
     /// raw radiometric values.  Common for Seek Thermal, DJI Zenmuse XT2.
     pub fn parse_thermal_tiff(data: &[u8]) -> Result<(ThermalMetadata, Vec<f32>), GeoError> {
         use std::io::Cursor;
-        use tiff::decoder::Decoder;
 
-        let cursor = Cursor::new(data);
-        let mut decoder = Decoder::new(cursor)
-            .map_err(|e| GeoError::Tiff(format!("Failed to open thermal TIFF: {e}")))?;
+        // Decoder limits follow `data.len()`, so the header cannot claim a
+        // raster larger than the file could hold.
+        let mut decoder = crate::geotiff::open_decoder(Cursor::new(data))?;
 
         let (width, height) = decoder
             .dimensions()
@@ -229,16 +227,14 @@ impl ThermalParser {
             }
         };
 
-        let pixel_count = (width * height) as usize;
-        let raw_slice = if raw_values.len() >= pixel_count {
-            &raw_values[..pixel_count]
-        } else {
-            return Err(GeoError::InvalidFormat(format!(
+        let pixel_count = crate::geotiff::pixel_count(width, height)?;
+        let raw_slice = raw_values.get(..pixel_count).ok_or_else(|| {
+            GeoError::InvalidFormat(format!(
                 "TIFF has {} pixels but only {} values decoded",
                 pixel_count,
                 raw_values.len()
-            )));
-        };
+            ))
+        })?;
 
         let planck = PlanckConstants::default();
         let emissivity: f32 = 0.95;

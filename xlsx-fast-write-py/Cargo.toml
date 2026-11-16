@@ -1,6 +1,6 @@
 [package]
 name = "xlsx-fast-write-py"
-version = "0.2.0"
+version = "0.2.6"
 edition.workspace = true
 authors.workspace = true
 description = "Python bindings for xlsx-fast-write (sovereign XLSX writer)"
@@ -17,4 +17,7 @@ pyo3 = { workspace = true }
 xlsx-fast-write = { path = "../xlsx-fast-write" }
 
 [build-dependencies]
-pyo3-build-config = "0.28.3"
+pyo3-build-config = "0.29.3"
+
+[lints]
+workspace = true

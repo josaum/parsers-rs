@@ -35,7 +35,7 @@ fn particle_names(content: &ContentModel) -> Vec<String> {
         .filter_map(|particle| match &particle.element {
             ElementRef::Inline(decl) => Some(decl.name.local.clone()),
             ElementRef::Ref(qn) => Some(qn.local.clone()),
-            ElementRef::Group(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -270,6 +270,7 @@ fn nested_choice_in_sequence_becomes_group() {
 
 // ── Backward-compatibility snapshot ─────────────────────────────────────────
 
+#[cfg(feature = "arrow")]
 const SNAPSHOT_XSD: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
            targetNamespace="urn:test" elementFormDefault="qualified">

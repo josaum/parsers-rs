@@ -10,7 +10,7 @@ fn map_err(e: impl std::fmt::Display) -> Error {
 
 /// List all global element names in the schema.
 /// Follows xs:include / xs:import relative paths automatically.
-#[napi]
+#[napi(catch_unwind)]
 pub fn list_elements(schema_path: String, max_includes: Option<u32>) -> Result<Vec<String>> {
     let opts = ParseOptions {
         max_includes: max_includes.unwrap_or(64) as usize,
@@ -21,7 +21,7 @@ pub fn list_elements(schema_path: String, max_includes: Option<u32>) -> Result<V
 }
 
 /// Return Arrow schema description for a root element as a JSON string.
-#[napi]
+#[napi(catch_unwind)]
 pub fn describe_element_json(
     schema_path: String,
     element: String,
@@ -55,7 +55,7 @@ pub fn describe_element_json(
 }
 
 /// Validate an XML file against the schema. Returns JSON string.
-#[napi]
+#[napi(catch_unwind)]
 pub fn validate_json(
     schema_path: String,
     xml_path: String,
@@ -75,7 +75,7 @@ pub fn validate_json(
 }
 
 /// Validate XML bytes against the schema. Returns JSON string.
-#[napi]
+#[napi(catch_unwind)]
 pub fn validate_bytes_json(
     schema_path: String,
     xml_bytes: Buffer,
@@ -96,7 +96,7 @@ pub fn validate_bytes_json(
 }
 
 /// Write Arrow IPC schema description for a root element to a file path.
-#[napi]
+#[napi(catch_unwind)]
 pub fn write_schema_ipc(
     schema_path: String,
     element: String,
@@ -118,7 +118,7 @@ pub fn write_schema_ipc(
 }
 
 /// Return Arrow IPC schema description bytes for a root element.
-#[napi]
+#[napi(catch_unwind)]
 pub fn schema_ipc_bytes(
     schema_path: String,
     element: String,
@@ -137,6 +137,45 @@ pub fn schema_ipc_bytes(
         .write_schema_ipc(&element, arrow_opts, &mut buf)
         .map_err(map_err)?;
     Ok(buf.into())
+}
+
+/// Describe the Arrow schema of every global element in one pass.
+///
+/// Returns a JSON object mapping each element name to its field list. An
+/// element whose schema cannot be derived is an error, not an omission.
+#[napi(catch_unwind)]
+pub fn all_arrow_schemas_json(
+    schema_path: String,
+    max_depth: Option<u32>,
+    map_dates: Option<bool>,
+    include_attributes: Option<bool>,
+) -> Result<String> {
+    let arrow_opts = ArrowOptions {
+        max_depth: max_depth.unwrap_or(8) as usize,
+        map_date_types: map_dates.unwrap_or(true),
+        include_attributes: include_attributes.unwrap_or(true),
+        batch_size: 8_192,
+    };
+    let schema = SchemaSet::load(schema_path, ParseOptions::default()).map_err(map_err)?;
+    let schemas = schema.try_all_arrow_schemas(arrow_opts).map_err(map_err)?;
+    let described: serde_json::Map<String, serde_json::Value> = schemas
+        .into_iter()
+        .map(|(name, arrow_schema)| {
+            let fields: Vec<serde_json::Value> = arrow_schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "path": f.name(),
+                        "arrow_type": format!("{:?}", f.data_type()),
+                        "nullable": f.is_nullable(),
+                    })
+                })
+                .collect();
+            (name, serde_json::Value::Array(fields))
+        })
+        .collect();
+    serde_json::to_string(&described).map_err(map_err)
 }
 
 #[cfg(test)]

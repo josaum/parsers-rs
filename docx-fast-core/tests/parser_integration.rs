@@ -2,7 +2,7 @@ use docx_fast_core::{parse_docx, Block, ParseOptions};
 use std::fs::File;
 use std::path::Path;
 use tempfile::tempdir;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 fn write_part(writer: &mut ZipWriter<File>, path: &str, contents: &str) {
@@ -15,7 +15,7 @@ fn write_part_compressed(
     contents: &str,
     compression: CompressionMethod,
 ) {
-    let options = FileOptions::default().compression_method(compression);
+    let options = SimpleFileOptions::default().compression_method(compression);
     writer.start_file(path, options).unwrap();
     std::io::Write::write_all(writer, contents.as_bytes()).unwrap();
 }

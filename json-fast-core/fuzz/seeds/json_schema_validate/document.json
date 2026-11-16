@@ -1,0 +1,3 @@
+{"id":10452,"name":"Ana é \"q\"","tags":["a","b",null],"score":-1.5e3,
+"active":true,"address":{"street":"Av. Paulista","n":1000,"geo":[-23.5,-46.6]},"email":"a@example.org",
+"when":"2026-01-02T03:04:05Z","big":18446744073709551615,"nested":[[[{"k":[]}]]]}

@@ -2,7 +2,7 @@
 
 Reviewed against the published specifications on 2026-11-15; crawler/browser additions checked on 2026-11-16. This records the
 scope of the JSON, XML, GeoJSON, email, shared ZIP and binary Excel changes, not full
-certification of every format in the workspace. Arrow wire pins are unchanged.
+certification of every format in the workspace. The release retains upstream Arrow 58.4.1 wire pins.
 Binary Excel uses Calamine 0.38.0 (released 2026-11-02); its dependency subtree
 and the lockfile have been updated.
 
@@ -28,9 +28,9 @@ by each type's `parse` method; deriving `Deserialize` is not a substitute for it
 
 JSON:API resource contents, links, profiles and extensions are not fully validated
 or retained by this envelope API. JSON-RPC helpers handle individual messages,
-not batch dispatch. JSON Schema still reports warnings for unsupported constructs,
-including remote references and dynamic/recursive references; schema dialects,
-embedded resource scope, and arbitrary-precision numbers are not fully implemented.
+not batch dispatch. JSON Schema retains upstream resource-scoped references and dynamic references.
+Unresolved references fail closed; supported meta-schema references that are not
+bundled report warnings. Arbitrary-precision numbers are not implemented.
 These changes do not claim complete JSON Schema conformance.
 
 The shared ZIP reader still borrows stored bytes and enforces the aggregate inflate
@@ -126,7 +126,8 @@ compressed-rtf crate is a test-only independent fixture generator.
 `max_inflate` now caps input and aggregate decoded content separately, including
 MSG stream/RTF expansion checks. New Rust fields `max_mime_depth` (64),
 `max_mime_parts` (10,000) and `max_header_bytes` (256 KiB) bound structure. Input
-and root headers are checked before MIME parsing; mailparse also has an internal
+and root headers are checked before MIME parsing. Upstream also caps MIME
+container nesting at 32 before parsing; mailparse has an internal
 recursion cap, and the configured tree limits are checked before content decoding.
 These are not process-wide peak-memory or CPU limits. Attachment budgets apply
 to decoded payload bytes; MIME headers/Base64 overhead no longer cause false

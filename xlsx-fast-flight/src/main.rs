@@ -1,47 +1,129 @@
-use anyhow::anyhow;
-use arrow_flight::encode::FlightDataEncoderBuilder;
-use arrow_flight::error::FlightError;
-use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
-use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
-};
-use arrow_ipc::writer::IpcWriteOptions;
-use flight_ipc_config::{
-    capability_json, do_put_unsupported, parse_writer_policies_for_process, resolve_path,
-    split_query, url_decode, FlightIpcDirection, FlightIpcObservationGuard,
-    FlightRequestAuthVerifier, FlightRpcAction, ParserRoute, CAPABILITY_ACTION,
-};
-use futures::stream::BoxStream;
-use futures::StreamExt;
-use std::collections::VecDeque;
-use std::fs;
+//! The `.xlsx` Flight server. The server itself is
+//! `flight_ipc_config::table_server`, shared with the other parsers' servers;
+//! this file says what is particular to `.xlsx`: one `cells` table, its own
+//! command line, and its own query keys (`sheet`, `range`, `raw`, `dates`,
+//! `formulas`, `sheet_names`, `batch`, `threads`).
 use std::path::{Path, PathBuf};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status, Streaming};
+
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
+use flight_ipc_config::table_server::{TableFlightService, TableParser};
+use flight_ipc_config::{
+    capability_json, parse_writer_policies_for_process, url_decode, FlightRequestAuthVerifier,
+    ParserRoute,
+};
+use tonic::Status;
+use xlsx_fast_core::arrow::{self, ArrowOptions, RangeFilter};
+use xlsx_fast_core::{find_first_digit, ParseOptions};
 
 #[cfg(test)]
 #[path = "../../flight-ipc-config/test-support/mod.rs"]
 mod flight_auth_test_support;
-use xlsx_fast_core::arrow::{self, ArrowOptions, RangeFilter};
-use xlsx_fast_core::ParseOptions;
 
-#[derive(Clone)]
-struct XlsxFlightService {
-    root: PathBuf,
-    parse_options: ParseOptions,
-    arrow_options: ArrowOptions,
-    write_options: IpcWriteOptions,
-    /// Serialized once at startup; DoAction must not reserialize on every call.
-    capability_body: Vec<u8>,
-    auth_verifier: FlightRequestAuthVerifier,
+#[cfg(test)]
+use arrow_flight::flight_service_server::FlightService;
+#[cfg(all(test, unix))]
+use arrow_flight::FlightData;
+#[cfg(test)]
+use arrow_flight::{Action, Empty, FlightDescriptor};
+#[cfg(test)]
+use arrow_ipc::writer::IpcWriteOptions;
+#[cfg(test)]
+use flight_ipc_config::{do_put_unsupported, CAPABILITY_ACTION};
+#[cfg(test)]
+use tonic::Request;
+
+/// What `.xlsx` contributes to the shared server.
+struct Xlsx;
+
+impl TableParser for Xlsx {
+    type ParseOptions = ParseOptions;
+    type ArrowOptions = ArrowOptions;
+
+    const ROUTE: ParserRoute = ParserRoute::Xlsx;
+    const SERVER_NAME: &'static str = "xlsx-fast-flight";
+    const DEFAULT_BIND: &'static str = "0.0.0.0:50051";
+    const DEFAULT_TABLE: &'static str = "cells";
+    const MISSING_DEFAULT_SCHEMA: &'static str = "missing schema for default xlsx table";
+    const EXTENSIONS: &'static [&'static str] = &["xlsx", "xlsm", "xltx", "xltm", "xls", "xlsb"];
+    // Every workbook has the same schema, so GetSchema has never looked at
+    // the file it is asked about.
+    const GET_SCHEMA_READS_DESCRIPTOR: bool = false;
+
+    fn parse_options(max_inflate: usize) -> ParseOptions {
+        ParseOptions {
+            decode_dates: true,
+            include_formulas: false,
+            raw_values: false,
+            max_inflate,
+        }
+    }
+
+    fn arrow_options(batch_size: usize) -> ArrowOptions {
+        ArrowOptions {
+            batch_size,
+            include_sheet_names: true,
+            sheet_filter: None,
+            range_filter: None,
+            parallel_sheets: 0,
+        }
+    }
+
+    fn set_max_inflate(options: &mut ParseOptions, max_inflate: usize) {
+        options.max_inflate = max_inflate;
+    }
+
+    fn set_batch_size(options: &mut ArrowOptions, batch_size: usize) {
+        options.batch_size = batch_size;
+    }
+
+    fn list_tables() -> &'static [&'static str] {
+        &[Self::DEFAULT_TABLE]
+    }
+
+    fn schema_for_table(table: &str) -> Option<SchemaRef> {
+        (table == Self::DEFAULT_TABLE).then(arrow::schema)
+    }
+
+    fn parse_table_batches<F>(
+        path: &Path,
+        parse_options: ParseOptions,
+        arrow_options: ArrowOptions,
+        _table: &str,
+        emit: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(RecordBatch) -> anyhow::Result<()>,
+    {
+        arrow::parse_xlsx_to_arrow_batches(path, parse_options, arrow_options, emit)
+    }
+
+    /// The workbook keys, not the shared ones: `table` and `max_inflate` are
+    /// ignored here as they always were.
+    fn apply_query(
+        query: &str,
+        _table: &mut Option<String>,
+        parse_options: &mut ParseOptions,
+        arrow_options: &mut ArrowOptions,
+    ) -> Result<(), Status> {
+        let query = parse_query(query)?;
+        apply_query_overrides(&query, parse_options, arrow_options)?;
+        if let Some(filter) = query.sheet_filter {
+            arrow_options.sheet_filter = Some(filter);
+        }
+        if let Some(range) = query.range {
+            arrow_options.range_filter = Some(range);
+        }
+        Ok(())
+    }
 }
 
-impl XlsxFlightService {
-    fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        self.auth_verifier.verify_metadata(request.metadata())
-    }
+type XlsxFlightService = TableFlightService<Xlsx>;
+
+/// The name the tests below have always called the listing walk by.
+#[cfg(test)]
+fn collect_xlsx_paths(root: &Path, limit: usize) -> Result<Vec<PathBuf>, Status> {
+    flight_ipc_config::table_server::collect_paths::<Xlsx>(root, limit)
 }
 
 #[derive(Default, Debug, Clone)]
@@ -55,8 +137,6 @@ struct FlightQuery {
     batch_size: Option<usize>,
     parallel_sheets: Option<usize>,
 }
-
-const MAX_LIST_FLIGHTS: usize = 1024;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -149,406 +229,11 @@ async fn main() -> anyhow::Result<()> {
     println!("[xlsx-fast-flight] listening on {addr}");
 
     tonic::transport::Server::builder()
-        .add_service(FlightServiceServer::new(service))
+        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
         .serve(addr)
         .await?;
 
     Ok(())
-}
-
-#[tonic::async_trait]
-impl FlightService for XlsxFlightService {
-    type HandshakeStream = ReceiverStream<Result<HandshakeResponse, Status>>;
-    type ListFlightsStream = ReceiverStream<Result<FlightInfo, Status>>;
-    type DoGetStream = BoxStream<'static, Result<FlightData, Status>>;
-    type DoPutStream = ReceiverStream<Result<PutResult, Status>>;
-    type DoExchangeStream = BoxStream<'static, Result<FlightData, Status>>;
-    type DoActionStream = ReceiverStream<Result<arrow_flight::Result, Status>>;
-    type ListActionsStream = ReceiverStream<Result<ActionType, Status>>;
-
-    async fn handshake(
-        &self,
-        _request: Request<Streaming<HandshakeRequest>>,
-    ) -> Result<Response<Self::HandshakeStream>, Status> {
-        let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn list_flights(
-        &self,
-        request: Request<Criteria>,
-    ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        self.authorize(&request)?;
-        let root = self.root.clone();
-        let schema = arrow::schema();
-        let (tx, rx) = mpsc::channel(4);
-
-        std::thread::spawn(move || {
-            let root_canon = match root.canonicalize() {
-                Ok(path) => path,
-                Err(_) => {
-                    let _ = tx.blocking_send(Err(Status::internal("failed to resolve root")));
-                    return;
-                }
-            };
-            let paths = match collect_xlsx_paths(&root_canon, MAX_LIST_FLIGHTS) {
-                Ok(list) => list,
-                Err(err) => {
-                    let _ = tx.blocking_send(Err(err));
-                    return;
-                }
-            };
-
-            for path in paths {
-                let rel = match path.strip_prefix(&root_canon) {
-                    Ok(rel) => rel,
-                    Err(_) => continue,
-                };
-                let components = path_components(rel);
-                let rel_str = components.join("/");
-                let ticket = Ticket::new(rel_str);
-                let descriptor = FlightDescriptor::new_path(components);
-                let endpoint = FlightEndpoint::new().with_ticket(ticket);
-
-                let mut info = match FlightInfo::new().try_with_schema(schema.as_ref()) {
-                    Ok(info) => info,
-                    Err(err) => {
-                        let _ = tx.blocking_send(Err(to_status(err)));
-                        return;
-                    }
-                };
-                info = info.with_endpoint(endpoint).with_descriptor(descriptor);
-
-                if let Ok(meta) = fs::metadata(&path) {
-                    info = info.with_total_bytes(meta.len() as i64);
-                }
-
-                if tx.blocking_send(Ok(info)).is_err() {
-                    return;
-                }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn get_flight_info(
-        &self,
-        request: Request<FlightDescriptor>,
-    ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request)?;
-        let descriptor = request.into_inner();
-        let (path, query) = descriptor_to_request(&self.root, &descriptor)?;
-        ensure_query_supported(&query)?;
-        let ticket = Ticket::new(path_to_ticket(&self.root, &path));
-
-        let schema = arrow::schema();
-        let endpoint = FlightEndpoint::new().with_ticket(ticket);
-        let mut info = FlightInfo::new()
-            .try_with_schema(schema.as_ref())
-            .map_err(to_status)?
-            .with_endpoint(endpoint)
-            .with_descriptor(descriptor);
-        if let Ok(meta) = fs::metadata(&path) {
-            info = info.with_total_bytes(meta.len() as i64);
-        }
-
-        Ok(Response::new(info))
-    }
-
-    async fn poll_flight_info(
-        &self,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<PollInfo>, Status> {
-        Err(Status::unimplemented("poll_flight_info"))
-    }
-
-    async fn get_schema(
-        &self,
-        request: Request<FlightDescriptor>,
-    ) -> Result<Response<SchemaResult>, Status> {
-        self.authorize(&request)?;
-        let schema = arrow::schema();
-        let options = IpcWriteOptions::default();
-        let schema_ipc = arrow_flight::SchemaAsIpc::new(schema.as_ref(), &options);
-        let result = SchemaResult::try_from(schema_ipc).map_err(to_status)?;
-        Ok(Response::new(result))
-    }
-
-    async fn do_get(
-        &self,
-        request: Request<Ticket>,
-    ) -> Result<Response<Self::DoGetStream>, Status> {
-        self.authorize(&request)?;
-        let observation = FlightIpcObservationGuard::new(
-            ParserRoute::Xlsx,
-            FlightIpcDirection::Read,
-            FlightRpcAction::DoGet,
-        );
-        let ticket = request.into_inner();
-        let (path, query) = ticket_to_request(&self.root, &ticket)?;
-        ensure_query_supported(&query)?;
-        let mut parse_options = self.parse_options;
-        let mut arrow_options = self.arrow_options.clone();
-        apply_query_overrides(&query, &mut parse_options, &mut arrow_options)?;
-        if let Some(filter) = query.sheet_filter {
-            arrow_options.sheet_filter = Some(filter);
-        }
-        if let Some(range) = query.range {
-            arrow_options.range_filter = Some(range);
-        }
-        let schema = arrow::schema();
-
-        let (tx, rx) =
-            mpsc::channel::<std::result::Result<arrow_array::RecordBatch, FlightError>>(2);
-
-        std::thread::spawn(move || {
-            let result =
-                arrow::parse_xlsx_to_arrow_batches(&path, parse_options, arrow_options, |batch| {
-                    tx.blocking_send(Ok(batch))
-                        .map_err(|_| anyhow!("flight client dropped"))?;
-                    Ok(())
-                });
-            if let Err(err) = result {
-                let io_err = std::io::Error::other(err);
-                let _ = tx.blocking_send(Err(FlightError::from_external_error(Box::new(io_err))));
-            }
-        });
-
-        let batch_stream = ReceiverStream::new(rx);
-        let write_options = self.write_options.clone();
-        let flight_stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .with_options(write_options)
-            .build(batch_stream);
-
-        let output = flight_ipc_config::observe_flight_stream(
-            flight_stream.map(|res| res.map_err(to_status)),
-            observation,
-        );
-        Ok(Response::new(output))
-    }
-
-    async fn do_put(
-        &self,
-        _request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(do_put_unsupported())
-    }
-
-    async fn do_exchange(
-        &self,
-        request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        self.authorize(&request)?;
-        let observation = FlightIpcObservationGuard::new(
-            ParserRoute::Xlsx,
-            FlightIpcDirection::Read,
-            FlightRpcAction::DoExchange,
-        );
-        let mut inbound = request.into_inner();
-        let first = inbound
-            .message()
-            .await
-            .map_err(|_| Status::invalid_argument("invalid exchange stream"))?
-            .ok_or_else(|| Status::invalid_argument("exchange missing initial message"))?;
-
-        tokio::spawn(async move {
-            let mut inbound = inbound;
-            while let Ok(Some(_)) = inbound.message().await {}
-        });
-
-        let (path, query) = if let Some(descriptor) = first.flight_descriptor {
-            descriptor_to_request(&self.root, &descriptor)?
-        } else if !first.app_metadata.is_empty() {
-            let ticket = Ticket::new(first.app_metadata);
-            ticket_to_request(&self.root, &ticket)?
-        } else {
-            return Err(Status::invalid_argument(
-                "exchange requires descriptor or app_metadata path",
-            ));
-        };
-
-        let mut parse_options = self.parse_options;
-        let mut arrow_options = self.arrow_options.clone();
-        apply_query_overrides(&query, &mut parse_options, &mut arrow_options)?;
-        if let Some(filter) = query.sheet_filter {
-            arrow_options.sheet_filter = Some(filter);
-        }
-        if let Some(range) = query.range {
-            arrow_options.range_filter = Some(range);
-        }
-        let schema = arrow::schema();
-
-        let (tx, rx) =
-            mpsc::channel::<std::result::Result<arrow_array::RecordBatch, FlightError>>(2);
-        std::thread::spawn(move || {
-            let result =
-                arrow::parse_xlsx_to_arrow_batches(&path, parse_options, arrow_options, |batch| {
-                    tx.blocking_send(Ok(batch))
-                        .map_err(|_| anyhow!("flight client dropped"))?;
-                    Ok(())
-                });
-            if let Err(err) = result {
-                let io_err = std::io::Error::other(err);
-                let _ = tx.blocking_send(Err(FlightError::from_external_error(Box::new(io_err))));
-            }
-        });
-
-        let batch_stream = ReceiverStream::new(rx);
-        let write_options = self.write_options.clone();
-        let flight_stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .with_options(write_options)
-            .build(batch_stream);
-
-        let output = flight_ipc_config::observe_flight_stream(
-            flight_stream.map(|res| res.map_err(to_status)),
-            observation,
-        );
-        Ok(Response::new(output))
-    }
-
-    async fn do_action(
-        &self,
-        request: Request<Action>,
-    ) -> Result<Response<Self::DoActionStream>, Status> {
-        self.authorize(&request)?;
-        let action = request.into_inner();
-        if action.r#type != CAPABILITY_ACTION {
-            return Err(Status::unimplemented("do_action"));
-        }
-        let (tx, rx) = mpsc::channel(1);
-        tx.send(Ok(arrow_flight::Result {
-            body: self.capability_body.clone().into(),
-        }))
-        .await
-        .map_err(|_| Status::internal("capability response failed"))?;
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn list_actions(
-        &self,
-        request: Request<Empty>,
-    ) -> Result<Response<Self::ListActionsStream>, Status> {
-        self.authorize(&request)?;
-        let (tx, rx) = mpsc::channel(1);
-        tx.send(Ok(ActionType {
-            r#type: CAPABILITY_ACTION.to_owned(),
-            description: "cached codec capabilities".to_owned(),
-        }))
-        .await
-        .map_err(|_| Status::internal("capability listing failed"))?;
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-}
-
-fn descriptor_to_request(
-    root: &Path,
-    descriptor: &FlightDescriptor,
-) -> Result<(PathBuf, FlightQuery), Status> {
-    if !descriptor.path.is_empty() {
-        let mut parts = descriptor.path.clone();
-        let mut query = FlightQuery::default();
-        if let Some(last) = parts.last_mut() {
-            let last_value = last.clone();
-            if let Some((base, q)) = split_query(&last_value) {
-                *last = base.to_string();
-                query = parse_query(q)?;
-            }
-        }
-        let path = parts.into_iter().fold(PathBuf::new(), |mut buf, part| {
-            buf.push(part);
-            buf
-        });
-        resolve_path(root, &path).map(|path| (path, query))
-    } else if !descriptor.cmd.is_empty() {
-        let cmd = std::str::from_utf8(&descriptor.cmd)
-            .map_err(|_| Status::invalid_argument("descriptor cmd must be utf-8 path"))?;
-        let (path_str, query) = split_query(cmd).unwrap_or((cmd, ""));
-        let query = if query.is_empty() {
-            FlightQuery::default()
-        } else {
-            parse_query(query)?
-        };
-        resolve_path(root, Path::new(path_str)).map(|path| (path, query))
-    } else {
-        Err(Status::invalid_argument("missing flight descriptor path"))
-    }
-}
-
-fn ticket_to_request(root: &Path, ticket: &Ticket) -> Result<(PathBuf, FlightQuery), Status> {
-    let path = std::str::from_utf8(&ticket.ticket)
-        .map_err(|_| Status::invalid_argument("ticket must be utf-8 path"))?;
-    let (path_str, query_str) = split_query(path).unwrap_or((path, ""));
-    let query = if query_str.is_empty() {
-        FlightQuery::default()
-    } else {
-        parse_query(query_str)?
-    };
-    resolve_path(root, Path::new(path_str)).map(|path| (path, query))
-}
-
-fn path_to_ticket(root: &Path, path: &Path) -> String {
-    if let Ok(root_canon) = root.canonicalize() {
-        if let Ok(rel) = path.strip_prefix(&root_canon) {
-            return path_components(rel).join("/");
-        }
-    }
-    path.to_string_lossy().to_string()
-}
-
-fn path_components(path: &Path) -> Vec<String> {
-    path.components()
-        .map(|comp| comp.as_os_str().to_string_lossy().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-fn collect_xlsx_paths(root: &Path, limit: usize) -> Result<Vec<PathBuf>, Status> {
-    let mut out = Vec::new();
-    let mut queue = VecDeque::new();
-    queue.push_back(root.to_path_buf());
-
-    while let Some(dir) = queue.pop_front() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                queue.push_back(path);
-                continue;
-            }
-            if file_type.is_file() && is_xlsx_file(&path) {
-                out.push(path);
-                if out.len() >= limit {
-                    return Ok(out);
-                }
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-fn is_xlsx_file(path: &Path) -> bool {
-    let ext = match path.extension().and_then(|s| s.to_str()) {
-        Some(ext) => ext.to_ascii_lowercase(),
-        None => return false,
-    };
-    matches!(
-        ext.as_str(),
-        "xls" | "xlsb" | "xlsx" | "xlsm" | "xltx" | "xltm"
-    )
 }
 
 fn parse_query(query: &str) -> Result<FlightQuery, Status> {
@@ -626,10 +311,6 @@ fn parse_query(query: &str) -> Result<FlightQuery, Status> {
         }
     }
     Ok(out)
-}
-
-fn ensure_query_supported(_query: &FlightQuery) -> Result<(), Status> {
-    Ok(())
 }
 
 fn apply_query_overrides(
@@ -820,7 +501,9 @@ fn parse_ref_kind(input: &str) -> Option<RefKind> {
         if b.is_ascii_alphabetic() {
             has_col = true;
             let upper = b & 0xDF;
-            col = col * 26 + (upper - b'A' + 1) as u32;
+            col = col
+                .checked_mul(26)?
+                .checked_add(u32::from(upper - b'A' + 1))?;
         } else {
             break;
         }
@@ -833,7 +516,7 @@ fn parse_ref_kind(input: &str) -> Option<RefKind> {
             }
             if b.is_ascii_digit() {
                 has_row = true;
-                row = row * 10 + (b - b'0') as u32;
+                row = row.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
             } else {
                 break;
             }
@@ -848,162 +531,122 @@ fn parse_ref_kind(input: &str) -> Option<RefKind> {
     }
 }
 
-#[inline]
-fn find_first_digit(bytes: &[u8]) -> Option<usize> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if bytes.len() >= 16 {
-            // SAFETY: NEON is baseline on aarch64.
-            unsafe {
-                if let Some(idx) = find_first_digit_neon(bytes) {
-                    return Some(idx);
+#[cfg(test)]
+mod range_reference_tests {
+    use super::*;
+
+    /// Inputs for the digit scan: every length up to 80 bytes, a digit at
+    /// every position, surrounded by letters, `$`, the ASCII neighbours of
+    /// the digits, and bytes that differ from a digit only in the high bit.
+    fn digit_scan_inputs() -> Vec<Vec<u8>> {
+        let fillers = [b'A', b'$', b'/', b':', 0x00, 0x7F, 0xB0, 0xB9, 0xFF];
+        let mut inputs = Vec::new();
+        for len in 0..=80usize {
+            for &filler in &fillers {
+                inputs.push(vec![filler; len]);
+                for position in 0..len {
+                    for digit in *b"059" {
+                        let mut bytes = vec![filler; len];
+                        bytes[position] = digit;
+                        inputs.push(bytes.clone());
+                        bytes[len - 1] = b'7';
+                        inputs.push(bytes);
+                    }
                 }
             }
         }
+        inputs
     }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    {
-        if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
-            // SAFETY: we gate on AVX2 support.
-            unsafe {
-                if let Some(idx) = find_first_digit_avx2(bytes) {
-                    return Some(idx);
-                }
-            }
-        }
-        if bytes.len() >= 16
-            && (cfg!(target_arch = "x86_64") || std::is_x86_feature_detected!("sse2"))
-        {
-            // SAFETY: we gate on SSE2 support.
-            unsafe {
-                if let Some(idx) = find_first_digit_sse2(bytes) {
-                    return Some(idx);
-                }
-            }
+
+    /// WHY: this server used to carry its own copy of the vectorized digit
+    /// scan. It now calls the one in xlsx-fast-core, which must keep giving
+    /// the answer a plain byte-by-byte scan gives.
+    #[test]
+    fn the_shared_digit_scan_agrees_with_a_byte_by_byte_scan() {
+        let inputs = digit_scan_inputs();
+        assert!(inputs.len() > 150_000, "{} inputs", inputs.len());
+        for input in &inputs {
+            assert_eq!(
+                find_first_digit(input),
+                input.iter().position(u8::is_ascii_digit),
+                "input {input:?}"
+            );
         }
     }
 
-    for (idx, &b) in bytes.iter().enumerate() {
-        if b.is_ascii_digit() {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn find_first_digit_neon(bytes: &[u8]) -> Option<usize> {
-    use std::arch::aarch64 as arch;
-
-    let mut i = 0usize;
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-    let lower = arch::vdupq_n_u8(b'0');
-    let upper = arch::vdupq_n_u8(b'9');
-
-    while i + 16 <= len {
-        let chunk = arch::vld1q_u8(ptr.add(i));
-        let ge0 = arch::vcgeq_u8(chunk, lower);
-        let le9 = arch::vcleq_u8(chunk, upper);
-        let mask = arch::vandq_u8(ge0, le9);
-        if arch::vmaxvq_u8(mask) != 0 {
-            for j in 0..16 {
-                let b = *ptr.add(i + j);
-                if b.is_ascii_digit() {
-                    return Some(i + j);
-                }
-            }
-        }
-        i += 16;
+    fn range(input: &str) -> Option<(u32, u32, u32, u32)> {
+        parse_range_part(input).ok().map(|range| {
+            (
+                range.row_start,
+                range.row_end,
+                range.col_start,
+                range.col_end,
+            )
+        })
     }
 
-    while i < len {
-        let b = *ptr.add(i);
-        if b.is_ascii_digit() {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse2")]
-unsafe fn find_first_digit_sse2(bytes: &[u8]) -> Option<usize> {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86 as arch;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64 as arch;
-
-    let mut i = 0usize;
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-    let lower = arch::_mm_set1_epi8((b'0' - 1) as i8);
-    let upper = arch::_mm_set1_epi8((b'9' + 1) as i8);
-
-    while i + 16 <= len {
-        let chunk = arch::_mm_loadu_si128(ptr.add(i) as *const arch::__m128i);
-        let ge0 = arch::_mm_cmpgt_epi8(chunk, lower);
-        let le9 = arch::_mm_cmplt_epi8(chunk, upper);
-        let mask = arch::_mm_and_si128(ge0, le9);
-        let bits = arch::_mm_movemask_epi8(mask) as u32;
-        if bits != 0 {
-            let offset = bits.trailing_zeros() as usize;
-            return Some(i + offset);
-        }
-        i += 16;
+    /// WHY: range queries are parsed around the digit scan. These results
+    /// were recorded with the server's own copy of the scan and must not move
+    /// when it is replaced by the shared one. The long references are 16
+    /// bytes or more, which is where the vectorized path starts.
+    #[test]
+    fn range_queries_parse_the_same_references() {
+        let all = u32::MAX;
+        assert_eq!(range("A1:C3"), Some((1, 3, 1, 3)));
+        assert_eq!(range("c3:a1"), Some((1, 3, 1, 3)));
+        assert_eq!(range("$B$2:$D$10"), Some((2, 10, 2, 4)));
+        assert_eq!(range("B2"), Some((2, all, 2, all)));
+        assert_eq!(range(":B2"), Some((1, 2, 1, 2)));
+        assert_eq!(range("2:5"), Some((2, 5, 1, all)));
+        assert_eq!(range("B:D"), Some((1, all, 2, 4)));
+        assert_eq!(range("AA10:XFD1048576"), Some((10, 1_048_576, 27, 16_384)));
+        assert_eq!(range("$$$$$$$$$$$$$$$$AB$12"), Some((12, all, 28, all)));
+        assert_eq!(
+            range("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$C7:$$$$$$$$$$$$$$$$$$$$E9"),
+            Some((7, 9, 3, 5))
+        );
+        assert_eq!(
+            range("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$ZZ"),
+            Some((1, all, 702, all))
+        );
+        assert_eq!(
+            range("0000000000000000000000000000000000042"),
+            Some((42, all, 1, all))
+        );
+        assert_eq!(range("A1:5"), None);
     }
 
-    while i < len {
-        let b = *ptr.add(i);
-        if b.is_ascii_digit() {
-            return Some(i);
+    /// WHY: a range comes straight from the client's query. A column or row
+    /// too large for the arithmetic used to panic in a debug build and wrap
+    /// to an unrelated range in a release build; it is an invalid argument.
+    #[test]
+    fn a_reference_too_large_to_compute_is_an_invalid_argument() {
+        for input in [
+            "AAAAAAAAAAAAAAAA1",
+            "ZZZZZZZ",
+            "A99999999999",
+            "99999999999",
+            "A1:ZZZZZZZZ9",
+            "1:4294967296",
+        ] {
+            let err = parse_range_part(input).expect_err(input);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{input}");
         }
-        i += 1;
-    }
-    None
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx2")]
-unsafe fn find_first_digit_avx2(bytes: &[u8]) -> Option<usize> {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86 as arch;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64 as arch;
-
-    let mut i = 0usize;
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-    let lower = arch::_mm256_set1_epi8((b'0' - 1) as i8);
-    let upper = arch::_mm256_set1_epi8((b'9' + 1) as i8);
-
-    while i + 32 <= len {
-        let chunk = arch::_mm256_loadu_si256(ptr.add(i) as *const arch::__m256i);
-        let ge0 = arch::_mm256_cmpgt_epi8(chunk, lower);
-        let le9 = arch::_mm256_cmpgt_epi8(upper, chunk);
-        let mask = arch::_mm256_and_si256(ge0, le9);
-        let bits = arch::_mm256_movemask_epi8(mask) as u32;
-        if bits != 0 {
-            let offset = bits.trailing_zeros() as usize;
-            return Some(i + offset);
-        }
-        i += 32;
+        // The largest values that still fit are accepted as before.
+        assert_eq!(
+            range("4294967295"),
+            Some((4_294_967_295, u32::MAX, 1, u32::MAX))
+        );
     }
 
-    while i < len {
-        let b = *ptr.add(i);
-        if b.is_ascii_digit() {
-            return Some(i);
-        }
-        i += 1;
+    #[test]
+    fn range_queries_reject_malformed_references() {
+        assert_eq!(range("A:5"), None);
+        assert_eq!(range("A0"), None);
+        assert_eq!(range("!!"), None);
+        assert_eq!(range(""), None);
+        assert_eq!(range(":"), None);
     }
-    None
-}
-
-fn to_status(err: impl std::fmt::Display) -> Status {
-    Status::internal(err.to_string())
 }
 
 #[cfg(test)]
@@ -1013,17 +656,6 @@ mod symlink_listing_tests {
     use std::os::unix::fs::symlink as symlink_file;
     #[cfg(windows)]
     use std::os::windows::fs::symlink_file;
-
-    #[test]
-    fn lists_binary_and_xml_workbooks() {
-        let root = tempfile::tempdir().unwrap();
-        for name in ["book.XLS", "book.XLSB", "book.xlsx", "ignore.txt"] {
-            std::fs::write(root.path().join(name), b"fixture").unwrap();
-        }
-        let found = collect_xlsx_paths(root.path(), 100).unwrap();
-        assert_eq!(found.len(), 3);
-        assert!(found.iter().all(|path| is_xlsx_file(path)));
-    }
 
     #[test]
     fn collect_xlsx_paths_skips_symlinks() {
@@ -1132,5 +764,250 @@ mod read_only_flight_contract_tests {
             "__missing_auth_probe__.xlsx".to_owned(),
         ])));
         assert!(FlightService::get_schema(&service, request).await.is_ok());
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "../../flight-ipc-config/test-support/wire.rs"]
+mod flight_wire_test_support;
+
+#[cfg(all(test, unix))]
+mod wire_parity_tests {
+    //! What a Flight client sees from this server, pinned as text in
+    //! `tests/wire_transcript.txt`.
+    //!
+    //! The transcript was captured from the server while it still carried its
+    //! own copy of the Flight skeleton, so a change to any answer in it is a
+    //! change in behaviour, not in structure. Unix only: the probes include a
+    //! symbolic link and a backslash in a file name.
+    use super::*;
+    use crate::flight_auth_test_support::required_auth_verifier;
+    use crate::flight_wire_test_support::{stored_zip, Wire};
+
+    const EXPECTED: &str = include_str!("../tests/wire_transcript.txt");
+
+    /// The one-sheet workbook `xlsx-fast-core`'s own tests build
+    /// (`tests/parser_integration.rs`), as a stored archive.
+    fn fixture() -> Vec<u8> {
+        stored_zip(&[
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <workbookPr date1904="false"/>
+  <sheets>
+    <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/sharedStrings.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
+  <si><t>Hello XLSX</t></si>
+</sst>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="s"><v>0</v></c>
+      <c r="B1"><v>42</v></c>
+      <c r="C1"><f>SUM(B1,B1)</f><v>84</v></c>
+    </row>
+    <row r="2">
+      <c r="A2"><v>7</v></c>
+    </row>
+  </sheetData>
+</worksheet>"#,
+            ),
+        ])
+    }
+
+    fn service(root: &Path) -> XlsxFlightService {
+        XlsxFlightService {
+            root: root.to_path_buf(),
+            parse_options: ParseOptions {
+                decode_dates: true,
+                include_formulas: false,
+                raw_values: false,
+                max_inflate: 128 * 1024 * 1024,
+            },
+            arrow_options: ArrowOptions {
+                batch_size: 64,
+                include_sheet_names: true,
+                sheet_filter: None,
+                range_filter: None,
+                parallel_sheets: 0,
+            },
+            write_options: IpcWriteOptions::default(),
+            capability_body: b"{}".to_vec(),
+            auth_verifier: required_auth_verifier(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_opened_is_named_as_the_caller_named_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).expect("directories");
+        let locked = root.join("locked.xlsx");
+        std::fs::write(&locked, fixture()).expect("fixture");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("permissions");
+        if std::fs::File::open(&locked).is_ok() {
+            // A superuser opens the file anyway, so there is no error to read.
+            return;
+        }
+
+        let mut wire = Wire::start(service(&root), base.path()).await;
+        wire.do_get(b"locked.xlsx", true).await;
+
+        assert!(wire.seen.contains("locked.xlsx"), "{}", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_root_is_answered_like_a_missing_one() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).expect("directories");
+        let mut wire = Wire::start(service(&root), base.path()).await;
+        wire.assert_outside_paths_look_missing(base.path(), "xlsx")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn every_rpc_answers_as_it_did_before_the_shared_server() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("directories");
+        let fixture = fixture();
+        std::fs::write(root.join("book.xlsx"), &fixture).expect("fixture");
+        std::fs::write(root.join("sub").join("Upper.XLSX"), &fixture).expect("nested");
+        std::fs::write(root.join("notes.txt"), b"not a workbook").expect("other file");
+        std::fs::write(base.path().join("outside.xlsx"), &fixture).expect("outside");
+        std::os::unix::fs::symlink(base.path().join("outside.xlsx"), root.join("link.xlsx"))
+            .expect("symlink");
+        let outside = base.path().join("outside.xlsx");
+        let outside = outside.to_string_lossy();
+
+        let mut wire = Wire::start(service(&root), base.path()).await;
+
+        wire.handshake(false).await;
+        wire.handshake(true).await;
+        wire.list_flights(false).await;
+        wire.list_flights(true).await;
+
+        wire.get_flight_info("book.xlsx", false).await;
+        for path in [
+            "book.xlsx",
+            "book.xlsx?sheet=Sheet1&range=A1:B2",
+            "book.xlsx?table=x&max_inflate=0",
+            "book.xlsx?batch=0",
+            "book.xlsx?batch=x",
+            "book.xlsx?raw=maybe",
+            "book.xlsx?range=A:5",
+            "book.xlsx?threads=x",
+            "sub/Upper.XLSX",
+            "sub\\Upper.XLSX",
+            "missing.xlsx",
+            "../outside.xlsx",
+            "link.xlsx",
+            outside.as_ref(),
+        ] {
+            wire.get_flight_info(path, true).await;
+        }
+        wire.get_flight_info_parts(&["sub", "Upper.XLSX?batch=2"], true)
+            .await;
+        wire.get_flight_info_parts(&["sub", "..", "book.xlsx"], true)
+            .await;
+        wire.get_flight_info_cmd(b"book.xlsx?batch=2", true).await;
+        wire.get_flight_info_cmd(b"book.xlsx?batch=0", true).await;
+        wire.get_flight_info_cmd(b"\xff", true).await;
+        wire.get_flight_info_cmd(b"", true).await;
+
+        wire.poll_flight_info("book.xlsx", false).await;
+        wire.poll_flight_info("book.xlsx", true).await;
+
+        wire.get_schema("book.xlsx", false).await;
+        wire.get_schema("book.xlsx", true).await;
+        wire.get_schema("missing.xlsx?batch=0", true).await;
+
+        wire.do_get(b"book.xlsx", false).await;
+        for ticket in [
+            "book.xlsx",
+            "book.xlsx?batch=1",
+            "book.xlsx?sheet=Nope",
+            "book.xlsx?sheets=Sheet1,Nope&range=B1:C1",
+            "book.xlsx?raw=1&formulas=yes&sheet_names=off&dates=0&threads=2",
+            "book.xlsx?table=x&max_inflate=0",
+            "book.xlsx?batch=0",
+            "book.xlsx?range=A:5",
+            "book.xlsx?",
+            "sub/Upper.XLSX",
+            "sub\\Upper.XLSX",
+            "notes.txt",
+            "missing.xlsx",
+            "../outside.xlsx",
+            "sub/../book.xlsx",
+            "link.xlsx",
+            outside.as_ref(),
+            "",
+        ] {
+            wire.do_get(ticket.as_bytes(), true).await;
+        }
+        wire.do_get(b"\xff", true).await;
+        wire.do_get(b"sub", true).await;
+
+        wire.do_put(false).await;
+        wire.do_put(true).await;
+
+        wire.do_exchange_path("book.xlsx", false).await;
+        wire.do_exchange_path("book.xlsx", true).await;
+        wire.do_exchange_path("book.xlsx?batch=0", true).await;
+        wire.do_exchange_path("missing.xlsx", true).await;
+        wire.do_exchange_metadata("book.xlsx?batch=1", true).await;
+        wire.do_exchange_metadata("../outside.xlsx", true).await;
+        wire.do_exchange("an empty message", vec![FlightData::default()], true)
+            .await;
+        wire.do_exchange("no message", Vec::new(), true).await;
+
+        wire.do_action(CAPABILITY_ACTION, "", true, false).await;
+        wire.do_action(CAPABILITY_ACTION, "", true, true).await;
+        wire.do_action("unknown", "", true, true).await;
+        wire.list_actions(false).await;
+        wire.list_actions(true).await;
+        wire.path_probes(&root, base.path(), "xlsx").await;
+
+        assert_eq!(wire.seen, EXPECTED, "\n<<<WIRE\n{}WIRE>>>", wire.seen);
+        assert_eq!(
+            wire.answers_naming_server_paths,
+            Vec::<String>::new(),
+            "an answer named a directory on the server"
+        );
     }
 }

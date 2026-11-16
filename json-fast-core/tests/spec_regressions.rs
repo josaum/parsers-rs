@@ -146,7 +146,8 @@ fn schema_anchors_in_instance_data_are_not_registered() {
     let schema = json!({"const":{"$anchor":"fake"}, "$ref":"#fake"});
     assert!(schema::validate(&json!({"$anchor":"fake"}), &schema)
         .iter()
-        .any(|finding| finding.severity == schema::Severity::Warning));
+        .any(|finding| finding.severity == schema::Severity::Error
+            && finding.message.contains("does not resolve")));
 }
 
 #[test]
@@ -160,12 +161,13 @@ fn schema_pointer_references_validate_escapes_and_array_indices() {
         assert!(
             findings
                 .iter()
-                .any(|finding| finding.severity == schema::Severity::Warning),
+                .any(|finding| finding.severity == schema::Severity::Error
+                    && finding.message.contains("does not resolve")),
             "{reference}"
         );
         assert!(
-            !schema::has_errors(&findings),
-            "invalid pointers must not select a schema"
+            schema::has_errors(&findings),
+            "invalid pointers must fail closed"
         );
     }
     let schema = json!({"$defs":{"a/b~c":false}, "$ref":"#/$defs/a~1b~0c"});

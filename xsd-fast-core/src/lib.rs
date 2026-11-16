@@ -11,8 +11,27 @@
 //!
 //! - Parses `xs:element`, `xs:complexType`, `xs:simpleType`, `xs:sequence`, `xs:choice`,
 //!   `xs:all`, `xs:extension`, `xs:restriction`, `xs:enumeration`, `xs:include`, `xs:import`
+//! - Follows chains of named simple types; `xs:list` keeps its item type and
+//!   `xs:union` the kind its members share (a string when they differ)
+//! - Resolves `xs:attribute ref` and `xs:attributeGroup ref`, nested groups
+//!   included
+//! - Models `xs:any` element wildcards for validation; they derive no column
+//!
+//! ## What the default Arrow shape leaves out
+//!
+//! An attribute that reaches a type through `xs:attribute ref` or
+//! `xs:attributeGroup ref` is not a column of a child element whose own
+//! content derives exactly one column (typically its text): that child stays
+//! the one column, named after the element, as before references were
+//! resolved. The same type keeps those attributes as the root element, or as
+//! a child with no column or several of its own.
+//! `arrow::ArrowShape::attributes_on_simple_children` makes such a child a
+//! struct of its value and all its attributes.
 //! - Resolves multi-file schemas (relative `schemaLocation` paths)
-//! - Derives an Arrow [`Schema`] from a root element (for downstream Flight / IPC)
+//! - Derives an Arrow `Schema` from a root element (for downstream Flight / IPC),
+//!   with one column per name: sibling elements of one name are one column,
+//!   a scalar across the branches of a choice and a `List` otherwise (see
+//!   the `arrow` module, "One column per name")
 //! - Validates XML byte slices against the parsed schema rules (enumeration, pattern,
 //!   minLength/maxLength, minInclusive/maxInclusive for simple types)
 //! - Produces structured [`ValidationError`] values — never panics on bad input
@@ -20,7 +39,12 @@
 //! ## Out of scope (v1)
 //!
 //! - `xs:key` / `xs:keyref` / `xs:unique` identity constraints
-//! - `xs:union` member resolution beyond string fallback
+//! - Named model groups: `xs:group ref` is not expanded, so a group's
+//!   particles are not part of the types that reference it. The elements a
+//!   named group declares appear as top-level (global) elements instead.
+//! - Attribute values are not validated, and union values are not checked
+//!   against their members' facets
+//! - `xs:anyAttribute`
 //! - XPath-based assertions
 //!
 //! ## Quick Start
@@ -57,7 +81,7 @@ pub mod arrow;
 
 pub use parser::{ParseOptions, SchemaSet};
 pub use schema::{
-    ComplexType, ContentModel, ElementDecl, EnumValue, OccurrenceConstraint, SchemaType,
-    SimpleTypeKind, XsdType,
+    ComplexType, ContentModel, Derivation, ElementDecl, EnumValue, OccurrenceConstraint,
+    SchemaType, SimpleTypeKind, XsdType,
 };
 pub use validator::{ValidateOptions, ValidationError, ValidationSeverity};

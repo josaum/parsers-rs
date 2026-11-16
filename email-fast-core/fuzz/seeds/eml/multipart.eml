@@ -1,0 +1,58 @@
+From: =?ISO-8859-1?Q?Jos=E9_Mu=F1oz?= <jose@example.com>
+To: =?UTF-8?B?U8O4cmVuLCBLaWVya2VnYWFyZA==?= <s@example.com>,
+ "Doe, Jane" <j@example.com>, plain@example.com
+Cc: Team: a@example.com, Bob <b@example.com>;, c@example.com
+Reply-To: replies@example.com
+Subject: =?UTF-8?Q?Relat=C3=B3rio?= =?UTF-8?B?IHRyaW1lc3RyYWw=?=
+Date: Mon, 15 Jan 2024 14:30:00 +0000
+Message-ID: <msg-1@example.com>
+In-Reply-To: <msg-0@example.com>
+References: <a@example.com> <b@example.com>
+X-Priority: 3
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="outer"
+
+preamble
+--outer
+Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset=ISO-8859-1
+Content-Transfer-Encoding: quoted-printable
+
+Ol=E1 mundo=
+ continua
+--alt
+Content-Type: text/html; charset=UTF-8
+Content-Transfer-Encoding: base64
+
+PGh0bWw+PGhlYWQ+PHN0eWxlPnAgeyBjb2xvcjogcmVkOyB9PC9zdHlsZT48c2NyaXB0PnZhciBhID0gMSA8IDI7PC9zY3JpcHQ+PC9oZWFkPjxib2R5PjwhLS0gbm90ZSAtLT48cD5PbCZhYWN1dGU7ICZsdDtiJmd0OyAmIzIzMzsgJiN4MjBBQzs8YnI+bXVuZG88L3A+PC9ib2R5PjwvaHRtbD4=
+--alt--
+--outer
+Content-Type: application/pdf
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment;
+ filename*0*=UTF-8''r%C3%A9sum%C3%A9; filename*1*=.pdf
+
+JVBERi0xLjQK
+--outer
+Content-Type: image/png; name="logo.png"
+Content-Transfer-Encoding: base64
+Content-ID: <logo@example.com>
+
+iVBORw0KGgo=
+--outer
+Content-Type: message/rfc822
+Content-Disposition: attachment; filename="forwarded.eml"
+
+From: nested@example.com
+To: recipient@example.com
+Subject: =?UTF-8?Q?Encaminhada?=
+Content-Type: multipart/mixed; boundary="inner"
+
+--inner
+Content-Type: text/plain
+
+Nested body
+--inner--
+--outer--

@@ -1,25 +1,37 @@
 [package]
 name = "ooxml-archive"
-version = "0.1.4"
+version = "0.1.10"
 edition.workspace = true
 authors.workspace = true
-description = "Shared OOXML ZIP archive, inflate, and relationship helpers"
+description = "Shared OOXML ZIP archive, inflate, relationship and document property helpers"
 license.workspace = true
 keywords = ["ooxml", "zip", "office", "parser"]
 categories = ["parser-implementations", "encoding"]
 rust-version.workspace = true
+# Benchmarks and the one-shot bench drivers are for this repository, not for
+# users of the crate: they stay out of the published package.
+exclude = ["benches/", "examples/"]
 
 [lib]
 name = "ooxml_archive"
 
 [dependencies]
 anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 flate2 = "1.0"
 memmap2 = "0.9"
-quick-xml = "0.36"
-rawzip = "0.4.3"
+quick-xml = "0.42"
+rawzip = "0.5.2"
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 proptest = "1.10"
 tempfile = "3.10"
-zip = "0.6"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[[bench]]
+name = "archive"
+harness = false
+
+[lints]
+workspace = true

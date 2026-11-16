@@ -21,7 +21,8 @@ and aggregate attachment limits. The byte API forwards every limit to Rust.
 
 Defaults are 128 MiB input/decoded content, 100 MiB per attachment and in total,
 64 nesting levels, 10,000 MIME parts/MSG entries, and 256 KiB headers per MIME
-part. Input and decoded-content ceilings apply separately; these are not a
+part. MIME containers additionally have a hard preflight nesting cap of 32.
+Input and decoded-content ceilings apply separately; these are not a
 process-wide memory cap. Attachment sizes count decoded payload bytes rather
 than MIME headers or Base64 overhead. Exceeded limits raise `RuntimeError`.
 
@@ -58,4 +59,20 @@ Build/install the wheel, then run:
 python -m pytest email-fast-py/tests -q
 ```
 
-Licensed under MIT.
+Licensed under either of MIT ([LICENSE](LICENSE)) or Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your option.
+## An mbox mailbox from bytes
+
+```python
+import email_fast
+
+mailbox = (
+    b"From sender@example.com Mon Sep 21 00:00:00 2026\n"
+    b"From: sender@example.com\nTo: recipient@example.com\nSubject: first\n\nbody\n"
+)
+messages = email_fast.parse_mbox_bytes(mailbox)
+print([m["subject"] for m in messages])   # ['first']
+```
+
+`parse_mbox_bytes` takes the same keyword options as `parse_email_bytes`
+and returns one dict per message, in mailbox order. A message that does not
+parse is skipped.

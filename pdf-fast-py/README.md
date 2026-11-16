@@ -32,4 +32,4 @@ because the parser returned content.
 cargo test -p pdf-fast-py
 ```
 
-Licensed under MIT.
+Licensed under either of MIT ([LICENSE](LICENSE)) or Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your option.
