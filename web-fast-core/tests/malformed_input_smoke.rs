@@ -251,9 +251,21 @@ fn span_values_are_read_like_a_browser_reads_them() {
 /// `dom_path` strings total about 38 MB, which must not count against the
 /// 32 MiB budget for extracted text.
 #[test]
-fn many_shallow_blocks_fit_the_default_budgets() {
+fn many_shallow_blocks_include_structural_paths_in_the_budget() {
     let html = "<section>".repeat(12) + &"<p>x</p>".repeat(240_000);
-    let document = parse_html(&html, None, ParseOptions::default()).expect("parses");
+    assert!(matches!(
+        parse_html(&html, None, ParseOptions::default()),
+        Err(WebParseError::TextLimitExceeded)
+    ));
+    let document = parse_html(
+        &html,
+        None,
+        ParseOptions {
+            max_text_bytes: 256 * 1024 * 1024,
+            ..Default::default()
+        },
+    )
+    .expect("parses with room for paths");
     assert_eq!(document.blocks.len(), 240_000);
 }
 
@@ -507,7 +519,16 @@ fn nested_tables_report_only_their_own_rows_and_cells() {
     let document = parse_html(&html, None, ParseOptions::default()).expect("parses");
     assert_eq!(document.tables.len(), depth);
     for table in &document.tables {
-        assert_eq!(table.rows, [["x"]], "table {}", table.ordinal);
+        assert_eq!(
+            table.rows,
+            [[if table.ordinal as usize == depth - 1 {
+                "x"
+            } else {
+                ""
+            }]],
+            "table {}",
+            table.ordinal
+        );
     }
 }
 

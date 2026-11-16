@@ -49,13 +49,13 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use chrono::{DateTime, Utc};
 use memmap2::Mmap;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, Read};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -66,6 +66,9 @@ pub mod arrow;
 // consumer integrations: they depend on one product's SDK and belong in that
 // product, not in a parser shared across consumers.
 
+mod extraction;
+mod mbox;
+mod mime;
 mod msg;
 
 /// The shared mutation harness, for unit tests that compare private helpers
@@ -113,14 +116,15 @@ where
 /// Configuration options for email parsing.
 #[derive(Debug, Clone, Copy)]
 pub struct ParseOptions {
-    /// Has no effect today: nothing in this crate reads it.
-    ///
-    /// The field mirrors `max_inflate` in the OOXML parsers so that every
-    /// `*-fast-core` crate takes the same options, but an email is not a
-    /// compressed container and this crate inflates nothing. The sizes that
-    /// are enforced are `max_attachment_size` and
-    /// `max_total_attachment_bytes`. Default: 128 MiB.
+    /// Maximum input message bytes and aggregate decoded content bytes.
+    /// Each ceiling is checked separately; this is not a process memory cap.
     pub max_inflate: usize,
+    /// Maximum MIME/MSG tree depth (default: 64; MIME containers are capped at 32 before parsing).
+    pub max_mime_depth: usize,
+    /// Maximum MIME parts or MSG directory entries (default: 10,000).
+    pub max_mime_parts: usize,
+    /// Maximum header bytes per MIME part (default: 256 KiB).
+    pub max_header_bytes: usize,
     /// Maximum size of attachments to process in bytes (default: 100 MB)
     pub max_attachment_size: usize,
     /// Maximum decoded bytes retained across all attachments (default: 100 MB).
@@ -140,6 +144,9 @@ pub struct ParseOptions {
 impl Default for ParseOptions {
     fn default() -> Self {
         Self {
+            max_mime_depth: 64,
+            max_mime_parts: 10_000,
+            max_header_bytes: 256 * 1024,
             max_inflate: 128 * 1024 * 1024,                // 128 MiB
             max_attachment_size: 100 * 1024 * 1024,        // 100 MB
             max_total_attachment_bytes: 100 * 1024 * 1024, // 100 MB
@@ -195,7 +202,11 @@ impl Attachment {
         self.content_type
             .to_ascii_lowercase()
             .contains("message/rfc822")
+            || self
+                .content_type
+                .eq_ignore_ascii_case("application/vnd.ms-outlook")
             || self.filename.to_ascii_lowercase().ends_with(".eml")
+            || self.filename.to_ascii_lowercase().ends_with(".msg")
     }
 
     /// Decoded attachment bytes, when content extraction was enabled
@@ -242,8 +253,8 @@ pub struct EmailBody {
 /// Threading information for email conversations
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ThreadInfo {
-    /// Message ID
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Message ID, serialized on Email only.
+    #[serde(skip_serializing)]
     pub message_id: Option<String>,
     /// In-Reply-To header
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -422,11 +433,14 @@ pub fn parse_email_bytes(
 pub fn parse_eml(path: impl AsRef<Path>, options: ParseOptions) -> Result<Email> {
     let path = path.as_ref();
     let file = File::open(path).with_context(|| format!("open file: {}", path.display()))?;
-    // SAFETY: `Mmap::map` is unsafe because the mapping is only sound while
-    // no one modifies or truncates the file, which no code here can enforce.
-    // The crate states that contract on this function: the caller must not
-    // let the file change during the call. Within this process the mapping
-    // is read-only, never written through, and dropped before this returns.
+    ensure!(
+        file.metadata()?.len() <= options.max_inflate as u64,
+        "message exceeds max_inflate"
+    );
+    if file.metadata()?.len() == 0 {
+        return parse_eml_bytes(&[], options);
+    }
+    // SAFETY: The mapping is read-only and the caller must keep the file unchanged during parsing.
     let mmap = unsafe { Mmap::map(&file)? };
 
     parse_eml_bytes(&mmap, options)
@@ -434,22 +448,31 @@ pub fn parse_eml(path: impl AsRef<Path>, options: ParseOptions) -> Result<Email>
 
 /// Parse EML from bytes
 pub fn parse_eml_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
-    // `mailparse` decodes some header lines in more than linear time, and it
-    // decodes `Content-*` headers on its own while it splits the message, so
-    // the cost is bounded before it sees a single header.
+    parse_eml_with_sink(bytes, options, None)
+}
+
+fn parse_eml_with_sink(
+    bytes: &[u8],
+    options: ParseOptions,
+    sink: Option<&mut mime::AttachmentSink<'_>>,
+) -> Result<Email> {
+    use mailparse::MailHeaderMap;
+    ensure!(
+        bytes.len() <= options.max_inflate,
+        "message exceeds max_inflate"
+    );
     header_decode_cost(bytes, MAX_HEADER_DECODE_COST)
         .map_err(|refusal| anyhow!("Failed to parse email: {refusal}"))?;
-    // `mailparse` recurses once per nested multipart, so the depth is checked
-    // before it sees the message.
-    if mime_nesting_exceeds(bytes, MAX_MIME_DEPTH) {
-        return Err(anyhow!(
-            "Failed to parse email: multipart nesting deeper than {MAX_MIME_DEPTH} levels"
-        ));
+    mime::check_root_headers(bytes, options.max_header_bytes)?;
+    let depth_limit = options.max_mime_depth.min(MAX_MIME_DEPTH);
+    if mime_nesting_exceeds(bytes, depth_limit) {
+        return Err(anyhow!("Failed to parse email: multipart nesting deeper than {depth_limit} levels (max_mime_depth)"));
     }
     let parsed =
         mailparse::parse_mail(bytes).map_err(|e| anyhow!("Failed to parse email: {}", e))?;
 
     // Parse headers
+    mime::validate_tree(&parsed, &options)?;
     let headers = parsed.get_headers();
 
     let from = parse_address_header(&headers, "From");
@@ -458,7 +481,9 @@ pub fn parse_eml_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
     let cc = parse_address_list_header(&headers, "Cc");
     let bcc = parse_address_list_header(&headers, "Bcc");
 
-    let subject = get_header_value(&headers, "Subject").and_then(|s| decode_header(&s).ok());
+    let subject = headers
+        .get_first_header("Subject")
+        .map(|header| decode_header_once(header).unwrap_or_else(|_| header.get_value()));
 
     let date = get_header_value(&headers, "Date").and_then(|d| parse_date(&d).ok());
 
@@ -473,17 +498,7 @@ pub fn parse_eml_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
         .and_then(|p| p.parse::<u8>().ok());
 
     // Parse body
-    let mut body = EmailBody::default();
-    let mut attachments = Vec::new();
-
-    let mut total_attachment_bytes = 0usize;
-    parse_mime_part(
-        &parsed,
-        &mut body,
-        &mut attachments,
-        &options,
-        &mut total_attachment_bytes,
-    )?;
+    let (mut body, attachments) = mime::parse(&parsed, options, sink)?;
 
     // Convert HTML to text if requested
     if options.html_to_text && body.text.is_none() {
@@ -498,7 +513,7 @@ pub fn parse_eml_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
         // mailparse 0.15+: headers is a Vec<MailHeader>, iterate directly
         for header in headers {
             let key = header.get_key().to_string();
-            let value = decode_header(&header.get_value()).unwrap_or_default();
+            let value = header.get_value();
             map.entry(key).or_default().push(value);
         }
         Some(map)
@@ -530,7 +545,7 @@ pub fn parse_eml_bytes(bytes: &[u8], options: ParseOptions) -> Result<Email> {
 /// Parse MSG (Outlook) file
 pub fn parse_msg(path: impl AsRef<Path>, options: ParseOptions) -> Result<Email> {
     let path = path.as_ref();
-    let bytes = std::fs::read(path)?;
+    let bytes = read_bounded(path, options.max_inflate)?;
     parse_msg_bytes(&bytes, options)
 }
 
@@ -552,8 +567,30 @@ pub fn parse_mbox(
     options: ParseOptions,
     callback: impl FnMut(Email) -> Result<()>,
 ) -> Result<usize> {
-    let file = File::open(path.as_ref())?;
-    parse_mbox_reader(BufReader::new(file), options, callback)
+    mbox::parse(path.as_ref(), options, callback, |_, _, error| Err(error))
+}
+
+/// Parse a mailbox with an explicit callback for parse errors and offsets.
+pub fn parse_mbox_with_errors(
+    path: impl AsRef<Path>,
+    options: ParseOptions,
+    callback: impl FnMut(Email) -> Result<()>,
+    on_error: impl FnMut(usize, u64, anyhow::Error) -> Result<()>,
+) -> Result<usize> {
+    mbox::parse(path.as_ref(), options, callback, on_error)
+}
+
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let file = File::open(path)?;
+    ensure!(
+        file.metadata()?.len() <= limit as u64,
+        "message exceeds max_inflate"
+    );
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= limit, "message exceeds max_inflate");
+    Ok(bytes)
 }
 
 /// Parse an mbox mailbox from a buffered reader (streaming).
@@ -597,111 +634,17 @@ pub fn parse_mbox(
 /// that does not parse is skipped, so one bad message does not lose the
 /// mailbox.
 pub fn parse_mbox_reader(
-    mut reader: impl BufRead,
+    reader: impl BufRead,
     options: ParseOptions,
-    mut callback: impl FnMut(Email) -> Result<()>,
+    callback: impl FnMut(Email) -> Result<()>,
 ) -> Result<usize> {
-    let mut count = 0;
-    let mut current_message: Vec<u8> = Vec::new();
-    // `None` until the mailbox's first separator has been read.
-    let mut separators: Option<SeparatorRule> = None;
-
-    // Byte-wise line reads: real-world mbox corpora (e.g. 1990s corporate
-    // mail) contain non-UTF-8 bytes, so `BufRead::lines` would abort the whole
-    // mailbox on the first one. The bytes are kept exactly as stored rather
-    // than converted lossily, because an 8-bit body is only decodable through
-    // the charset its own headers declare; replacing its bytes here would
-    // leave U+FFFD for the MIME decoder to misread as that charset.
-    let mut raw: Vec<u8> = Vec::new();
-    loop {
-        raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
-            break;
-        }
-        let mut line = raw.as_slice();
-        while let [rest @ .., b'\r' | b'\n'] = line {
-            line = rest;
-        }
-
-        // A message starts at a "From " separator line. The first one of the
-        // mailbox is taken as written and decides the rule for the rest:
-        // see `SeparatorRule`.
-        let starts_message = line.starts_with(b"From ")
-            && match separators {
-                None => {
-                    separators = Some(if is_mbox_separator(line) {
-                        SeparatorRule::Dated
-                    } else {
-                        SeparatorRule::AnyFromLine
-                    });
-                    true
-                }
-                Some(SeparatorRule::Dated) => is_mbox_separator(line),
-                Some(SeparatorRule::AnyFromLine) => true,
-            };
-        if starts_message {
-            if !current_message.is_empty() {
-                // Parse previous message
-                if let Ok(email) = parse_eml_bytes(&current_message, options) {
-                    callback(email)?;
-                    count += 1;
-                }
-                current_message.clear();
-            }
-            continue;
-        }
-
-        // Lines before the first separator belong to no message.
-        if separators.is_some() {
-            if !current_message.is_empty() {
-                current_message.push(b'\n');
-            }
-            if separators == Some(SeparatorRule::Dated) {
-                line = unquote_from_line(line);
-            }
-            current_message.extend_from_slice(line);
-        }
-    }
-
-    // Parse last message
-    if !current_message.is_empty() {
-        if let Ok(email) = parse_eml_bytes(&current_message, options) {
-            callback(email)?;
-            count += 1;
-        }
-    }
-
-    Ok(count)
+    mbox::parse_reader(reader, options, callback, |_, _, _| Ok(()))
 }
 
 /// Removes one level of mboxrd quoting from `line`.
 ///
 /// A line of one or more `>` followed by `From ` loses its first `>`; any
 /// other line is returned as it is.
-fn unquote_from_line(line: &[u8]) -> &[u8] {
-    let quotes = line.iter().take_while(|byte| **byte == b'>').count();
-    if quotes > 0 && line[quotes..].starts_with(b"From ") {
-        &line[1..]
-    } else {
-        line
-    }
-}
-
-/// How one mailbox marks where its messages start.
-///
-/// Chosen from the mailbox's first `From ` line and kept for the rest of it,
-/// because a mailbox is written by one tool in one form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SeparatorRule {
-    /// Separators carry an `asctime` date ([`is_mbox_separator`]); a line
-    /// that begins with `From ` but has no such date is body text.
-    Dated,
-    /// The first separator had no `asctime` date, so no later one can be
-    /// told from body text by its date: every line that begins with `From `
-    /// starts a message.
-    AnyFromLine,
-}
-
 /// Reports whether `line` is a dated mbox message separator (a "From_ line").
 ///
 /// A dated separator is `From `, an envelope sender, and a date in `asctime` form:
@@ -722,7 +665,7 @@ enum SeparatorRule {
 /// Separators in other forms are not recognized here: a date with a comma
 /// after the weekday or with no weekday, an ISO 8601 timestamp, a two-digit
 /// year, or no date at all. A mailbox whose first separator is one of those
-/// is split by [`SeparatorRule::AnyFromLine`] instead.
+/// is split by the simple `From ` separator rule instead.
 fn is_mbox_separator(line: &[u8]) -> bool {
     /// Words examined after `From `. A separator is a sender plus at most
     /// seven date words; the rest of a long body line is not worth scanning.
@@ -828,30 +771,7 @@ pub fn extract_attachments(
     out_dir: impl AsRef<Path>,
     options: ParseOptions,
 ) -> Result<Vec<PathBuf>> {
-    let email = parse_email(path, options)?;
-    let out_dir = out_dir.as_ref();
-    std::fs::create_dir_all(out_dir)?;
-
-    let mut paths = Vec::new();
-    let mut used_names = std::collections::HashSet::new();
-
-    for (index, attachment) in email.attachments.into_iter().enumerate() {
-        if let Some(content) = attachment.content {
-            let file_name = unique_file_name(
-                attachment_file_name(&attachment.filename, index),
-                &mut used_names,
-            );
-            let out_path = out_dir.join(file_name);
-            use base64::Engine;
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&content)
-                .map_err(|e| anyhow!("Failed to decode attachment: {}", e))?;
-            std::fs::write(&out_path, decoded)?;
-            paths.push(out_path);
-        }
-    }
-
-    Ok(paths)
+    extraction::extract(path.as_ref(), out_dir.as_ref(), options)
 }
 
 // Helper functions
@@ -1473,6 +1393,19 @@ fn email_address_from(single: &mailparse::SingleInfo) -> EmailAddress {
     }
 }
 
+fn flatten_addresses(list: &mailparse::MailAddrList) -> Vec<EmailAddress> {
+    let convert = |info: &mailparse::SingleInfo| EmailAddress {
+        name: info.display_name.clone(),
+        address: info.addr.clone(),
+    };
+    list.iter()
+        .flat_map(|addr| match addr {
+            mailparse::MailAddr::Single(info) => vec![convert(info)],
+            mailparse::MailAddr::Group(group) => group.addrs.iter().map(convert).collect(),
+        })
+        .collect()
+}
+
 fn get_header_value(headers: &dyn mailparse::MailHeaderMap, name: &str) -> Option<String> {
     headers
         .get_first_header(name)
@@ -1508,41 +1441,41 @@ fn parse_email_address(s: &str) -> Result<EmailAddress> {
     })
 }
 
-fn decode_header(value: &str) -> Result<String> {
-    // Handle encoded-words like =?UTF-8?B?...?=
-    // Simple decoder for encoded-word syntax: =?charset?encoding?encoded-text?=
+/// Repair unknown outer encoded-word charsets before mailparse decodes once.
+fn decode_header_once(header: &mailparse::MailHeader<'_>) -> Result<String> {
+    use base64::Engine;
     use regex::Regex;
     use std::sync::LazyLock;
-
-    // Compiled once: this runs for every header of every message, and
-    // building the automaton costs far more than matching one header.
-    static ENCODED_WORD: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"=\?([^?]+)\?([BbQq])\?([^?]+)\?=")
-            .expect("static encoded-word regex must compile")
+    static WORD: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"=\?([^?]+)\?([BbQq])\?([^?]+)\?=").expect("encoded word regex")
     });
-    let result = ENCODED_WORD.replace_all(value, |caps: &regex::Captures<'_>| {
-        let charset = &caps[1];
-        let encoding = &caps[2];
-        let encoded = &caps[3];
-
-        let decoded = if encoding.eq_ignore_ascii_case("B") {
-            // Base64 encoding
-            use base64::Engine;
+    let raw = std::str::from_utf8(header.get_value_raw())?;
+    let repaired = WORD.replace_all(raw, |caps: &regex::Captures<'_>| {
+        if encoding_rs::Encoding::for_label(caps[1].as_bytes()).is_some() {
+            return caps[0].to_owned();
+        }
+        let decoded = if caps[2].eq_ignore_ascii_case("B") {
             base64::engine::general_purpose::STANDARD
-                .decode(encoded)
+                .decode(&caps[3])
                 .ok()
-                .and_then(|bytes| decode_bytes(&bytes, charset))
-        } else if encoding.eq_ignore_ascii_case("Q") {
-            // Quoted-printable encoding
-            decode_quoted_printable(encoded, charset)
+                .map(|bytes| decode_unlabeled_bytes(&bytes))
         } else {
-            None
+            decode_quoted_printable(&caps[3], &caps[1])
         };
-
-        decoded.unwrap_or_else(|| caps[0].to_string())
+        decoded
+            .map(|text| {
+                format!(
+                    "=?UTF-8?B?{}?=",
+                    base64::engine::general_purpose::STANDARD.encode(text)
+                )
+            })
+            .unwrap_or_else(|| caps[0].to_owned())
     });
-
-    Ok(result.to_string())
+    if repaired == raw {
+        return Ok(header.get_value());
+    }
+    let line = format!("Subject: {repaired}\r\n");
+    Ok(mailparse::parse_header(line.as_bytes())?.0.get_value())
 }
 
 fn decode_bytes(bytes: &[u8], charset: &str) -> Option<String> {
@@ -1572,19 +1505,6 @@ pub(crate) fn decode_unlabeled_bytes(bytes: &[u8]) -> String {
             .0
             .into_owned(),
     }
-}
-
-/// Decodes a `text/*` part body through the charset its headers declare.
-///
-/// `mailparse` substitutes U+FFFD for every non-ASCII byte when the label is
-/// one it does not recognize (for example `x-unknown`), which loses the text.
-/// Those parts are decoded from their transfer-decoded bytes instead.
-fn decode_text_body(part: &mailparse::ParsedMail<'_>) -> Result<String> {
-    if encoding_rs::Encoding::for_label(part.ctype.charset.as_bytes()).is_some() {
-        return part.get_body().map_err(|e| anyhow!("{e}"));
-    }
-    let raw = part.get_body_raw().map_err(|e| anyhow!("{e}"))?;
-    Ok(decode_unlabeled_bytes(&raw))
 }
 
 fn decode_quoted_printable(encoded: &str, charset: &str) -> Option<String> {
@@ -1634,148 +1554,6 @@ fn parse_date(s: &str) -> Result<DateTime<Utc>> {
     }
 
     Err(anyhow!("Cannot parse date: {}", s))
-}
-
-/// Reports whether `part` is a multipart container rather than a leaf.
-///
-/// The rule is the one `mailparse` splits by: a type that begins with
-/// `multipart` and declares a `boundary`. A part it split always qualifies,
-/// so a part that has children is never read as a leaf. A part whose type
-/// says multipart but that declares no boundary is not split, and its
-/// content is kept as a leaf's. `mime_nesting_depth` counts containers by
-/// the same rule. `content_type` is the part's type, lowercased.
-fn is_container(part: &mailparse::ParsedMail<'_>, content_type: &str) -> bool {
-    !part.subparts.is_empty()
-        || (content_type.starts_with("multipart") && part.ctype.params.contains_key("boundary"))
-}
-
-fn parse_mime_part(
-    part: &mailparse::ParsedMail<'_>,
-    body: &mut EmailBody,
-    attachments: &mut Vec<Attachment>,
-    options: &ParseOptions,
-    total_attachment_bytes: &mut usize,
-) -> Result<()> {
-    let content_type = part.ctype.mimetype.to_lowercase();
-
-    // A container is never treated as a leaf; only its children are
-    // classified. Any other part, whatever its type says, is a leaf.
-    if is_container(part, &content_type) {
-        for subpart in &part.subparts {
-            parse_mime_part(subpart, body, attachments, options, total_attachment_bytes)?;
-        }
-        return Ok(());
-    }
-
-    let content_disposition = part.get_content_disposition();
-
-    // mailparse defaults the disposition to `Inline` when no Content-Disposition
-    // header is present, so we must check whether the header actually exists to
-    // tell "explicitly inline" apart from "unspecified".
-    let has_disposition_header = part
-        .headers
-        .iter()
-        .any(|h| h.get_key().eq_ignore_ascii_case("content-disposition"));
-    let explicit_attachment =
-        content_disposition.disposition == mailparse::DispositionType::Attachment;
-    let explicit_inline = has_disposition_header
-        && content_disposition.disposition == mailparse::DispositionType::Inline;
-
-    // Filename may live in the Content-Disposition `filename` param or the
-    // Content-Type `name` param (common for attachments with no disposition).
-    let filename = content_disposition
-        .params
-        .get("filename")
-        .or_else(|| part.ctype.params.get("name"))
-        .cloned();
-
-    let content_id = part
-        .headers
-        .iter()
-        .find(|h| h.get_key().eq_ignore_ascii_case("content-id"))
-        .map(|h| {
-            h.get_value()
-                .trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .trim()
-                .to_string()
-        })
-        .filter(|s| !s.is_empty());
-
-    let is_body_text = content_type == "text/plain" || content_type == "text/html";
-
-    // Inline = embedded resource referenced from the body (cid:) or an
-    // explicitly inline disposition. An explicit `attachment` disposition wins.
-    let is_inline = explicit_inline || (content_id.is_some() && !explicit_attachment);
-
-    // A leaf is an attachment when it carries an attachment disposition, a
-    // filename, or a content-id, or when it is a non-text media type that isn't
-    // serving as the message body.
-    let is_attachment =
-        explicit_attachment || filename.is_some() || content_id.is_some() || !is_body_text;
-
-    if is_attachment {
-        let filename = filename.unwrap_or_else(|| fallback_filename(&content_id, &content_type));
-
-        // `raw_bytes` is a borrowed encoded representation, so reject it before
-        // asking mailparse to allocate a decoded body. Both ceilings are applied
-        // over the running total: max_attachment_size bounds one part,
-        // max_total_attachment_bytes bounds their sum.
-        let encoded_len = part.raw_bytes.len();
-        if encoded_len > options.max_attachment_size
-            || encoded_len
-                > options
-                    .max_total_attachment_bytes
-                    .saturating_sub(*total_attachment_bytes)
-        {
-            return Err(anyhow!("attachment encoded bytes exceed parser budget"));
-        }
-
-        let content_data = part
-            .get_body_raw()
-            .map_err(|e| anyhow!("Failed to read attachment: {}", e))?;
-        if content_data.len() > options.max_attachment_size {
-            return Err(anyhow!("attachment exceeds max_attachment_size"));
-        }
-        *total_attachment_bytes = total_attachment_bytes
-            .checked_add(content_data.len())
-            .ok_or_else(|| anyhow!("attachment byte count overflow"))?;
-        if *total_attachment_bytes > options.max_total_attachment_bytes {
-            return Err(anyhow!("attachments exceed max_total_attachment_bytes"));
-        }
-
-        let attachment = Attachment {
-            filename,
-            content_type,
-            size: content_data.len(),
-            content_id,
-            is_inline,
-            content: if options.extract_attachment_content {
-                use base64::Engine;
-                Some(base64::engine::general_purpose::STANDARD.encode(&content_data))
-            } else {
-                None
-            },
-        };
-
-        attachments.push(attachment);
-    } else if content_type == "text/plain" && body.text.is_none() {
-        let text =
-            decode_text_body(part).map_err(|e| anyhow!("Failed to read text body: {}", e))?;
-        body.text = Some(text);
-    } else if content_type == "text/html" && body.html.is_none() {
-        let html =
-            decode_text_body(part).map_err(|e| anyhow!("Failed to read HTML body: {}", e))?;
-        body.html = Some(html);
-    }
-
-    // Recursively process subparts (e.g. message/rfc822 with nested MIME).
-    for subpart in &part.subparts {
-        parse_mime_part(subpart, body, attachments, options, total_attachment_bytes)?;
-    }
-
-    Ok(())
 }
 
 /// Build a filename for an attachment that carries no explicit name,

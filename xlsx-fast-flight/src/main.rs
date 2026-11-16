@@ -45,7 +45,7 @@ impl TableParser for Xlsx {
     const DEFAULT_BIND: &'static str = "0.0.0.0:50051";
     const DEFAULT_TABLE: &'static str = "cells";
     const MISSING_DEFAULT_SCHEMA: &'static str = "missing schema for default xlsx table";
-    const EXTENSIONS: &'static [&'static str] = &["xlsx", "xlsm", "xltx", "xltm"];
+    const EXTENSIONS: &'static [&'static str] = &["xlsx", "xlsm", "xltx", "xltm", "xls", "xlsb"];
     // Every workbook has the same schema, so GetSchema has never looked at
     // the file it is asked about.
     const GET_SCHEMA_READS_DESCRIPTOR: bool = false;

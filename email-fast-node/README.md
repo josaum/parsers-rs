@@ -6,7 +6,7 @@ High-performance email parser for .eml and .msg formats.
 
 - **Fast**: Memory-mapped files for large mailboxes
 - **Multi-format**: EML (RFC 5322) and MSG (Outlook) support
-- **Complete**: Headers, body (text/html), attachments, threading
+- **Projection**: Headers, body (text/html), attachments, threading
 - **Streaming**: Mbox format support for bulk processing
 - **Arrow IPC**: Export to Apache Arrow format
 - **Safe**: Rust memory safety guarantees
@@ -51,7 +51,12 @@ console.log('Extracted:', paths);
 
 ```javascript
 const email = parseEmail('/path/to/message.eml', {
-  maxInflate: 100 * 1024 * 1024,  // Max attachment size (default: 100 MB)
+  maxInflate: 128 * 1024 * 1024,    // Input and decoded-content ceiling
+  maxAttachmentSize: 100 * 1024 * 1024,
+  maxTotalAttachmentBytes: 100 * 1024 * 1024,
+  maxMimeDepth: 64,
+  maxMimeParts: 10000,
+  maxHeaderBytes: 256 * 1024,
   includeRawHeaders: false,        // Include all headers (default: false)
   htmlToText: false,               // Convert HTML to text (default: false)
   extractAttachmentContent: false, // Include attachment content (default: false)
@@ -84,12 +89,12 @@ const count = parseMboxArrow(
 
 ```javascript
 {
-  messageId: "<abc123@example.com>",
+  message_id: "<abc123@example.com>",
   from: {
     name: "John Doe",
     address: "john@example.com"
   },
-  replyTo: { name: null, address: "reply@example.com" },
+  reply_to: { name: null, address: "reply@example.com" },
   to: [{ name: null, address: "jane@example.com" }],
   cc: [],
   bcc: [],
@@ -102,13 +107,13 @@ const count = parseMboxArrow(
   attachments: [
     {
       filename: "document.pdf",
-      contentType: "application/pdf",
+      content_type: "application/pdf",
       size: 12345,
-      contentId: "<attachment1>",
-      isInline: false
+      content_id: "<attachment1>",
+      is_inline: false
     }
   ],
-  inReplyTo: "<parent@example.com>",
+  in_reply_to: "<parent@example.com>",
   references: ["<ancestor@example.com>"],
   priority: 3
 }
@@ -124,11 +129,26 @@ import { parseEmail, Email, ParseOptions } from 'email-fast-node';
 const email: Email = parseEmail('message.eml');
 ```
 
-## Performance
+## Reliability and resource limits
 
-- **10x faster** than JavaScript email parsers
-- **Streaming mbox processing** for mailboxes with millions of messages
-- **Low memory footprint** even for large attachments
+All limits also accept snake_case names. `maxInflate` caps input and aggregate
+decoded content separately; it is not a process memory cap. Attachment budgets
+count decoded payload bytes. `extractAttachments(path, directory, options)`
+accepts the same resource limits; its historical numeric third argument remains
+supported.
+
+Extraction discards sender-supplied directories and uses exclusive file creation.
+Existing files/symlinks are not overwritten; collisions get numeric suffixes.
+EML attachments decode directly into files, without Base64 re-encoding.
+
+Mbox preserves original charset bytes and stops on parse errors, reporting the
+message index and byte offset. Earlier output may remain after a failure. MIME
+alternatives/related roots and quoted addresses are interpreted structurally.
+MSG includes recipient objects, dates, threading, codepages, compressed RTF text,
+and embedded `.msg` attachments.
+
+See [compatibility notes and benchmarks](../SPEC_COMPLIANCE.md). Performance
+figures describe measured workloads, not comparisons with other parser products.
 
 ## Platform Support
 

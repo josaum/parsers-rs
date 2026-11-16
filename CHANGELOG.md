@@ -4,6 +4,51 @@ Changes a consumer of the wheels, Node packages, crates or Flight servers
 can observe. Each release also has generated notes listing every pull
 request.
 
+## v2026.11.16
+
+Integrates the parser and crawler work with the current main branch. Existing
+crates receive new patch versions; `web-fast-crawl` is introduced at 0.1.0.
+The binary release retains all 48 Python wheels and 40 Node packages across
+macOS ARM64, Linux x86_64/ARM64 and Windows x86_64. The crawler is a Rust crate
+and CLI built from source; it has no Python or Node binding artifact.
+
+### Added
+
+- XLS and XLSB content detection and reading through the existing Excel path,
+  byte, JSON, NDJSON and Arrow APIs, with binary fixtures and resource limits.
+- Bounded semantic crawling with an optional Playwright browser, hydration and
+  captured API JSON, commerce observations, offline JSON-LD expansion, indexed
+  provenance graphs and an optional O-Laya classification example.
+- MIME structure and header budgets, streaming attachment extraction that avoids
+  overwrites, MSG recipient/property projection, embedded MSG and compressed RTF
+  support, and mbox error callbacks carrying message numbers and byte offsets.
+
+### Correctness and compatibility
+
+- Sitemap parsing uses quick-xml 0.42; JSON-LD uses oxjsonld directly, removing
+  unused RDF/XML dependencies affected by RUSTSEC-2026-0194 and -0195.
+
+- JSON protocol envelopes retain explicit nulls and reject malformed member
+  shapes. JSON Schema pointers reject malformed escapes and array indices;
+  unresolved references remain errors under the upstream fail-closed policy.
+- XSD preserves string whitespace, normalizes token/normalizedString values,
+  checks minimum occurrences greater than one and rejects children in simple
+  values. GeoJSON validates feature and coordinate shapes; null IDs remain
+  accepted as absent for compatibility.
+- OOXML reads verify size and CRC, including a zero CRC, and reject duplicate
+  normalized part names. Corrupt archives previously accepted now return errors.
+- HTML extraction excludes hidden/inert content, preserves visible inline text,
+  separates nested tables and extracts structured script data. Structural paths
+  count toward the output text budget, so very large pages may need a larger
+  `max_text_bytes`. Outer table cells no longer repeat nested-table text.
+- Rust email and HTML options have additional fields; callers constructing
+  exhaustive literals should add those fields or `..Default::default()`.
+  Python email resource limits are keyword-only. MIME container nesting remains
+  capped at 32 before parsing, independently of the configurable tree limit.
+- Attachment failures now return errors rather than silently dropping content;
+  completed extraction files can remain if a later attachment fails. See
+  `SPEC_COMPLIANCE.md` and the crate READMEs for format and crawler limitations.
+
 ## v2026.11.13.3
 
 Every crate's patch version moves; `mcts-fast-core` and `mcts-fast-py` are

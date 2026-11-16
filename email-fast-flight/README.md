@@ -30,7 +30,12 @@ Options:
   -r, --root <ROOT>                  Root directory containing email files
   -p, --port <PORT>                  Port to listen on [default: 50054]
   -H, --host <HOST>                  Host to bind to [default: 0.0.0.0]
-      --max-attachment-size <SIZE>   Max attachment size in MB [default: 100]
+      --max-attachment-size <SIZE>   Per-attachment decoded MiB [default: 100]
+      --max-total-attachment-size <SIZE> Aggregate decoded MiB [default: per-attachment limit]
+      --max-message-size <SIZE>      Input/decoded message MiB [default: 128]
+      --max-mime-depth <DEPTH>       Nesting depth [default: 64]
+      --max-mime-parts <COUNT>       MIME parts/MSG entries [default: 10000]
+      --max-header-bytes <BYTES>     Headers per MIME part [default: 262144]
   -h, --help                         Print help
 ```
 
@@ -45,7 +50,7 @@ email-fast-flight --root /var/mail --port 50054
 # With custom attachment limit
 PARSERS_FLIGHT_REQUIRE_AUTH=true \
 PARSERS_JWT_PUBLIC_KEY_PATH=/run/secrets/parsers-jwt-public.pem \
-email-fast-flight --root ~/Emails --max-attachment-size 500
+email-fast-flight --root ~/Emails --max-attachment-size 500 --max-message-size 768
 ```
 
 ## License

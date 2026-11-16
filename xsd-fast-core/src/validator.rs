@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::parser::{schema_input, Repairs, SchemaInput, SchemaSet};
 use crate::schema::{
     ComplexType, ContentModel, ElementRef, OccurrenceConstraint, Particle, SchemaModel,
-    SimpleTypeDef, XsdType,
+    SimpleTypeDef, SimpleTypeKind, XsdType,
 };
 
 /// Deepest nesting of list item types checked.
@@ -233,7 +233,7 @@ impl<'m> ValidationContext<'m> {
         // Text is not trimmed as it is read. An element's value can arrive in
         // several pieces (text, a CDATA section, more text), and trimming each
         // piece would delete the spaces between them. The whole value is
-        // trimmed once, at the end tag.
+        // normalized according to its XSD type at the end tag.
         reader.config_mut().trim_text(false);
         // A bare `&` is not well-formed, but it is read as the text it is, so
         // the value is checked as written and the rest of the document is
@@ -366,7 +366,7 @@ impl<'m> ValidationContext<'m> {
                     if let Some(frame) = self.type_stack.pop() {
                         if let Some(t) = frame.xsd_type.filter(|_| !frame.nil) {
                             if self.opts.check_facets {
-                                self.check_text_for_type_val(t, frame.text.trim());
+                                self.check_text_for_type_val(t, &frame.text);
                             }
                             if self.opts.check_cardinality {
                                 self.collect_unclaimed(t, &frame.child_namespaces);
@@ -688,6 +688,10 @@ impl<'m> ValidationContext<'m> {
     fn resolve_child_type(&mut self, child_local: &str) -> Option<ResolvedType<'m>> {
         if let Some(parent) = self.type_stack.last() {
             let ResolvedType::Complex(parent_type) = parent.xsd_type? else {
+                self.push_error(
+                    ValidationSeverity::Error,
+                    format!("unexpected child <{child_local}> inside a simple value"),
+                );
                 return None;
             };
             return self.find_child_in_content(&parent_type.content, child_local);
@@ -847,10 +851,23 @@ impl<'m> ValidationContext<'m> {
         let kind = &st.kind;
         // A list's white space collapses: items are separated by single
         // spaces, with none at either end, before any facet is checked.
-        let collapsed;
-        let text = if st.list_item.is_some() {
-            collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            collapsed.as_str()
+        let normalized;
+        let text = if st.list_item.is_some()
+            || !matches!(
+                kind,
+                SimpleTypeKind::String
+                    | SimpleTypeKind::NormalizedString
+                    | SimpleTypeKind::Other(_)
+            ) {
+            normalized = text
+                .split([' ', '\t', '\r', '\n'])
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            normalized.as_str()
+        } else if matches!(kind, SimpleTypeKind::NormalizedString) {
+            normalized = text.replace(['\t', '\r', '\n'], " ");
+            normalized.as_str()
         } else {
             text
         };
@@ -1026,10 +1043,17 @@ impl<'m> ValidationContext<'m> {
             branch_total += count;
             // In a choice, no single branch is individually required — only the
             // union is. Skip the per-branch required check there.
-            if !is_choice && occ.min >= 1 && count == 0 {
+            if (!is_choice || count > 0) && count < occ.min as usize {
                 self.push_error(
                     ValidationSeverity::Error,
-                    format!("required child <{child_name}> is missing"),
+                    if count == 0 {
+                        format!("required child <{child_name}> is missing")
+                    } else {
+                        format!(
+                            "required child <{child_name}> appears {count} times, min is {}",
+                            occ.min
+                        )
+                    },
                 );
             }
             if let Some(m) = occ.max {

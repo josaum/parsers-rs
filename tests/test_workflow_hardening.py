@@ -53,7 +53,7 @@ REQUIRED_CI_JOBS = {
     "lean-formal": None,
 }
 # ci.yml jobs that report but are not required checks.
-OPTIONAL_CI_JOBS = {"rustdoc"}
+OPTIONAL_CI_JOBS = {"browser-crawler", "rustdoc"}
 DENY_CONFIG = "deny.toml"
 SKIP_CONDITION = "${{ inputs.skip_binding_jobs != true }}"
 
@@ -639,8 +639,10 @@ def assert_deny_policy(policy: str) -> None:
     exceptions = {entry["crate"]: entry["allow"] for entry in licenses.get("exceptions", [])}
     assert len(exceptions) == len(licenses.get("exceptions", [])), "a crate is excepted twice"
     # The only exceptions are the named MPL-2.0 crates; nothing stronger.
-    assert set(exceptions) == MPL_CRATES, "the MPL-2.0 exceptions changed: update README.md with them"
-    assert all(allow == ["MPL-2.0"] for allow in exceptions.values())
+    assert set(exceptions) == MPL_CRATES | {"web-fast-crawl"}, "license exceptions changed: update README.md with them"
+    assert all(exceptions[crate] == ["MPL-2.0"] for crate in MPL_CRATES)
+    assert exceptions["web-fast-crawl"] == ["CC-BY-SA-3.0"]
+    assert (ROOT / "web-fast-crawl/contexts/NOTICE.md").is_file()
     readme = read(ROOT / "README.md")
     for crate in MPL_CRATES:
         assert f"`{crate}`" in readme, f"README.md does not say where the source of {crate} is"

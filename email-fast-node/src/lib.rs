@@ -18,6 +18,16 @@ use napi_derive::napi;
 /// All fields are optional; omitted fields fall back to [`ParseOptions::default()`].
 #[napi(object)]
 pub struct ParseOptionsJs {
+    /// Maximum input/decoded message bytes.
+    pub max_inflate: Option<u32>,
+    /// Maximum MIME/MSG nesting depth.
+    pub max_mime_depth: Option<u32>,
+    /// Maximum MIME parts or MSG directory entries.
+    pub max_mime_parts: Option<u32>,
+    /// Maximum header bytes per MIME part.
+    pub max_header_bytes: Option<u32>,
+    /// Aggregate decoded attachment budget.
+    pub max_total_attachment_bytes: Option<u32>,
     /// Maximum size of one attachment, in bytes (default: 100 MB).
     pub max_attachment_size: Option<u32>,
     /// Include raw headers in the output (default: false).
@@ -40,14 +50,22 @@ pub struct ArrowOptionsJs {
 
 /// Build [`ParseOptions`] from a partial JS object, filling unset fields from the core default.
 ///
-/// The aggregate attachment budget (`max_total_attachment_bytes`) is not
-/// exposed: it stays at the core default so a caller raising the per-part
-/// ceiling cannot lift the sum without a deliberate binding change.
+/// Resource limits are forwarded consistently with Rust and Python.
 fn to_parse_options(opts: Option<ParseOptionsJs>) -> ParseOptions {
     let d = ParseOptions::default();
     match opts {
         None => d,
         Some(o) => ParseOptions {
+            max_inflate: o.max_inflate.map_or(d.max_inflate, |v| v as usize),
+            max_mime_depth: o.max_mime_depth.map_or(d.max_mime_depth, |v| v as usize),
+            max_mime_parts: o.max_mime_parts.map_or(d.max_mime_parts, |v| v as usize),
+            max_header_bytes: o
+                .max_header_bytes
+                .map_or(d.max_header_bytes, |v| v as usize),
+            max_total_attachment_bytes: o
+                .max_total_attachment_bytes
+                .map_or(d.max_total_attachment_bytes, |v| v as usize),
+
             max_attachment_size: o
                 .max_attachment_size
                 .map_or(d.max_attachment_size, |v| v as usize),
@@ -56,7 +74,6 @@ fn to_parse_options(opts: Option<ParseOptionsJs>) -> ParseOptions {
             extract_attachment_content: o
                 .extract_attachment_content
                 .unwrap_or(d.extract_attachment_content),
-            ..d
         },
     }
 }
@@ -73,7 +90,7 @@ fn to_arrow_options(opts: Option<ArrowOptionsJs>) -> ArrowOptions {
 
 /// Convert a core error into a JavaScript error carrying its message.
 fn js_error(err: impl std::fmt::Display) -> Error {
-    Error::from_reason(err.to_string())
+    Error::from_reason(format!("{err:#}"))
 }
 
 /// Parse an email file (EML or MSG, detected by content) and return it as a JSON value.
@@ -139,12 +156,14 @@ pub fn extract_attachments_js(
     path: String,
     out_dir: String,
     max_attachment_size: Option<u32>,
+    options: Option<ParseOptionsJs>,
 ) -> Result<Vec<String>> {
-    let d = ParseOptions::default();
+    let defaults = to_parse_options(options);
     let options = ParseOptions {
-        max_attachment_size: max_attachment_size.map_or(d.max_attachment_size, |v| v as usize),
+        max_attachment_size: max_attachment_size
+            .map_or(defaults.max_attachment_size, |v| v as usize),
         extract_attachment_content: true,
-        ..d
+        ..defaults
     };
     let paths = extract_attachments(path, out_dir, options).map_err(js_error)?;
     Ok(paths

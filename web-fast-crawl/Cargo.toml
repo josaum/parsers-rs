@@ -1,0 +1,38 @@
+[package]
+name = "web-fast-crawl"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license = "(MIT OR Apache-2.0) AND CC-BY-SA-3.0"
+repository.workspace = true
+rust-version.workspace = true
+description = "Bounded asynchronous semantic crawler with indexed provenance graphs"
+
+[dependencies]
+web-fast-core = { path = "../web-fast-core", version = "0.1.7" }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "gzip", "brotli", "deflate", "stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "process"] }
+futures-util = "0.3"
+robotstxt = "0.3"
+httpdate = "1"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+graphql-parser = "0.4.1"
+scraper = { version = "0.29", default-features = false, features = ["atomic"] }
+mime = "0.3"
+quick-xml = "0.42"
+oxrdf = { version = "0.3", features = ["rdf-12"] }
+oxjsonld = { version = "0.2.7", default-features = false, features = ["rdf-12"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror = "2"
+url = "2.5"
+clap = { version = "4", features = ["derive"] }
+
+[[bench]]
+name = "graph_paths"
+harness = false
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+flate2 = "1"

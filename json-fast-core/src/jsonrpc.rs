@@ -18,19 +18,29 @@ pub struct JsonRpcRequest {
     /// Method name.
     pub method: String,
     /// Positional or named parameters.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub params: Option<Value>,
-    /// Request identifier (echoed back on the response).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Request identifier (echoed back on the response). Explicit null is
+    /// `Some(Null)`; only an absent identifier denotes a notification.
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub id: Option<Value>,
 }
 
 impl JsonRpcRequest {
     /// Parse and validate a JSON-RPC 2.0 request envelope.
     ///
-    /// Fails loud when `jsonrpc` is not `"2.0"` or `method` is missing/empty.
+    /// Requires version `"2.0"`, a string method, structured parameters if
+    /// present, and a string, number or null identifier if present.
     pub fn parse(input: &str) -> Result<Self> {
-        let request: JsonRpcRequest = crate::parse(input)?;
+        let request: JsonRpcRequest = crate::parse_object(input)?;
         request.validate()?;
         Ok(request)
     }
@@ -42,11 +52,16 @@ impl JsonRpcRequest {
                 self.jsonrpc
             )));
         }
-        if self.method.is_empty() {
+        if self
+            .params
+            .as_ref()
+            .is_some_and(|params| !params.is_array() && !params.is_object())
+        {
             return Err(JsonError::Structure(
-                "jsonrpc request method is empty".into(),
+                "jsonrpc params must be an array or object".into(),
             ));
         }
+        validate_id(self.id.as_ref())?;
         Ok(())
     }
 }
@@ -59,7 +74,11 @@ pub struct JsonRpcError {
     /// Short human-readable message.
     pub message: String,
     /// Optional additional data.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub data: Option<Value>,
 }
 
@@ -68,14 +87,26 @@ pub struct JsonRpcError {
 pub struct JsonRpcResponse {
     /// Must be `"2.0"`.
     pub jsonrpc: String,
-    /// Present on success.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Present on success, including an explicit null result (`Some(Null)`).
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub result: Option<Value>,
     /// Present on failure.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_error",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub error: Option<JsonRpcError>,
-    /// Echoes the request identifier.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Echoes the request identifier; an unknown identifier is `Some(Null)`.
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub id: Option<Value>,
 }
 
@@ -83,9 +114,10 @@ impl JsonRpcResponse {
     /// Parse and validate a JSON-RPC 2.0 response envelope.
     ///
     /// Fails loud when `jsonrpc` is not `"2.0"`, or when both `result` and
-    /// `error` are present (a response must be exactly one of them).
+    /// `error` are present (a response must be exactly one of them), or the
+    /// required identifier is missing or has an invalid type.
     pub fn parse(input: &str) -> Result<Self> {
-        let response: JsonRpcResponse = crate::parse(input)?;
+        let response: JsonRpcResponse = crate::parse_object(input)?;
         response.validate()?;
         Ok(response)
     }
@@ -107,8 +139,42 @@ impl JsonRpcResponse {
                 "jsonrpc response has neither result nor error".into(),
             ));
         }
+        if self.id.is_none() {
+            return Err(JsonError::Structure("jsonrpc response requires id".into()));
+        }
+        validate_id(self.id.as_ref())?;
         Ok(())
     }
+}
+
+fn validate_id(id: Option<&Value>) -> Result<()> {
+    if id.is_some_and(|id| !(id.is_null() || id.is_string() || id.is_number())) {
+        return Err(JsonError::Structure(
+            "jsonrpc id must be a string, number, or null".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_error<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<JsonRpcError>, D::Error> {
+    struct ErrorObject;
+    impl<'de> serde::de::Visitor<'de> for ErrorObject {
+        type Value = Option<JsonRpcError>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON-RPC error object")
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            map: M,
+        ) -> std::result::Result<Self::Value, M::Error> {
+            JsonRpcError::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Some)
+        }
+    }
+    deserializer.deserialize_map(ErrorObject)
 }
 
 #[cfg(test)]
@@ -127,9 +193,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_version_and_empty_method() {
+    fn rejects_wrong_version_and_accepts_string_methods() {
         assert!(JsonRpcRequest::parse(r#"{"jsonrpc":"1.0","method":"m"}"#).is_err());
-        assert!(JsonRpcRequest::parse(r#"{"jsonrpc":"2.0","method":""}"#).is_err());
+        assert!(JsonRpcRequest::parse(r#"{"jsonrpc":"2.0","method":""}"#).is_ok());
     }
 
     #[test]

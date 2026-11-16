@@ -6,8 +6,8 @@
 //!   JSON as a string. An upload is parsed where it already is, with no temp
 //!   file and no subprocess, because the parse is fast enough to run in-process.
 //! - `parse_xlsx_json_py` / `parse_xlsx_ndjson_py` / `parse_xlsx_arrow_ipc_py` —
-//!   path-based, writing to a path. A large workbook on disk should stream to
-//!   NDJSON or Arrow IPC rather than materialize in memory.
+//!   path-based output. XLSX emits cells incrementally; XLS/XLSB materialize
+//!   the workbook under resource budgets before writing NDJSON or Arrow IPC.
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -74,9 +74,9 @@ fn parse_xlsx_json_py(
     let path_fs = fs_path(path)?;
     py.detach(|| -> PyResult<String> {
         let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
-        let workbook =
-            parse_xlsx(path_fs, options).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        serde_json::to_string(&workbook).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+        let workbook = parse_xlsx(path_fs, options)
+            .map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))?;
+        serde_json::to_string(&workbook).map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
     })
 }
 
@@ -96,7 +96,7 @@ fn parse_xlsx_ndjson_py(
     py.detach(|| -> PyResult<()> {
         let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
         parse_xlsx_to_ndjson(path_fs, out_path_fs, options)
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+            .map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
     })
 }
 
@@ -113,8 +113,8 @@ fn parse_xlsx_bytes_py(
     py.detach(|| -> PyResult<String> {
         let options = build_options(decode_dates, include_formulas, raw_values, max_inflate);
         let workbook = xlsx_fast_core::parse_xlsx_bytes(bytes.to_vec(), options)
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        serde_json::to_string(&workbook).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+            .map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))?;
+        serde_json::to_string(&workbook).map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
     })
 }
 
@@ -141,7 +141,7 @@ fn parse_xlsx_arrow_ipc_py(
             ..ArrowOptions::default()
         };
         parse_xlsx_to_arrow_ipc(path_fs, out_path_fs, options, arrow_options)
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+            .map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
     })
 }
 

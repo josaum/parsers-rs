@@ -55,6 +55,9 @@ allow = [
   # zerovec, yoke, litemap, tinystr, writeable, potential_utf). Permissive,
   # notice required.
   "Unicode-3.0",
+  # Mozilla root certificate data used by rustls-platform-verifier.
+  # Permissive data licence; preserve its agreement with redistributed data.
+  "CDLA-Permissive-2.0",
 ]
 # How sure the licence-text matcher must be before it names a licence.
 confidence-threshold = 0.93
@@ -80,6 +83,13 @@ allow = ["MPL-2.0"]
 [[licenses.exceptions]]
 crate = "selectors"
 allow = ["MPL-2.0"]
+
+# The crawler bundles an unmodified Schema.org context as data. Its CC-BY-SA
+# terms and attribution are recorded in web-fast-crawl/contexts/NOTICE.md;
+# Rust source remains MIT OR Apache-2.0. This exception is crate-scoped.
+[[licenses.exceptions]]
+crate = "web-fast-crawl"
+allow = ["CC-BY-SA-3.0"]
 
 [bans]
 # Two versions of one crate in the lockfile. This cannot be "deny" today:

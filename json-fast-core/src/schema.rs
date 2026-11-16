@@ -2884,12 +2884,21 @@ impl<'s> Registry<'s> {
             });
         }
         if let Some(pointer) = fragment.strip_prefix('/') {
+            validate_json_pointer(&fragment).ok()?;
             let mut node = declared.root;
             for raw in pointer.split('/') {
                 let token = raw.replace("~1", "/").replace("~0", "~");
                 node = match node {
                     Value::Object(map) => map.get(&token)?,
-                    Value::Array(items) => items.get(token.parse::<usize>().ok()?)?,
+                    Value::Array(items) => {
+                        if token.is_empty()
+                            || (token.len() > 1 && token.starts_with('0'))
+                            || !token.bytes().all(|byte| byte.is_ascii_digit())
+                        {
+                            return None;
+                        }
+                        items.get(token.parse::<usize>().ok()?)?
+                    }
                     _ => return None,
                 };
                 // A pointer may walk into an embedded resource.

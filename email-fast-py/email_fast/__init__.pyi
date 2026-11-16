@@ -10,6 +10,11 @@ def parse_email(
     html_to_text: bool = ...,
     extract_attachment_content: bool = ...,
     max_total_attachment_bytes: Optional[int] = ...,
+    *,
+    max_inflate: Optional[int] = ...,
+    max_mime_depth: Optional[int] = ...,
+    max_mime_parts: Optional[int] = ...,
+    max_header_bytes: Optional[int] = ...,
 ) -> Dict[str, Any]: ...
 def parse_eml(
     path: str,
@@ -18,6 +23,11 @@ def parse_eml(
     html_to_text: bool = ...,
     extract_attachment_content: bool = ...,
     max_total_attachment_bytes: Optional[int] = ...,
+    *,
+    max_inflate: Optional[int] = ...,
+    max_mime_depth: Optional[int] = ...,
+    max_mime_parts: Optional[int] = ...,
+    max_header_bytes: Optional[int] = ...,
 ) -> Dict[str, Any]: ...
 def parse_email_json(
     path: str,
@@ -26,6 +36,11 @@ def parse_email_json(
     html_to_text: bool = ...,
     extract_attachment_content: bool = ...,
     max_total_attachment_bytes: Optional[int] = ...,
+    *,
+    max_inflate: Optional[int] = ...,
+    max_mime_depth: Optional[int] = ...,
+    max_mime_parts: Optional[int] = ...,
+    max_header_bytes: Optional[int] = ...,
 ) -> str: ...
 def parse_email_ndjson(
     path: str,
@@ -35,6 +50,11 @@ def parse_email_ndjson(
     html_to_text: bool = ...,
     extract_attachment_content: bool = ...,
     max_total_attachment_bytes: Optional[int] = ...,
+    *,
+    max_inflate: Optional[int] = ...,
+    max_mime_depth: Optional[int] = ...,
+    max_mime_parts: Optional[int] = ...,
+    max_header_bytes: Optional[int] = ...,
 ) -> None: ...
 def parse_mbox_ndjson(
     path: str,
@@ -44,6 +64,11 @@ def parse_mbox_ndjson(
     html_to_text: bool = ...,
     extract_attachment_content: bool = ...,
     max_total_attachment_bytes: Optional[int] = ...,
+    *,
+    max_inflate: Optional[int] = ...,
+    max_mime_depth: Optional[int] = ...,
+    max_mime_parts: Optional[int] = ...,
+    max_header_bytes: Optional[int] = ...,
 ) -> int: ...
 def parse_mbox_arrow(
     path: str,
@@ -54,12 +79,22 @@ def parse_mbox_arrow(
     extract_attachment_content: bool = ...,
     max_total_attachment_bytes: Optional[int] = ...,
     batch_size: Optional[int] = ...,
+    *,
+    max_inflate: Optional[int] = ...,
+    max_mime_depth: Optional[int] = ...,
+    max_mime_parts: Optional[int] = ...,
+    max_header_bytes: Optional[int] = ...,
 ) -> int: ...
 def extract_attachments(
     path: str,
     out_dir: str,
     max_attachment_size: Optional[int] = ...,
     max_total_attachment_bytes: Optional[int] = ...,
+    *,
+    max_inflate: Optional[int] = ...,
+    max_mime_depth: Optional[int] = ...,
+    max_mime_parts: Optional[int] = ...,
+    max_header_bytes: Optional[int] = ...,
 ) -> List[str]: ...
 def parse_email_bytes(
     source: bytes,
@@ -70,6 +105,10 @@ def parse_email_bytes(
     html_to_text: bool = ...,
     extract_attachment_content: bool = ...,
     max_total_attachment_bytes: Optional[int] = ...,
+    max_inflate: Optional[int] = ...,
+    max_mime_depth: Optional[int] = ...,
+    max_mime_parts: Optional[int] = ...,
+    max_header_bytes: Optional[int] = ...,
 ) -> Dict[str, Any]: ...
 def parse_mbox_bytes(
     source: bytes,
@@ -79,6 +118,10 @@ def parse_mbox_bytes(
     html_to_text: bool = ...,
     extract_attachment_content: bool = ...,
     max_total_attachment_bytes: Optional[int] = ...,
+    max_inflate: Optional[int] = ...,
+    max_mime_depth: Optional[int] = ...,
+    max_mime_parts: Optional[int] = ...,
+    max_header_bytes: Optional[int] = ...,
 ) -> List[Dict[str, Any]]: ...
 
 __all__: List[str]

@@ -1,6 +1,6 @@
 [package]
 name = "mcts-fast-core"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 authors.workspace = true
 description = "Arena-based PUCT MCTS with embedding-guided simulation for ontology/KB navigation"

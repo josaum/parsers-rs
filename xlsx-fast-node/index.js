@@ -40,3 +40,8 @@ module.exports = {
     return native.parseXlsxArrowIpcJs(path, outPath, parseOpts(options), arrowOpts);
   },
 };
+
+// Generic names for the content-detected XLS, XLSB and XLSX readers.
+module.exports.parseExcel = module.exports.parseXlsx;
+module.exports.parseExcelNdjson = module.exports.parseXlsxNdjson;
+module.exports.parseExcelArrowIpc = module.exports.parseXlsxArrowIpc;

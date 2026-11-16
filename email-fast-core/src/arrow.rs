@@ -4,7 +4,7 @@
 //! for efficient data interchange with data processing systems.
 
 use crate::{Email, EmailAddress, ParseOptions};
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use arrow_array::{
     builder::{StringBuilder, TimestampMicrosecondBuilder, UInt32Builder},
     RecordBatch,
@@ -204,17 +204,27 @@ pub fn parse_emails_to_arrow_ipc(
     paths: &[impl AsRef<Path>],
     out_path: impl AsRef<Path>,
     parse_options: ParseOptions,
-    _arrow_options: ArrowOptions,
+    arrow_options: ArrowOptions,
 ) -> Result<()> {
+    ensure!(
+        arrow_options.batch_size > 0,
+        "batch_size must be greater than zero"
+    );
+    let schema = emails_schema();
+    let file = std::fs::File::create(out_path)?;
+    let mut writer = FileWriter::try_new(file, &schema)?;
     let mut emails = Vec::new();
-
     for path in paths {
-        let email = crate::parse_email(path, parse_options)?;
-        emails.push(email);
+        emails.push(crate::parse_email(path, parse_options)?);
+        if emails.len() >= arrow_options.batch_size {
+            writer.write(&emails_to_record_batch(&emails)?)?;
+            emails.clear();
+        }
     }
-
-    let mut file = std::fs::File::create(out_path)?;
-    export_emails_to_arrow_ipc(&emails, &mut file)?;
+    if !emails.is_empty() {
+        writer.write(&emails_to_record_batch(&emails)?)?;
+    }
+    writer.finish()?;
 
     Ok(())
 }
@@ -226,7 +236,11 @@ pub fn parse_mbox_to_arrow_ipc(
     parse_options: ParseOptions,
     arrow_options: ArrowOptions,
 ) -> Result<usize> {
-    let mut emails = Vec::with_capacity(arrow_options.batch_size);
+    ensure!(
+        arrow_options.batch_size > 0,
+        "batch_size must be greater than zero"
+    );
+    let mut emails = Vec::new();
     let mut total_count = 0;
     let mut file_counter = 0;
 

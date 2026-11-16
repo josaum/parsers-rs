@@ -1,0 +1,35 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { enrichProducts } from './olaya-products.mjs';
+
+const runtimePath = process.env.OLAYA_RUNTIME;
+test('actual Olaya decisions preserve facts, provenance, missing fields and review state', { skip: !runtimePath && 'Set OLAYA_RUNTIME to the local Node runtime' }, async () => {
+  const runtime = await import(pathToFileURL(resolve(runtimePath)).href);
+  const ontology = JSON.parse(await readFile(new URL('./commerce-ontology.json', import.meta.url)));
+  const evidence = { description_kind: 'feature_bullets_excerpt', description_truncated: true };
+  const product = { source: 0, json_pointer: '/a~1b/~0/0', name: 'Wireless charging station', description: 'Wireless charger for three devices.', offers: [{ price: '15.28', currency: 'USD', availability: 'In Stock', seller: null }] };
+  const page = { url: 'https://example.com/product', structured: { sources: [{ kind: 'html_product_detail', locator: 'fixture', value_sha256: 'fixture-hash', value: { 'a/b': { '~': [{ evidence }] } } }], products: [product] } };
+  const before = JSON.stringify(page);
+  const { products } = await enrichProducts({ pages: [page, { ...page, robots: { noindex: true } }] }, runtime, ontology);
+  assert.equal(products.length, 1);
+  assert.equal(JSON.stringify(page), before);
+  assert.deepEqual(products[0].offers, product.offers);
+  assert.equal(products[0].description, product.description);
+  assert.deepEqual(products[0].missing_fields, ['seller']);
+  assert.deepEqual(products[0].provenance.extraction_evidence, evidence);
+  assert.equal(products[0].classification.curie, 'shop:WirelessChargingStation');
+  assert.equal(products[0].classification.axioms_verified, true);
+  assert.deepEqual(products[0].classification.lineage, ['shop:Product', 'shop:Electronics', 'shop:ChargingAccessory', 'shop:WirelessChargingStation']);
+  const unknown = structuredClone(page);
+  unknown.structured.products[0] = { source: 0, json_pointer: product.json_pointer, name: 'unrelated qzxv material', offers: [] };
+  const result = (await enrichProducts({ pages: [unknown] }, runtime, ontology)).products[0];
+  assert.equal(result.classification.status, 'needs_review');
+  assert.equal(result.classification.curie, null);
+  assert.deepEqual(result.missing_fields, ['description', 'price', 'currency', 'availability', 'seller']);
+  await assert.rejects(enrichProducts({ pages: [page] }, runtime, ontology, NaN), /confidence/);
+  unknown.structured.products[0].json_pointer = '/missing';
+  await assert.rejects(enrichProducts({ pages: [unknown] }, runtime, ontology), /pointer/);
+});

@@ -1,6 +1,6 @@
 [package]
 name = "xsd-fast-core"
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 authors.workspace = true
 description = "High-performance XSD schema parser with Arrow schema derivation and simple-type validation"
@@ -11,6 +11,10 @@ rust-version.workspace = true
 
 [lib]
 name = "xsd_fast_core"
+
+[[bench]]
+name = "validate"
+harness = false
 
 [features]
 default = []

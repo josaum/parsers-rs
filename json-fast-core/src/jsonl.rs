@@ -9,7 +9,16 @@ use crate::{JsonError, JsonLimits, JsonResource, Result};
 
 /// Count non-blank lines in a JSONL document (a cheap streaming pass).
 pub fn count_lines(jsonl: &str) -> usize {
-    jsonl.lines().filter(|line| !line.trim().is_empty()).count()
+    jsonl
+        .lines()
+        .filter(|line| !trim_json_whitespace(line).is_empty())
+        .count()
+}
+
+// RFC 8259 permits only these four whitespace characters. Unicode `trim`
+// would turn invalid records (including non-breaking spaces) into valid JSON.
+fn trim_json_whitespace(line: &str) -> &str {
+    line.trim_matches([' ', '\t', '\r', '\n'])
 }
 
 /// Parse every non-blank line of a JSONL document into typed values.
@@ -28,32 +37,32 @@ pub fn parse_many_with_limits<T: serde::de::DeserializeOwned>(
     jsonl: &str,
     limits: &JsonLimits,
 ) -> Result<Vec<T>> {
-    preflight_jsonl(jsonl, limits)?;
-
-    jsonl
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(idx, line)| {
-            crate::parse_preflighted::<T>(line.trim())
-                .map_err(|error| JsonError::Parse(format!("line {}: {error}", idx + 1)))
-        })
-        .collect()
+    let records = preflight_jsonl(jsonl, limits)?;
+    let mut values = Vec::with_capacity(records);
+    for (idx, line) in jsonl.lines().enumerate() {
+        let line = trim_json_whitespace(line);
+        if !line.is_empty() {
+            values.push(
+                crate::parse_preflighted::<T>(line)
+                    .map_err(|error| JsonError::Parse(format!("line {}: {error}", idx + 1)))?,
+            );
+        }
+    }
+    Ok(values)
 }
 
-fn preflight_jsonl(jsonl: &str, limits: &JsonLimits) -> Result<()> {
+fn preflight_jsonl(jsonl: &str, limits: &JsonLimits) -> Result<usize> {
     crate::check_limit(
         JsonResource::InputBytes,
         jsonl.len(),
         limits.max_input_bytes,
     )?;
-    crate::check_limit(JsonResource::Lines, jsonl.lines().count(), limits.max_lines)?;
-
     let mut records = 0usize;
     let mut tokens = 0usize;
     let mut retained_bytes = 0usize;
-    for line in jsonl.lines() {
-        let line = line.trim();
+    for (idx, line) in jsonl.lines().enumerate() {
+        crate::check_limit(JsonResource::Lines, idx + 1, limits.max_lines)?;
+        let line = trim_json_whitespace(line);
         if line.is_empty() {
             continue;
         }
@@ -69,7 +78,7 @@ fn preflight_jsonl(jsonl: &str, limits: &JsonLimits) -> Result<()> {
             limits.max_retained_bytes,
         )?;
     }
-    Ok(())
+    Ok(records)
 }
 
 /// Lazily iterate parsed JSON values in a JSONL document without building a
@@ -101,7 +110,7 @@ pub fn iter_with_limits<'a, T: serde::de::DeserializeOwned>(
         }
 
         for (idx, line) in lines.by_ref() {
-            let line = line.trim();
+            let line = trim_json_whitespace(line);
             if line.is_empty() {
                 continue;
             }

@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "xlsx-fast"
-version = "0.2.11"
-description = "High-performance Excel (.xlsx) parser powered by Rust"
+version = "0.2.12"
+description = "Excel (.xlsx, .xls, .xlsb) parser powered by Rust"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.8"

@@ -25,23 +25,32 @@ def parse_email(
     html_to_text=False,
     extract_attachment_content=False,
     max_total_attachment_bytes=None,
+    *,
+    max_inflate=None,
+    max_mime_depth=None,
+    max_mime_parts=None,
+    max_header_bytes=None,
 ):
     """
     Parse an email file (.eml or .msg) and return a Python dict.
-    
+
     Args:
         path: Path to the email file
         max_attachment_size: Maximum attachment size to process (bytes)
         include_raw_headers: Include all raw headers in output
         html_to_text: Convert HTML body to plain text
         extract_attachment_content: Include attachment content (base64 encoded)
-    
+
     Returns:
         Email dict with headers, body, attachments, etc.
     """
     payload = parse_email_json_py(
         path,
         max_attachment_size=max_attachment_size,
+        max_inflate=max_inflate,
+        max_mime_depth=max_mime_depth,
+        max_mime_parts=max_mime_parts,
+        max_header_bytes=max_header_bytes,
         include_raw_headers=include_raw_headers,
         html_to_text=html_to_text,
         extract_attachment_content=extract_attachment_content,
@@ -57,23 +66,32 @@ def parse_eml(
     html_to_text=False,
     extract_attachment_content=False,
     max_total_attachment_bytes=None,
+    *,
+    max_inflate=None,
+    max_mime_depth=None,
+    max_mime_parts=None,
+    max_header_bytes=None,
 ):
     """
     Parse an EML file and return a Python dict.
-    
+
     Args:
         path: Path to the .eml file
         max_attachment_size: Maximum attachment size to process (bytes)
         include_raw_headers: Include all raw headers in output
         html_to_text: Convert HTML body to plain text
         extract_attachment_content: Include attachment content (base64 encoded)
-    
+
     Returns:
         Email dict with headers, body, attachments, etc.
     """
     payload = parse_eml_json_py(
         path,
         max_attachment_size=max_attachment_size,
+        max_inflate=max_inflate,
+        max_mime_depth=max_mime_depth,
+        max_mime_parts=max_mime_parts,
+        max_header_bytes=max_header_bytes,
         include_raw_headers=include_raw_headers,
         html_to_text=html_to_text,
         extract_attachment_content=extract_attachment_content,
@@ -89,23 +107,32 @@ def parse_email_json(
     html_to_text=False,
     extract_attachment_content=False,
     max_total_attachment_bytes=None,
+    *,
+    max_inflate=None,
+    max_mime_depth=None,
+    max_mime_parts=None,
+    max_header_bytes=None,
 ):
     """
     Parse an email file and return raw JSON string.
-    
+
     Args:
         path: Path to the email file
         max_attachment_size: Maximum attachment size to process (bytes)
         include_raw_headers: Include all raw headers in output
         html_to_text: Convert HTML body to plain text
         extract_attachment_content: Include attachment content (base64 encoded)
-    
+
     Returns:
         JSON string
     """
     return parse_email_json_py(
         path,
         max_attachment_size=max_attachment_size,
+        max_inflate=max_inflate,
+        max_mime_depth=max_mime_depth,
+        max_mime_parts=max_mime_parts,
+        max_header_bytes=max_header_bytes,
         include_raw_headers=include_raw_headers,
         html_to_text=html_to_text,
         extract_attachment_content=extract_attachment_content,
@@ -121,10 +148,15 @@ def parse_email_ndjson(
     html_to_text=False,
     extract_attachment_content=False,
     max_total_attachment_bytes=None,
+    *,
+    max_inflate=None,
+    max_mime_depth=None,
+    max_mime_parts=None,
+    max_header_bytes=None,
 ):
     """
     Parse an email file and write to NDJSON.
-    
+
     Args:
         path: Path to the email file
         out_path: Path for the output .ndjson file
@@ -137,6 +169,10 @@ def parse_email_ndjson(
         path,
         out_path,
         max_attachment_size=max_attachment_size,
+        max_inflate=max_inflate,
+        max_mime_depth=max_mime_depth,
+        max_mime_parts=max_mime_parts,
+        max_header_bytes=max_header_bytes,
         include_raw_headers=include_raw_headers,
         html_to_text=html_to_text,
         extract_attachment_content=extract_attachment_content,
@@ -152,10 +188,15 @@ def parse_mbox_ndjson(
     html_to_text=False,
     extract_attachment_content=False,
     max_total_attachment_bytes=None,
+    *,
+    max_inflate=None,
+    max_mime_depth=None,
+    max_mime_parts=None,
+    max_header_bytes=None,
 ):
     """
     Parse an mbox file and write to NDJSON.
-    
+
     Args:
         path: Path to the .mbox file
         out_path: Path for the output .ndjson file
@@ -163,7 +204,7 @@ def parse_mbox_ndjson(
         include_raw_headers: Include all raw headers in output
         html_to_text: Convert HTML body to plain text
         extract_attachment_content: Include attachment content
-    
+
     Returns:
         Number of emails processed
     """
@@ -171,6 +212,10 @@ def parse_mbox_ndjson(
         path,
         out_path,
         max_attachment_size=max_attachment_size,
+        max_inflate=max_inflate,
+        max_mime_depth=max_mime_depth,
+        max_mime_parts=max_mime_parts,
+        max_header_bytes=max_header_bytes,
         include_raw_headers=include_raw_headers,
         html_to_text=html_to_text,
         extract_attachment_content=extract_attachment_content,
@@ -187,10 +232,15 @@ def parse_mbox_arrow(
     extract_attachment_content=False,
     max_total_attachment_bytes=None,
     batch_size=None,
+    *,
+    max_inflate=None,
+    max_mime_depth=None,
+    max_mime_parts=None,
+    max_header_bytes=None,
 ):
     """
     Parse an mbox file and write to Apache Arrow IPC format.
-    
+
     Args:
         path: Path to the .mbox file
         out_path: Path for the output .arrow file(s)
@@ -199,7 +249,7 @@ def parse_mbox_arrow(
         html_to_text: Convert HTML body to plain text
         extract_attachment_content: Include attachment content
         batch_size: Number of emails per batch (default: 10000)
-    
+
     Returns:
         Number of emails processed
     """
@@ -207,6 +257,10 @@ def parse_mbox_arrow(
         path,
         out_path,
         max_attachment_size=max_attachment_size,
+        max_inflate=max_inflate,
+        max_mime_depth=max_mime_depth,
+        max_mime_parts=max_mime_parts,
+        max_header_bytes=max_header_bytes,
         include_raw_headers=include_raw_headers,
         html_to_text=html_to_text,
         extract_attachment_content=extract_attachment_content,
@@ -216,26 +270,37 @@ def parse_mbox_arrow(
 
 
 def extract_attachments(
-    path, out_dir, max_attachment_size=None, max_total_attachment_bytes=None
+    path,
+    out_dir,
+    max_attachment_size=None,
+    max_total_attachment_bytes=None,
+    *,
+    max_inflate=None,
+    max_mime_depth=None,
+    max_mime_parts=None,
+    max_header_bytes=None,
 ):
     """
     Extract attachments from an email file.
-    
+
     Args:
         path: Path to the email file
         out_dir: Output directory for extracted attachments
         max_attachment_size: Maximum attachment size to process (bytes)
-    
+
     Returns:
         List of paths to extracted files
     """
     return extract_attachments_py(
-               path,
-               out_dir,
-               max_attachment_size=max_attachment_size,
-               max_total_attachment_bytes=max_total_attachment_bytes,
-           )
-
+        path,
+        out_dir,
+        max_attachment_size=max_attachment_size,
+        max_inflate=max_inflate,
+        max_mime_depth=max_mime_depth,
+        max_mime_parts=max_mime_parts,
+        max_header_bytes=max_header_bytes,
+        max_total_attachment_bytes=max_total_attachment_bytes,
+    )
 
 
 def parse_email_bytes(
@@ -247,6 +312,10 @@ def parse_email_bytes(
     html_to_text=False,
     extract_attachment_content=False,
     max_total_attachment_bytes=None,
+    max_inflate=None,
+    max_mime_depth=None,
+    max_mime_parts=None,
+    max_header_bytes=None,
 ):
     """Parse EML or MSG bytes without creating or accepting a file path.
 
@@ -258,6 +327,10 @@ def parse_email_bytes(
             source,
             format,
             max_attachment_size=max_attachment_size,
+            max_inflate=max_inflate,
+            max_mime_depth=max_mime_depth,
+            max_mime_parts=max_mime_parts,
+            max_header_bytes=max_header_bytes,
             include_raw_headers=include_raw_headers,
             html_to_text=html_to_text,
             extract_attachment_content=extract_attachment_content,
@@ -274,6 +347,10 @@ def parse_mbox_bytes(
     html_to_text=False,
     extract_attachment_content=False,
     max_total_attachment_bytes=None,
+    max_inflate=None,
+    max_mime_depth=None,
+    max_mime_parts=None,
+    max_header_bytes=None,
 ):
     """Parse an mbox mailbox held in memory; return a list of message dicts.
 
@@ -288,8 +365,13 @@ def parse_mbox_bytes(
             html_to_text=html_to_text,
             extract_attachment_content=extract_attachment_content,
             max_total_attachment_bytes=max_total_attachment_bytes,
+            max_inflate=max_inflate,
+            max_mime_depth=max_mime_depth,
+            max_mime_parts=max_mime_parts,
+            max_header_bytes=max_header_bytes,
         )
     )
+
 
 __all__ = [
     "parse_email_bytes",

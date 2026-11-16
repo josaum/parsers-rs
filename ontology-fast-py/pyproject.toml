@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ontology-fast"
-version = "0.1.6"
+version = "0.1.7"
 description = "Canonical Turtle reading and indexed triple access powered by Rust"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }

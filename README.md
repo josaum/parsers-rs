@@ -8,27 +8,28 @@ Every published wheel and Node tarball is bound by `release-manifest.json` and `
 
 ---
 
-## Workspace Catalog (44 Crates)
+## Workspace Catalog (45 Crates)
 
-A crate belongs in `parsers-rs` when it provides a deterministic, side-effect-free parser, a generic format writer, or a shared Arrow IPC / Flight transport contract with zero dependencies on any downstream consumer.
+A crate belongs in `parsers-rs` when it provides a deterministic, side-effect-free parser, a generic format writer, a shared Arrow IPC / Flight transport contract, or a generic acquisition layer with zero dependencies on any downstream consumer. Network and browser execution live in `web-fast-crawl`, separate from the parser cores.
 
 | Domain | Rust Core / Writer | Python Binding (`abi3`) | Node-API Binding (`napi-2`) | Arrow Flight Service | Capabilities |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **JSON** | `json-fast-core` (`0.1.12`) | `json-fast-py` (`json_fast`) | `json-fast-node` | `json-fast-flight` (`0.1.6`) | SIMD JSON/JSONL parsing, JSON Schema validation, JSON-RPC 2.0, JSON:API, JWT/JWK split, JSON-LD context peek, Arrow batches |
-| **XSD / XML** | `xsd-fast-core` (`0.3.1`) | `xsd-fast-py` (`xsd_fast`) | `xsd-fast-node` | `xsd-fast-flight` (`0.2.6`) | XSD schema parsing, element/type introspection, XML validation, and Arrow schema derivation |
-| **DOCX** | `docx-fast-core` (`0.2.11`) | `docx-fast-py` (`docx_fast`) | `docx-fast-node` | `docx-fast-flight` (`0.2.7`) | Read-only DOCX structure extraction, tables, paragraphs, metadata, NDJSON & Arrow IPC streaming |
-| **XLSX (Read)** | `xlsx-fast-core` (`0.2.11`) | `xlsx-fast-py` (`xlsx_fast`) | `xlsx-fast-node` | `xlsx-fast-flight` (`0.2.7`) | Read-only XLSX workbook extraction, typed cells, formulas, merged ranges, NDJSON & Arrow IPC streaming |
-| **XLSX (Write)** | `xlsx-fast-write` (`0.2.5`) | `xlsx-fast-write-py` (`xlsx_fast_write`) | `xlsx-fast-write-node` | — | Streaming XLSX writer with zero-copy XML sheet writing, shared-strings deduplication, wrap/zebra/freeze-rows styling |
-| **PPTX** | `pptx-fast-core` (`0.2.11`) | `pptx-fast-py` (`pptx_fast`) | `pptx-fast-node` | `pptx-fast-flight` (`0.2.7`) | Read-only PPTX slide, shape, table, notes, and embedded media extraction, NDJSON & Arrow datasets |
-| **PDF (Read)** | `pdf-fast-core` (`0.2.10`) | `pdf-fast-py` (`pdf_fast`) | `pdf-fast-node` | — | Read-only PDF text, glyph catalog, vector/raster images, CCITT/LZW, tables, page rendering, and Arrow batches |
-| **PDF (Write)** | `pdf-fast-write` (`0.2.5`) | `pdf-fast-write-py` (`pdf_fast_write`) | `pdf-fast-write-node` | — | Direct PDF 1.7 writer for vector primitives, TrueType font subsetting, raster images, and structured tables |
-| **Email** | `email-fast-core` (`0.2.12`) | `email-fast-py` (`email_fast`) | `email-fast-node` | `email-fast-flight` (`0.2.6`) | Read-only EML (RFC 5322), OLE/CFB `.msg`, and `mbox` extraction with bounded attachment budgets and Arrow IPC |
-| **Geospatial** | `geo-fast-core` (`0.2.6`) | `geo-fast-py` (`geo_fast`) | `geo-fast-node` | — | GeoParquet, Shapefile, FlatGeobuf, GeoJSON, GeoTIFF, SAR, thermal, hyperspectral, WMS/WFS, and GeoArrow IPC |
-| **Ontology** | `ontology-fast-core` (`0.1.6`) | `ontology-fast-py` (`ontology_fast`) | — | — | Canonical Turtle/RDF reading and indexed triple store with strict memory and triple-count budgets |
-| **MCTS / Search** | `mcts-fast-core` (`0.2.0`) | `mcts-fast-py` (`mcts_fast_py`) | — | — | Arena-based PUCT Monte Carlo Tree Search with embedding-guided simulation for ontology/KB navigation |
-| **Web / HTML** | `web-fast-core` (`0.1.6`) | — | — | — | Deterministic, side-effect-free HTML5 DOM & table extraction with Apache Arrow record batches |
-| **OOXML ZIP** | `ooxml-archive` (`0.1.9`) | — | — | — | Shared OOXML ZIP reader, aggregate `max_inflate` decompression bomb guard, and relationship resolution |
-| **Flight Config** | `flight-ipc-config` (`0.1.5`) | — | — | — | Shared Arrow Flight IPC compression (`LZ4`/`ZSTD`), JWT bearer authentication, and transport configuration |
+| **JSON** | `json-fast-core` (`0.1.13`) | `json-fast-py` (`json_fast`) | `json-fast-node` | `json-fast-flight` (`0.1.7`) | SIMD JSON/JSONL parsing, JSON Schema validation, JSON-RPC 2.0, JSON:API, JWT/JWK split, JSON-LD context peek, Arrow batches |
+| **XSD / XML** | `xsd-fast-core` (`0.3.2`) | `xsd-fast-py` (`xsd_fast`) | `xsd-fast-node` | `xsd-fast-flight` (`0.2.7`) | XSD schema parsing, element/type introspection, XML validation, and Arrow schema derivation |
+| **DOCX** | `docx-fast-core` (`0.2.12`) | `docx-fast-py` (`docx_fast`) | `docx-fast-node` | `docx-fast-flight` (`0.2.8`) | Read-only DOCX structure extraction, tables, paragraphs, metadata, NDJSON & Arrow IPC streaming |
+| **Excel (Read)** | `xlsx-fast-core` (`0.2.12`) | `xlsx-fast-py` (`xlsx_fast`) | `xlsx-fast-node` | `xlsx-fast-flight` (`0.2.8`) | Read-only XLSX/XLS/XLSB workbook extraction, typed cells, formulas, merged ranges, NDJSON & Arrow IPC streaming |
+| **XLSX (Write)** | `xlsx-fast-write` (`0.2.6`) | `xlsx-fast-write-py` (`xlsx_fast_write`) | `xlsx-fast-write-node` | — | Streaming XLSX writer with zero-copy XML sheet writing, shared-strings deduplication, wrap/zebra/freeze-rows styling |
+| **PPTX** | `pptx-fast-core` (`0.2.12`) | `pptx-fast-py` (`pptx_fast`) | `pptx-fast-node` | `pptx-fast-flight` (`0.2.8`) | Read-only PPTX slide, shape, table, notes, and embedded media extraction, NDJSON & Arrow datasets |
+| **PDF (Read)** | `pdf-fast-core` (`0.2.11`) | `pdf-fast-py` (`pdf_fast`) | `pdf-fast-node` | — | Read-only PDF text, glyph catalog, vector/raster images, CCITT/LZW, tables, page rendering, and Arrow batches |
+| **PDF (Write)** | `pdf-fast-write` (`0.2.6`) | `pdf-fast-write-py` (`pdf_fast_write`) | `pdf-fast-write-node` | — | Direct PDF 1.7 writer for vector primitives, TrueType font subsetting, raster images, and structured tables |
+| **Email** | `email-fast-core` (`0.2.13`) | `email-fast-py` (`email_fast`) | `email-fast-node` | `email-fast-flight` (`0.2.7`) | Read-only EML (RFC 5322), OLE/CFB `.msg`, and `mbox` extraction with bounded attachment budgets and Arrow IPC |
+| **Geospatial** | `geo-fast-core` (`0.2.7`) | `geo-fast-py` (`geo_fast`) | `geo-fast-node` | — | GeoParquet, Shapefile, FlatGeobuf, GeoJSON, GeoTIFF, SAR, thermal, hyperspectral, WMS/WFS, and GeoArrow IPC |
+| **Ontology** | `ontology-fast-core` (`0.1.7`) | `ontology-fast-py` (`ontology_fast`) | — | — | Canonical Turtle/RDF reading and indexed triple store with strict memory and triple-count budgets |
+| **MCTS / Search** | `mcts-fast-core` (`0.2.1`) | `mcts-fast-py` (`mcts_fast_py`) | — | — | Arena-based PUCT Monte Carlo Tree Search with embedding-guided simulation for ontology/KB navigation |
+| **Web / HTML** | `web-fast-core` (`0.1.7`) | — | — | — | Deterministic, side-effect-free HTML5 DOM & table extraction with Apache Arrow record batches |
+| **Semantic Crawler** | [`web-fast-crawl`](web-fast-crawl/README.md) (`0.1.0`) | — | — | — | Bounded HTTP/browser crawling, hydration/API JSON, commerce observations, offline JSON-LD, provenance and indexed RDF graphs |
+| **OOXML ZIP** | `ooxml-archive` (`0.1.10`) | — | — | — | Shared OOXML ZIP reader, aggregate `max_inflate` decompression bomb guard, and relationship resolution |
+| **Flight Config** | `flight-ipc-config` (`0.1.6`) | — | — | — | Shared Arrow Flight IPC compression (`LZ4`/`ZSTD`), JWT bearer authentication, and transport configuration |
 
 ---
 
@@ -37,7 +38,7 @@ A crate belongs in `parsers-rs` when it provides a deterministic, side-effect-fr
 1. **Aggregate Decompression Budgets (`ooxml-archive`)**:
    `max_inflate` is enforced as an **aggregate budget across the entire archive view**, not merely per ZIP entry. Archive parts are inflated through a bounded `flate2` reader that caps output bytes *before* exposing buffers, preventing multi-part zip-bomb amplification.
 2. **Strict Input & Structural Budgets**:
-   `json-fast-core`, `email-fast-core`, `ontology-fast-core`, and `web-fast-core` enforce explicit byte, nesting-depth, token-count, attachment, and triple-count limits prior to full materialization.
+   Parser cores apply explicit byte, nesting-depth, token-count, attachment, and triple-count limits at their documented stages. `web-fast-core` checks source bytes before parsing and DOM size/depth after HTML5 tree construction, before extraction; its limits are not a process-memory cap.
 3. **Hardened Arrow Flight Services (`*-flight`)**:
    All six Arrow Flight services (`docx`, `xlsx`, `pptx`, `email`, `xsd`, `json`) are strictly read-only (`do_put` and mutating actions fail loud), require valid JWT bearer authorization before request parsing, reject symlinks during directory enumeration across both POSIX and Windows, prevent path traversal outside `--root`, and normalize Flight tickets to canonical `/` separators on every OS.
 4. **Pinned Arrow Wire Format**:
@@ -60,7 +61,9 @@ field can be changed by the caller; a `const` cannot.
 | `xlsx-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `xlsx-fast-core/src/lib.rs` |
 | `pptx-fast-core` | Inflate budget | 128 MiB | `ParseOptions::max_inflate`, `pptx-fast-core/src/lib.rs` |
 | `email-fast-core` | One attachment / all attachments | 100 MiB / 100 MiB | `ParseOptions::max_attachment_size`, `max_total_attachment_bytes`, `email-fast-core/src/lib.rs` |
-| | MIME nesting depth | 32 | `MAX_MIME_DEPTH` |
+| | MIME container nesting depth | 32 | `MAX_MIME_DEPTH` |
+| | Input / decoded payload bytes | 128 MiB each | `ParseOptions::max_inflate` |
+| | MIME/MSG tree depth / parts / per-part headers | 64 / 10,000 / 256 KiB | `max_mime_depth`, `max_mime_parts`, `max_header_bytes` |
 | | Header-decoding work per message | 3,000,000,000 characters walked | `MAX_HEADER_DECODE_COST` |
 | | Multipart boundary length | 200 bytes | `MAX_BOUNDARY_LEN` |
 | `json-fast-core` | Input size | 8 MiB | `DEFAULT_MAX_INPUT_BYTES`, `json-fast-core/src/lib.rs` |
@@ -174,13 +177,17 @@ Every tagged release (`vYYYY.MM.DD`) builds and publishes **88 binary artifacts*
 
 ## Development & Verification
 
+See [Parser compatibility and conformance checks](SPEC_COMPLIANCE.md) for specification
+references, compatibility changes, regression coverage, and reproducible parser
+benchmarks.
+
 ### Rust Workspace & Architectural Doctors
 
 ```bash
 # Format check
 cargo fmt --all --check
 
-# Lint all 44 crates and all targets (default and Arrow feature sets)
+# Lint all 45 crates and all targets (default and Arrow feature sets)
 RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked
 RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked \
   --features docx-fast-core/arrow,xlsx-fast-core/arrow,pptx-fast-core/arrow,pdf-fast-core/arrow,email-fast-core/arrow,json-fast-core/arrow,xsd-fast-core/arrow,web-fast-core/arrow
@@ -242,6 +249,15 @@ python3 vendor/parsers-rs/src/scripts/consumer_surface_check.py --dist dist --co
 ```
 
 ## Third-party licences
+
+`web-fast-crawl` bundles the unmodified Schema.org context under CC-BY-SA-3.0;
+[the context notice](web-fast-crawl/contexts/NOTICE.md) records its source, hash,
+attribution and terms. This applies to the context data; the Rust source remains
+MIT OR Apache-2.0. `deny.toml` scopes this data-license exception to the crawler.
+
+The TLS verifier uses Mozilla root certificate data from `webpki-root-certs`
+under CDLA-Permissive-2.0. Its agreement is included in
+[LICENSE-CDLA-Permissive-2.0](LICENSE-CDLA-Permissive-2.0).
 
 `web-fast-core` links four crates under the Mozilla Public License 2.0, through
 its HTML parser `scraper`: `cssparser`, `cssparser-macros`, `selectors` and

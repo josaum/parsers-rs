@@ -1,6 +1,6 @@
 [package]
 name = "json-fast-core"
-version = "0.1.12"
+version = "0.1.13"
 edition.workspace = true
 authors.workspace = true
 description = "SIMD-accelerated JSON/JSON-family parser: the six ECMA-404 JSON types, JSONL/NDJSON streaming, JSON Schema validation, JSON-RPC 2.0, JSON:API, JWK/JWT split, JSON-LD context peek"
@@ -11,6 +11,10 @@ rust-version.workspace = true
 
 [lib]
 name = "json_fast_core"
+
+[[bench]]
+name = "parse_paths"
+harness = false
 
 [features]
 default = []

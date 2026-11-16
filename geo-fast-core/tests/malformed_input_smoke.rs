@@ -1653,11 +1653,9 @@ const GEOJSON_NESTING_LIMIT: usize = 32;
 #[test]
 fn deeply_nested_geojson_is_bounded_on_a_small_stack() {
     guarded("nested geojson", SINGLE_INPUT_DEADLINE, || {
-        /// A Feature whose `id` and `properties` are both `properties`.
+        /// A Feature with a scalar ID and the supplied properties.
         fn feature(geometry: &[u8], properties: &[u8]) -> String {
-            let mut document = br#"{"type":"Feature","id":"#.to_vec();
-            document.extend_from_slice(properties);
-            document.extend_from_slice(br#","properties":"#);
+            let mut document = br#"{"type":"Feature","id":"nested","properties":"#.to_vec();
             document.extend_from_slice(properties);
             document.extend_from_slice(br#","geometry":"#);
             document.extend_from_slice(geometry);
@@ -1681,8 +1679,14 @@ fn deeply_nested_geojson_is_bounded_on_a_small_stack() {
         // Inside the limit: the Feature object is one level, so its values
         // may nest one level less. These parse, and everything a consumer
         // then does with the features fits the small stack.
-        for value in nested_values(GEOJSON_NESTING_LIMIT - 1) {
-            let document = feature(point, &value);
+        for value in nested_values(GEOJSON_NESTING_LIMIT - 2) {
+            // Properties must be an object and IDs scalar; nest arbitrary values
+            // under a property so this still exercises the exact depth boundary.
+            let document = format!(
+                r#"{{"type":"Feature","id":"nested","properties":{{"value":{}}},"geometry":{}}}"#,
+                String::from_utf8(value).unwrap(),
+                std::str::from_utf8(point).unwrap()
+            );
             smoke::run_on_small_stack(move || {
                 let features = parse_geojson_str(&document).expect("nesting within the limit");
                 assert_eq!(features.len(), 1);

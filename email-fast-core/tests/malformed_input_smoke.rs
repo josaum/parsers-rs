@@ -858,10 +858,7 @@ fn msg_difat_cycle_is_detected_at_the_repeated_sector() {
     bytes.extend_from_slice(&difat);
     bytes[0x44..0x48].copy_from_slice(&sector.to_le_bytes());
     let error = parse_msg_bytes(&bytes, ParseOptions::default()).expect_err("cycle");
-    assert!(
-        error.to_string().contains("DIFAT cycle at sector"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("DIFAT"), "{error}");
 }
 
 #[test]

@@ -1,9 +1,10 @@
-"""Read-only XLSX parsing, from bytes or from a path.
+"""Read-only XLS, XLSB and XLSX parsing, from bytes or from a path.
 
 `parse_xlsx_bytes` is the in-memory entry point: it parses an upload where it
 already is, with no temp file and no subprocess. The path-based functions exist
-for workbooks too large to want to materialize — `parse_xlsx_ndjson` and
-`parse_xlsx_arrow_ipc` stream to a file instead of returning a workbook object.
+to write NDJSON or Arrow IPC without returning a Python workbook object.
+XLSX emits cells incrementally; XLS/XLSB materialize a budgeted Rust workbook
+before writing output.
 """
 
 import json
@@ -62,7 +63,7 @@ def parse_xlsx_ndjson(
 def parse_xlsx_bytes(
     data, decode_dates=True, include_formulas=False, raw_values=False, max_inflate=None
 ):
-    """Parse an XLSX workbook from raw bytes (no temp file needed)."""
+    """Parse XLS, XLSB or XLSX bytes (no temp file needed)."""
     payload = parse_xlsx_bytes_py(
                   data,
                   decode_dates=decode_dates,
@@ -100,4 +101,16 @@ __all__ = [
     "parse_xlsx_bytes",
     "parse_xlsx_ndjson",
     "parse_xlsx_arrow_ipc",
+    "parse_excel",
+    "parse_excel_json",
+    "parse_excel_bytes",
+    "parse_excel_ndjson",
+    "parse_excel_arrow_ipc",
 ]
+
+# The historical names remain compatible; all readers detect XLS/XLSB/XLSX.
+parse_excel = parse_xlsx
+parse_excel_json = parse_xlsx_json
+parse_excel_bytes = parse_xlsx_bytes
+parse_excel_ndjson = parse_xlsx_ndjson
+parse_excel_arrow_ipc = parse_xlsx_arrow_ipc

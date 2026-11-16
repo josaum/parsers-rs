@@ -218,6 +218,34 @@ pub(crate) fn parse_preflighted<T: serde::de::DeserializeOwned>(input: &str) -> 
     sonic_rs::from_str(input).map_err(JsonError::from)
 }
 
+pub(crate) fn parse_object<T: serde::de::DeserializeOwned>(input: &str) -> Result<T> {
+    scan_json(input, &JsonLimits::default())?;
+    // Serde-derived structs also accept positional arrays. Protocol objects
+    // must not accept that alternate representation.
+    if !input
+        .trim_start_matches([' ', '\t', '\r', '\n'])
+        .starts_with('{')
+    {
+        return Err(JsonError::Structure(
+            "protocol envelope must be a JSON object".into(),
+        ));
+    }
+    parse_preflighted(input)
+}
+
+// With `#[serde(default)]`, missing members remain None while explicitly
+// present null is deserialized as T (Some(Null) for Value, an error for an
+// object/array). Protocol envelopes distinguish presence from nullability.
+pub(crate) fn deserialize_present<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 /// Parse a UTF-8 JSON document into a typed value via the SIMD fast path.
 ///
 /// `T` must implement `serde::DeserializeOwned`. For an untyped value use
@@ -267,7 +295,7 @@ pub fn query_with_limits<T: serde::de::DeserializeOwned>(
     let node = value
         .pointer(json_pointer)
         .ok_or_else(|| JsonError::Structure(format!("missing JSON pointer {json_pointer:?}")))?;
-    serde_json::from_value(node.clone()).map_err(JsonError::from)
+    T::deserialize(node).map_err(JsonError::from)
 }
 
 #[cfg(feature = "mmap")]

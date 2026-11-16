@@ -24,8 +24,7 @@ struct Case {
     /// What a schema attribute holding it reads as; `None` when the whole
     /// attribute is dropped, as if it had not been written.
     attribute: Option<&'static str>,
-    /// What an instance element holding it is validated as (after the
-    /// surrounding whitespace is trimmed).
+    /// What an xs:string element is validated as, preserving whitespace.
     text: &'static str,
 }
 
@@ -70,7 +69,7 @@ const CASES: &[Case] = &[
         label: "reference with only spaces around it",
         written: " &amp; ",
         attribute: Some(" & "),
-        text: "&",
+        text: " & ",
     },
     Case {
         label: "bare ampersand",
@@ -286,7 +285,7 @@ fn instance_text_keeps_references_next_to_cdata_and_spaces() {
     let cases = [
         ("&amp;<![CDATA[ b]]>", "& b"),
         ("<![CDATA[a ]]>&amp;", "a &"),
-        (" a &lt; <![CDATA[b]]> &gt; c ", "a < b > c"),
+        (" a &lt; <![CDATA[b]]> &gt; c ", " a < b > c "),
         ("&foo;", "&foo;"),
         ("x &amp; &foo; y", "x & &foo; y"),
         ("a & b; c &", "a & b; c &"),

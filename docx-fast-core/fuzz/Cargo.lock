@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "docx-fast-core"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "chrono",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "ooxml-archive"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "chrono",
